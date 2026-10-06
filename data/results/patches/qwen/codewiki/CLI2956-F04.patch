@@ -1,0 +1,136 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..cc80b35 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import builtins
+ 
+ import collections.abc as cabc
+ import enum
+@@ -1196,6 +1197,55 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        # Check required_if conditions after all parameters are processed
++        for param in self.get_params(ctx):
++            if param.required_if is not None:
++                should_be_required = False
++                
++                if callable(param.required_if):
++                    # Callable predicate
++                    should_be_required = bool(param.required_if(ctx, param))
++                elif isinstance(param.required_if, dict):
++                    # Empty mapping means no requirement
++                    if len(param.required_if) == 0:
++                        should_be_required = False
++                    else:
++                        # Mapping of parameter names to expected values
++                        for req_param_name, expected_value in param.required_if.items():
++                            # Check if the referenced parameter exists
++                            ref_param = next(
++                                (p for p in self.get_params(ctx) if p.name == req_param_name),
++                                None
++                            )
++                            if ref_param is None:
++                                # Parameter not found - configuration error
++                                raise UsageError(
++                                    f"required_if references unknown parameter {req_param_name!r}"
++                                )
++                            
++                            # Get the actual value from context
++                            actual_value = ctx.params.get(req_param_name)
++                            
++                            if actual_value != expected_value:
++                                # Condition doesn't match
++                                break
++                        else:
++                            # All conditions matched
++                            should_be_required = True
++                
++                if should_be_required:
++                    # Check if the parameter value is missing or not provided
++                    value = ctx.params.get(param.name)
++                    
++                    # For flags, check if it was explicitly provided
++                    if param.is_flag:
++                        source = ctx.get_parameter_source(param.name)
++                        if source in (None, ParameterSource.DEFAULT):
++                            # Flag was not explicitly provided
++                            raise MissingParameter(ctx=ctx, param=param)
++                    elif param.value_is_missing(value):
++                        raise MissingParameter(ctx=ctx, param=param)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2027,6 +2077,16 @@ class Parameter:
+                         its deprecation in --help. The message can be customized
+                         by using a string as the value. A deprecated parameter
+                         cannot be required, a ValueError will be raised otherwise.
++    :param required_if: A mapping of parameter names to values that must match
++                        for this parameter to be required, or a callable that
++                        takes ``(ctx, param)`` and returns True if this parameter
++                        should be required. An empty mapping or None disables the
++                        feature. Keys are normalized Python parameter names without
++                        option prefixes. Values are compared with those parameters'
++                        final converted values. A mapping that names no parameter
++                        on the command is a configuration error reported as
++                        UsageError. Existing unconditional ``required`` behavior
++                        remains unchanged.
+ 
+     .. versionchanged:: 8.2.0
+         Introduction of ``deprecated``.
+@@ -2091,6 +2151,7 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        required_if: dict[str, t.Any] | t.Callable[[Context, Parameter], bool] | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2180,7 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.required_if = required_if
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2168,6 +2230,24 @@ class Parameter:
+                     f"{self.param_type_name} cannot be required."
+                 )
+ 
++            # Validate required_if
++            if required_if is not None:
++                if isinstance(required_if, dict):
++                    for key in required_if:
++                        if not isinstance(key, str):
++                            raise TypeError(
++                                f"required_if keys must be strings, got {key!r}"
++                            )
++                        if key.startswith("-"):
++                            raise TypeError(
++                                f"required_if key {key!r} should not have option prefix"
++                            )
++                elif not callable(required_if):
++                    raise TypeError(
++                        f"required_if must be a mapping, callable, or None, "
++                        f"got {builtins.type(required_if).__name__}"
++                    )
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         """Gather information that could be useful for a tool generating
+         user-facing documentation.
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index e5e5119..aeaf06c 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -27,6 +27,7 @@ click.echo(json.dumps(rv))
+ 
+ ALLOWED_IMPORTS = {
+     "__future__",
++    "builtins",
+     "weakref",
+     "os",
+     "struct",

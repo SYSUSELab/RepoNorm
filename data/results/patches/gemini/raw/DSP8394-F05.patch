@@ -1,0 +1,363 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..154d8abe 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -33,6 +33,9 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    compress: Optional[str] = None,
++    cull_limit: Optional[int] = None,
++    eviction_policy: Optional[str] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +46,9 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        compress: Compression codec ("gzip", "zlib", or None).
++        cull_limit: Cull limit for disk cache.
++        eviction_policy: Eviction policy for disk cache.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,6 +78,9 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        compress=compress,
++        cull_limit=cull_limit,
++        eviction_policy=eviction_policy,
+     )
+ 
+ 
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..34e47bbf 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -5,6 +5,9 @@ import threading
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
++import gzip
++import zlib
++import pickle
+ 
+ import cloudpickle
+ import pydantic
+@@ -30,7 +33,9 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        compress: Optional[str] = None,
++        cull_limit: Optional[int] = None,
++        eviction_policy: Optional[str] = None,
+     ):
+         """
+         Args:
+@@ -39,26 +44,67 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            compress: Compression codec ("gzip", "zlib", or None).
++            cull_limit: Cull limit for disk cache.
++            eviction_policy: Eviction policy for disk cache.
+         """
+ 
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
++        self.set_compression(compress)
++        
+         if self.enable_memory_cache:
+             self.memory_cache = LRUCache(maxsize=memory_max_entries)
+         else:
+             self.memory_cache = {}
+         if self.enable_disk_cache:
+-            self.disk_cache = FanoutCache(
+-                shards=16,
+-                timeout=10,
+-                directory=disk_cache_dir,
+-                size_limit=disk_size_limit_bytes,
+-            )
++            disk_cache_kwargs = {
++                "shards": 16,
++                "timeout": 10,
++                "directory": disk_cache_dir,
++                "size_limit": disk_size_limit_bytes,
++            }
++            if cull_limit is not None:
++                disk_cache_kwargs["cull_limit"] = cull_limit
++            if eviction_policy is not None:
++                disk_cache_kwargs["eviction_policy"] = eviction_policy
++                
++            self.disk_cache = FanoutCache(**disk_cache_kwargs)
+         else:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
+ 
++    def set_compression(self, codec: Optional[str]) -> None:
++        if codec not in [None, "gzip", "zlib"]:
++            raise ValueError("Compression must be 'gzip', 'zlib', or None")
++        self.compress = codec
++
++    def _serialize(self, value: Any) -> bytes:
++        payload = pickle.dumps(value)
++        if self.compress == "gzip":
++            return b"DSPC" + b"\x01" + gzip.compress(payload)
++        elif self.compress == "zlib":
++            return b"DSPC" + b"\x02" + zlib.compress(payload)
++        else:
++            return b"DSPC" + b"\x00" + payload
++
++    def _deserialize(self, data: Any) -> Any:
++        if not isinstance(data, bytes) or not data.startswith(b"DSPC"):
++            return data
++        
++        codec_byte = data[4:5]
++        payload = data[5:]
++        
++        if codec_byte == b"\x00":
++            return pickle.loads(payload)
++        elif codec_byte == b"\x01":
++            return pickle.loads(gzip.decompress(payload))
++        elif codec_byte == b"\x02":
++            return pickle.loads(zlib.decompress(payload))
++        else:
++            raise ValueError("Unknown codec")
++
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache
+@@ -108,7 +154,7 @@ class Cache:
+                 response = self.memory_cache[key]
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
++            response = self._deserialize(self.disk_cache[key])
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
+@@ -140,7 +186,7 @@ class Cache:
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                self.disk_cache[key] = self._serialize(value)
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+diff --git a/reproduce_cache.py b/reproduce_cache.py
+new file mode 100644
+index 00000000..3cb948c8
+--- /dev/null
++++ b/reproduce_cache.py
+@@ -0,0 +1,29 @@
++import os
++import shutil
++import tempfile
++from dspy.clients.cache import Cache
++
++# Setup
++cache_dir = tempfile.mkdtemp()
++try:
++    # Test initialization
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=True,
++        disk_cache_dir=cache_dir,
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=100,
++    )
++    
++    # Test put/get
++    request = {"prompt": "hello"}
++    value = {"response": "world"}
++    cache.put(request, value)
++    
++    retrieved = cache.get(request)
++    print(f"Retrieved: {retrieved}")
++    assert retrieved == value
++    
++    print("Basic cache functionality works.")
++finally:
++    shutil.rmtree(cache_dir)
+diff --git a/test_compression.py b/test_compression.py
+new file mode 100644
+index 00000000..c1929ed1
+--- /dev/null
++++ b/test_compression.py
+@@ -0,0 +1,66 @@
++import os
++import shutil
++import tempfile
++import gzip
++import zlib
++import pickle
++from dspy.clients.cache import Cache
++
++# Setup
++cache_dir = tempfile.mkdtemp()
++try:
++    # Initialize Cache with compression
++    # We need to modify Cache to accept these arguments first.
++    # This script is to verify the *design* of the compression.
++    
++    # The requirement:
++    # The persisted compressed representation is bytes beginning with b"DSPC", 
++    # followed by one codec byte (0x00: uncompressed pickle; 0x01: gzip; 0x02: zlib) 
++    # and the encoded pickle payload.
++    
++    def compress_data(data, codec):
++        payload = pickle.dumps(data)
++        if codec == "gzip":
++            compressed = gzip.compress(payload)
++            return b"DSPC" + b"\x01" + compressed
++        elif codec == "zlib":
++            compressed = zlib.compress(payload)
++            return b"DSPC" + b"\x02" + compressed
++        elif codec is None:
++            return b"DSPC" + b"\x00" + payload
++        else:
++            raise ValueError("Invalid codec")
++
++    def decompress_data(data):
++        if not data.startswith(b"DSPC"):
++            # Legacy support
++            return pickle.loads(data)
++        
++        codec_byte = data[4:5]
++        payload = data[5:]
++        
++        if codec_byte == b"\x00":
++            return pickle.loads(payload)
++        elif codec_byte == b"\x01":
++            return pickle.loads(gzip.decompress(payload))
++        elif codec_byte == b"\x02":
++            return pickle.loads(zlib.decompress(payload))
++        else:
++            raise ValueError("Unknown codec")
++
++    # Test
++    data = {"a": 1, "b": [1, 2, 3]}
++    
++    for codec in [None, "gzip", "zlib"]:
++        compressed = compress_data(data, codec)
++        decompressed = decompress_data(compressed)
++        print(f"Codec {codec}: {decompressed == data}")
++        assert decompressed == data
++        
++    # Test legacy
++    legacy_data = pickle.dumps(data)
++    assert decompress_data(legacy_data) == data
++    print("Compression/Decompression logic works.")
++
++finally:
++    shutil.rmtree(cache_dir)
+diff --git a/test_invalid_codec.py b/test_invalid_codec.py
+new file mode 100644
+index 00000000..aaad10f4
+--- /dev/null
++++ b/test_invalid_codec.py
+@@ -0,0 +1,16 @@
++from dspy.clients.cache import Cache
++import tempfile
++import shutil
++
++cache_dir = tempfile.mkdtemp()
++try:
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=cache_dir,
++        compress="invalid"
++    )
++except ValueError as e:
++    print(f"Caught expected error: {e}")
++finally:
++    shutil.rmtree(cache_dir)
+diff --git a/test_legacy_compatibility.py b/test_legacy_compatibility.py
+new file mode 100644
+index 00000000..5abf563f
+--- /dev/null
++++ b/test_legacy_compatibility.py
+@@ -0,0 +1,32 @@
++import os
++import shutil
++import tempfile
++import pickle
++from dspy.clients.cache import Cache
++from diskcache import FanoutCache
++
++# Setup
++cache_dir = tempfile.mkdtemp()
++try:
++    # Initialize Cache
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=cache_dir,
++    )
++    
++    # Manually put a legacy entry (no header) into the disk cache
++    request = {"prompt": "hello"}
++    key = cache.cache_key(request)
++    
++    # Access the underlying disk_cache
++    cache.disk_cache[key] = {"data": "legacy"}
++    
++    # Now get it
++    retrieved = cache.get(request)
++    print(f"Retrieved: {retrieved}")
++    assert retrieved == {"data": "legacy"}
++    
++    print("Legacy compatibility works.")
++finally:
++    shutil.rmtree(cache_dir)
+diff --git a/test_new_cache.py b/test_new_cache.py
+new file mode 100644
+index 00000000..10b438fd
+--- /dev/null
++++ b/test_new_cache.py
+@@ -0,0 +1,39 @@
++import os
++import shutil
++import tempfile
++from dspy.clients.cache import Cache
++
++# Setup
++cache_dir = tempfile.mkdtemp()
++try:
++    # Test initialization with new args
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=True,
++        disk_cache_dir=cache_dir,
++        compress="gzip",
++        cull_limit=10,
++        eviction_policy="least-recently-used",
++    )
++    
++    # Test put/get with compression
++    request = {"prompt": "hello"}
++    value = {"response": "world"}
++    cache.put(request, value)
++    
++    retrieved = cache.get(request)
++    print(f"Retrieved: {retrieved}")
++    assert retrieved == value
++    
++    # Test changing compression
++    cache.set_compression("zlib")
++    value2 = {"response": "new"}
++    cache.put({"prompt": "new"}, value2)
++    assert cache.get({"prompt": "new"}) == value2
++    
++    # Verify old entry still readable
++    assert cache.get(request) == value
++    
++    print("New cache functionality works.")
++finally:
++    shutil.rmtree(cache_dir)

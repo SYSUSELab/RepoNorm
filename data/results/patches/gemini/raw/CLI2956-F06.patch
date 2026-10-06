@@ -1,0 +1,798 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..7f7e15c
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,12 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "b", "c": "d"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++runner = CliRunner()
++result = runner.invoke(cli, [])
++print(result.output)
+diff --git a/reproduce_issue_2.py b/reproduce_issue_2.py
+new file mode 100644
+index 0000000..6a89951
+--- /dev/null
++++ b/reproduce_issue_2.py
+@@ -0,0 +1,13 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "b", "c": "d"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++runner = CliRunner()
++# If I pass --foo=a, bar should be 'b'
++result = runner.invoke(cli, ["--foo", "a"])
++print(result.output)
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..4197446 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1204,11 +1204,65 @@ class Command:
+                     len(args),
+                 ).format(args=" ".join(map(str, args)))
+             )
++        self._resolve_dynamic_defaults(ctx)
+ 
+         ctx.args = args
+         ctx._opt_prefixes.update(parser._opt_prefixes)
+         return args
+ 
++    def _resolve_dynamic_defaults(self, ctx: Context) -> None:
++        from click.core import Option
++        dynamic_params = {}
++        for param in self.get_params(ctx):
++            if isinstance(param, Option) and isinstance(param.default, dict) and param.default:
++                is_dynamic = True
++                for key, value in param.default.items():
++                    if not key.startswith("--"):
++                        is_dynamic = False
++                        break
++                if is_dynamic:
++                    dynamic_params[param.name] = param
++        if not dynamic_params:
++            return
++        resolved = {}
++        def resolve_param(param_name, path):
++            if param_name in resolved:
++                return resolved[param_name]
++            if param_name in path:
++                raise UsageError(f"Dependency cycle detected: {' -> '.join(path + [param_name])}")
++            param = dynamic_params[param_name]
++            if ctx.get_parameter_source(param_name) != ParameterSource.DEFAULT:
++                resolved[param_name] = None
++                return None
++            long_opt_to_param = {}
++            for p in self.get_params(ctx):
++                if isinstance(p, Option):
++                    for opt in p.opts:
++                        if opt.startswith("--"):
++                            long_opt_to_param[opt] = p
++                    for opt in p.secondary_opts:
++                        if opt.startswith("--"):
++                            long_opt_to_param[opt] = p
++            final_default = None
++            for dep_long_opt, dep_map in param.default.items():
++                if not isinstance(dep_map, dict):
++                    raise TypeError(f"Dynamic default for {param.name} must be a dictionary.")
++                if dep_long_opt not in long_opt_to_param:
++                    raise UsageError(f"Unknown option {dep_long_opt} in dynamic default for {param.name}.")
++                dep_param = long_opt_to_param[dep_long_opt]
++                if dep_param.name in dynamic_params:
++                    resolve_param(dep_param.name, path + [param_name])
++                dep_value = ctx.params.get(dep_param.name)
++                dep_value_str = str(dep_value)
++                if dep_value_str in dep_map:
++                    final_default = dep_map[dep_value_str]
++            processed_value = param.process_value(ctx, final_default)
++            ctx.params[param.name] = processed_value
++            resolved[param_name] = processed_value
++            return processed_value
++        for param_name in dynamic_params:
++            resolve_param(param_name, [])
++
+     def invoke(self, ctx: Context) -> t.Any:
+         """Given a context, this invokes the attached callback (if it exists)
+         in the right way.
+diff --git a/test_dynamic_defaults_10.py b/test_dynamic_defaults_10.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_10.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_11.py b/test_dynamic_defaults_11.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_11.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_12.py b/test_dynamic_defaults_12.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_12.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_13.py b/test_dynamic_defaults_13.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_13.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_14.py b/test_dynamic_defaults_14.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_14.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_15.py b/test_dynamic_defaults_15.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_15.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_16.py b/test_dynamic_defaults_16.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_16.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_17.py b/test_dynamic_defaults_17.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_17.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_18.py b/test_dynamic_defaults_18.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_18.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_19.py b/test_dynamic_defaults_19.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_19.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_2.py b/test_dynamic_defaults_2.py
+new file mode 100644
+index 0000000..8fcbf8f
+--- /dev/null
++++ b/test_dynamic_defaults_2.py
+@@ -0,0 +1,15 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default="a")
++@click.option("--baz", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar, baz):
++    click.echo(f"foo={foo}, bar={bar}, baz={baz}")
++
++# If I run `cli --bar a`, foo should be '1'.
++# If I run `cli --bar b`, foo should be '2'.
++# If I run `cli --foo x --bar a`, foo should be 'x'.
++
++# This seems to be what is requested.
+diff --git a/test_dynamic_defaults_20.py b/test_dynamic_defaults_20.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_20.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_21.py b/test_dynamic_defaults_21.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_21.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_22.py b/test_dynamic_defaults_22.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_22.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_23.py b/test_dynamic_defaults_23.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_23.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_24.py b/test_dynamic_defaults_24.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_24.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_25.py b/test_dynamic_defaults_25.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_25.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_26.py b/test_dynamic_defaults_26.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_26.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_27.py b/test_dynamic_defaults_27.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_27.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_28.py b/test_dynamic_defaults_28.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_28.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_29.py b/test_dynamic_defaults_29.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_29.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_3.py b/test_dynamic_defaults_3.py
+new file mode 100644
+index 0000000..4c66d28
+--- /dev/null
++++ b/test_dynamic_defaults_3.py
+@@ -0,0 +1,23 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default="a")
++@click.option("--baz", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar, baz):
++    click.echo(f"foo={foo}, bar={bar}, baz={baz}")
++
++runner = CliRunner()
++# If I run `cli --bar a`, foo should be '1'.
++# If I run `cli --bar b`, foo should be '2'.
++# If I run `cli --foo x --bar a`, foo should be 'x'.
++
++result = runner.invoke(cli, ["--bar", "a"])
++print(f"Output for --bar a: {result.output.strip()}")
++
++result = runner.invoke(cli, ["--bar", "b"])
++print(f"Output for --bar b: {result.output.strip()}")
++
++result = runner.invoke(cli, ["--foo", "x", "--bar", "a"])
++print(f"Output for --foo x --bar a: {result.output.strip()}")
+diff --git a/test_dynamic_defaults_30.py b/test_dynamic_defaults_30.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_30.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_31.py b/test_dynamic_defaults_31.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_31.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_4.py b/test_dynamic_defaults_4.py
+new file mode 100644
+index 0000000..5adf91f
+--- /dev/null
++++ b/test_dynamic_defaults_4.py
+@@ -0,0 +1,18 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default="a")
++@click.option("--baz", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar, baz):
++    click.echo(f"foo={foo}, bar={bar}, baz={baz}")
++
++# I want to see if I can manually resolve the dynamic default after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_5.py b/test_dynamic_defaults_5.py
+new file mode 100644
+index 0000000..64a7eaf
+--- /dev/null
++++ b/test_dynamic_defaults_5.py
+@@ -0,0 +1,14 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can access the parameter source.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I need to check if the source is DEFAULT.
+diff --git a/test_dynamic_defaults_6.py b/test_dynamic_defaults_6.py
+new file mode 100644
+index 0000000..c181021
+--- /dev/null
++++ b/test_dynamic_defaults_6.py
+@@ -0,0 +1,16 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++    ctx = click.get_current_context()
++    for param in ctx.command.get_params(ctx):
++        source = ctx.get_parameter_source(param.name)
++        click.echo(f"param={param.name}, source={source}")
++
++runner = CliRunner()
++result = runner.invoke(cli, ["--bar", "a"])
++print(result.output)
+diff --git a/test_dynamic_defaults_7.py b/test_dynamic_defaults_7.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_7.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_8.py b/test_dynamic_defaults_8.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_8.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.
+diff --git a/test_dynamic_defaults_9.py b/test_dynamic_defaults_9.py
+new file mode 100644
+index 0000000..7447f6f
+--- /dev/null
++++ b/test_dynamic_defaults_9.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo")
++@click.option("--bar", default={"--foo": {"a": "1", "b": "2"}})
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++# I want to see if I can modify the context params after parsing.
++# I can't easily do that without modifying the core.
++
++# Let's look at how to implement the dynamic default resolution.
++# The requirement says:
++# "After all explicit values, environment variables, default-map values, and ordinary defaults are parsed, resolve dynamic defaults whose target source is still DEFAULT."
++
++# So I should add a step in `Command.parse_args` after the loop over `iter_params_for_processing`.

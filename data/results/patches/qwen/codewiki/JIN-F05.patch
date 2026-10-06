@@ -1,0 +1,166 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..3659a3b 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -17,8 +17,10 @@ from .async_utils import auto_aiter
+ from .async_utils import auto_await
+ from .async_utils import auto_to_list
+ from .exceptions import FilterArgumentError
++from .runtime import StrictUndefined
+ from .runtime import Undefined
+ from .utils import htmlsafe_json_dumps
++from .utils import missing
+ from .utils import pass_context
+ from .utils import pass_environment
+ from .utils import pass_eval_context
+@@ -52,6 +54,33 @@ def ignore_case(value: V) -> V:
+     return value
+ 
+ 
++def _make_groupby_key(key):
++    """Create a sort key that orders: normal keys < None < missing/undefined.
++
++    This ensures that:
++    1. Normal comparable keys come first (including empty string in string order)
++    2. Then None values
++    3. Then missing/Undefined values
++
++    Returns a tuple (type_index, value) where type_index is:
++    - 0 for normal keys
++    - 1 for None
++    - 2 for missing/Undefined
++
++    For missing/undefined values, we use a sentinel to avoid comparison issues
++    between different types of missing values.
++    """
++    if key is missing or isinstance(key, Undefined):
++        # Return a high value for missing/undefined with a consistent sentinel
++        return (2, "___MISSING___")
++    elif key is None:
++        # Return middle value for None
++        return (1, None)
++    else:
++        # Return low value for normal keys
++        return (0, key)
++
++
+ def make_attrgetter(
+     environment: "Environment",
+     attribute: t.Optional[t.Union[str, int]],
+@@ -1156,13 +1185,13 @@ class _GroupTuple(t.NamedTuple):
+     def __str__(self) -> str:
+         return tuple.__str__(self)
+ 
+-
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = True,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1203,6 +1232,19 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    By default, items whose resolved grouping key is falsy (after existing
++    default substitution) are retained. To remove such items, set
++    ``include_empty=False``.
++
++    Retained keys are ordered as follows: normal comparable keys first
++    (including the empty string in string order), then None, then a separate
++    missing/Undefined group. Missing keys do not split into multiple groups
++    when interleaved with None. StrictUndefined retains its error behavior
++    rather than silently becoming an ordinary missing key.
++
++    .. versionchanged:: 3.1
++        Added the ``include_empty`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+@@ -1210,10 +1252,35 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    
++    # Collect all items with their keys
++    items_with_keys = []
++    for item in value:
++        key = expr(item)
++        
++        # Check for StrictUndefined - should raise error
++        if isinstance(key, StrictUndefined):
++            raise key._undefined_exception(key._undefined_message)
++        
++        # If include_empty=False and key is falsy, skip it
++        if not include_empty and not key:
++            continue
++            
++        items_with_keys.append((key, item))
++    
++    # Sort by the custom key
++    sorted_items = sorted(items_with_keys, key=lambda x: _make_groupby_key(x[0]))
++    
++    # Group by key
++    result = []
++    for sort_key, values in groupby(sorted_items, key=lambda x: _make_groupby_key(x[0])):
++        key_values = list(values)
++        # Get the actual key value (not the sort key)
++        actual_key = key_values[0][0]
++        result.append(_GroupTuple(actual_key, [v[1] for v in key_values]))
++    
++    return result
++
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1289,37 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = True,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    
++    # Collect all items with their keys
++    items_with_keys = []
++    for item in await auto_to_list(value):
++        key = expr(item)
++        
++        # Check for StrictUndefined - should raise error
++        if isinstance(key, StrictUndefined):
++            raise key._undefined_exception(key._undefined_message)
++        
++        # If include_empty=False and key is falsy, skip it
++        if not include_empty and not key:
++            continue
++            
++        items_with_keys.append((key, item))
++    
++    # Sort by the custom key
++    sorted_items = sorted(items_with_keys, key=lambda x: _make_groupby_key(x[0]))
++    
++    # Group by key
++    result = []
++    for sort_key, values in groupby(sorted_items, key=lambda x: _make_groupby_key(x[0])):
++        key_values = list(values)
++        # Get the actual key value (not the sort key)
++        actual_key = key_values[0][0]
++        result.append(_GroupTuple(actual_key, [v[1] for v in key_values]))
++    
++    return result
+ 
+ 
+ @pass_environment

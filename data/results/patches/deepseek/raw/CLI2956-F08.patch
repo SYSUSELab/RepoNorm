@@ -1,0 +1,123 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..1bd95d9 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -165,6 +165,34 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++class _ParamHistoryDict(dict):
++    """A dict subclass that records option assignment history when tracking is enabled."""
++
++    def __init__(self, ctx, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._ctx = ctx
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key, value)
++        ctx = self._ctx
++        command = ctx.command
++        if hasattr(command, "track_changes") and command.track_changes:
++            history = ctx._option_history
++            if key not in history:
++                history[key] = []
++            # First assignment (from parsing) uses the source from set_parameter_source
++            # Subsequent assignments (from user code) use source=None
++            if len(history[key]) == 0:
++                source = ctx.get_parameter_source(key)
++            else:
++                source = None
++            history[key].append({
++                "value": value,
++                "source": source,
++                "timestamp": __import__("time").time(),
++            })
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -296,7 +324,7 @@ class Context:
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+-        self.params: dict[str, t.Any] = {}
++        self.params: dict[str, t.Any] = _ParamHistoryDict(self)
+         #: the leftover arguments.
+         self.args: list[str] = []
+         #: protected arguments.  These are arguments that are prepended
+@@ -437,6 +465,8 @@ class Context:
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
++        self._option_history: dict[str, list[dict[str, t.Any]]] = {}
++
+         self._exit_stack = ExitStack()
+ 
+     @property
+@@ -839,6 +869,41 @@ class Context:
+         """
+         return self._parameter_source.get(name)
+ 
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        """Get the history of values assigned to an option.
++
++        :param name: The option's Python parameter name, a long option such as
++            ``"--count"``, or a short option such as ``"-c"``.
++        :return: A list of history entries, or ``None`` if tracking is not
++            enabled on the current command.
++
++        .. versionadded:: 8.2
++        """
++        command = self.command
++        if not hasattr(command, "track_changes") or not command.track_changes:
++            return None
++
++        # Resolve name to parameter name
++        param_name = None
++        for param in command.params:
++            if hasattr(param, "name") and param.name == name:
++                param_name = param.name
++                break
++            if hasattr(param, "opts") and name in param.opts:
++                param_name = param.name
++                break
++            if hasattr(param, "secondary_opts") and name in param.secondary_opts:
++                param_name = param.name
++                break
++
++        if param_name is None:
++            return []
++
++        # Return a snapshot copy
++        history = self._option_history.get(param_name, [])
++        return [dict(e) for e in history]
++
++
+ 
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+@@ -916,6 +981,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        track_changes: bool = False,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -945,6 +1011,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -2119,7 +2186,6 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
+-
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+                 raise ValueError(

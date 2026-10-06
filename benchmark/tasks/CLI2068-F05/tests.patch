@@ -1,0 +1,132 @@
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..b8966a6 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -1,3 +1,4 @@
++from pathlib import Path
+ import platform
+ import time
+ 
+@@ -470,3 +471,122 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++class _LockProcess:
++    pid = 1009
++    def __init__(self, code=0): self.code = code
++    def wait(self): return self.code
++
++
++def _lock_path(path):
++    return path.with_name(f".{path.name}.lock")
++
++
++def test_edit_lock_is_present_during_editor_and_cleaned(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("text")
++    def popen(*args, **kwargs):
++        lock = _lock_path(path)
++        assert lock.exists()
++        lines = lock.read_text().splitlines()
++        assert lines[0].startswith("PID: ") and lines[0][5:].isdigit()
++        assert lines[1].startswith("Time: ")
++        return _LockProcess()
++    monkeypatch.setattr("subprocess.Popen", popen)
++    click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert not _lock_path(path).exists()
++
++
++def test_edit_lock_existing_prevents_launch(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    lock = _lock_path(path)
++    lock.write_text("PID: 123\nTime: 2020-01-01T00:00:00\n")
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: pytest.fail("must not launch"))
++    with pytest.raises(click.ClickException, match="already being edited") as exc_info:
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert str(lock) in str(exc_info.value)
++    assert lock.exists()
++
++
++def test_edit_lock_nested_attempt_is_atomic(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    attempts = []
++    def popen(*args, **kwargs):
++        attempts.append("first")
++        with pytest.raises(click.ClickException, match="already being edited"):
++            click.edit(filename=str(path), editor="editor", lock_files=True)
++        return _LockProcess()
++    monkeypatch.setattr("subprocess.Popen", popen)
++    click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert attempts == ["first"]
++
++
++def test_edit_lock_creation_does_not_depend_on_a_stale_exists_check(tmp_path, monkeypatch):
++    import os
++
++    path = tmp_path / "note.txt"
++    lock = _lock_path(path)
++    lock.write_text("owner")
++    real_exists = os.path.exists
++
++    def stale_exists(candidate):
++        if os.fspath(candidate) == os.fspath(lock):
++            return False
++        return real_exists(candidate)
++
++    monkeypatch.setattr("click._termui_impl.os.path.exists", stale_exists)
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: pytest.fail("must not launch"))
++    with pytest.raises(click.ClickException, match="already being edited"):
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert lock.read_text() == "owner"
++
++
++def test_edit_lock_cleans_after_editor_failure(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _LockProcess(2))
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert not _lock_path(path).exists()
++
++
++def test_edit_lock_cleanup_failure_is_chained(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _LockProcess())
++    monkeypatch.setattr("click._termui_impl.os.unlink", lambda name: (_ for _ in ()).throw(OSError("busy")))
++    with pytest.raises(click.ClickException, match="Failed to remove lock file") as exc_info:
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert isinstance(exc_info.value.__cause__, OSError)
++
++
++def test_edit_lock_same_basename_different_directories(tmp_path, monkeypatch):
++    left = tmp_path / "left" / "note.txt"; left.parent.mkdir()
++    right = tmp_path / "right" / "note.txt"; right.parent.mkdir()
++    calls = []
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: calls.append(a[0]) or _LockProcess())
++    click.edit(filename=str(left), editor="editor", lock_files=True)
++    click.edit(filename=str(right), editor="editor", lock_files=True)
++    assert len(calls) == 2
++
++
++
++def test_edit_lock_not_used_for_temporary_text(monkeypatch):
++    import shlex
++    def popen(command, **kwargs):
++        argv = shlex.split(command) if isinstance(command, str) else list(command)
++        temporary = Path(argv[-1])
++        assert not temporary.with_name(f".{temporary.name}.lock").exists()
++        return _LockProcess()
++    monkeypatch.setattr("subprocess.Popen", popen)
++    assert click.edit("text", editor="editor", lock_files=True, require_save=False) == "text\n"
++
++
++def test_edit_lock_cleans_after_process_creation_error(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    def popen(*args, **kwargs):
++        assert _lock_path(path).exists()
++        raise OSError("cannot launch")
++    monkeypatch.setattr("subprocess.Popen", popen)
++    with pytest.raises(click.ClickException, match="Editing failed") as exc_info:
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert isinstance(exc_info.value.__cause__, OSError)
++    assert not _lock_path(path).exists()

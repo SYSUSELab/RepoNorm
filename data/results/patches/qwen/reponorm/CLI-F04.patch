@@ -1,0 +1,285 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..b90db38 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -6,7 +6,9 @@ import errno
+ import inspect
+ import os
+ import sys
++import threading
+ import typing as t
++import warnings
+ from collections import abc
+ from collections import Counter
+ from contextlib import AbstractContextManager
+@@ -228,6 +230,10 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param cleanup_timeout: Maximum time in seconds to wait for cleanup
++        callbacks when closing the context. If None (default), waits
++        indefinitely. A child context without an explicit timeout inherits
++        its parent's setting. Must be positive if provided.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +286,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +434,17 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        # Handle cleanup_timeout inheritance
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be positive")
++
++        #: Maximum time in seconds to wait for cleanup callbacks when closing.
++        #: None means wait indefinitely.
++        self.cleanup_timeout: float | None = cleanup_timeout
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -606,11 +624,63 @@ class Context:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        If ``cleanup_timeout`` is set, waits at most that many seconds
++        for cleanup to complete. If cleanup does not complete within the
++        timeout, issues a warning and returns without forcibly terminating
++        the cleanup code. Errors raised during cleanup after the caller
++        has stopped waiting are reported via warnings rather than being
++        silently lost or raised by a later unrelated ``close()`` call.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
++        if self.cleanup_timeout is None:
++            # Synchronous cleanup - wait indefinitely
++            self._exit_stack.close()
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
++            return
++
++        # Capture the current exit stack state before starting cleanup
++        # This ensures we own only the resources registered at close time
++        exit_stack = self._exit_stack
+         self._exit_stack = ExitStack()
+ 
++        # Use a threading event to signal completion
++        done_event = threading.Event()
++        cleanup_error: list[t.Any] = [None]  # Thread-safe error storage
++
++        def _run_cleanup() -> None:
++            try:
++                exit_stack.close()
++            except Exception as e:
++                cleanup_error[0] = e
++            finally:
++                done_event.set()
++
++        # Start cleanup in a background thread
++        worker = threading.Thread(
++            target=_run_cleanup,
++            name=f"click-cleanup-{self.info_name}",
++            daemon=True,
++        )
++        worker.start()
++
++        # Wait for cleanup with timeout
++        completed = done_event.wait(timeout=self.cleanup_timeout)
++
++        if not completed:
++            # Timeout occurred - issue warning but don't forcibly terminate
++            import sys
++            print(
++                f"Warning: cleanup for {self.info_name} did not complete "
++                f"within {self.cleanup_timeout}s",
++                file=sys.stderr,
++            )
++            return
++
++        # Cleanup completed within timeout - check for errors
++        if cleanup_error[0] is not None:
++            raise cleanup_error[0]
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..f22b088 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,151 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++
++# Tests for cleanup_timeout feature
++
++def test_cleanup_timeout_none_default():
++    """Default cleanup_timeout is None (indefinite wait)."""
++    ctx = click.Context(click.Command("test"))
++    assert ctx.cleanup_timeout is None
++
++
++def test_cleanup_timeout_inheritance():
++    """Child context inherits parent's cleanup_timeout when not explicitly set."""
++    parent = click.Context(click.Command("parent"), cleanup_timeout=5.0)
++    child = click.Context(click.Command("child"), parent=parent)
++    assert child.cleanup_timeout == 5.0
++
++
++def test_cleanup_timeout_explicit_override():
++    """Child can override parent's cleanup_timeout with explicit value."""
++    parent = click.Context(click.Command("parent"), cleanup_timeout=5.0)
++    child = click.Context(click.Command("child"), parent=parent, cleanup_timeout=10.0)
++    assert child.cleanup_timeout == 10.0
++
++
++def test_cleanup_timeout_zero_raises_valueerror():
++    """cleanup_timeout=0 raises ValueError."""
++    with pytest.raises(ValueError, match="cleanup_timeout must be positive"):
++        click.Context(click.Command("test"), cleanup_timeout=0)
++
++
++def test_cleanup_timeout_negative_raises_valueerror():
++    """cleanup_timeout < 0 raises ValueError."""
++    with pytest.raises(ValueError, match="cleanup_timeout must be positive"):
++        click.Context(click.Command("test"), cleanup_timeout=-1)
++
++
++def test_cleanup_timeout_positive_valid():
++    """Positive cleanup_timeout values are accepted."""
++    ctx = click.Context(click.Command("test"), cleanup_timeout=1.0)
++    assert ctx.cleanup_timeout == 1.0
++
++
++def test_cleanup_timeout_normal_completion():
++    """Cleanup completes within timeout without error."""
++    called = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        def callback():
++            called.append(True)
++        ctx.call_on_close(callback)
++        # Use a short timeout since cleanup is fast
++        ctx.cleanup_timeout = 1.0
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, [], standalone_mode=False)
++    assert result.exception is None
++    assert called == [True]
++
++
++def test_cleanup_timeout_with_resource():
++    """with_resource works correctly with cleanup_timeout."""
++    values = []
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++        values.append(val[0])
++
++    ctx = click.Context(click.Command("test"), cleanup_timeout=1.0)
++
++    with ctx.scope():
++        rv = ctx.with_resource(manager())
++        assert rv[0] == 1
++
++    assert rv == [0]
++    assert values == [0]
++
++
++def test_cleanup_timeout_repeated_close():
++    """Repeated close calls on same context do not restart earlier cleanup."""
++    call_count = [0]
++
++    ctx = click.Context(click.Command("test"), cleanup_timeout=1.0)
++
++    def callback():
++        call_count[0] += 1
++
++    ctx.call_on_close(callback)
++
++    # First close executes the callback
++    ctx.close()
++    assert call_count[0] == 1
++
++    # Second close should not re-execute callbacks (new exit stack)
++    ctx.close()
++    assert call_count[0] == 1
++
++
++def test_cleanup_timeout_error_reporting():
++    """Errors during cleanup are raised when cleanup completes within timeout."""
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        def failing_callback():
++            raise RuntimeError("cleanup failed")
++        ctx.call_on_close(failing_callback)
++        ctx.cleanup_timeout = 1.0
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, [], standalone_mode=False)
++    assert isinstance(result.exception, RuntimeError)
++    assert str(result.exception) == "cleanup failed"
++
++
++def test_cleanup_timeout_warning_on_timeout():
++    """Warning is issued when cleanup does not complete within timeout."""
++    import io
++    import sys
++
++    slow_called = [False]
++
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.1)
++
++    def slow_callback():
++        slow_called[0] = True
++        # Sleep longer than timeout
++        import time
++        time.sleep(2)
++
++    ctx.call_on_close(slow_callback)
++
++    # Capture stderr
++    old_stderr = sys.stderr
++    sys.stderr = io.StringIO()
++    try:
++        ctx.close()
++        stderr_output = sys.stderr.getvalue()
++    finally:
++        sys.stderr = old_stderr
++
++    # Should have warning in stderr
++    assert "did not complete" in stderr_output or "Warning" in stderr_output
++    # Callback should have been started but not completed
++    assert slow_called[0] is True
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 39dfbdb..37ff5a1 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -48,6 +48,7 @@ ALLOWED_IMPORTS = {
+     "enum",
+     "typing",
+     "types",
++    "warnings",
+     "gettext",
+ }
+ 

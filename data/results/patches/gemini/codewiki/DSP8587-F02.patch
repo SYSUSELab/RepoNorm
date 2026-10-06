@@ -1,0 +1,401 @@
+diff --git a/dspy/streaming/messages.py b/dspy/streaming/messages.py
+index 9a73f19b..1d9c6810 100644
+--- a/dspy/streaming/messages.py
++++ b/dspy/streaming/messages.py
+@@ -14,6 +14,7 @@ class StreamResponse:
+     predict_name: str
+     signature_field_name: str
+     chunk: str
++    buffer_watermark: int
+ 
+ 
+ @dataclass
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..692769c5 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -26,6 +26,7 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        end_buffer_size: int = 10,
+     ):
+         """
+         Args:
+@@ -36,17 +37,24 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            end_buffer_size: The number of recent model chunks retained for end-identifier detection.
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+         self.predict_name = predict_name
+-
++        self.allow_reuse = allow_reuse
++        if not isinstance(end_buffer_size, int) or isinstance(end_buffer_size, bool):
++            raise ValueError("end_buffer_size must be an integer")
++        if end_buffer_size < 3:
++            raise ValueError("end_buffer_size must be at least 3")
++        if end_buffer_size > 64:
++            raise ValueError("end_buffer_size must be at most 64")
++        self.end_buffer_size = end_buffer_size
+         self.field_start_queue = []
+         self.field_end_queue = Queue()
+         self.stream_start = False
+         self.stream_end = False
+         self.cache_hit = False
+-        self.allow_reuse = allow_reuse
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -152,7 +160,8 @@ class StreamListener:
+             # The stream is started, we keep returning the token until we see the start of the next field.
+             token = None
+             self.field_end_queue.put(chunk_message)
+-            if self.field_end_queue.qsize() > 10:
++            current_queue_size = self.field_end_queue.qsize()
++            if self.field_end_queue.qsize() > self.end_buffer_size:
+                 # We keep the last 10 tokens in the buffer to check if they form a valid identifier for end_identifier,
+                 # i.e., "[[ ## {next_field_name} ## ]]" for ChatAdapter to identify the end of the current field.
+                 # In most cases 10 tokens are enough to cover the end_identifier for all adapters.
+@@ -165,8 +174,7 @@ class StreamListener:
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+-            if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++            return StreamResponse(self.predict_name, self.signature_field_name, token or "", min(current_queue_size, self.end_buffer_size))
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..120ae6a6
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,50 @@
++import re
++from queue import Queue
++from dataclasses import dataclass
++from typing import Any
++
++# Mocking dependencies
++class ModelResponseStream:
++    def __init__(self, content):
++        self.choices = [type('obj', (object,), {'delta': type('obj', (object,), {'content': content})})]
++
++@dataclass
++class StreamResponse:
++    predict_name: str
++    signature_field_name: str
++    chunk: str
++    buffer_watermark: int = 0 # This will be added
++
++# Mocking StreamListener
++class StreamListener:
++    def __init__(self, signature_field_name: str, end_buffer_size: int = 10):
++        self.signature_field_name = signature_field_name
++        self.field_end_queue = Queue()
++        self.end_buffer_size = end_buffer_size
++        self.adapter_identifiers = {
++            "ChatAdapter": {
++                "end_identifier": re.compile(r"\[\[ ## (\w+) ## \]\]"),
++            }
++        }
++
++    def receive(self, chunk: ModelResponseStream):
++        chunk_message = chunk.choices[0].delta.content
++        self.field_end_queue.put(chunk_message)
++        
++        # Current logic uses hardcoded 10
++        if self.field_end_queue.qsize() > 10:
++            token = self.field_end_queue.get()
++        else:
++            token = None
++            
++        # This is where we need to add buffer_watermark
++        # The requirement says: min(current_queue_size, end_buffer_size)
++        # current_queue_size is captured after enqueued and before dequeues/flushes
++        
++        return StreamResponse("predict_name", self.signature_field_name, token or "")
++
++# Test
++listener = StreamListener("field", end_buffer_size=5)
++chunk = ModelResponseStream("test")
++response = listener.receive(chunk)
++print(f"Response: {response}")
+diff --git a/reproduce_issue_v2.py b/reproduce_issue_v2.py
+new file mode 100644
+index 00000000..6658c13c
+--- /dev/null
++++ b/reproduce_issue_v2.py
+@@ -0,0 +1,46 @@
++import re
++from queue import Queue
++from dataclasses import dataclass
++from typing import Any
++
++# Mocking dependencies
++class ModelResponseStream:
++    def __init__(self, content):
++        self.choices = [type('obj', (object,), {'delta': type('obj', (object,), {'content': content})})]
++
++@dataclass
++class StreamResponse:
++    predict_name: str
++    signature_field_name: str
++    chunk: str
++    buffer_watermark: int
++
++# Mocking StreamListener
++class StreamListener:
++    def __init__(self, signature_field_name: str, end_buffer_size: int = 10):
++        self.signature_field_name = signature_field_name
++        self.field_end_queue = Queue()
++        self.end_buffer_size = end_buffer_size
++        self.predict_name = "predict_name"
++        self.stream_start = True # Simulate stream started
++
++    def receive(self, chunk: ModelResponseStream):
++        chunk_message = chunk.choices[0].delta.content
++        self.field_end_queue.put(chunk_message)
++        
++        # Capture current_queue_size
++        current_queue_size = self.field_end_queue.qsize()
++        
++        if self.field_end_queue.qsize() > self.end_buffer_size:
++            token = self.field_end_queue.get()
++        else:
++            token = None
++            
++        return StreamResponse(self.predict_name, self.signature_field_name, token or "", min(current_queue_size, self.end_buffer_size))
++
++# Test
++listener = StreamListener("field", end_buffer_size=3)
++for i in range(5):
++    chunk = ModelResponseStream(f"token{i}")
++    response = listener.receive(chunk)
++    print(f"Chunk {i}: {response}")
+diff --git a/test_validation.py b/test_validation.py
+new file mode 100644
+index 00000000..43b953aa
+--- /dev/null
++++ b/test_validation.py
+@@ -0,0 +1,30 @@
++def validate_end_buffer_size(end_buffer_size):
++    if not isinstance(end_buffer_size, int) or isinstance(end_buffer_size, bool):
++        raise ValueError("end_buffer_size must be an integer")
++    if end_buffer_size < 3:
++        raise ValueError("end_buffer_size must be at least 3")
++    if end_buffer_size > 64:
++        raise ValueError("end_buffer_size must be at most 64")
++    return True
++
++# Test cases
++try:
++    validate_end_buffer_size(True)
++except ValueError as e:
++    print(f"Bool test: {e}")
++
++try:
++    validate_end_buffer_size(2)
++except ValueError as e:
++    print(f"Below 3 test: {e}")
++
++try:
++    validate_end_buffer_size(65)
++except ValueError as e:
++    print(f"Above 64 test: {e}")
++
++try:
++    validate_end_buffer_size(10)
++    print("10 is valid")
++except ValueError as e:
++    print(f"10 test: {e}")
+diff --git a/tests/streaming/test_buffer_watermark.py b/tests/streaming/test_buffer_watermark.py
+new file mode 100644
+index 00000000..25d4bc9e
+--- /dev/null
++++ b/tests/streaming/test_buffer_watermark.py
+@@ -0,0 +1,40 @@
++import pytest
++from unittest.mock import MagicMock
++from dspy.streaming.streaming_listener import StreamListener
++from dspy.streaming.messages import StreamResponse
++from queue import Queue
++
++def test_buffer_watermark():
++    listener = StreamListener(signature_field_name="answer", end_buffer_size=5)
++    listener.stream_start = True
++    
++    # Simulate receiving 10 chunks
++    for i in range(10):
++        chunk = MagicMock()
++        chunk.choices = [MagicMock()]
++        chunk.choices[0].delta.content = f"chunk{i}"
++        
++        response = listener.receive(chunk)
++        
++        # Expected watermark: min(i+1, 5)
++        expected_watermark = min(i + 1, 5)
++        assert response.buffer_watermark == expected_watermark
++        
++        # The first 5 chunks (i=0 to 4) should be empty because they are in the buffer.
++        # Wait, if end_buffer_size is 5, then the first 5 chunks are in the buffer.
++        # So for i=0, 1, 2, 3, 4, the chunk should be empty.
++        # For i=5, the chunk should be chunk0.
++        
++        if i < 5:
++            assert response.chunk == ""
++        else:
++            assert response.chunk == f"chunk{i-5}"
++
++def test_invalid_buffer_size():
++    with pytest.raises(ValueError, match="end_buffer_size must be an integer"):
++        StreamListener(signature_field_name="answer", end_buffer_size="10")
++    with pytest.raises(ValueError, match="end_buffer_size must be at least 3"):
++        StreamListener(signature_field_name="answer", end_buffer_size=2)
++    with pytest.raises(ValueError, match="end_buffer_size must be at most 64"):
++        StreamListener(signature_field_name="answer", end_buffer_size=65)
++
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6d..b19e337a 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -158,7 +158,7 @@ async def test_stream_listener_chat_adapter(lm_for_test):
+         all_chunks = []
+         async for value in output:
+             if isinstance(value, dspy.streaming.StreamResponse):
+-                all_chunks.append(value)
++                if value.chunk: all_chunks.append(value)
+ 
+     assert all_chunks[0].predict_name == "predict1"
+     assert all_chunks[0].signature_field_name == "answer"
+@@ -221,7 +221,7 @@ async def test_stream_listener_json_adapter(lm_for_test):
+         all_chunks = []
+         async for value in output:
+             if isinstance(value, dspy.streaming.StreamResponse):
+-                all_chunks.append(value)
++                if value.chunk: all_chunks.append(value)
+ 
+     assert all_chunks[0].predict_name == "predict1"
+     assert all_chunks[0].signature_field_name == "answer"
+@@ -255,7 +255,7 @@ async def test_streaming_handles_space_correctly():
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+     assert all_chunks[0].chunk == "How are you doing?"
+ 
+@@ -288,7 +288,7 @@ def test_sync_streaming(lm_for_test):
+         all_chunks = []
+         for value in output:
+             if isinstance(value, dspy.streaming.StreamResponse):
+-                all_chunks.append(value)
++                if value.chunk: all_chunks.append(value)
+ 
+     assert all_chunks[0].predict_name == "predict1"
+     assert all_chunks[0].signature_field_name == "answer"
+@@ -400,7 +400,7 @@ async def test_stream_listener_returns_correct_chunk_chat_adapter():
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+         assert all_chunks[0].predict_name == "predict1"
+         assert all_chunks[0].signature_field_name == "answer"
+@@ -496,7 +496,7 @@ async def test_stream_listener_returns_correct_chunk_json_adapter():
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+         assert all_chunks[0].predict_name == "predict1"
+         assert all_chunks[0].signature_field_name == "answer"
+@@ -574,7 +574,7 @@ async def test_stream_listener_returns_correct_chunk_chat_adapter_untokenized_st
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+         assert all_chunks[0].predict_name == "predict1"
+         assert all_chunks[0].signature_field_name == "answer"
+@@ -641,7 +641,7 @@ async def test_stream_listener_returns_correct_chunk_json_adapter_untokenized_st
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+         assert all_chunks[0].predict_name == "predict1"
+         assert all_chunks[0].signature_field_name == "answer"
+@@ -757,7 +757,7 @@ async def test_stream_listener_allow_reuse():
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+     concat_message = "".join([chunk.chunk for chunk in all_chunks])
+     # The listener functions twice.
+@@ -828,7 +828,7 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+             all_chunks = []
+             async for value in output:
+                 if isinstance(value, dspy.streaming.StreamResponse):
+-                    all_chunks.append(value)
++                    if value.chunk: all_chunks.append(value)
+ 
+     assert all_chunks[0].predict_name == "predict1"
+     assert all_chunks[0].signature_field_name == "answer"
+diff --git a/update_listener.py b/update_listener.py
+new file mode 100644
+index 00000000..5253598c
+--- /dev/null
++++ b/update_listener.py
+@@ -0,0 +1,40 @@
++import re
++
++with open('dspy/streaming/streaming_listener.py', 'r') as f:
++    content = f.read()
++
++# Update __init__
++content = content.replace(
++    'allow_reuse: bool = False,',
++    'allow_reuse: bool = False, end_buffer_size: int = 10,'
++)
++# Add validation
++validation_code = """
++        if not isinstance(end_buffer_size, int) or isinstance(end_buffer_size, bool):
++            raise ValueError("end_buffer_size must be an integer")
++        if end_buffer_size < 3:
++            raise ValueError("end_buffer_size must be at least 3")
++        if end_buffer_size > 64:
++            raise ValueError("end_buffer_size must be at most 64")
++        self.end_buffer_size = end_buffer_size
++"""
++content = content.replace(
++    'self.allow_reuse = allow_reuse',
++    'self.allow_reuse = allow_reuse' + validation_code
++)
++
++# Update receive method
++# Capture current_queue_size
++# Replace `if self.field_end_queue.qsize() > 10:` with `if self.field_end_queue.qsize() > self.end_buffer_size:`
++content = content.replace(
++    'if self.field_end_queue.qsize() > 10:',
++    'if self.field_end_queue.qsize() > self.end_buffer_size:'
++)
++
++# Add watermark to StreamResponse
++# Find `return StreamResponse(self.predict_name, self.signature_field_name, token)`
++# and replace with `return StreamResponse(self.predict_name, self.signature_field_name, token, min(self.field_end_queue.qsize(), self.end_buffer_size))`
++# Wait, the requirement says: "current_queue_size is captured after the received model chunk is enqueued and before that emission dequeues or flushes buffered chunks."
++# So I should capture it before `self.field_end_queue.get()`.
++
++# Let's do this manually.

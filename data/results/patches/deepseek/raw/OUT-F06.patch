@@ -1,0 +1,343 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..56684b5 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,6 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Callable, Optional, Union
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -13,6 +13,9 @@ from outlines.processors.base_logits_processor import (
+ if TYPE_CHECKING:
+     from xgrammar.contrib.hf import LogitsProcessor
+ 
++# Sentinel value to distinguish "not passed" from "explicitly None"
++_UNSET = object()
++
+ 
+ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+     """Logits processor for XGrammar.
+@@ -53,12 +56,25 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self,
++        model: SteerableModel,
++        validate_grammar: Optional[Callable[[str], object]] = None,
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        validate_grammar
++            A default validation callback that will be called on the original
++            grammar string before compilation. The callback receives the
++            grammar string and returns any value (including `False`) to
++            indicate validation success. If it raises an exception, the
++            exception propagates and no processor is created. If `None`
++            (the default), no validation is performed at the backend level,
++            but per-request `validate_grammar` can still be provided to the
++            factory methods.
+ 
+         """
+         import xgrammar as xgr
+@@ -77,9 +93,56 @@ class XGrammarBackend(BaseBackend):
+             vocab_size=vocab_size
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
++        self.validate_grammar = validate_grammar
++
++    def _resolve_validate_grammar(
++        self,
++        validate_grammar: object = _UNSET,
++    ) -> Optional[Callable[[str], object]]:
++        """Resolve which validation callback to use.
++
++        If `validate_grammar` is not provided (sentinel), use the backend default.
++        If it is provided as a callable, use it.
++        If it is explicitly `None`, disable validation for this request.
++
++        Returns
++        -------
++        Optional[Callable[[str], object]]
++            The resolved validation callback, or None if no validation.
++
++        """
++        # Use a sentinel to distinguish "not passed" from "explicitly None"
++        if validate_grammar is _UNSET:
++            return self.validate_grammar
++        return validate_grammar
++
++    def _apply_validation(
++        self,
++        grammar_string: str,
++        validator: Optional[Callable[[str], object]],
++    ) -> None:
++        """Apply the validation callback if present.
++
++        Parameters
++        ----------
++        grammar_string
++            The grammar string to validate.
++        validator
++            The validation callback, or None.
++
++        Raises
++        ------
++        Exception
++            Any exception raised by the validator propagates.
++
++        """
++        if validator is not None:
++            validator(grammar_string)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self,
++        json_schema: str,
++        validate_grammar: object = _UNSET,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +150,11 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        validate_grammar
++            Optional per-request validation callback. If not provided, uses
++            the backend default. If a callable is provided, it overrides the
++            backend default. If explicitly `None`, no validation is performed
++            for this request.
+ 
+         Returns
+         -------
+@@ -94,18 +162,29 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        validator = self._resolve_validate_grammar(validate_grammar)
++        self._apply_validation(json_schema, validator)
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self,
++        regex: str,
++        validate_grammar: object = _UNSET,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        validate_grammar
++            Optional per-request validation callback. If not provided, uses
++            the backend default. If a callable is provided, it overrides the
++            backend default. If explicitly `None`, no validation is performed
++            for this request.
+ 
+         Returns
+         -------
+@@ -113,16 +192,27 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        validator = self._resolve_validate_grammar(validate_grammar)
++        self._apply_validation(regex, validator)
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self,
++        grammar: str,
++        validate_grammar: object = _UNSET,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        validate_grammar
++            Optional per-request validation callback. If not provided, uses
++            the backend default. If a callable is provided, it overrides the
++            backend default. If explicitly `None`, no validation is performed
++            for this request.
+ 
+         Returns
+         -------
+@@ -130,5 +220,7 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        validator = self._resolve_validate_grammar(validate_grammar)
++        self._apply_validation(grammar, validator)
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+         return XGrammarLogitsProcessor(compiled_grammar)
+diff --git a/tests/backends/test_xgrammar.py b/tests/backends/test_xgrammar.py
+index 1133b9f..ba8120a 100644
+--- a/tests/backends/test_xgrammar.py
++++ b/tests/backends/test_xgrammar.py
+@@ -93,3 +93,151 @@ def test_xgrammar_backend_invalid_model(model_llamacpp):
+         match="The xgrammar backend only supports Transformers models",
+     ):
+         XGrammarBackend(model_llamacpp)
++
++
++# --- validate_grammar tests ---
++
++def test_xgrammar_validate_grammar_backend_default(model_transformers, json_schema, regex, cfg):
++    """Test that backend-level validate_grammar is called for all processor types."""
++    calls = []
++
++    def validator(s: str) -> None:
++        calls.append(s)
++
++    backend = XGrammarBackend(model_transformers, validate_grammar=validator)
++    assert len(calls) == 0
++
++    # JSON schema
++    backend.get_json_schema_logits_processor(json_schema)
++    assert len(calls) == 1
++    assert calls[0] == json_schema
++
++    # Regex
++    calls.clear()
++    backend.get_regex_logits_processor(regex)
++    assert len(calls) == 1
++    assert calls[0] == regex
++
++    # CFG
++    calls.clear()
++    backend.get_cfg_logits_processor(cfg)
++    assert len(calls) == 1
++    assert calls[0] == cfg
++
++
++def test_xgrammar_validate_grammar_no_backend_default(model_transformers, json_schema):
++    """Test that without backend-level validate_grammar, nothing is called."""
++    calls = []
++
++    def validator(s: str) -> None:
++        calls.append(s)
++
++    backend = XGrammarBackend(model_transformers)  # no validator
++
++    # Per-request validator should still work
++    backend.get_json_schema_logits_processor(json_schema, validate_grammar=validator)
++    assert len(calls) == 1
++
++    # Without per-request, no validation
++    calls.clear()
++    backend.get_json_schema_logits_processor(json_schema)
++    assert len(calls) == 0
++
++
++def test_xgrammar_validate_grammar_per_request_override(model_transformers, json_schema):
++    """Test that per-request validate_grammar overrides the backend default."""
++    backend_calls = []
++    request_calls = []
++
++    def backend_validator(s: str) -> None:
++        backend_calls.append(s)
++
++    def request_validator(s: str) -> None:
++        request_calls.append(s)
++
++    backend = XGrammarBackend(model_transformers, validate_grammar=backend_validator)
++
++    # Per-request should override backend default
++    backend.get_json_schema_logits_processor(json_schema, validate_grammar=request_validator)
++    assert len(backend_calls) == 0
++    assert len(request_calls) == 1
++    assert request_calls[0] == json_schema
++
++
++def test_xgrammar_validate_grammar_explicit_none_disables(model_transformers, json_schema):
++    """Test that explicit None disables validation for that request."""
++    calls = []
++
++    def validator(s: str) -> None:
++        calls.append(s)
++
++    backend = XGrammarBackend(model_transformers, validate_grammar=validator)
++
++    # Explicit None disables
++    backend.get_json_schema_logits_processor(json_schema, validate_grammar=None)
++    assert len(calls) == 0
++
++
++def test_xgrammar_validate_grammar_exception_propagation(model_transformers, json_schema):
++    """Test that exceptions from validate_grammar propagate and backend remains usable."""
++    calls = []
++
++    def failing_validator(s: str) -> None:
++        calls.append(s)
++        raise ValueError("Bad grammar!")
++
++    def good_validator(s: str) -> None:
++        calls.append(s)
++
++    backend = XGrammarBackend(model_transformers, validate_grammar=failing_validator)
++
++    # Exception propagates
++    with pytest.raises(ValueError, match="Bad grammar!"):
++        backend.get_json_schema_logits_processor(json_schema)
++    assert len(calls) == 1
++
++    # Backend is still usable with a per-request override
++    backend.get_json_schema_logits_processor(json_schema, validate_grammar=good_validator)
++    assert len(calls) == 2
++
++    # Per-request None disables the failing backend default
++    calls.clear()
++    backend.get_json_schema_logits_processor(json_schema, validate_grammar=None)
++    assert len(calls) == 0
++
++
++def test_xgrammar_validate_grammar_false_return(model_transformers, json_schema):
++    """Test that returning False is treated as success."""
++    calls = []
++
++    def validator(s: str) -> object:
++        calls.append(s)
++        return False  # should be treated as success
++
++    backend = XGrammarBackend(model_transformers, validate_grammar=validator)
++    proc = backend.get_json_schema_logits_processor(json_schema)
++    assert isinstance(proc, XGrammarLogitsProcessor)
++    assert len(calls) == 1
++
++
++def test_xgrammar_validate_grammar_backend_isolation(model_transformers, json_schema):
++    """Test that multiple backend instances are isolated."""
++    calls_a = []
++    calls_b = []
++
++    def validator_a(s: str) -> None:
++        calls_a.append(s)
++
++    def validator_b(s: str) -> None:
++        calls_b.append(s)
++
++    backend_a = XGrammarBackend(model_transformers, validate_grammar=validator_a)
++    backend_b = XGrammarBackend(model_transformers, validate_grammar=validator_b)
++
++    backend_a.get_json_schema_logits_processor(json_schema)
++    assert len(calls_a) == 1
++    assert len(calls_b) == 0
++
++    backend_b.get_json_schema_logits_processor(json_schema)
++    assert len(calls_a) == 1
++    assert len(calls_b) == 1

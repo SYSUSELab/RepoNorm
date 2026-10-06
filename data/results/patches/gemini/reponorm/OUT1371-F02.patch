@@ -1,0 +1,142 @@
+diff --git a/outlines/__init__.py b/outlines/__init__.py
+index eeba78d..d07aebe 100644
+--- a/outlines/__init__.py
++++ b/outlines/__init__.py
+@@ -8,7 +8,7 @@ import outlines.types
+ from outlines.base import vectorize
+ from outlines.caching import clear_cache, disable_cache, get_cache
+ from outlines.function import Function
+-from outlines.prompts import Prompt, prompt
++from outlines.prompts import Prompt, prompt, register_filter, unregister_filter
+ 
+ __all__ = [
+     "clear_cache",
+@@ -19,4 +19,6 @@ __all__ = [
+     "Prompt",
+     "vectorize",
+     "grammars",
++    "register_filter",
++    "unregister_filter",
+ ]
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..c2b74b6 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -11,6 +11,42 @@ from typing import Any, Callable, Dict, Optional, Type, cast
+ import jinja2
+ import pydantic
+ 
++# Global registry for filters
++_GLOBAL_FILTERS: Dict[str, Callable] = {}
++_PROTECTED_FILTERS = {"name", "description", "source", "signature", "schema", "args"}
++
++def register_filter(name: str, callable: Callable):
++    """Register a global filter for prompts."""
++    if name in _PROTECTED_FILTERS:
++        raise ValueError(f"Filter '{name}' is protected and cannot be overridden.")
++    _GLOBAL_FILTERS[name] = callable
++
++def unregister_filter(name: str):
++    """Unregister a global filter for prompts."""
++    if name in _GLOBAL_FILTERS:
++        del _GLOBAL_FILTERS[name]
++
++def _get_env():
++    """Create a Jinja2 environment with default and global filters."""
++    env = jinja2.Environment(
++        trim_blocks=True,
++        lstrip_blocks=True,
++        keep_trailing_newline=True,
++        undefined=jinja2.StrictUndefined,
++    )
++    # Default filters
++    env.filters["name"] = get_fn_name
++    env.filters["description"] = get_fn_description
++    env.filters["source"] = get_fn_source
++    env.filters["signature"] = get_fn_signature
++    env.filters["schema"] = get_schema
++    env.filters["args"] = get_fn_args
++    
++    # Global filters
++    for name, filter_func in _GLOBAL_FILTERS.items():
++        env.filters[name] = filter_func
++        
++    return env
+ 
+ @dataclass
+ class Prompt:
+@@ -93,31 +129,14 @@ class Prompt:
+         # used to continue to the next line without linebreak.
+         cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
+ 
+-        env = jinja2.Environment(
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
+-        )
+-        env.filters["name"] = get_fn_name
+-        env.filters["description"] = get_fn_description
+-        env.filters["source"] = get_fn_source
+-        env.filters["signature"] = get_fn_signature
+-        env.filters["schema"] = get_schema
+-        env.filters["args"] = get_fn_args
+-
++        env = _get_env()
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+     def _template_from_file(_, path: Path) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+-        env = jinja2.Environment(
+-            loader=jinja2.FileSystemLoader(file_directory),
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
+-        )
++        env = _get_env()
++        env.loader = jinja2.FileSystemLoader(file_directory)
+         return env.get_template(os.path.basename(path))
+ 
+ 
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..4790435 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -403,3 +403,35 @@ def test_template_from_str_with_extra_linebreaks():
+     """
+     template = Prompt._template_from_str(content)
+     assert template.render(name="World") == "Hello, World!\n"
++
++def test_global_filter_registry():
++    import outlines.prompts as prompts
++    import jinja2
++
++    # Test registration
++    def my_filter(x):
++        return f"filtered_{x}"
++    
++    prompts.register_filter("my_filter", my_filter)
++    
++    # Test that it's available in new prompts
++    p1 = prompts.Prompt.from_str("{{ 'hello' | my_filter }}")
++    assert p1() == "filtered_hello"
++    
++    # Test that existing prompts are NOT affected
++    prompts.unregister_filter("my_filter")
++    
++    # p1 should still work
++    assert p1() == "filtered_hello"
++    
++    # New prompt should fail
++    with pytest.raises(jinja2.exceptions.TemplateAssertionError):
++        p2 = prompts.Prompt.from_str("{{ 'hello' | my_filter }}")
++        p2()
++
++    # Test that we cannot override protected filters
++    def my_name_filter(fn):
++        return "hacked"
++    
++    with pytest.raises(ValueError, match="protected"):
++        prompts.register_filter("name", my_name_filter)

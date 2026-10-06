@@ -1,0 +1,423 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..b29fd53 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,7 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++import warnings
++from typing import TYPE_CHECKING, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -19,15 +20,24 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     This class wraps the `xgr.contrib.hf.LogitsProcessor` class and adds
+     a `reset` method to reset the logits processor for a new generation.
++    An optional fallback processor can be provided: if the primary grammar
++    processor raises an exception the fallback will be used instead.
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(
++        self,
++        compiled_grammar: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
++    ):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional logits processor to use as fallback if the primary
++            processor raises an exception.
+ 
+         """
+         import xgrammar as xgr
+@@ -35,19 +45,41 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
++        self.fallback_processor = fallback_processor
++        self._fallback_activated = False
+         super().__init__("torch")
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+         self.xgrammar_logits_processor = None
++        self._fallback_activated = False
++        if self.fallback_processor is not None:
++            self.fallback_processor.reset()
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
++        if self._fallback_activated:
++            if self.fallback_processor is not None:
++                return self.fallback_processor.process_logits(input_ids, logits)
++            # Should not reach here because _fallback_activated only set
++            # when fallback_processor is not None.
++
+         if self.xgrammar_logits_processor is None:
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++
++        try:
++            return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++        except Exception:
++            if self.fallback_processor is not None:
++                warnings.warn(
++                    "XGrammar primary logits processor failed; "
++                    "using fallback processor."
++                )
++                self._fallback_activated = True
++                return self.fallback_processor.process_logits(input_ids, logits)
++            raise
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -79,7 +111,9 @@ class XGrammarBackend(BaseBackend):
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self,
++        json_schema: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +121,9 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional logits processor to use as fallback if the primary
++            processor raises an exception.
+ 
+         Returns
+         -------
+@@ -97,15 +134,22 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self,
++        regex: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional logits processor to use as fallback if the primary
++            processor raises an exception.
+ 
+         Returns
+         -------
+@@ -114,15 +158,22 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self,
++        grammar: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional logits processor to use as fallback if the primary
++            processor raises an exception.
+ 
+         Returns
+         -------
+@@ -131,4 +182,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor)
+diff --git a/tests/backends/test_xgrammar_fallback.py b/tests/backends/test_xgrammar_fallback.py
+new file mode 100644
+index 0000000..41f03b7
+--- /dev/null
++++ b/tests/backends/test_xgrammar_fallback.py
+@@ -0,0 +1,258 @@
++"""Tests for XGrammar fallback processor behavior."""
++
++import warnings
++
++import pytest
++import torch
++
++from outlines.backends.xgrammar import XGrammarLogitsProcessor
++from outlines.processors.base_logits_processor import OutlinesLogitsProcessor
++
++
++class DummyFallbackProcessor(OutlinesLogitsProcessor):
++    """A minimal fallback processor that records calls and returns logits unchanged."""
++
++    def __init__(self):
++        self.call_count = 0
++        self.reset_called = False
++        super().__init__("torch")
++
++    def process_logits(self, input_ids, logits):
++        self.call_count += 1
++        return logits
++
++    def reset(self):
++        self.reset_called = True
++        self.call_count = 0
++
++
++class RaisingFallbackProcessor(OutlinesLogitsProcessor):
++    """A fallback processor that always raises."""
++
++    def __init__(self):
++        super().__init__("torch")
++
++    def process_logits(self, input_ids, logits):
++        raise RuntimeError("fallback failure")
++
++
++def test_no_fallback_passes_through():
++    """Without an error, the primary processor is used and the fallback is
++    untouched."""
++    # We need a valid compiled grammar; but to avoid creating a full backend we
++    # test via the primary processor path only.  The primary call should work
++    # and the fallback should never be called.
++    fallback = DummyFallbackProcessor()
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar=r"root ::= answer\nanswer ::= \"yes\" | \"no\"",
++        fallback_processor=fallback,
++    )
++
++    # Even though the compiled_grammar string is not a real compiled grammar,
++    # the xgrammar LogitsProcessor constructor will be called when
++    # process_logits is first used.  We don't actually want to run it because
++    # we can't easily create a valid compiled grammar without the backend.
++    # Instead we directly test the _fallback_activated flag and reset path.
++    assert not processor._fallback_activated
++    assert processor.fallback_processor is fallback
++
++
++def test_primary_exception_triggers_fallback():
++    """If primary logits processing raises an exception, the same call is
++    completed through the fallback and a warning records the switch."""
++    fallback = DummyFallbackProcessor()
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar="",
++        fallback_processor=fallback,
++    )
++
++    # Make the xgrammar LogitsProcessor raise during lazy init by
++    # monkeypatching the class used inside process_logits.
++    import xgrammar as xgr
++
++    original_logits_processor_cls = xgr.contrib.hf.LogitsProcessor
++
++    class FailingLogitsProcessor:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def __call__(self, input_ids, logits):
++            raise RuntimeError("xgrammar primary failure")
++
++    xgr.contrib.hf.LogitsProcessor = FailingLogitsProcessor
++
++    input_ids = torch.tensor([[1, 2, 3]])
++    logits = torch.tensor([[0.1, 0.2, 0.3]])
++
++    try:
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            result = processor.process_logits(input_ids, logits)
++
++        # The call should succeed via the fallback
++        assert torch.equal(result, logits)
++        assert fallback.call_count == 1
++        assert processor._fallback_activated
++
++        # Check that a warning was issued
++        assert len(w) == 1
++        assert "XGrammar primary logits processor failed" in str(w[0].message)
++    finally:
++        xgr.contrib.hf.LogitsProcessor = original_logits_processor_cls
++
++
++def test_fallback_handles_subsequent_calls():
++    """Once activated, the fallback handles subsequent calls without repeatedly
++    retrying the failed primary processor."""
++    fallback = DummyFallbackProcessor()
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar="",
++        fallback_processor=fallback,
++    )
++
++    import xgrammar as xgr
++
++    original_logits_processor_cls = xgr.contrib.hf.LogitsProcessor
++
++    class FailingLogitsProcessor:
++        def __init__(self, *args, **kwargs):
++            pass
++
++        def __call__(self, input_ids, logits):
++            raise RuntimeError("xgrammar primary failure")
++
++    xgr.contrib.hf.LogitsProcessor = FailingLogitsProcessor
++
++    input_ids = torch.tensor([[1, 2, 3]])
++    logits = torch.tensor([[0.1, 0.2, 0.3]])
++
++    try:
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            # First call triggers fallback
++            result1 = processor.process_logits(input_ids, logits)
++            # Second call should go directly to fallback
++            result2 = processor.process_logits(input_ids, logits)
++
++        assert torch.equal(result1, logits)
++        assert torch.equal(result2, logits)
++        # Fallback was called twice
++        assert fallback.call_count == 2
++        # The primary xgrammar processor object was only created once
++        # (it would fail on __call__, not __init__)
++    finally:
++        xgr.contrib.hf.LogitsProcessor = original_logits_processor_cls
++
++
++def test_reset_reenables_primary():
++    """reset() resets both processors as applicable and makes the primary
++    eligible for the next call again."""
++    fallback = DummyFallbackProcessor()
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar="",
++        fallback_processor=fallback,
++    )
++
++    import xgrammar as xgr
++
++    original_cls = xgr.contrib.hf.LogitsProcessor
++
++    class ToggleProcessor:
++        """Raises on first call, succeeds after reset."""
++        def __init__(self, *args, **kwargs):
++            pass
++        def __call__(self, input_ids, logits):
++            raise RuntimeError("primary failure")
++
++    xgr.contrib.hf.LogitsProcessor = ToggleProcessor
++
++    input_ids = torch.tensor([[1, 2, 3]])
++    logits = torch.tensor([[0.1, 0.2, 0.3]])
++
++    try:
++        with warnings.catch_warnings(record=True):
++            warnings.simplefilter("always")
++            processor.process_logits(input_ids, logits)
++
++        assert processor._fallback_activated
++        assert fallback.call_count == 1
++
++        # Reset
++        processor.reset()
++        assert not processor._fallback_activated
++        assert processor.xgrammar_logits_processor is None
++        assert fallback.reset_called
++        # fallback.call_count was reset to 0 in DummyFallbackProcessor.reset()
++        assert fallback.call_count == 0
++
++        # Now with a working primary after reset, it should use primary
++        # (We test via the fact that _fallback_activated is False and
++        # xgrammar_logits_processor is None, so it will try primary again.)
++        # Since the toggle still raises, it will fallback again.
++        with warnings.catch_warnings(record=True):
++            warnings.simplefilter("always")
++            processor.process_logits(input_ids, logits)
++
++        assert processor._fallback_activated
++        # fallback was called again after reset
++        # But wait, DummyFallbackProcessor.reset() sets call_count = 0
++        # So after this second process_logits call, call_count should be 1
++        assert fallback.call_count == 1
++    finally:
++        xgr.contrib.hf.LogitsProcessor = original_cls
++
++
++def test_no_fallback_propagates_exception():
++    """If no fallback was supplied, the original primary exception propagates."""
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar="",
++        fallback_processor=None,
++    )
++
++    import xgrammar as xgr
++
++    original_cls = xgr.contrib.hf.LogitsProcessor
++
++    class FailingProcessor:
++        def __init__(self, *args, **kwargs):
++            pass
++        def __call__(self, input_ids, logits):
++            raise ValueError("xgrammar primary failure")
++
++    xgr.contrib.hf.LogitsProcessor = FailingProcessor
++
++    input_ids = torch.tensor([[1, 2, 3]])
++    logits = torch.tensor([[0.1, 0.2, 0.3]])
++
++    try:
++        with pytest.raises(ValueError, match="xgrammar primary failure"):
++            processor.process_logits(input_ids, logits)
++    finally:
++        xgr.contrib.hf.LogitsProcessor = original_cls
++
++
++def test_constructor_without_fallback_preserves_behavior():
++    """Existing construction that omits the parameter retains behavior."""
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar=r"root ::= answer\nanswer ::= \"yes\" | \"no\"",
++    )
++    assert processor.fallback_processor is None
++    assert not processor._fallback_activated
++    assert processor.xgrammar_logits_processor is None
++
++
++def test_fallback_reset_resets_fallback():
++    """reset() resets the fallback processor when one is present."""
++    fallback = DummyFallbackProcessor()
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar="",
++        fallback_processor=fallback,
++    )
++
++    # Manually set fallback_activated to simulate state
++    processor._fallback_activated = True
++    processor.reset()
++
++    assert not processor._fallback_activated
++    assert processor.xgrammar_logits_processor is None
++    assert fallback.reset_called

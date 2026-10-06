@@ -1,0 +1,200 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..ff30265 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -8,6 +8,7 @@ import os
+ import sys
+ import typing as t
+ from collections import abc
++import copy
+ from collections import Counter
+ from contextlib import AbstractContextManager
+ from contextlib import contextmanager
+@@ -833,6 +834,187 @@ class Context:
+         return self._parameter_source.get(name)
+ 
+ 
++
++    def save_state(self) -> dict[str, t.Any]:
++        """Create a snapshot of the current parsing and presentation
++        state that can be restored with :meth:`restore_state`.
++
++        The snapshot is a dictionary covering ``params``, ``args``,
++        protected arguments, option prefixes, ``obj``, metadata,
++        ``default_map``, ``invoked_subcommand``, terminal and content
++        widths, parsing flags, ``help_option_names``,
++        ``token_normalize_func``, ``auto_envvar_prefix``, ``color``,
++        ``show_default``, and parameter-source tracking.
++
++        Mutable values in the snapshot are independent of the source
++        :class:`Context`. Shared references across supported fields and
++        cycles are preserved. Snapshots are reusable and multiple
++        snapshots remain independently restorable.
++
++        .. versionadded:: 8.2
++        """
++        import copy as _copy
++
++        snapshot: dict[str, t.Any] = {
++            "params": self.params,
++            "args": self.args,
++            "_protected_args": self._protected_args,
++            "_opt_prefixes": self._opt_prefixes,
++            "obj": self.obj,
++            "_meta": self._meta,
++            "default_map": self.default_map,
++            "invoked_subcommand": self.invoked_subcommand,
++            "terminal_width": self.terminal_width,
++            "max_content_width": self.max_content_width,
++            "allow_extra_args": self.allow_extra_args,
++            "allow_interspersed_args": self.allow_interspersed_args,
++            "ignore_unknown_options": self.ignore_unknown_options,
++            "help_option_names": self.help_option_names,
++            "token_normalize_func": self.token_normalize_func,
++            "resilient_parsing": self.resilient_parsing,
++            "auto_envvar_prefix": self.auto_envvar_prefix,
++            "color": self.color,
++            "show_default": self.show_default,
++            "_parameter_source": self._parameter_source,
++        }
++
++        return _copy.deepcopy(snapshot)
++
++    def restore_state(self, snapshot: dict[str, t.Any]) -> None:
++        """Restore parsing and presentation state from a snapshot
++        created by :meth:`save_state`.
++
++        The snapshot must be a dictionary with all supported keys and
++        dictionary-valued metadata. Missing keys, invalid metadata, or
++        copying failures raise an exception without partially changing
++        the :class:`Context`.
++
++        Restoring metadata changes its contents while preserving the
++        existing metadata dictionary shared by parent and child
++        contexts. References to that dictionary within the restored
++        state still point to the shared dictionary.
++
++        Unknown snapshot keys are ignored.
++
++        .. versionadded:: 8.2
++        """
++        import copy as _copy
++
++        _meta_key: str = "_meta"
++
++        # The set of keys that we recognise and validate.
++        supported_keys: set[str] = {
++            "params",
++            "args",
++            "_protected_args",
++            "_opt_prefixes",
++            "obj",
++            _meta_key,
++            "default_map",
++            "invoked_subcommand",
++            "terminal_width",
++            "max_content_width",
++            "allow_extra_args",
++            "allow_interspersed_args",
++            "ignore_unknown_options",
++            "help_option_names",
++            "token_normalize_func",
++            "resilient_parsing",
++            "auto_envvar_prefix",
++            "color",
++            "show_default",
++            "_parameter_source",
++        }
++
++        # --- Validation (must succeed before any mutation) ---
++
++        missing = supported_keys - snapshot.keys()
++        if missing:
++            raise ValueError(
++                f"Snapshot is missing required keys: {sorted(missing)}"
++            )
++
++        if not isinstance(snapshot[_meta_key], dict):
++            raise TypeError(
++                f"Snapshot '{_meta_key}' must be a dictionary, got "
++                f"{type(snapshot[_meta_key]).__name__}"
++            )
++
++        # --- Copy so restored values are independent of the snapshot ---
++
++        snapshot_copy = _copy.deepcopy(snapshot)
++
++        old_meta = snapshot_copy[_meta_key]
++        new_meta = self._meta
++
++        # ---- Helper: replace every reference to *old* with *new* ----
++
++        def _replace_refs(
++            value: t.Any, old: t.Any, new: t.Any,
++            _memo: dict[int, t.Any] | None = None,
++        ) -> t.Any:
++            if _memo is None:
++                _memo = {}
++
++            if value is old:
++                return new
++
++            vid = id(value)
++            if vid in _memo:
++                return _memo[vid]
++
++            if isinstance(value, dict):
++                _memo[vid] = value
++                for k, v in value.items():
++                    value[k] = _replace_refs(v, old, new, _memo)
++                return value
++
++            if isinstance(value, list):
++                _memo[vid] = value
++                for i, v in enumerate(value):
++                    value[i] = _replace_refs(v, old, new, _memo)
++                return value
++
++            if isinstance(value, set):
++                _memo[vid] = value
++                new_vals: list[t.Any] = []
++                changed = False
++                for v in value:
++                    replaced = _replace_refs(v, old, new, _memo)
++                    if replaced is not v:
++                        changed = True
++                    new_vals.append(replaced)
++                if changed:
++                    return set(new_vals)
++                return value
++
++            if isinstance(value, tuple):
++                return tuple(
++                    _replace_refs(v, old, new, _memo) for v in value
++                )
++
++            return value
++
++        # --- Update *meta* in-place (preserve shared dict identity) ---
++
++        new_meta.clear()
++        new_meta.update(old_meta)
++
++        # --- Replace references to the old meta copy in other fields ---
++
++        for key in supported_keys:
++            if key == _meta_key:
++                continue
++            val = snapshot_copy[key]
++            snapshot_copy[key] = _replace_refs(val, old_meta, new_meta)
++
++        # --- Assign everything else to the context ---
++
++        for key in supported_keys:
++            if key == _meta_key:
++                continue
++            setattr(self, key, snapshot_copy[key])
++
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+     Click.  A basic command handles command line parsing and might dispatch

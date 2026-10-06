@@ -1,0 +1,5 @@
+# Mutually conflicting options
+
+Add `conflicts_with` to `click.Option` and `@click.option`. It accepts normalized Python parameter names such as `input_text`, without option prefixes. A declaration is directional but still rejects the pair when both options are explicitly supplied. After parsing and before the command callback, raise `UsageError` with `Option '--first' cannot be used together with '--second'.` when both sources are `COMMANDLINE` or `PROMPT` in any combination.
+
+Defaults, environment variables, and default-map values do not trigger a conflict. Negative boolean spellings, count options, and multiple options count as explicit command-line input. Reject a string or sequence containing a non-string/prefixed name with `TypeError`; report an unknown or self-referencing name as a `UsageError` configuration error. `None` and an empty sequence disable the feature. `to_info_dict()` always exposes a list-valued `conflicts_with`, empty by default. No parser `opts` check or private validation hook is prescribed.

@@ -1,0 +1,339 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..df882b19 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,7 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add persistent filters and temporary scopes for loader listings.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..f56df89e 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -438,7 +438,22 @@ All loaders are subclasses of :class:`BaseLoader`.  If you want to create your
+ own loader, subclass :class:`BaseLoader` and override `get_source`.
+ 
+ .. autoclass:: jinja2.BaseLoader
+-    :members: get_source, load
++    :members: get_source, load, list_templates, add_filter,
++        clear_filters, filter_scope
++
++Supported builtin listings accept persistent ``add_filter`` exclusions.
++Strings use case-sensitive globs, regex patterns search, and callables
++exclude a name when truthy. ``clear_filters`` restores the unfiltered
++listing. Filtering never prevents direct template loading. Child listing
++filters apply before a prefix or choice loader applies its own filters.
++Loaders without enumeration support still raise ``TypeError``.
++
++``filter_scope(*patterns)`` adds exclusions temporarily. Nested scopes,
++failed entry, and body exceptions restore the entering configuration;
++changes inside a scope are temporary. This synchronous loader-local
++context does not isolate threads or asynchronous tasks. It can select a
++compilation subset without changing the compilation error policy.
++``Environment.list_templates`` retains its separate one-shot filtering.
+ 
+ Here a list of the builtin loaders Jinja provides:
+ 
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..aba8bae1 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -1,6 +1,7 @@
+ """API and implementations for loading templates from different data
+ sources.
+ """
++import fnmatch
+ import importlib.util
+ import os
+ import sys
+@@ -8,6 +9,7 @@ import typing as t
+ import weakref
+ import zipimport
+ from collections import abc
++from contextlib import contextmanager
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -44,6 +46,13 @@ class BaseLoader:
+     `get_template` method that calls the loader's `load` method to get the
+     :class:`Template` object.
+ 
++    Supported builtin listings can register persistent exclusions or use
++    temporary scopes. Direct loading is unaffected; unsupported listings
++    still raise ``TypeError``.
++
++    .. versionchanged:: 3.1.0
++        Add persistent filters and temporary listing scopes.
++
+     A very basic example for a loader that looks up templates on the file
+     system could look like this::
+ 
+@@ -71,6 +80,112 @@ class BaseLoader:
+     #: .. versionadded:: 2.4
+     has_source_access = True
+ 
++    # Internal container for filter objects that control list_templates output.
++    # A template is excluded if any filter matches it (OR logic).
++    #
++    # Supported filter types:
++    # - str: glob-style pattern, matched with fnmatch.fnmatchcase
++    # - compiled regex: any object with a .search callable attribute
++    # - callable: a function taking (path: str) -> bool indicating exclusion
++    _template_filters: t.List[t.Any]
++
++    def __init__(self) -> None:
++        # Existing subclasses might not call super().__init__.
++        # Ensure attribute exists when BaseLoader is constructed.
++        self._template_filters = []
++
++    def add_filter(self, filter_pattern: t.Any) -> None:
++        """Exclude matching names from supported loader listings.
++
++        Strings are case-sensitive globs, regex-like objects use their
++        callable ``search``, and callables exclude names when truthy.
++        Any matching filter excludes the name. Matching exceptions
++        propagate; unsupported filter types raise ``TypeError``.
++        Direct source access and loading remain unaffected.
++
++        .. versionadded:: 3.1.0
++            Add persistent loader listing filters.
++        """
++        # Initialize lazily in case subclass __init__ didn't call super().__init__
++        if not hasattr(self, "_template_filters"):
++            self._template_filters = []
++
++        is_valid = False
++        if isinstance(filter_pattern, str):
++            is_valid = True
++        elif hasattr(filter_pattern, "search") and callable(filter_pattern.search):
++            # compiled regex-like object
++            is_valid = True
++        elif callable(filter_pattern):
++            is_valid = True
++
++        if not is_valid:
++            raise TypeError(
++                "Unsupported filter type. Use a glob string, compiled regex "
++                "with .search, or a callable."
++            )
++
++        self._template_filters.append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        """Remove all persistent listing filters on this loader.
++
++        Unsupported listings still raise their ordinary error.
++
++        .. versionadded:: 3.1.0
++            Add persistent loader listing filters.
++        """
++        # Initialize lazily in case subclass __init__ didn't call super().__init__
++        if not hasattr(self, "_template_filters"):
++            self._template_filters = []
++        else:
++            self._template_filters.clear()
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Any) -> t.Iterator[None]:
++        """Temporarily add filters and restore the original filters.
++
++        Accept the same patterns as :meth:`add_filter`. Scopes may nest.
++        Entry failures, body exceptions, and changes inside the scope
++        restore the previous filters on exit. This is synchronous and
++        local to this loader, not thread or asynchronous-task isolation.
++
++        .. versionadded:: 3.1.0
++            Add temporary loader listing filters.
++        """
++        previous = list(getattr(self, "_template_filters", ()))
++        try:
++            for pattern in patterns:
++                self.add_filter(pattern)
++            yield
++        finally:
++            self._template_filters = previous
++
++    def _apply_filters(self, names: t.Iterable[str]) -> t.List[str]:
++        """Apply registered filters to an iterable of template names.
++
++        Return names that do not match a filter. With no filters,
++        return the input as a new list.
++        """
++        filters = getattr(self, "_template_filters", [])
++        if not filters:
++            # Return as list to ensure consistent return type
++            return list(names)
++
++        def matches_any(path: str) -> bool:
++            for f in filters:
++                if isinstance(f, str):
++                    if fnmatch.fnmatchcase(path, f):
++                        return True
++                elif hasattr(f, "search") and callable(f.search):
++                    if bool(f.search(path)):
++                        return True
++                elif callable(f) and bool(f(path)):
++                    return True
++            return False
++
++        return [n for n in names if not matches_any(n)]
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+@@ -181,6 +296,7 @@ class FileSystemLoader(BaseLoader):
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
++        super().__init__()
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+@@ -214,6 +330,13 @@ class FileSystemLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
++        """Return sorted names, respecting roots and followlinks.
++
++        Registered filters exclude names from this listing only.
++
++        .. versionchanged:: 3.1.0
++            Add persistent filters and temporary filter scopes.
++        """
+         found = set()
+         for searchpath in self.searchpath:
+             walk_dir = os.walk(searchpath, followlinks=self.followlinks)
+@@ -228,7 +351,8 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        names = sorted(found)
++        return self._apply_filters(names)
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -270,6 +394,7 @@ class PackageLoader(BaseLoader):
+         package_path: "str" = "templates",
+         encoding: str = "utf-8",
+     ) -> None:
++        super().__init__()
+         package_path = os.path.normpath(package_path).rstrip(os.path.sep)
+ 
+         # normpath preserves ".", which isn't valid in zip paths.
+@@ -357,6 +482,13 @@ class PackageLoader(BaseLoader):
+         return source.decode(self.encoding), p, up_to_date
+ 
+     def list_templates(self) -> t.List[str]:
++        """Return sorted relative package file names with / separators.
++
++        Registered filters exclude names from this listing only.
++
++        .. versionchanged:: 3.1.0
++            Add persistent filters and temporary filter scopes.
++        """
+         results: t.List[str] = []
+ 
+         if self._archive is None:
+@@ -389,7 +521,7 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
+-        return results
++        return self._apply_filters(results)
+ 
+ 
+ class DictLoader(BaseLoader):
+@@ -402,6 +534,7 @@ class DictLoader(BaseLoader):
+     """
+ 
+     def __init__(self, mapping: t.Mapping[str, str]) -> None:
++        super().__init__()
+         self.mapping = mapping
+ 
+     def get_source(
+@@ -413,7 +546,15 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        """Return sorted names from the current mapping.
++
++        Registered filters exclude names from this listing only.
++
++        .. versionchanged:: 3.1.0
++            Add persistent filters and temporary filter scopes.
++        """
++        names = sorted(self.mapping)
++        return self._apply_filters(names)
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -445,6 +586,7 @@ class FunctionLoader(BaseLoader):
+             ],
+         ],
+     ) -> None:
++        super().__init__()
+         self.load_func = load_func
+ 
+     def get_source(
+@@ -479,6 +621,7 @@ class PrefixLoader(BaseLoader):
+     def __init__(
+         self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
+     ) -> None:
++        super().__init__()
+         self.mapping = mapping
+         self.delimiter = delimiter
+ 
+@@ -517,11 +660,18 @@ class PrefixLoader(BaseLoader):
+             raise TemplateNotFound(name) from e
+ 
+     def list_templates(self) -> t.List[str]:
++        """List child names using the configured prefix delimiter.
++
++        Registered filters exclude names from this listing only.
++
++        .. versionchanged:: 3.1.0
++            Add persistent filters and temporary filter scopes.
++        """
+         result = []
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
+-        return result
++        return self._apply_filters(result)
+ 
+ 
+ class ChoiceLoader(BaseLoader):
+@@ -539,6 +689,7 @@ class ChoiceLoader(BaseLoader):
+     """
+ 
+     def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        super().__init__()
+         self.loaders = loaders
+ 
+     def get_source(
+@@ -566,10 +717,18 @@ class ChoiceLoader(BaseLoader):
+         raise TemplateNotFound(name)
+ 
+     def list_templates(self) -> t.List[str]:
++        """Return the sorted union of the current child listings.
++
++        Registered filters exclude names from this listing only.
++
++        .. versionchanged:: 3.1.0
++            Add persistent filters and temporary filter scopes.
++        """
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
+-        return sorted(found)
++        names = sorted(found)
++        return self._apply_filters(names)
+ 
+ 
+ class _TemplateModule(ModuleType):

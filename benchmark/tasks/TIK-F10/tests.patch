@@ -1,0 +1,120 @@
+diff --git a/tests/test_feature10.py b/tests/test_feature10.py
+new file mode 100644
+index 0000000..4f0cbf9
+--- /dev/null
++++ b/tests/test_feature10.py
+@@ -0,0 +1,68 @@
++import tiktoken
++
++class CountingBPE:
++    def __init__(self, wrapped):
++        self.wrapped = wrapped
++        self.calls = 0
++
++    def encode(self, *args, **kwargs):
++        self.calls += 1
++        return self.wrapped.encode(*args, **kwargs)
++
++    def __getattr__(self, name):
++        return getattr(self.wrapped, name)
++
++
++def counting_encoding():
++    enc = tiktoken.Encoding('fresh-byte-cache', pat_str=r'[\s\S]',
++        mergeable_ranks={bytes([i]):i for i in range(256)},
++        special_tokens={'<|endoftext|>':256})
++    enc._core_bpe = CountingBPE(enc._core_bpe)
++    return enc
++
++
++def test_cache_is_opt_in_and_hits_without_timing_assumptions():
++    enc = counting_encoding()
++
++    assert enc.encode("repeated", use_cache=False) == enc.encode("repeated", use_cache=False)
++    assert enc._core_bpe.calls == 2
++
++    first = enc.encode("cached", use_cache=True)
++    second = enc.encode("cached", use_cache=True)
++    assert first == second
++    assert enc._core_bpe.calls == 3
++
++
++def test_cached_results_cannot_be_mutated_by_the_caller():
++    enc = counting_encoding()
++    expected = enc.encode("immutable cache entry", use_cache=True)
++    expected.append(-1)
++
++    assert -1 not in enc.encode("immutable cache entry", use_cache=True)
++    assert enc._core_bpe.calls == 1
++
++
++def test_cache_key_includes_special_token_policy():
++    enc = counting_encoding()
++    text = "<|endoftext|>"
++
++    natural = enc.encode(text, disallowed_special=(), use_cache=True)
++    special = enc.encode(text, allowed_special="all", use_cache=True)
++    assert natural != special
++    assert enc._core_bpe.calls == 2
++    assert enc.encode(text, disallowed_special=(), use_cache=True) == natural
++    assert enc._core_bpe.calls == 2
++
++
++def test_cache_is_bounded_and_evicts_least_recently_used_entry():
++    enc = counting_encoding()
++    for index in range(128):
++        enc.encode(f"entry-{index}", use_cache=True)
++
++    enc.encode("entry-0", use_cache=True)
++    enc.encode("entry-128", use_cache=True)
++    calls_after_eviction = enc._core_bpe.calls
++    enc.encode("entry-0", use_cache=True)
++    assert enc._core_bpe.calls == calls_after_eviction
++    enc.encode("entry-1", use_cache=True)
++    assert enc._core_bpe.calls == calls_after_eviction + 1
+diff --git a/tests/test_feature_engineering.py b/tests/test_feature_engineering.py
+new file mode 100644
+index 0000000..030fee2
+--- /dev/null
++++ b/tests/test_feature_engineering.py
+@@ -0,0 +1,40 @@
++import pickle
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++import pytest
++import tiktoken
++from tests.test_feature10 import counting_encoding
++
++
++def test_cross_entry_hits_and_policy_validation():
++    enc=counting_encoding()
++    ordinary=enc.encode('text',use_cache=True)
++    assert enc.encode_batch(['text'],use_cache=True)==[ordinary]
++    assert enc._core_bpe.calls==1
++    special=enc.encode('<|endoftext|>',allowed_special='all',use_cache=True)
++    assert enc.encode_batch(['<|endoftext|>'],allowed_special='all',use_cache=True)==[special]
++    assert enc._core_bpe.calls==2
++    with pytest.raises(ValueError):enc.encode_batch(['<|endoftext|>'],use_cache=True)
++    assert enc.encode_batch([],use_cache=True)==[]
++    value=enc.encode_batch(['text'],use_cache=True)
++    value[0].append(-1)
++    assert enc.encode('text',use_cache=True)==ordinary
++
++
++def test_concurrent_cache_eviction_and_pickle():
++    enc=counting_encoding()
++    gate=Barrier(4)
++    def worker(i):
++        gate.wait(timeout=10)
++        texts=[str(n) for n in range(i*40,i*40+140)]
++        return texts,enc.encode_batch(texts,num_threads=2,use_cache=True)
++    with ThreadPoolExecutor(4) as pool:
++        for texts,results in pool.map(worker,range(4)):
++            assert results==[enc.encode(t) for t in texts]
++    for original in [enc,tiktoken.get_encoding('cl100k_base')]:
++        original.encode('pickle',use_cache=True)
++        restored=pickle.loads(pickle.dumps(original))
++        assert restored.encode_batch(['pickle',''],use_cache=True)==[original.encode('pickle'),[]]
++    other=tiktoken.Encoding('shifted',pat_str=r'[\s\S]',
++        mergeable_ranks={bytes([i]):i+1 for i in range(256)},special_tokens={})
++    assert other.encode_batch(['x'],use_cache=True)!=enc.encode_batch(['x'],use_cache=True)

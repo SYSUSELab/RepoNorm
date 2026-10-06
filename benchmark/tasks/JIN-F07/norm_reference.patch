@@ -1,0 +1,210 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..f062f274 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add a ``stable`` option to ``groupby`` that supports unhashable keys and
++    orders groups by their first appearance while preserving member order.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..cfc8728b 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1163,12 +1163,16 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    stable: bool = False,
++) -> "t.List[_GroupTuple]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+-    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
+-    the values are sorted first so only one group is returned for each
+-    unique value.
++    nested access, like ``"address.city"``.
++
++    Unlike Python's ``groupby``, the values are sorted first so only one
++    group is returned for each unique value. When ``stable=True``, the
++    original order of items within each group is preserved and groups are
++    returned in the order their keys are first seen in the input.
+ 
+     For example, a list of ``User`` objects with a ``city`` attribute
+     can be rendered in groups. In this example, ``grouper`` refers to
+@@ -1206,14 +1210,32 @@ def sync_do_groupby(
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
++    .. versionchanged:: 3.1
++        Added the ``stable`` parameter to preserve item order within
++        groups and group order by first occurrence.
++
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++
++    if not stable:
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value, key=expr), expr)
++        ]
++
++    groups: t.List[_GroupTuple] = []
++    for item in value:
++        key = expr(item)
++        for existing in groups:
++            if existing.grouper == key:
++                existing.list.append(item)
++                break
++        else:
++            groups.append(_GroupTuple(key, [item]))
++
++    return groups
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1244,30 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    stable: bool = False,
++) -> "t.List[_GroupTuple]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++
++    if not stable:
++        return [
++            _GroupTuple(key, await auto_to_list(values))
++            for key, values in groupby(
++                sorted(await auto_to_list(value), key=expr), expr
++            )
++        ]
++
++    seq = await auto_to_list(value)
++    groups: t.List[_GroupTuple] = []
++    for item in seq:
++        key = expr(item)
++        for existing in groups:
++            if existing.grouper == key:
++                existing.list.append(item)
++                break
++        else:
++            groups.append(_GroupTuple(key, [item]))
++
++    return groups
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_stable_contribution.py b/tests/test_groupby_stable_contribution.py
+new file mode 100644
+index 00000000..14616b21
+--- /dev/null
++++ b/tests/test_groupby_stable_contribution.py
+@@ -0,0 +1,92 @@
++import asyncio
++from copy import deepcopy
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import StrictUndefined
++from jinja2 import UndefinedError
++
++
++def test_stable_supports_unhashable_equal_keys_without_mutation():
++    env = Environment()
++    keys = [[2], {"a": 1, "b": 2}, 4, [2], {"b": 2, "a": 1}, "[2]"]
++    rows = [{"meta": {"key": key}, "id": i} for i, key in enumerate(keys)]
++    before = deepcopy(rows)
++
++    result = env.call_filter("groupby", iter(rows), ["meta.key"], {"stable": True})
++
++    assert [group.grouper for group in result] == [
++        [2],
++        {"a": 1, "b": 2},
++        4,
++        "[2]",
++    ]
++    assert result[0].grouper is keys[0]
++    assert result[1].grouper is keys[1]
++    assert [[row["id"] for row in group.list] for group in result] == [
++        [0, 3],
++        [1, 4],
++        [2],
++        [5],
++    ]
++    assert rows == before
++
++
++def test_stable_changes_group_order_but_preserves_group_interface():
++    env = Environment()
++    rows = [
++        {"kind": "b", "value": 1},
++        {"kind": "a", "value": 2},
++        {"kind": "b", "value": 3},
++    ]
++
++    stable = env.call_filter("groupby", rows, ["kind"], {"stable": True})
++    sorted_result = env.call_filter("groupby", rows, ["kind"], {"stable": False})
++
++    assert [group.grouper for group in stable] == ["b", "a"]
++    assert [group.grouper for group in sorted_result] == ["a", "b"]
++    assert stable[0] == ("b", [rows[0], rows[2]])
++    assert repr(stable[0]) == repr(("b", [rows[0], rows[2]]))
++
++
++def test_stable_uses_environment_lookup_and_default():
++    class UpperKeyEnvironment(Environment):
++        def getitem(self, obj, argument):
++            if argument == "kind" and argument in obj:
++                return obj[argument].upper()
++
++            return super().getitem(obj, argument)
++
++    env = UpperKeyEnvironment()
++    rows = [{"kind": "b"}, {}, {"kind": "B"}]
++
++    result = env.call_filter(
++        "groupby", rows, ["kind"], {"default": "missing", "stable": True}
++    )
++
++    assert [group.grouper for group in result] == ["B", "missing"]
++    assert [group.list for group in result] == [[rows[0], rows[2]], [rows[1]]]
++
++
++def test_stable_propagates_strict_undefined():
++    env = Environment(undefined=StrictUndefined)
++
++    with pytest.raises(UndefinedError):
++        env.call_filter("groupby", [{}, {}], ["missing"], {"stable": True})
++
++
++def test_stable_async_accepts_async_input():
++    async def stream():
++        for row in [{"kind": [2], "id": 1}, {"kind": [2], "id": 2}]:
++            yield row
++
++    async def run():
++        env = Environment(enable_async=True)
++        result = await env.call_filter("groupby", stream(), ["kind"], {"stable": True})
++        return result
++
++    result = asyncio.run(run())
++
++    assert [group.grouper for group in result] == [[2]]
++    assert [[row["id"] for row in group.list] for group in result] == [[1, 2]]

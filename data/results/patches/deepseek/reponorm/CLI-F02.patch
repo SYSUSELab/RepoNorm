@@ -1,0 +1,314 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..c515584 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,11 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param on_exit: A callback to invoke when the context is torn down.
++        It receives the context as its sole argument. The callback runs
++        after the command has completed, before registered close
++        callbacks and context manager resources are released. Ordinary
++        exceptions raised by the callback are silently ignored.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -241,6 +246,9 @@ class Context:
+         The ``show_default`` parameter defaults to the value from the
+         parent context.
+ 
++    .. versionchanged:: 8.1
++        Added the ``on_exit`` parameter.
++
+     .. versionchanged:: 7.1
+        Added the ``show_default`` parameter.
+ 
+@@ -280,6 +288,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        on_exit: t.Callable[[Context], t.Any] | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +436,8 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        self._on_exit: t.Callable[[Context], t.Any] | None = on_exit
++        self._on_exit_called: bool = False
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -468,6 +479,7 @@ class Context:
+     def __enter__(self) -> Context:
+         self._depth += 1
+         push_context(self)
++        self._on_exit_called = False
+         return self
+ 
+     def __exit__(
+@@ -477,9 +489,11 @@ class Context:
+         tb: TracebackType | None,
+     ) -> None:
+         self._depth -= 1
+-        if self._depth == 0:
+-            self.close()
+-        pop_context()
++        try:
++            if self._depth == 0:
++                self.close()
++        finally:
++            pop_context()
+ 
+     @contextmanager
+     def scope(self, cleanup: bool = True) -> cabc.Iterator[Context]:
+@@ -607,6 +621,18 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self._on_exit is not None and not self._on_exit_called:
++            self._on_exit_called = True
++            try:
++                self._on_exit(self)
++            except Exception:
++                pass
++            except BaseException:
++                self._exit_stack.close()
++                # In case the context is reused, create a new exit stack.
++                self._exit_stack = ExitStack()
++                raise
++
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..1e43d34 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,224 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++def test_on_exit_basic(runner):
++    """Test that on_exit callback is invoked on context teardown."""
++    results = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        click.echo("running")
++
++    ctx = click.Context(cli, on_exit=lambda ctx: results.append("exit"))
++    assert results == []
++    with ctx:
++        pass
++    assert results == ["exit"]
++
++
++def test_on_exit_not_called_on_nested_exit():
++    """Exiting an inner with ctx while an outer entry remains open must not invoke on_exit."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    ctx = click.Context(cli, on_exit=lambda ctx: results.append("exit"))
++    with ctx:
++        with ctx:
++            pass
++        assert results == []
++    assert results == ["exit"]
++
++
++def test_on_exit_multiple_cycles():
++    """A later, separate enter/exit cycle invokes on_exit again."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    ctx = click.Context(cli, on_exit=lambda ctx: results.append("exit"))
++    with ctx:
++        pass
++    assert results == ["exit"]
++
++    with ctx:
++        pass
++    assert results == ["exit", "exit"]
++
++
++def test_on_exit_not_double_on_close():
++    """Calling close() twice must not invoke on_exit twice."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    ctx = click.Context(cli, on_exit=lambda ctx: results.append("exit"))
++    ctx.close()
++    assert results == ["exit"]
++    ctx.close()
++    assert results == ["exit"]
++
++
++def test_on_exit_cleanup_false():
++    """scope(cleanup=False) must not trigger on_exit."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    ctx = click.Context(cli, on_exit=lambda ctx: results.append("exit"))
++    with ctx.scope(cleanup=False):
++        pass
++    assert results == []
++
++    with ctx.scope():
++        pass
++    assert results == ["exit"]
++
++
++def test_on_exit_parent_and_child_independent():
++    """Parent and child contexts may have independent callbacks."""
++    parent_results = []
++    child_results = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        pass
++
++    @click.command()
++    @click.pass_context
++    def sub(ctx):
++        pass
++
++    parent_ctx = click.Context(cli, on_exit=lambda ctx: parent_results.append("parent"))
++    child_ctx = click.Context(sub, parent=parent_ctx, on_exit=lambda ctx: child_results.append("child"))
++
++    with parent_ctx:
++        with child_ctx:
++            pass
++        assert child_results == ["child"]
++        assert parent_results == []
++    assert parent_results == ["parent"]
++    assert child_results == ["child"]
++
++
++def test_on_exit_omitted_preserves_existing():
++    """Omitting on_exit preserves existing behavior."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    ctx = click.Context(cli)
++    @ctx.call_on_close
++    def cb():
++        results.append("close")
++    with ctx:
++        pass
++    assert results == ["close"]
++
++
++def test_on_exit_receives_context():
++    """The callback receives the Context being closed."""
++    received = []
++
++    @click.command()
++    def cli():
++        pass
++
++    ctx = click.Context(cli, on_exit=lambda ctx: received.append(ctx))
++    with ctx:
++        pass
++    assert received == [ctx]
++    assert received[0].command is cli
++
++
++def test_on_exit_exception_ignored():
++    """Ordinary Exception from the callback must be silently ignored."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    def bad_callback(ctx):
++        raise ValueError("boom")
++
++    ctx = click.Context(cli, on_exit=bad_callback)
++    @ctx.call_on_close
++    def cb():
++        results.append("close")
++    with ctx:
++        pass
++    assert results == ["close"]
++
++
++def test_on_exit_keyboard_interrupt_propagates():
++    """KeyboardInterrupt from callback must propagate but resources are still released."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    def ki_callback(ctx):
++        raise KeyboardInterrupt()
++
++    ctx = click.Context(cli, on_exit=ki_callback)
++    @ctx.call_on_close
++    def cb():
++        results.append("close")
++
++    with pytest.raises(KeyboardInterrupt):
++        with ctx:
++            pass
++    assert results == ["close"]
++
++
++def test_on_exit_system_exit_propagates():
++    """SystemExit from callback must propagate but resources are still released."""
++    results = []
++
++    @click.command()
++    def cli():
++        pass
++
++    def se_callback(ctx):
++        raise SystemExit(42)
++
++    ctx = click.Context(cli, on_exit=se_callback)
++    @ctx.call_on_close
++    def cb():
++        results.append("close")
++
++    with pytest.raises(SystemExit):
++        with ctx:
++            pass
++    assert results == ["close"]
++
++
++def test_on_exit_command_raises(runner):
++    """Command that raises still triggers on_exit."""
++    results = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        raise ValueError("boom")
++
++    ctx = click.Context(cli, on_exit=lambda ctx: results.append("exit"))
++    with pytest.raises(ValueError):
++        with ctx:
++            cli.invoke(ctx)
++    assert results == ["exit"]

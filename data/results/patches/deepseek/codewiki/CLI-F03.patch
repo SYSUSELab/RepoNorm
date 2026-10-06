@@ -1,0 +1,103 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..2435a8e 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -158,6 +158,31 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++
++class _ResourceContextManager:
++    """Wraps a context manager to track resource counts for max_resources."""
++
++    __slots__ = ("ctx", "cm")
++
++    def __init__(self, ctx: Context, cm: AbstractContextManager) -> None:
++        self.ctx = ctx
++        self.cm = cm
++
++    def __enter__(self) -> t.Any:
++        return self.cm.__enter__()
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc_val: BaseException | None,
++        exc_tb: TracebackType | None,
++    ) -> bool | None:
++        try:
++            return self.cm.__exit__(exc_type, exc_val, exc_tb)
++        finally:
++            self.ctx._add_resource_count(-1)
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -272,6 +297,7 @@ class Context:
+         default_map: cabc.MutableMapping[str, t.Any] | None = None,
+         terminal_width: int | None = None,
+         max_content_width: int | None = None,
++        max_resources: int | None = None,
+         resilient_parsing: bool = False,
+         allow_extra_args: bool | None = None,
+         allow_interspersed_args: bool | None = None,
+@@ -343,6 +369,14 @@ class Context:
+         #: default which is 80 for most things).
+         self.max_content_width: int | None = max_content_width
+ 
++        if max_resources is None and parent is not None:
++            max_resources = parent.max_resources
++
++        #: The maximum number of active resources that can be registered.
++        #: None means unlimited.
++        self.max_resources: int | None = max_resources
++        self._resource_count: int = 0
++
+         if allow_extra_args is None:
+             allow_extra_args = command.allow_extra_args
+ 
+@@ -561,6 +595,8 @@ class Context:
+             width=self.terminal_width, max_width=self.max_content_width
+         )
+ 
++
++
+     def with_resource(self, context_manager: AbstractContextManager[V]) -> V:
+         """Register a resource as if it were used in a ``with``
+         statement. The resource will be cleaned up when the context is
+@@ -588,7 +624,33 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        self._check_resource_limit()
++        self._add_resource_count(1)
++        wrapped = _ResourceContextManager(self, context_manager)
++        try:
++            return self._exit_stack.enter_context(wrapped)
++        except BaseException:
++            self._add_resource_count(-1)
++            raise
++
++
++    def _check_resource_limit(self) -> None:
++        """Check if adding a new resource would exceed any limit."""
++        node: Context | None = self
++        while node is not None:
++            if node.max_resources is not None and node._resource_count >= node.max_resources:
++                raise RuntimeError(
++                    f"Context {node.info_name!r} has reached its limit of "
++                    f"{node.max_resources} resources."
++                )
++            node = node.parent
++
++    def _add_resource_count(self, delta: int) -> None:
++        """Add delta to resource count for this context and all ancestors."""
++        node: Context | None = self
++        while node is not None:
++            node._resource_count += delta
++            node = node.parent
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.

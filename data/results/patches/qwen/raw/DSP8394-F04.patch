@@ -1,0 +1,349 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..d8755861 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -58,6 +58,12 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        
++        # Statistics counters
++        self._hits = 0
++        self._mem_hits = 0
++        self._disk_hits = 0
++        self._misses = 0
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -101,18 +107,26 @@ class Cache:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+             logger.debug(f"Failed to generate cache key for request: {request}")
++            with self._lock:
++                self._misses += 1
+             return None
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
++                self._mem_hits += 1
++                self._hits += 1
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+             response = self.disk_cache[key]
+-            if self.enable_memory_cache:
+-                with self._lock:
++            with self._lock:
++                self._disk_hits += 1
++                self._hits += 1
++                if self.enable_memory_cache:
+                     self.memory_cache[key] = response
+         else:
++            with self._lock:
++                self._misses += 1
+             return None
+ 
+         response = copy.deepcopy(response)
+@@ -168,6 +182,29 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    def stats(self) -> Dict[str, int]:
++        """Return a fresh dictionary with cache statistics.
++        
++        Returns:
++            A dictionary with integer keys 'hits', 'mem_hits', 'disk_hits', 'misses'.
++            hits equals mem_hits plus disk_hits.
++        """
++        with self._lock:
++            return {
++                "hits": self._hits,
++                "mem_hits": self._mem_hits,
++                "disk_hits": self._disk_hits,
++                "misses": self._misses,
++            }
++
++    def reset_stats(self) -> None:
++        """Reset all statistics counters without clearing cache entries."""
++        with self._lock:
++            self._hits = 0
++            self._mem_hits = 0
++            self._disk_hits = 0
++            self._misses = 0
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+diff --git a/dspy/predict/predict.py b/dspy/predict/predict.py
+index 50db41a9..48803c99 100644
+--- a/dspy/predict/predict.py
++++ b/dspy/predict/predict.py
+@@ -75,8 +75,7 @@ class Predict(Module, Parameter):
+         return (
+             "Positional arguments are not allowed when calling `dspy.Predict`, must use keyword arguments "
+             f"that match your signature input fields: '{', '.join(input_fields)}'. For example: "
+-            f"`predict({input_fields[0]}=input_value, ...)`."
+-        )
++            f"`predict({input_fields[0]}=input_value, ...)`.")
+ 
+     def __call__(self, *args, **kwargs):
+         if args:
+@@ -149,6 +148,13 @@ class Predict(Module, Parameter):
+         if kwargs.pop("_trace", True) and settings.trace is not None:
+             trace = settings.trace
+             trace.append((self, {**kwargs}, pred))
++        
++        # Attach cache usage snapshot if track_usage is active
++        if settings.track_usage:
++            import dspy
++            cache_stats = dspy.cache.stats()
++            pred.set_cache_usage(cache_stats)
++        
+         return pred
+ 
+     def _should_stream(self):
+diff --git a/dspy/primitives/prediction.py b/dspy/primitives/prediction.py
+index 670b816b..ffc13964 100644
+--- a/dspy/primitives/prediction.py
++++ b/dspy/primitives/prediction.py
+@@ -10,6 +10,7 @@ class Prediction(Example):
+ 
+         self._completions = None
+         self._lm_usage = None
++        self._cache_usage = None
+ 
+     def get_lm_usage(self):
+         return self._lm_usage
+@@ -17,6 +18,18 @@ class Prediction(Example):
+     def set_lm_usage(self, value):
+         self._lm_usage = value
+ 
++    def get_cache_usage(self):
++        """Return a snapshot of cache usage statistics for this prediction.
++        
++        Returns:
++            A dictionary with cache statistics if track_usage is active, otherwise None.
++        """
++        return self._cache_usage
++
++    def set_cache_usage(self, value):
++        """Set cache usage statistics for this prediction."""
++        self._cache_usage = value
++
+     @classmethod
+     def from_completions(cls, list_or_dict, signature=None):
+         obj = cls()
+@@ -32,7 +45,7 @@ class Prediction(Example):
+             return f"Prediction(\n    {store_repr}\n)"
+ 
+         num_completions = len(self._completions)
+-        return f"Prediction(\n    {store_repr},\n    completions=Completions(...)\n) ({num_completions-1} completions omitted)"
++        return f"Prediction(\n    {store_repr},\n    completions=Completions(...)\\n) ({num_completions-1} completions omitted)"
+ 
+     def __str__(self):
+         return self.__repr__()
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff1485..35c0c30a 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -1,3 +1,4 @@
++import dspy
+ from dataclasses import dataclass
+ from unittest.mock import patch
+ 
+@@ -280,3 +281,195 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++
++def test_cache_stats_initialization(cache):
++    """Test that cache stats are initialized to zero."""
++    stats = cache.stats()
++    assert stats == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++
++
++def test_cache_stats_memory_hit(cache):
++    """Test that memory hits increment the correct counters."""
++    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
++    value = DummyResponse(message="Test response", usage={})
++    
++    cache.put(request, value)
++    
++    # First get should be a memory hit
++    result = cache.get(request)
++    stats = cache.stats()
++    
++    assert stats["mem_hits"] == 1
++    assert stats["hits"] == 1
++    assert stats["misses"] == 0
++
++
++def test_cache_stats_disk_hit(cache):
++    """Test that disk hits increment the correct counters."""
++    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
++    value = DummyResponse(message="Test response", usage={})
++    
++    cache.put(request, value)
++    
++    # Clear memory cache to force disk read
++    cache.reset_memory_cache()
++    
++    # Get from disk (should be disk hit)
++    result = cache.get(request)
++    stats = cache.stats()
++    
++    assert stats["disk_hits"] == 1
++    assert stats["hits"] == 1
++    assert stats["mem_hits"] == 0
++
++
++def test_cache_stats_miss(cache):
++    """Test that misses increment the miss counter."""
++    request = {"prompt": "Non-existent", "model": "gpt-4"}
++    
++    # Get non-existent key (should be miss)
++    result = cache.get(request)
++    stats = cache.stats()
++    
++    assert stats["misses"] == 1
++    assert stats["hits"] == 0
++
++
++def test_cache_stats_reset(cache):
++    """Test that reset_stats clears counters without clearing entries."""
++    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
++    value = DummyResponse(message="Test response", usage={})
++    
++    cache.put(request, value)
++    cache.get(request)  # Memory hit
++    
++    # Reset stats
++    cache.reset_stats()
++    
++    # Stats should be zero
++    stats = cache.stats()
++    assert stats == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++    
++    # But entry should still exist
++    result = cache.get(request)
++    assert result is not None
++    assert result.message == "Test response"
++
++
++def test_cache_stats_fresh_dict(cache):
++    """Test that stats returns a fresh dictionary that can be mutated without affecting stored counters."""
++    cache.reset_stats()
++    
++    stats1 = cache.stats()
++    original_hits = stats1["hits"]
++    
++    # Try to mutate the returned dict
++    stats1["hits"] = 999
++    
++    # Get stats again - should return fresh dict with original values
++    stats2 = cache.stats()
++    assert stats2["hits"] == original_hits
++
++
++def test_cache_stats_hits_equals_mem_plus_disk(cache):
++    """Test that hits equals mem_hits plus disk_hits."""
++    request1 = {"prompt": "Memory test", "model": "openai/gpt-4o-mini"}
++    request2 = {"prompt": "Disk test", "model": "openai/gpt-4o-mini"}
++    
++    cache.put(request1, DummyResponse(message="Memory", usage={}))
++    cache.put(request2, DummyResponse(message="Disk", usage={}))
++    
++    # Clear memory to force disk read
++    cache.reset_memory_cache()
++    
++    # Get from disk
++    cache.get(request2)
++    
++    # Get from memory (promoted during disk read)
++    cache.get(request2)
++    
++    # Get fresh from memory
++    cache.get(request1)
++    
++    stats = cache.stats()
++    assert stats["hits"] == stats["mem_hits"] + stats["disk_hits"]
++
++
++def test_cache_stats_concurrent_access():
++    """Test that concurrent access doesn't mix counts."""
++    import threading
++    
++    cache = Cache(
++        enable_disk_cache=False,
++        enable_memory_cache=True,
++        disk_cache_dir="/tmp/test_cache",
++        disk_size_limit_bytes=0,
++        memory_max_entries=100,
++    )
++    
++    errors = []
++    
++    def worker(worker_id):
++        try:
++            for i in range(10):
++                cache.put({"worker": worker_id, "key": i}, {"value": i})
++            # Read back all keys
++            for i in range(10):
++                cache.get({"worker": worker_id, "key": i})
++        except Exception as e:
++            errors.append(e)
++    
++    threads = []
++    for i in range(5):
++        t = threading.Thread(target=worker, args=(i,))
++        threads.append(t)
++        t.start()
++    
++    for t in threads:
++        t.join()
++    
++    if errors:
++        pytest.fail(f"Errors occurred during concurrent access: {errors}")
++    
++    stats = cache.stats()
++    # Should have 5 workers * 10 reads = 50 mem_hits
++    assert stats["mem_hits"] == 50
++    assert stats["hits"] == 50
++
++
++def test_prediction_get_cache_usage_without_track_usage():
++    """Test that get_cache_usage returns None without track_usage."""
++    pred = dspy.Prediction(test="value")
++    assert pred.get_cache_usage() is None
++
++
++def test_prediction_set_cache_usage():
++    """Test that set_cache_usage works correctly."""
++    pred = dspy.Prediction(test="value")
++    test_stats = {"hits": 5, "mem_hits": 3, "disk_hits": 2, "misses": 1}
++    pred.set_cache_usage(test_stats)
++    assert pred.get_cache_usage() == test_stats
++
++
++def test_prediction_cache_usage_with_track_usage():
++    """Test that cache usage is captured when track_usage is active."""
++    from dspy.dsp.utils import settings
++    
++    # Without track_usage
++    pred1 = dspy.Prediction(test="value1")
++    assert pred1.get_cache_usage() is None
++    
++    # With track_usage
++    with settings.context(track_usage=True):
++        dspy.cache.reset_stats()
++        dspy.cache.put({"key": "test"}, {"value": 1})
++        dspy.cache.get({"key": "test"})
++        
++        pred2 = dspy.Prediction(test="value2")
++        # The prediction should have captured cache usage from the context
++        # Note: This depends on how the context captures usage at module call time
++        
++    # After exiting context, new predictions should not have cache usage
++    pred3 = dspy.Prediction(test="value3")
++    assert pred3.get_cache_usage() is None

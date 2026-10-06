@@ -1,0 +1,460 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..7612eafc 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add loader-owned one-step template aliases with cache invalidation
++    when mappings change, and listing of resolvable aliases.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..136b0ba6 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -438,7 +438,24 @@ All loaders are subclasses of :class:`BaseLoader`.  If you want to create your
+ own loader, subclass :class:`BaseLoader` and override `get_source`.
+ 
+ .. autoclass:: jinja2.BaseLoader
+-    :members: get_source, load
++    :members: get_source, load, add_alias, remove_alias,
++        resolve_template_name
++
++Built-in loaders provide ``add_alias(alias, target)`` and
++``remove_alias(alias)``. Aliases and targets are strings. Normal loading
++resolves one mapping on its owning loader before source access or
++composite routing; children resolve their own mappings independently.
++Aliases never chain within one loader. Missing targets report their
++target name with :exc:`TemplateNotFound`, including prefixed names.
++
++Replacing or removing an alias invalidates it in each Environment that
++has loaded it, without removing unrelated cached names. Ordinary
++template names remain distinct Environment cache entries. Listing keeps
++direct targets and adds aliases whose one-step target is in the ordinary
++listing; broken or chained aliases do not create extra entries. A loader
++without ordinary enumeration still raises its existing ``TypeError``.
++Custom subclasses retain their source and loading extension protocol and
++do not need to call the BaseLoader initializer merely to keep working.
+ 
+ Here a list of the builtin loaders Jinja provides:
+ 
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..f5b0945b 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -44,6 +44,13 @@ class BaseLoader:
+     `get_template` method that calls the loader's `load` method to get the
+     :class:`Template` object.
+ 
++    Built-in loaders support one-step aliases through ``add_alias``
++    and ``remove_alias``. Alias loading retains the normal provider
++    protocol. Existing custom subclasses need not call this initializer.
++
++    .. versionchanged:: 3.1.0
++        Add loader-owned aliases and cache invalidation on mutation.
++
+     A very basic example for a loader that looks up templates on the file
+     system could look like this::
+ 
+@@ -71,6 +78,76 @@ class BaseLoader:
+     #: .. versionadded:: 2.4
+     has_source_access = True
+ 
++    def __init__(self, aliases: t.Optional[t.Mapping[str, str]] = None) -> None:
++        self.aliases: t.Dict[str, str] = dict(aliases or ())
++        self._alias_environments: "weakref.WeakSet[Environment]" = weakref.WeakSet()
++
++    def _ensure_alias_state(self) -> None:
++        if not hasattr(self, "aliases"):
++            self.aliases = {}
++        if not hasattr(self, "_alias_environments"):
++            self._alias_environments = weakref.WeakSet()
++
++    def _register_alias_environment(self, environment: "Environment") -> None:
++        self._ensure_alias_state()
++        self._alias_environments.add(environment)
++
++    def _invalidate_alias(self, alias: str) -> None:
++        for environment in list(self._alias_environments):
++            cache = environment.cache
++            if cache is None:
++                continue
++            for key in list(cache):
++                loader_ref, name = key
++                if loader_ref() is self and name == alias:
++                    del cache[key]
++
++    def add_alias(self, alias: str, target: str) -> None:
++        """Add or overwrite a loader-owned, one-step template alias.
++
++        Both arguments must be strings. Invalidate this alias in every
++        Environment that has loaded it; leave other entries untouched.
++        Aliases do not chain within one loader.
++
++        .. versionadded:: 3.1.0
++        """
++        self._ensure_alias_state()
++        if not isinstance(alias, str) or not isinstance(target, str):
++            raise TypeError("alias and target must be strings")
++        self.aliases[alias] = target
++        self._invalidate_alias(alias)
++
++    def remove_alias(self, alias: str) -> None:
++        """Remove an alias and invalidate its cached requests.
++
++        Removing an unknown alias is harmless.
++
++        .. versionadded:: 3.1.0
++        """
++        self._ensure_alias_state()
++        if not isinstance(alias, str):
++            raise TypeError("alias must be a string")
++        self.aliases.pop(alias, None)
++        self._invalidate_alias(alias)
++
++    def resolve_template_name(self, template: str) -> str:
++        """Resolve exactly one mapping on this loader.
++
++        Normal loading or routing then uses the returned name.
++
++        .. versionadded:: 3.1.0
++        """
++        self._ensure_alias_state()
++        return self.aliases.get(template, template)
++
++    def _listed_with_aliases(self, names: t.Iterable[str]) -> t.List[str]:
++        ordinary = set(names)
++        self._ensure_alias_state()
++        included = {
++            alias for alias, target in self.aliases.items() if target in ordinary
++        }
++        return sorted(ordinary | included)
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+@@ -111,11 +188,18 @@ class BaseLoader:
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
+         """Loads a template.  This method looks up the template in the cache
+-        or loads one by calling :meth:`get_source`.  Subclasses should not
+-        override this method as loaders working on collections of other
+-        loaders (such as :class:`PrefixLoader` or :class:`ChoiceLoader`)
+-        will not call this method but `get_source` directly.
++        or loads one by calling :meth:`get_source`. Source-based
++        subclasses implement ``get_source`` and inherit this method.
++        Composite and precompiled loaders provide their own path.
++
++        Resolve this loader's alias once before requesting its source.
++        Retain bytecode caching and this load's globals normally.
++
++        .. versionchanged:: 3.1.0
++            Resolve loader aliases and register cache invalidation.
+         """
++        self._register_alias_environment(environment)
++        name = self.resolve_template_name(name)
+         code = None
+         if globals is None:
+             globals = {}
+@@ -181,6 +265,7 @@ class FileSystemLoader(BaseLoader):
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
++        super().__init__()
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+@@ -228,7 +313,7 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        return self._listed_with_aliases(found)
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -270,6 +355,7 @@ class PackageLoader(BaseLoader):
+         package_path: "str" = "templates",
+         encoding: str = "utf-8",
+     ) -> None:
++        super().__init__()
+         package_path = os.path.normpath(package_path).rstrip(os.path.sep)
+ 
+         # normpath preserves ".", which isn't valid in zip paths.
+@@ -389,7 +475,7 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
+-        return results
++        return self._listed_with_aliases(results)
+ 
+ 
+ class DictLoader(BaseLoader):
+@@ -402,6 +488,7 @@ class DictLoader(BaseLoader):
+     """
+ 
+     def __init__(self, mapping: t.Mapping[str, str]) -> None:
++        super().__init__()
+         self.mapping = mapping
+ 
+     def get_source(
+@@ -413,7 +500,7 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        return self._listed_with_aliases(self.mapping)
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -445,6 +532,7 @@ class FunctionLoader(BaseLoader):
+             ],
+         ],
+     ) -> None:
++        super().__init__()
+         self.load_func = load_func
+ 
+     def get_source(
+@@ -479,10 +567,19 @@ class PrefixLoader(BaseLoader):
+     def __init__(
+         self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
+     ) -> None:
++        super().__init__()
+         self.mapping = mapping
+         self.delimiter = delimiter
+ 
+     def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        """Resolve an owned alias, then find the prefixed child loader.
++
++        Use the configured delimiter; aliases do not chain.
++
++        .. versionchanged:: 3.1.0
++            Resolve an owned alias before prefix routing.
++        """
++        template = self.resolve_template_name(template)
+         try:
+             prefix, name = template.split(self.delimiter, 1)
+             loader = self.mapping[prefix]
+@@ -499,7 +596,7 @@ class PrefixLoader(BaseLoader):
+         except TemplateNotFound as e:
+             # re-raise the exception with the correct filename here.
+             # (the one that includes the prefix)
+-            raise TemplateNotFound(template) from e
++            raise TemplateNotFound(self.resolve_template_name(template)) from e
+ 
+     @internalcode
+     def load(
+@@ -508,20 +605,31 @@ class PrefixLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        """Load through the prefixed child with this load's globals.
++
++        Resolve this loader's alias once; the child owns its aliases.
++        Missing targets retain their qualified target name.
++
++        .. versionchanged:: 3.1.0
++            Add owned aliases and invalidation on mutation.
++        """
++        self._register_alias_environment(environment)
+         loader, local_name = self.get_loader(name)
+         try:
+             return loader.load(environment, local_name, globals)
+         except TemplateNotFound as e:
+             # re-raise the exception with the correct filename here.
+             # (the one that includes the prefix)
+-            raise TemplateNotFound(name) from e
++            raise TemplateNotFound(self.resolve_template_name(name)) from e
+ 
+     def list_templates(self) -> t.List[str]:
+         result = []
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
+-        return result
++        if not self.aliases:
++            return result
++        return self._listed_with_aliases(result)
+ 
+ 
+ class ChoiceLoader(BaseLoader):
+@@ -539,11 +647,13 @@ class ChoiceLoader(BaseLoader):
+     """
+ 
+     def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        super().__init__()
+         self.loaders = loaders
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        template = self.resolve_template_name(template)
+         for loader in self.loaders:
+             try:
+                 return loader.get_source(environment, template)
+@@ -558,6 +668,15 @@ class ChoiceLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        """Resolve an owned alias, then try each child in order.
++
++        Children retain their load protocol and own alias mappings.
++
++        .. versionchanged:: 3.1.0
++            Add owned aliases and invalidation on mutation.
++        """
++        self._register_alias_environment(environment)
++        name = self.resolve_template_name(name)
+         for loader in self.loaders:
+             try:
+                 return loader.load(environment, name, globals)
+@@ -569,7 +688,7 @@ class ChoiceLoader(BaseLoader):
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
+-        return sorted(found)
++        return self._listed_with_aliases(found)
+ 
+ 
+ class _TemplateModule(ModuleType):
+@@ -594,6 +713,7 @@ class ModuleLoader(BaseLoader):
+     def __init__(
+         self, path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
+     ) -> None:
++        super().__init__()
+         package_name = f"_jinja2_module_templates_{id(self):x}"
+ 
+         # create a fake module that looks for the templates in the
+@@ -630,6 +750,13 @@ class ModuleLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        """Load the alias target's precompiled module without source.
++
++        .. versionchanged:: 3.1.0
++            Resolve owned aliases and invalidate changed mappings.
++        """
++        self._register_alias_environment(environment)
++        name = self.resolve_template_name(name)
+         key = self.get_template_key(name)
+         module = f"{self.package_name}.{key}"
+         mod = getattr(self.module, module, None)
+diff --git a/tests/test_n4c_author_aliases.py b/tests/test_n4c_author_aliases.py
+new file mode 100644
+index 00000000..ee3ed744
+--- /dev/null
++++ b/tests/test_n4c_author_aliases.py
+@@ -0,0 +1,109 @@
++import pytest
++
++from jinja2 import BaseLoader
++from jinja2 import ChoiceLoader
++from jinja2 import DictLoader
++from jinja2 import Environment
++from jinja2 import PackageLoader
++from jinja2 import PrefixLoader
++from jinja2 import TemplateNotFound
++
++
++def test_alias_mutation_rejects_non_string_names():
++    loader = DictLoader({"real": "R"})
++    with pytest.raises(TypeError):
++        loader.add_alias(1, "real")
++    with pytest.raises(TypeError):
++        loader.add_alias("public", 1)
++    with pytest.raises(TypeError):
++        loader.remove_alias(1)
++
++
++def test_listing_does_not_accidentally_chain_aliases():
++    loader = DictLoader({"real": "R"})
++    loader.add_alias("public", "real")
++    loader.add_alias("chain", "public")
++    loader.add_alias("broken", "absent")
++    assert loader.list_templates() == ["public", "real"]
++    assert Environment(loader=loader).get_template("public").render() == "R"
++    with pytest.raises(TemplateNotFound) as caught:
++        Environment(loader=loader).get_template("chain")
++    assert caught.value.name == "public"
++
++
++def test_custom_subclass_without_base_initialization():
++    class Source(BaseLoader):
++        def __init__(self):
++            self.source = "{{ who }}"
++
++        def get_source(self, environment, name):
++            if name != "page":
++                raise TemplateNotFound(name)
++            return self.source, None, None
++
++    source = Source()
++    assert (
++        Environment(loader=source).get_template("page", globals={"who": "one"}).render()
++        == "one"
++    )
++    source.add_alias("public", "page")
++    assert (
++        Environment(loader=source)
++        .get_template("public", globals={"who": "two"})
++        .render()
++        == "two"
++    )
++
++
++def test_alias_cache_updates_multiple_environments_without_collateral():
++    loader = DictLoader({"one": "ONE", "two": "TWO", "stable": "STABLE"})
++    loader.add_alias("current", "one")
++    environments = [Environment(loader=loader, auto_reload=False) for _ in range(2)]
++    originals = [env.get_template("current") for env in environments]
++    unchanged = [env.get_template("stable") for env in environments]
++    loader.add_alias("current", "two")
++    for env, old, stable in zip(environments, originals, unchanged):
++        assert env.get_template("current") is not old
++        assert env.get_template("current").render() == "TWO"
++        assert env.get_template("stable") is stable
++    loader.remove_alias("not-present")
++
++
++@pytest.mark.parametrize("kind", ["prefix", "choice"])
++def test_composite_owns_one_step_aliases_and_preserves_globals(kind):
++    child = DictLoader({"real": "{{ who }}"})
++    child.add_alias("local", "real")
++    loader, target = ChoiceLoader([child]), "local"
++    if kind == "prefix":
++        loader, target = PrefixLoader({"pkg": child}, delimiter=":"), "pkg:local"
++    loader.add_alias("public", target)
++    loader.add_alias("chain", "public")
++    assert (
++        Environment(loader=loader)
++        .get_template("public", globals={"who": "ok"})
++        .render()
++        == "ok"
++    )
++    assert "public" in loader.list_templates()
++    assert "chain" not in loader.list_templates()
++
++
++def test_prefix_missing_target_reports_target_name():
++    loader = PrefixLoader({"pkg": DictLoader({})})
++    loader.add_alias("public", "pkg/missing")
++    with pytest.raises(TemplateNotFound) as caught:
++        Environment(loader=loader).get_template("public")
++    assert caught.value.name == "pkg/missing"
++
++
++def test_package_listing_exposes_resolvable_alias(tmp_path, monkeypatch):
++    package = tmp_path / "n4c_author_alias_package"
++    (package / "templates").mkdir(parents=True)
++    (package / "__init__.py").write_text("")
++    (package / "templates/page").write_text("page")
++    monkeypatch.syspath_prepend(str(tmp_path))
++    loader = PackageLoader(package.name)
++    loader.add_alias("public", "page")
++    loader.add_alias("chain", "public")
++    assert loader.list_templates() == ["page", "public"]
++    assert Environment(loader=loader).get_template("public").render() == "page"

@@ -1,0 +1,434 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..40b3b627 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,7 +1,10 @@
+ import asyncio
++import re
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
++from decimal import Decimal, InvalidOperation
++
+ from jsonschema import ValidationError, validate
+ from pydantic import BaseModel, TypeAdapter, create_model
+ 
+@@ -15,6 +18,83 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++def _coerce_arg(value, schema_type):
++    """Coerce a string value according to the JSON schema type.
++    
++    Only converts supplied strings; leaves string-typed fields, unknown kwargs,
++    and non-string values unchanged. Returns the coerced value or the original
++    value if conversion fails.
++    """
++    if not isinstance(value, str):
++        return value
++    
++    stripped = value.strip()
++    
++    if schema_type == "boolean":
++        lower = stripped.lower()
++        if lower == "true":
++            return True
++        elif lower == "false":
++            return False
++        return value
++    
++    if schema_type in ("integer", "number"):
++        # Try duration/size suffix parsing first
++        converted = _try_parse_unit(stripped, schema_type)
++        if converted is not None:
++            return converted
++        
++        # Try numeric string parsing
++        try:
++            d = Decimal(stripped)
++            if not d.is_finite():
++                return value  # NaN/Inf -> keep original for error path
++            if schema_type == "integer":
++                if d != d.to_integral_value():
++                    return value  # non-integral -> keep original for error path
++                return int(d)
++            else:  # number
++                return float(d)
++        except (InvalidOperation, ArithmeticError):
++            return value
++    
++    return value
++
++
++def _try_parse_unit(stripped, schema_type):
++    """Try to parse duration or size suffixes. Returns None if no unit matches."""
++    # Duration suffixes: ms, s, m, h (case-sensitive)
++    duration_match = re.match(r'^(\d+(?:\.\d+)?)\s*(ms|s|m|h)$', stripped)
++    if duration_match:
++        magnitude = Decimal(duration_match.group(1))
++        unit = duration_match.group(2)
++        factor = {
++            'ms': Decimal('0.001'),
++            's': Decimal('1'),
++            'm': Decimal('60'),
++            'h': Decimal('3600'),
++        }[unit]
++        seconds = float(magnitude * factor)
++        if schema_type == "integer":
++            return int(seconds)
++        return seconds
++    
++    # Size suffixes: KB, MB, GB (case-sensitive)
++    size_match = re.match(r'^(\d+(?:\.\d+)?)\s*(KB|MB|GB)$', stripped)
++    if size_match:
++        magnitude = Decimal(size_match.group(1))
++        unit = size_match.group(2)
++        factor = {
++            'KB': Decimal('1000'),
++            'MB': Decimal('1000000'),
++            'GB': Decimal('1000000000'),
++        }[unit]
++        bytes_val = magnitude * factor
++        truncated = int(bytes_val.to_integral_value(rounding='ROUND_DOWN'))
++        return truncated
++    
++    return None
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -116,8 +196,17 @@ class Tool(Type):
+         self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+ 
+     def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
++        # Coerce string values according to JSON schema type before validation.
++        coerced_kwargs = {}
+         for k, v in kwargs.items():
++            if k in self.args:
++                type_str = self.args[k].get("type")
++                coerced_kwargs[k] = _coerce_arg(v, type_str)
++            else:
++                coerced_kwargs[k] = v
++
++        # Validate the args value comply to the json schema.
++        for k, v in coerced_kwargs.items():
+             if k not in self.args:
+                 if self.has_kwargs:
+                     continue
+@@ -133,7 +222,7 @@ class Tool(Type):
+ 
+         # Parse the args to the correct type.
+         parsed_kwargs = {}
+-        for k, v in kwargs.items():
++        for k, v in coerced_kwargs.items():
+             if k in self.arg_types and self.arg_types[k] != Any:
+                 # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+                 # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..659b1337 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,302 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# --- Tests for scalar and unit coercion ---
++
++def test_coerce_boolean_strings():
++    """Test that string 'true'/'false' are coerced to bool."""
++    def bool_func(x: bool):
++        return f"result={x} type={type(x).__name__}"
++
++    tool = Tool(
++        func=bool_func,
++        name="bool_tool",
++        args={"x": {"type": "boolean"}},
++        arg_types={"x": bool},
++    )
++
++    # Valid boolean strings
++    assert tool(x=True) == "result=True type=bool"
++    assert tool(x="true") == "result=True type=bool"
++    assert tool(x="True") == "result=True type=bool"
++    assert tool(x="TRUE") == "result=True type=bool"
++    assert tool(x="false") == "result=False type=bool"
++    assert tool(x="False") == "result=False type=bool"
++    assert tool(x="FALSE") == "result=False type=bool"
++    assert tool(x="  true  ") == "result=True type=bool"
++
++    # Invalid boolean string -> should raise
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="yes")
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="1")
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="no")
++
++
++def test_coerce_integer_strings():
++    """Test that string numerals are coerced to int."""
++    def int_func(x: int):
++        return f"result={x} type={type(x).__name__}"
++
++    tool = Tool(
++        func=int_func,
++        name="int_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    # Valid integer strings
++    assert tool(x=42) == "result=42 type=int"
++    assert tool(x="42") == "result=42 type=int"
++    assert tool(x="  -17  ") == "result=-17 type=int"
++    assert tool(x="+100") == "result=100 type=int"
++    assert tool(x="0") == "result=0 type=int"
++
++    # Large integer beyond float precision
++    result = tool(x="10000000000")
++    assert result == "result=10000000000 type=int"
++
++    # Non-integral string -> should raise
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="3.14")
++
++    # Non-numeric string -> should raise
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="abc")
++
++    # NaN/Inf -> should raise
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="NaN")
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="Inf")
++
++
++def test_coerce_number_strings():
++    """Test that string numerals are coerced to float."""
++    def float_func(x: float):
++        return f"result={x} type={type(x).__name__}"
++
++    tool = Tool(
++        func=float_func,
++        name="float_tool",
++        args={"x": {"type": "number"}},
++        arg_types={"x": float},
++    )
++
++    # Valid number strings
++    assert tool(x=3.14) == "result=3.14 type=float"
++    res = tool(x="3.14")
++    assert "result=3.14" in res and "type=float" in res
++    res = tool(x="-2.5e2")
++    assert "result=-250.0" in res and "type=float" in res
++
++    # Non-numeric string -> should raise
++    with pytest.raises(ValueError, match="is invalid"):
++        tool(x="abc")
++
++
++def test_coerce_duration_suffixes():
++    """Test duration suffixes ms, s, m, h."""
++    def int_func(x: int):
++        return f"result={x} type={type(x).__name__}"
++
++    int_tool = Tool(
++        func=int_func,
++        name="int_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    # ms -> seconds (truncated for integer)
++    assert int_tool(x="500ms") == "result=0 type=int"  # 0.5s -> 0
++    assert int_tool(x="1000ms") == "result=1 type=int"  # 1.0s -> 1
++
++    # s
++    assert int_tool(x="5s") == "result=5 type=int"
++    assert int_tool(x="0s") == "result=0 type=int"
++
++    # m
++    assert int_tool(x="1m") == "result=60 type=int"
++
++    # h
++    assert int_tool(x="1h") == "result=3600 type=int"
++
++    # Whitespace between magnitude and suffix
++    assert int_tool(x="2.5 s") == "result=2 type=int"  # 2.5 -> truncated to 2
++
++    def float_func(x: float):
++        return f"result={x} type={type(x).__name__}"
++
++    float_tool = Tool(
++        func=float_func,
++        name="float_tool",
++        args={"x": {"type": "number"}},
++        arg_types={"x": float},
++    )
++
++    # ms for float
++    res = float_tool(x="500ms")
++    assert "result=0.5" in res
++
++    # s for float
++    res = float_tool(x="5s")
++    assert "result=5.0" in res
++
++    # Case sensitivity: 'S' should not be recognized
++    with pytest.raises(ValueError, match="is invalid"):
++        int_tool(x="5S")
++
++
++def test_coerce_size_suffixes():
++    """Test size suffixes KB, MB, GB."""
++    def int_func(x: int):
++        return f"result={x} type={type(x).__name__}"
++
++    int_tool = Tool(
++        func=int_func,
++        name="int_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    # KB
++    assert int_tool(x="1KB") == "result=1000 type=int"
++    assert int_tool(x="0KB") == "result=0 type=int"
++
++    # MB
++    assert int_tool(x="1MB") == "result=1000000 type=int"
++
++    # GB
++    assert int_tool(x="1GB") == "result=1000000000 type=int"
++
++    # Fractional magnitude
++    assert int_tool(x="2.5KB") == "result=2500 type=int"
++
++    # Truncation toward zero for fractional bytes
++    assert int_tool(x="1.999KB") == "result=1999 type=int"  # 1999.0 -> 1999
++    assert int_tool(x="0.001KB") == "result=1 type=int"  # 1.0 -> 1
++
++    # Whitespace
++    assert int_tool(x="1 KB") == "result=1000 type=int"
++
++    # Case sensitivity: 'kb' should not be recognized
++    with pytest.raises(ValueError, match="is invalid"):
++        int_tool(x="1kb")
++
++
++def test_coerce_string_fields_unchanged():
++    """Test that string-typed fields are not coerced."""
++    def str_func(x: str):
++        return f"result='{x}' type={type(x).__name__}"
++
++    tool = Tool(
++        func=str_func,
++        name="str_tool",
++        args={"x": {"type": "string"}},
++        arg_types={"x": str},
++    )
++
++    # String values stay as strings
++    assert tool(x="42") == "result='42' type=str"
++    assert tool(x="true") == "result='true' type=str"
++    assert tool(x="3.14") == "result='3.14' type=str"
++    assert tool(x="5s") == "result='5s' type=str"
++    assert tool(x="1KB") == "result='1KB' type=str"
++
++
++def test_coerce_unknown_type_not_coerced():
++    """Test that fields with unknown type are not coerced."""
++    def func(x):
++        return f"result={x!r} type={type(x).__name__}"
++
++    tool = Tool(
++        func=func,
++        name="any_tool",
++        args={"x": {"type": "Any"}},
++        arg_types={"x": str},
++    )
++
++    # String stays string even if parsable
++    result = tool(x="42")
++    assert isinstance(result, str)
++
++
++def test_coerce_kwargs_unchanged():
++    """Test that **kwargs values are not coerced."""
++    def kwarg_func(x: int, **kwargs):
++        return f"x={x} extra={kwargs}"
++
++    tool = Tool(
++        func=kwarg_func,
++        name="kwarg_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    result = tool(x="42", y="true", z="5s")
++    assert result == "x=42 extra={'y': 'true', 'z': '5s'}"
++
++
++def test_coerce_async():
++    """Test coercion works with async tools."""
++    import asyncio
++
++    async def async_func(x: int):
++        return f"result={x} type={type(x).__name__}"
++
++    tool = Tool(
++        func=async_func,
++        name="async_int_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    async def run():
++        res = await tool.acall(x="42")
++        assert res == "result=42 type=int"
++        res = await tool.acall(x="5s")
++        assert res == "result=5 type=int"
++        res = await tool.acall(x="1KB")
++        assert res == "result=1000 type=int"
++
++    asyncio.run(run())
++
++
++def test_coerce_input_mapping_not_mutated():
++    """Test that the original kwargs dict is not mutated."""
++    def int_func(x: int):
++        return f"result={x} type={type(x).__name__}"
++
++    tool = Tool(
++        func=int_func,
++        name="int_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    original_kwargs = {"x": "42"}
++    kwargs_copy = dict(original_kwargs)
++    result = tool(**kwargs_copy)
++    assert result == "result=42 type=int"
++    # Original dict unchanged
++    assert kwargs_copy == original_kwargs
++
++
++def test_coerce_non_string_values_unchanged():
++    """Test that non-string values (int, float, bool) pass through unchanged."""
++    def int_func(x: int):
++        return f"result={x} type={type(x).__name__}"
++
++    tool = Tool(
++        func=int_func,
++        name="int_tool",
++        args={"x": {"type": "integer"}},
++        arg_types={"x": int},
++    )
++
++    assert tool(x=42) == "result=42 type=int"
++    assert tool(x=0) == "result=0 type=int"
++    assert tool(x=-17) == "result=-17 type=int"

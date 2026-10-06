@@ -1,0 +1,329 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 64dc6a1..65157b0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -216,7 +216,7 @@ impl CoreBPE {
+         Ok(ret)
+     }
+ 
+-    pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
++    pub fn encode_ordinary(&self, text: &str, compress: bool) -> Vec<Rank> {
+         // This is the core of the encoding logic; the other functions in here
+         // just make things complicated :-)
+         let regex = self._get_tl_regex();
+@@ -228,10 +228,13 @@ impl CoreBPE {
+                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+             }
+         }
++        if compress {
++            ret = Self::compress_tokens(ret);
++        }
+         ret
+     }
+ 
+-    pub fn encode(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<Rank>, usize) {
++    pub fn encode(&self, text: &str, allowed_special: &HashSet<&str>, compress: bool) -> (Vec<Rank>, usize) {
+         let special_regex = self._get_tl_special_regex();
+         let regex = self._get_tl_regex();
+         let mut ret = vec![];
+@@ -284,6 +287,9 @@ impl CoreBPE {
+ 
+         // last_piece_token_len is how many tokens came from the last regex split. This is used
+         // for determining unstable tokens, since you can't merge across (stable) regex splits
++        if compress {
++            ret = Self::compress_tokens(ret);
++        }
+         (ret, last_piece_token_len)
+     }
+ 
+@@ -330,8 +336,9 @@ impl CoreBPE {
+         &self,
+         text: &str,
+         allowed_special: &HashSet<&str>,
++        compress: bool,
+     ) -> (Vec<Rank>, HashSet<Vec<Rank>>) {
+-        let (tokens, last_piece_token_len) = self.encode(text, allowed_special);
++        let (tokens, last_piece_token_len) = self.encode(text, allowed_special, compress);
+         if last_piece_token_len == 0 {
+             // If last_piece_token_len is zero, the last token was a special token and we have
+             // no unstable bytes
+@@ -390,7 +397,7 @@ impl CoreBPE {
+                     // So convert to UTF-8 and do regex splitting.
+                     // E.g. with cl100k_base "  !" gets split to " " + " !",
+                     // but byte_pair_encode("  !") != byte_pair_encode(" ")
+-                    Ok(s) => self.encode_ordinary(s),
++                    Ok(s) => self.encode_ordinary(s, compress),
+ 
+                     // Technically, whether or not this arm is correct depends on whether there
+                     // would be a regex split before the UTF-8 truncation point.
+@@ -513,10 +520,30 @@ impl CoreBPE {
+             .collect()
+     }
+ 
+-    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {
++    pub fn encode_with_special_tokens(&self, text: &str, compress: bool) -> Vec<Rank> {
+         let allowed_special = self.special_tokens();
+-        self.encode(text, &allowed_special).0
++        self.encode(text, &allowed_special, compress).0
++    }
++
++    fn compress_tokens(tokens: Vec<Rank>) -> Vec<Rank> {
++        if tokens.is_empty() {
++            return tokens;
++        }
++        
++        let mut compressed = Vec::with_capacity(tokens.len());
++        let mut prev_token = tokens[0];
++        compressed.push(prev_token);
++        
++        for &token in &tokens[1..] {
++            if token != prev_token {
++                compressed.push(token);
++                prev_token = token;
++            }
++        }
++        
++        compressed
+     }
++
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/py.rs b/src/py.rs
+index ed107b4..29dae01 100644
+--- a/src/py.rs
++++ b/src/py.rs
+@@ -32,8 +32,8 @@ impl CoreBPE {
+     // ====================
+ 
+     #[pyo3(name = "encode_ordinary")]
+-    fn py_encode_ordinary(&self, py: Python, text: &str) -> Vec<Rank> {
+-        py.allow_threads(|| self.encode_ordinary(text))
++    fn py_encode_ordinary(&self, py: Python, text: &str, compress: bool) -> Vec<Rank> {
++        py.allow_threads(|| self.encode_ordinary(text, compress))
+     }
+ 
+     #[pyo3(name = "encode")]
+@@ -42,11 +42,12 @@ impl CoreBPE {
+         py: Python,
+         text: &str,
+         allowed_special: HashSet<PyBackedStr>,
++        compress: bool,
+     ) -> Vec<Rank> {
+         py.allow_threads(|| {
+             let allowed_special: HashSet<&str> =
+                 allowed_special.iter().map(|s| s.as_ref()).collect();
+-            self.encode(text, &allowed_special).0
++            self.encode(text, &allowed_special, compress).0
+         })
+     }
+ 
+@@ -55,26 +56,32 @@ impl CoreBPE {
+         py: Python,
+         text: &str,
+         allowed_special: HashSet<PyBackedStr>,
++        compress: bool,
+     ) -> Py<PyAny> {
+         let tokens = py.allow_threads(|| {
+             let allowed_special: HashSet<&str> =
+                 allowed_special.iter().map(|s| s.as_ref()).collect();
+-            self.encode(text, &allowed_special).0
++            self.encode(text, &allowed_special, compress).0
+         });
+         let buffer = TiktokenBuffer { tokens };
+         buffer.into_py(py)
+     }
+ 
+-    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<Rank> {
++    fn _encode_bytes(
++        &self,
++        py: Python,
++        bytes: &[u8],
++        compress: bool,
++    ) -> Vec<Rank> {
+         py.allow_threads(|| {
+             match std::str::from_utf8(bytes) {
+                 // Straightforward case
+-                Ok(text) => self.encode_ordinary(text),
++                Ok(text) => self.encode_ordinary(text, compress),
+                 // Oops, don't actually have UTF-8. But we need to do the regex splitting in
+                 // Unicode space, so we make our best guess at where we would have splits
+                 Err(e) => {
+                     let text = unsafe { std::str::from_utf8_unchecked(&bytes[..e.valid_up_to()]) };
+-                    let (tokens, last_piece_token_len) = self.encode(text, &HashSet::new());
++                    let (tokens, last_piece_token_len) = self.encode(text, &HashSet::new(), compress);
+                     let (mut tokens, last_piece_token_len) =
+                         self._increase_last_piece_token_len(tokens, last_piece_token_len);
+ 
+@@ -115,11 +122,12 @@ impl CoreBPE {
+         py: Python,
+         text: &str,
+         allowed_special: HashSet<PyBackedStr>,
++        compress: bool,
+     ) -> Py<PyTuple> {
+         let (tokens, completions) = py.allow_threads(|| {
+             let allowed_special: HashSet<&str> =
+                 allowed_special.iter().map(|s| s.as_ref()).collect();
+-            self._encode_unstable_native(text, &allowed_special)
++            self._encode_unstable_native(text, &allowed_special, compress)
+         });
+         let py_completions = PyList::new_bound(
+             py,
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..0185142 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -60,7 +60,7 @@ class Encoding:
+     # Encoding
+     # ====================
+ 
+-    def encode_ordinary(self, text: str) -> list[int]:
++    def encode_ordinary(self, text: str, *, compress: bool = False) -> list[int]:
+         """Encodes a string into tokens, ignoring special tokens.
+ 
+         This is equivalent to `encode(text, disallowed_special=())` (but slightly faster).
+@@ -70,7 +70,7 @@ class Encoding:
+         [31373, 995]
+         """
+         try:
+-            return self._core_bpe.encode_ordinary(text)
++            return self._core_bpe.encode_ordinary(text, compress)
+         except UnicodeEncodeError:
+             # See comment in encode
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -96,6 +97,7 @@ class Encoding:
+           cause all text corresponding to special tokens to be encoded as natural text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
++        - Setting `compress` to True will collapse adjacent repeated token IDs into a single ID.
+ 
+         ```
+         >>> enc.encode("hello world")
+@@ -121,7 +123,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            return self._core_bpe.encode(text, allowed_special, compress)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +132,7 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            return self._core_bpe.encode(text, allowed_special, compress)
+ 
+     def encode_to_numpy(
+         self,
+@@ -138,10 +140,20 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> npt.NDArray[np.uint32]:
+         """Encodes a string into tokens, returning a numpy array.
+ 
+         Avoids the overhead of copying the token buffer into a Python list.
++        
++        Args:
++            text: The text to encode.
++            allowed_special: Special tokens that are allowed in the text.
++            disallowed_special: Special tokens that are not allowed in the text.
++            compress: If True, collapse adjacent repeated token IDs into a single ID.
++        
++        Returns:
++            A numpy array of token IDs.
+         """
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+@@ -155,20 +167,30 @@ class Encoding:
+ 
+         import numpy as np
+ 
+-        buffer = self._core_bpe.encode_to_tiktoken_buffer(text, self.special_tokens_set)
++        buffer = self._core_bpe.encode_to_tiktoken_buffer(text, self.special_tokens_set, compress)
+         return np.frombuffer(buffer, dtype=np.uint32)
+ 
+-    def encode_ordinary_batch(self, text: list[str], *, num_threads: int = 8) -> list[list[int]]:
++    def encode_ordinary_batch(
++        self, text: list[str], *, num_threads: int = 8, compress: bool = False
++    ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel, ignoring special tokens.
+ 
+-        This is equivalent to `encode_batch(text, disallowed_special=())` (but slightly faster).
++        This is equivalent to `encode_batch(text, disallowed_special=(), compress=compress)` (but slightly faster).
++
++        Args:
++            text: The list of strings to encode.
++            num_threads: The number of threads to use for parallel encoding.
++            compress: If True, collapse adjacent repeated token IDs into a single ID.
++
++        Returns:
++            A list of lists of token IDs.
+ 
+         ```
+         >>> enc.encode_ordinary_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
+         ```
+         """
+-        encoder = functools.partial(self.encode_ordinary)
++        encoder = functools.partial(self.encode_ordinary, compress=compress)
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+ 
+@@ -179,10 +201,11 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+-        See `encode` for more details on `allowed_special` and `disallowed_special`.
++        See `encode` for more details on `allowed_special`, `disallowed_special`, and `compress`.
+ 
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+@@ -197,7 +220,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, compress=compress
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+@@ -208,12 +231,13 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> tuple[list[int], list[list[int]]]:
+         """Encodes a string into stable tokens and possible completion sequences.
+ 
+         Note that the stable tokens will only represent a substring of `text`.
+ 
+-        See `encode` for more details on `allowed_special` and `disallowed_special`.
++        See `encode` for more details on `allowed_special`, `disallowed_special`, and `compress`.
+ 
+         This API should itself be considered unstable.
+ 
+@@ -237,7 +261,7 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        return self._core_bpe.encode_with_unstable(text, allowed_special)
++        return self._core_bpe.encode_with_unstable(text, allowed_special, compress)
+ 
+     def encode_single_token(self, text_or_bytes: str | bytes) -> int:
+         """Encodes text corresponding to a single token to its token value.

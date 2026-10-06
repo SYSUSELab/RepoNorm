@@ -1,0 +1,740 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..ee4d320b 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -33,6 +33,9 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    compress: Optional[str] = None,
++    cull_limit: Optional[int] = None,
++    eviction_policy: Optional[str] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +46,10 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        compress: Compression codec for disk cache ("gzip", "zlib", or None). Defaults to None.
++        cull_limit: Number of entries to remove when evicting. Defaults to diskcache default.
++        eviction_policy: Eviction policy ("none", "least-recently-stored", "least-recently-used", 
++                       "least-frequently-used"). Defaults to diskcache default.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,6 +79,9 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        compress,
++        cull_limit,
++        eviction_policy,
+     )
+ 
+ 
+@@ -79,6 +89,9 @@ litellm.telemetry = False
+ litellm.cache = None  # By default we disable litellm cache and use DSPy on-disk cache.
+ 
+ DSPY_CACHE = Cache(
++    compress=None,
++    cull_limit=None,
++    eviction_policy=None,
+     enable_disk_cache=True,
+     enable_memory_cache=True,
+     disk_cache_dir=DISK_CACHE_DIR,
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..5e1e1156 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,4 +1,6 @@
+ import copy
++import pickle
++import gzip
+ import inspect
+ import logging
+ import threading
+@@ -11,9 +13,170 @@ import pydantic
+ import ujson
+ from cachetools import LRUCache
+ from diskcache import FanoutCache
++from diskcache.core import Disk as BaseDisk
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Compression constants
++DSPC_HEADER = b"DSPC"
++CODEC_UNCOMPRESSED = 0x00
++CODEC_GZIP = 0x01
++CODEC_ZLIB = 0x02
++
++
++class CompressedDisk(BaseDisk):
++    """Custom Disk implementation with optional compression support."""
++    
++    def __init__(self, directory, min_file_size=0, pickle_protocol=0, compress=None):
++        super().__init__(directory, min_file_size, pickle_protocol)
++        self.compress = compress
++        
++    def _compress_value(self, pickled_data):
++        """Compress pickled data if compression is enabled."""
++        if self.compress == "gzip":
++            return gzip.compress(pickled_data)
++        elif self.compress == "zlib":
++            import zlib
++            return zlib.compress(pickled_data)
++        else:
++            return pickled_data
++    
++    def store(self, value, read, key=None):
++        """Store value with optional compression."""
++        # First, get the pickled data
++        result = pickle.dumps(value, protocol=self.pickle_protocol)
++        
++        # Apply compression if enabled
++        compressed_result = self._compress_value(result)
++        
++        # Add header for compressed data
++        if self.compress:
++            codec_byte = CODEC_GZIP if self.compress == "gzip" else CODEC_ZLIB
++            header = DSPC_HEADER + bytes([codec_byte])
++            final_data = header + compressed_result
++        else:
++            final_data = result
++        
++        # Use parent's logic for storing based on size and type
++        from diskcache.core import MODE_RAW, MODE_BINARY, MODE_TEXT, MODE_PICKLE
++        import sqlite3
++        import os
++        import io
++        
++        type_value = type(final_data)
++        min_file_size = self.min_file_size
++        
++        if (
++            (type_value is str and len(final_data) < min_file_size)
++            or (
++                type_value is int
++                and -9223372036854775808 <= value <= 9223372036854775807
++            )
++            or (type_value is float)
++        ):
++            return 0, MODE_RAW, None, final_data
++        elif type_value is bytes:
++            if len(final_data) < min_file_size:
++                # For pickle data without compression, store as MODE_PICKLE
++                if not self.compress:
++                    return 0, MODE_PICKLE, None, sqlite3.Binary(final_data)
++                return 0, MODE_RAW, None, sqlite3.Binary(final_data)
++            else:
++                filename, full_path = self.filename(key, final_data)
++                self._write(full_path, io.BytesIO(final_data), 'xb')
++                return len(final_data), MODE_BINARY, filename, None
++        elif type_value is str:
++            filename, full_path = self.filename(key, final_data)
++            self._write(full_path, io.StringIO(final_data), 'x', 'UTF-8')
++            size = os.path.getsize(full_path)
++            return size, MODE_TEXT, filename, None
++        else:
++            if len(final_data) < min_file_size:
++                return 0, MODE_PICKLE, None, sqlite3.Binary(final_data)
++            else:
++                filename, full_path = self.filename(key, final_data)
++                self._write(full_path, io.BytesIO(final_data), 'xb')
++                return len(final_data), MODE_PICKLE, filename, None
++    
++    def fetch(self, mode, filename, value, read):
++        """Fetch and decompress value if needed."""
++        from diskcache.core import MODE_RAW, MODE_BINARY, MODE_TEXT, MODE_PICKLE
++        import sqlite3
++        import os
++        import io
++        
++        # pylint: disable=unidiomatic-typecheck,consider-using-with
++        if mode == MODE_RAW:
++            data = bytes(value) if type(value) is sqlite3.Binary else value
++            # Check for DSPC header
++            if isinstance(data, bytes) and len(data) >= 4 and data[:4] == DSPC_HEADER:
++                codec_byte = data[4]
++                payload = data[5:]
++                if codec_byte == CODEC_GZIP:
++                    decompressed = gzip.decompress(payload)
++                elif codec_byte == CODEC_ZLIB:
++                    import zlib
++                    decompressed = zlib.decompress(payload)
++                else:
++                    raise ValueError(f"Unknown codec selector: {codec_byte}")
++                return pickle.loads(decompressed)
++            return data
++        elif mode == MODE_BINARY:
++            if read:
++                return open(os.path.join(self._directory, filename), 'rb')
++            else:
++                with open(os.path.join(self._directory, filename), 'rb') as reader:
++                    data = reader.read()
++                    # Check for DSPC header
++                    if isinstance(data, bytes) and len(data) >= 4 and data[:4] == DSPC_HEADER:
++                        codec_byte = data[4]
++                        payload = data[5:]
++                        if codec_byte == CODEC_GZIP:
++                            decompressed = gzip.decompress(payload)
++                        elif codec_byte == CODEC_ZLIB:
++                            import zlib
++                            decompressed = zlib.decompress(payload)
++                        else:
++                            raise ValueError(f"Unknown codec selector: {codec_byte}")
++                        return pickle.loads(decompressed)
++                    return data
++        elif mode == MODE_TEXT:
++            full_path = os.path.join(self._directory, filename)
++            with open(full_path, 'r', encoding='UTF-8') as reader:
++                return reader.read()
++        elif mode == MODE_PICKLE:
++            if value is None:
++                with open(os.path.join(self._directory, filename), 'rb') as reader:
++                    data = reader.read()
++                    # Check for DSPC header
++                    if isinstance(data, bytes) and len(data) >= 4 and data[:4] == DSPC_HEADER:
++                        codec_byte = data[4]
++                        payload = data[5:]
++                        if codec_byte == CODEC_GZIP:
++                            decompressed = gzip.decompress(payload)
++                        elif codec_byte == CODEC_ZLIB:
++                            import zlib
++                            decompressed = zlib.decompress(payload)
++                        else:
++                            raise ValueError(f"Unknown codec selector: {codec_byte}")
++                        return pickle.loads(decompressed)
++                    return pickle.load(reader)
++            else:
++                data = bytes(value) if type(value) is sqlite3.Binary else value
++                # Check for DSPC header
++                if isinstance(data, bytes) and len(data) >= 4 and data[:4] == DSPC_HEADER:
++                    codec_byte = data[4]
++                    payload = data[5:]
++                    if codec_byte == CODEC_GZIP:
++                        decompressed = gzip.decompress(payload)
++                    elif codec_byte == CODEC_ZLIB:
++                        import zlib
++                        decompressed = zlib.decompress(payload)
++                    else:
++                        raise ValueError(f"Unknown codec selector: {codec_byte}")
++                    return pickle.loads(decompressed)
++                return pickle.load(io.BytesIO(data))
++
+ 
+ class Cache:
+     """DSPy Cache
+@@ -30,7 +193,9 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        compress: Optional[str] = None,
++        cull_limit: Optional[int] = None,
++        eviction_policy: Optional[str] = None,
+     ):
+         """
+         Args:
+@@ -39,26 +204,83 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            compress: Compression codec for disk cache ("gzip", "zlib", or None). Defaults to None.
++            cull_limit: Number of entries to remove when evicting. Defaults to diskcache default.
++            eviction_policy: Eviction policy ("none", "least-recently-stored", "least-recently-used", 
++                           "least-frequently-used"). Defaults to diskcache default.
+         """
+-
++        # Validate compress parameter
++        if compress is not None and compress not in ("gzip", "zlib"):
++            raise ValueError(f"Invalid compression codec: {compress}. Must be 'gzip', 'zlib', or None.")
++        
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
++        self._compress = compress
++        self._cull_limit = cull_limit
++        self._eviction_policy = eviction_policy
++        
+         if self.enable_memory_cache:
+             self.memory_cache = LRUCache(maxsize=memory_max_entries)
+         else:
+             self.memory_cache = {}
+         if self.enable_disk_cache:
++            # Use diskcache defaults when None is provided
++            effective_cull_limit = cull_limit if cull_limit is not None else 10
++            effective_eviction_policy = eviction_policy if eviction_policy is not None else "least-recently-stored"
++            
+             self.disk_cache = FanoutCache(
+                 shards=16,
+                 timeout=10,
+                 directory=disk_cache_dir,
+                 size_limit=disk_size_limit_bytes,
++                disk=CompressedDisk,
++                disk_compress=compress,
++                cull_limit=effective_cull_limit,
++                eviction_policy=effective_eviction_policy,
+             )
+         else:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
+ 
++    def set_compression(self, codec: Optional[str]) -> None:
++        """Set the compression codec for subsequent disk writes.
++        
++        Args:
++            codec: Compression codec ("gzip", "zlib", or None). Invalid values leave
++                   the previous configuration unchanged.
++        
++        Raises:
++            ValueError: If codec is invalid, the previous configuration remains usable.
++        """
++        if codec is not None and codec not in ("gzip", "zlib"):
++            logger.warning(f"Invalid compression codec: {codec}. Previous configuration unchanged.")
++            return
++        
++        old_compress = self._compress
++        self._compress = codec
++        # Reconfigure the disk cache with new compression setting
++        if self.enable_disk_cache:
++            try:
++                # Use diskcache defaults when None is provided
++                effective_cull_limit = self._cull_limit if self._cull_limit is not None else 10
++                effective_eviction_policy = self._eviction_policy if self._eviction_policy is not None else "least-recently-stored"
++                
++                self.disk_cache = FanoutCache(
++                    shards=16,
++                    timeout=10,
++                    directory=self.disk_cache.directory,
++                    size_limit=self.disk_cache.size_limit * len(self.disk_cache._shards),
++                    disk=CompressedDisk,
++                    disk_compress=codec,
++                    cull_limit=effective_cull_limit,
++                    eviction_policy=effective_eviction_policy,
++                )
++            except Exception as e:
++                logger.warning(f"Failed to reconfigure disk cache with new compression: {e}")
++                # Restore previous configuration
++                self._compress = old_compress
++
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff1485..81df18c3 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -24,6 +24,9 @@ def cache_config(tmp_path):
+         "disk_cache_dir": str(tmp_path),
+         "disk_size_limit_bytes": 1024 * 1024,  # 1MB
+         "memory_max_entries": 100,
++        "compress": None,
++        "cull_limit": None,
++        "eviction_policy": None,
+     }
+ 
+ 
+@@ -42,6 +45,9 @@ def test_initialization(tmp_path):
+         disk_cache_dir="",
+         disk_size_limit_bytes=0,
+         memory_max_entries=50,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
+     )
+     assert isinstance(memory_cache.memory_cache, LRUCache)
+     assert memory_cache.memory_cache.maxsize == 50
+@@ -54,6 +60,9 @@ def test_initialization(tmp_path):
+         disk_cache_dir=str(tmp_path),
+         disk_size_limit_bytes=1024,
+         memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
+     )
+     assert isinstance(disk_cache.disk_cache, FanoutCache)
+     assert disk_cache.memory_cache == {}
+@@ -65,6 +74,9 @@ def test_initialization(tmp_path):
+         disk_cache_dir="",
+         disk_size_limit_bytes=0,
+         memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
+     )
+     assert disabled_cache.memory_cache == {}
+     assert disabled_cache.disk_cache == {}
+@@ -186,6 +198,9 @@ def test_save_and_load_memory_cache(cache, tmp_path):
+         disk_cache_dir=tmp_path / "disk_cache",
+         disk_size_limit_bytes=0,
+         memory_max_entries=100,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
+     )
+ 
+     # Load the memory cache
+@@ -280,3 +295,362 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++
++# Compression tests
++def test_invalid_codec_rejection():
++    """Test that invalid compression codecs are rejected."""
++    tmp_path = pytest.path if hasattr(pytest, 'path') else __import__('tempfile').mkdtemp()
++    
++    # Test invalid codec
++    with pytest.raises(ValueError, match="Invalid compression codec"):
++        Cache(
++            enable_disk_cache=True,
++            enable_memory_cache=False,
++            disk_cache_dir=tmp_path,
++            disk_size_limit_bytes=1024,
++            memory_max_entries=0,
++            compress="invalid_codec",
++            cull_limit=None,
++            eviction_policy=None,
++        )
++
++
++def test_gzip_compression_roundtrip(tmp_path):
++    """Test gzip compression preserves data integrity."""
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress="gzip",
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
++    value = DummyResponse(message="Compressed response", usage={"tokens": 100})
++    
++    cache.put(request, value)
++    result = cache.get(request)
++    
++    assert result.message == value.message
++    assert result.usage == {}
++
++
++def test_zlib_compression_roundtrip(tmp_path):
++    """Test zlib compression preserves data integrity."""
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress="zlib",
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
++    value = DummyResponse(message="Zlib compressed response", usage={"tokens": 100})
++    
++    cache.put(request, value)
++    result = cache.get(request)
++    
++    assert result.message == value.message
++    assert result.usage == {}
++
++
++def test_uncompressed_mode(tmp_path):
++    """Test uncompressed mode works correctly."""
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
++    value = DummyResponse(message="Uncompressed response", usage={"tokens": 100})
++    
++    cache.put(request, value)
++    result = cache.get(request)
++    
++    assert result.message == value.message
++    assert result.usage == {}
++
++
++def test_set_compression_method(tmp_path):
++    """Test set_compression method changes codec for subsequent writes."""
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    # Write without compression
++    request1 = {"prompt": "No compression", "model": "test"}
++    cache.put(request1, "response1")
++    
++    # Change to gzip
++    cache.set_compression("gzip")
++    
++    # Write with gzip
++    request2 = {"prompt": "Gzip compression", "model": "test"}
++    cache.put(request2, "response2")
++    
++    # Read both - both should work
++    result1 = cache.get(request1)
++    result2 = cache.get(request2)
++    
++    assert result1 == "response1"
++    assert result2 == "response2"
++
++
++def test_set_compression_invalid_leaves_unchanged(tmp_path, caplog):
++    """Test that invalid set_compression leaves previous config unchanged."""
++    import logging
++    
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress="gzip",
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    # Try to set invalid codec
++    cache.set_compression("invalid_codec")
++    
++    # Should still work with gzip
++    request = {"prompt": "Test", "model": "test"}
++    cache.put(request, "response")
++    result = cache.get(request)
++    
++    assert result == "response"
++
++
++def test_backward_compatibility_headerless_entries(tmp_path):
++    """Test that pre-existing header-less entries remain readable."""
++    import pickle
++    from diskcache import Disk
++    
++    # Create a cache without compression (header-less format)
++    cache_no_compress = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    # Write entry without compression
++    request = {"prompt": "Legacy", "model": "test"}
++    value = DummyResponse(message="Legacy response", usage={"tokens": 50})
++    cache_no_compress.put(request, value)
++    
++    # Create new cache with compression enabled
++    cache_with_compress = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress="gzip",
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    # Read legacy entry - should still work
++    result = cache_with_compress.get(request)
++    assert result.message == "Legacy response"
++    assert result.usage == {}
++
++
++def test_codec_switching_preserves_readability(tmp_path):
++    """Test that switching codecs preserves readability of all entries."""
++    # Write with gzip
++    cache_gzip = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress="gzip",
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    request_gzip = {"prompt": "Gzip entry", "model": "test"}
++    cache_gzip.put(request_gzip, "gzip_response")
++    
++    # Switch to zlib
++    cache_gzip.set_compression("zlib")
++    
++    # Write with zlib
++    request_zlib = {"prompt": "Zlib entry", "model": "test"}
++    cache_gzip.put(request_zlib, "zlib_response")
++    
++    # Switch to None
++    cache_gzip.set_compression(None)
++    
++    # Write uncompressed
++    request_none = {"prompt": "None entry", "model": "test"}
++    cache_gzip.put(request_none, "none_response")
++    
++    # Read all entries
++    result_gzip = cache_gzip.get(request_gzip)
++    result_zlib = cache_gzip.get(request_zlib)
++    result_none = cache_gzip.get(request_none)
++    
++    assert result_gzip == "gzip_response"
++    assert result_zlib == "zlib_response"
++    assert result_none == "none_response"
++
++
++def test_cull_limit_applied(tmp_path):
++    """Test that cull_limit is applied to disk backend."""
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=5,
++        eviction_policy=None,
++    )
++    
++    # Access the underlying disk cache settings
++    # The cull_limit should be passed to the FanoutCache
++    assert cache._cull_limit == 5
++
++
++def test_eviction_policy_applied(tmp_path):
++    """Test that eviction_policy is applied to disk backend."""
++    cache = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy="least-recently-used",
++    )
++    
++    # Access the underlying disk cache settings
++    # The eviction_policy should be passed to the FanoutCache
++    assert cache._eviction_policy == "least-recently-used"
++
++
++def test_memory_only_cache(tmp_path):
++    """Test memory-only cache works correctly."""
++    cache = Cache(
++        enable_disk_cache=False,
++        enable_memory_cache=True,
++        disk_cache_dir="",
++        disk_size_limit_bytes=0,
++        memory_max_entries=100,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    request = {"prompt": "Memory only", "model": "test"}
++    cache.put(request, "memory_response")
++    result = cache.get(request)
++    
++    assert result == "memory_response"
++
++
++def test_disabled_cache(tmp_path):
++    """Test disabled cache returns None for all operations."""
++    cache = Cache(
++        enable_disk_cache=False,
++        enable_memory_cache=False,
++        disk_cache_dir="",
++        disk_size_limit_bytes=0,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    request = {"prompt": "Disabled", "model": "test"}
++    cache.put(request, "should_not_be_cached")
++    result = cache.get(request)
++    
++    assert result is None
++
++
++def test_large_compressible_response_reduction(tmp_path):
++    """Test that compression measurably reduces storage for large responses."""
++    import gzip
++    
++    # Create a large compressible response
++    large_text = "This is a repeated pattern " * 10000
++    request = {"prompt": "Large response", "model": "test"}
++    
++    # Write with gzip
++    cache_gzip = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path / "gzip"),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress="gzip",
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    cache_gzip.put(request, large_text)
++    
++    # Write without compression
++    cache_none = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path / "none"),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=0,
++        compress=None,
++        cull_limit=None,
++        eviction_policy=None,
++    )
++    
++    cache_none.put(request, large_text)
++    
++    # Compare sizes
++    gzip_dir = tmp_path / "gzip"
++    none_dir = tmp_path / "none"
++    
++    # Count files and estimate total size
++    gzip_files = list(gzip_dir.glob("*"))
++    none_files = list(none_dir.glob("*"))
++    
++    # At least one file should exist in each
++    assert len(gzip_files) >= 1
++    assert len(none_files) >= 1
++    
++    # Gzip should be smaller than uncompressed for compressible data
++    gzip_total = sum(f.stat().st_size for f in gzip_files)
++    none_total = sum(f.stat().st_size for f in none_files)
++    
++    # Allow some margin for overhead
++    assert gzip_total < none_total * 1.5, f"Gzip ({gzip_total}) should be significantly smaller than uncompressed ({none_total})"

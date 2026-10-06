@@ -1,0 +1,254 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..d7857c03 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -1,7 +1,7 @@
+ import logging
+ import os
+ from pathlib import Path
+-from typing import Optional
++from typing import Optional, Literal
+ 
+ import litellm
+ from litellm.caching.caching import Cache as LitellmCache
+@@ -33,6 +33,9 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    compress: Optional[Literal["gzip", "zlib"]] = None,
++    cull_limit: Optional[int] = None,
++    eviction_policy: Optional[str] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +46,9 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        compress: Compression codec for disk cache ("gzip", "zlib", or None).
++        cull_limit: Cull limit for disk cache.
++        eviction_policy: Eviction policy for disk cache.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,6 +78,9 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        compress=compress,
++        cull_limit=cull_limit,
++        eviction_policy=eviction_policy,
+     )
+ 
+ 
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..7c6161a8 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,9 +2,12 @@ import copy
+ import inspect
+ import logging
+ import threading
++import gzip
++import zlib
++import pickle
+ from functools import wraps
+ from hashlib import sha256
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, Optional, Literal
+ 
+ import cloudpickle
+ import pydantic
+@@ -30,7 +33,9 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        compress: Optional[Literal["gzip", "zlib"]] = None,
++        cull_limit: Optional[int] = None,
++        eviction_policy: Optional[str] = None,
+     ):
+         """
+         Args:
+@@ -39,26 +44,68 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            compress: Compression codec for disk cache ("gzip", "zlib", or None).
++            cull_limit: Cull limit for disk cache.
++            eviction_policy: Eviction policy for disk cache.
+         """
+ 
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
++        self.set_compression(compress)
++        
+         if self.enable_memory_cache:
+             self.memory_cache = LRUCache(maxsize=memory_max_entries)
+         else:
+             self.memory_cache = {}
+         if self.enable_disk_cache:
+-            self.disk_cache = FanoutCache(
+-                shards=16,
+-                timeout=10,
+-                directory=disk_cache_dir,
+-                size_limit=disk_size_limit_bytes,
+-            )
++            kwargs = {
++                "shards": 16,
++                "timeout": 10,
++                "directory": disk_cache_dir,
++                "size_limit": disk_size_limit_bytes,
++            }
++            if cull_limit is not None:
++                kwargs["cull_limit"] = cull_limit
++            if eviction_policy is not None:
++                kwargs["eviction_policy"] = eviction_policy
++            self.disk_cache = FanoutCache(**kwargs)
+         else:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
+ 
++    def set_compression(self, codec: Optional[Literal["gzip", "zlib"]]) -> None:
++        if codec not in [None, "gzip", "zlib"]:
++            raise ValueError("Compression must be 'gzip', 'zlib', or None.")
++        self.compress = codec
++
++    def _serialize(self, value: Any) -> Any:
++        if self.compress is None:
++            return value
++        
++        payload = pickle.dumps(value)
++        if self.compress == "gzip":
++            return b"DSPC" + b"\x01" + gzip.compress(payload)
++        elif self.compress == "zlib":
++            return b"DSPC" + b"\x02" + zlib.compress(payload)
++        return value
++
++    def _deserialize(self, value: Any) -> Any:
++        if not isinstance(value, bytes) or not value.startswith(b"DSPC"):
++            return value
++        
++        codec_byte = value[4:5]
++        payload = value[5:]
++        
++        if codec_byte == b"\x00":
++            return pickle.loads(payload)
++        elif codec_byte == b"\x01":
++            return pickle.loads(gzip.decompress(payload))
++        elif codec_byte == b"\x02":
++            return pickle.loads(zlib.decompress(payload))
++        else:
++            raise ValueError("Unknown codec in cache header")
++
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache
+@@ -108,7 +155,7 @@ class Cache:
+                 response = self.memory_cache[key]
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
++            response = self._deserialize(self.disk_cache[key])
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
+@@ -140,7 +187,7 @@ class Cache:
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                self.disk_cache[key] = self._serialize(value)
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+diff --git a/tests/clients/test_cache_compression.py b/tests/clients/test_cache_compression.py
+new file mode 100644
+index 00000000..1c6fe28c
+--- /dev/null
++++ b/tests/clients/test_cache_compression.py
+@@ -0,0 +1,55 @@
++import pytest
++import os
++import shutil
++import tempfile
++from dspy.clients.cache import Cache
++
++def test_cache_compression():
++    cache_dir = tempfile.mkdtemp()
++    try:
++        # Test gzip
++        cache = Cache(enable_disk_cache=True, enable_memory_cache=False, disk_cache_dir=cache_dir, compress="gzip")
++        data = {"a": 1, "b": [1, 2, 3]}
++        cache.put({"req": 1}, data)
++        
++        # Verify it's compressed
++        assert cache.disk_cache.get(cache.cache_key({"req": 1})).startswith(b"DSPC\x01")
++        assert cache.get({"req": 1}) == data
++        
++        # Test zlib
++        cache.set_compression("zlib")
++        cache.put({"req": 2}, data)
++        assert cache.disk_cache.get(cache.cache_key({"req": 2})).startswith(b"DSPC\x02")
++        assert cache.get({"req": 2}) == data
++        
++        # Test None
++        cache.set_compression(None)
++        cache.put({"req": 3}, data)
++        # Should not have header
++        # When compress is None, _serialize returns the value directly, so it's not bytes.
++        # The disk cache stores it as is.
++        assert not isinstance(cache.disk_cache.get(cache.cache_key({"req": 3})), bytes)
++        assert cache.get({"req": 3}) == data
++        
++        # Test invalid
++        with pytest.raises(ValueError):
++            cache.set_compression("invalid")
++            
++    finally:
++        shutil.rmtree(cache_dir)
++
++def test_cache_backward_compatibility():
++    cache_dir = tempfile.mkdtemp()
++    try:
++        cache = Cache(enable_disk_cache=True, enable_memory_cache=False, disk_cache_dir=cache_dir)
++        data = {"a": 1}
++        
++        # Manually put uncompressed data
++        key = cache.cache_key({"req": 1})
++        cache.disk_cache[key] = data
++        
++        # Should be readable
++        assert cache.get({"req": 1}) == data
++        
++    finally:
++        shutil.rmtree(cache_dir)
+diff --git a/tests/clients/test_cache_cull.py b/tests/clients/test_cache_cull.py
+new file mode 100644
+index 00000000..6df160ce
+--- /dev/null
++++ b/tests/clients/test_cache_cull.py
+@@ -0,0 +1,22 @@
++import pytest
++import shutil
++import tempfile
++from dspy.clients.cache import Cache
++
++def test_cache_cull_and_eviction():
++    cache_dir = tempfile.mkdtemp()
++    try:
++        # Test cull_limit and eviction_policy
++        cache = Cache(
++            enable_disk_cache=True, 
++            enable_memory_cache=False, 
++            disk_cache_dir=cache_dir, 
++            cull_limit=10, 
++            eviction_policy="least-recently-used"
++        )
++        
++        assert cache.disk_cache.cull_limit == 10
++        assert cache.disk_cache.eviction_policy == "least-recently-used"
++        
++    finally:
++        shutil.rmtree(cache_dir)

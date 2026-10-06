@@ -1,0 +1,144 @@
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8..1bec544 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -26,7 +26,7 @@ def test_propose_instructions_for_program(demo_candidates):
+     assert isinstance(result, dict)
+     assert len(result) == len(program.predictors())
+     for pred_instructions in result.values():
+-        assert pred_instructions == ["instruction"]
++        assert pred_instructions == [program.signature.instructions]
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -51,4 +51,4 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         trial_logs={},
+         tip=None,
+     )
+-    assert result == "instruction"
++    assert result == program.signature.instructions
+diff --git a/tests/propose/test_grounded_proposer6.py b/tests/propose/test_grounded_proposer6.py
+new file mode 100644
+index 0000000..fed331f
+--- /dev/null
++++ b/tests/propose/test_grounded_proposer6.py
+@@ -0,0 +1,119 @@
++import copy
++import random
++from types import SimpleNamespace
++
++import pytest
++import dspy
++from dspy.predict.predict import Predict as RealPredict
++from dspy.propose import grounded_proposer as gp
++
++
++class ExampleProgram(dspy.Module):
++    def __init__(self, two=False):
++        super().__init__()
++        self.first = RealPredict('question -> answer')
++        if two:
++            self.second = RealPredict('question -> answer')
++
++
++def recording_proposer(monkeypatch, *, outputs=None, program=None, rng=None, **options):
++    program = program or ExampleProgram()
++    outputs = outputs or {}
++    events = []
++    model = SimpleNamespace(kwargs={'temperature': 0.7, 'max_tokens': 500}, inspect_history=lambda **kw: None)
++    class Recorder:
++        def __init__(self, signature):
++            self.signature = signature
++        def __call__(self, **kwargs):
++            events.append({'signature': self.signature, 'kwargs': copy.deepcopy(kwargs),
++                           'model_kwargs': dict(model.kwargs)})
++            if outputs.get('raise_on') == self.signature.__name__:
++                raise RuntimeError('recorded generation failure')
++            values = {}
++            for field in self.signature.output_fields:
++                if self.signature.__name__ == 'ShortenInstruction':
++                    values[field] = outputs.get('shortened', 'A shortened instruction.')
++                else:
++                    values[field] = outputs.get(field, {
++                        'program_description': 'Program description. More details.',
++                        'module_description': 'Module description. More details.',
++                        'proposed_instruction': 'PROPOSED INSTRUCTION: A useful generated instruction.',
++                    }.get(field, 'value'))
++            return dspy.Prediction(**values)
++    monkeypatch.setattr(gp.dspy, 'Predict', Recorder)
++    monkeypatch.setattr(gp, 'get_prompt_model', lambda supplied: supplied)
++    monkeypatch.setattr(gp, 'get_dspy_source_code', lambda program: 'recorded program code')
++    monkeypatch.setattr(gp, 'create_dataset_summary', lambda **kwargs: 'recorded summary')
++    settings = dict(use_dataset_summary=False, program_aware=True, use_task_demos=False,
++                    set_tip_randomly=False, set_history_randomly=False, rng=rng or random.Random(17))
++    settings.update(options)
++    proposer = gp.GroundedProposer(prompt_model=model, program=program, trainset=[], **settings)
++    return proposer, program, model, events
++
++
++def propose(proposer, program, *, count=1, logs=None):
++    return proposer.propose_instructions_for_program([], program, None, logs or {}, count, 0.5)
++
++
++def generation_events(events):
++    return [event for event in events if event['signature'].__name__ == 'GenerateSingleModuleInstruction']
++
++
++@pytest.mark.parametrize('text,min_chars,max_chars,expected', [
++    ('PROPOSED INSTRUCTION: exact', 5, 5, 'exact'),
++    ('First. More words continue forever.', 2, 12, 'First.…'),
++    ('abcdef', 0, 1, '…'), ('abcdef', 0, 0, ''),
++])
++def test_instruction_length_bounds_in_full_proposal(monkeypatch, text, min_chars, max_chars, expected):
++    proposer, program, model, events = recording_proposer(monkeypatch,
++        outputs={'proposed_instruction': text}, min_instr_chars=min_chars, max_instr_chars=max_chars)
++    before = dict(model.kwargs)
++    result = propose(proposer, program)[0][0]
++    assert result == expected
++    assert model.kwargs == before
++    assert not any(event['signature'].__name__ == 'ShortenInstruction' for event in events)
++
++
++def test_short_generated_and_short_basic_fallback(monkeypatch):
++    program = ExampleProgram()
++    program.first.signature = program.first.signature.with_instructions('Tiny')
++    proposer, program, model, events = recording_proposer(monkeypatch, program=program,
++        outputs={'proposed_instruction': ''}, min_instr_chars=10, max_instr_chars=20)
++    assert propose(proposer, program)[0][0] == 'Tiny'
++
++
++@pytest.mark.parametrize('shortened', ['PROPOSED INSTRUCTION: Concise text', '', 'z' * 100])
++def test_rephrase_once_uses_public_signature_and_caps_result(monkeypatch, shortened):
++    proposer, program, model, events = recording_proposer(monkeypatch,
++        outputs={'proposed_instruction': 'x' * 100, 'shortened': shortened},
++        min_instr_chars=5, max_instr_chars=20, rephrase_when_too_long=True)
++    before = dict(model.kwargs)
++    result = propose(proposer, program)[0][0]
++    rephrases = [event for event in events if event['signature'].__name__ == 'ShortenInstruction']
++    assert len(rephrases) == 1
++    event = rephrases[0]
++    assert event['kwargs'] == {'long_instruction': 'x' * 100, 'max_chars': 20}
++    assert event['signature'].output_fields['proposed_instruction'].json_schema_extra['prefix'] == 'PROPOSED INSTRUCTION:'
++    assert event['model_kwargs'] == before and model.kwargs == before
++    if shortened.startswith('PROPOSED'):
++        assert result == 'Concise text'
++    elif not shortened:
++        assert result == program.first.signature.instructions[:20]
++    else:
++        assert result == 'z' * 20
++
++
++def test_rephrase_error_propagates_without_mutating_kwargs(monkeypatch):
++    proposer, program, model, events = recording_proposer(monkeypatch,
++        outputs={'proposed_instruction': 'x' * 100, 'raise_on': 'ShortenInstruction'},
++        min_instr_chars=5, max_instr_chars=20, rephrase_when_too_long=True)
++    before = dict(model.kwargs)
++    with pytest.raises(RuntimeError):
++        propose(proposer, program)
++    assert model.kwargs == before
++
++
++@pytest.mark.parametrize('minimum,maximum', [(-1, 5), (5, 4), (True, 5), (1, 5.5)])
++def test_invalid_instruction_bounds_rejected(monkeypatch, minimum, maximum):
++    with pytest.raises(ValueError):
++        recording_proposer(monkeypatch, min_instr_chars=minimum, max_instr_chars=maximum)

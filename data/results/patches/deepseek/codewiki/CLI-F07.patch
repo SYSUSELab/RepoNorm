@@ -1,0 +1,95 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..fe6e3d2 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool = False,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,11 +428,21 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        if not validate_nesting and parent is not None and parent.validate_nesting:
++            validate_nesting = True
++
++        #: Validate that children are closed before this context is closed.
++        self.validate_nesting: bool = validate_nesting
++        self._children: set[Context] = set()
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++        if parent is not None:
++            parent._children.add(self)
++
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -466,6 +477,8 @@ class Context:
+         }
+ 
+     def __enter__(self) -> Context:
++        if self._depth == 0 and self.parent is not None:
++            self.parent._children.add(self)
+         self._depth += 1
+         push_context(self)
+         return self
+@@ -478,8 +491,12 @@ class Context:
+     ) -> None:
+         self._depth -= 1
+         if self._depth == 0:
+-            self.close()
+-        pop_context()
++            try:
++                self.close()
++            finally:
++                pop_context()
++        else:
++            pop_context()
+ 
+     @contextmanager
+     def scope(self, cleanup: bool = True) -> cabc.Iterator[Context]:
+@@ -607,9 +624,19 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self._children:
++            names = sorted(
++                ctx.info_name or str(ctx.command.name) for ctx in self._children
++            )
++            raise RuntimeError(
++                f"Cannot close context with open children: {', '.join(names)}"
++            )
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
++        # Unregister from parent after successful close.
++        if self.parent is not None:
++            self.parent._children.discard(self)
+ 
+     @property
+     def command_path(self) -> str:
+@@ -1151,8 +1178,14 @@ class Command:
+ 
+         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
+ 
+-        with ctx.scope(cleanup=False):
+-            self.parse_args(ctx, args)
++        try:
++            with ctx.scope(cleanup=False):
++                self.parse_args(ctx, args)
++        except:
++            # Parsing failed; remove child from parent to avoid phantom open child.
++            if ctx.parent is not None:
++                ctx.parent._children.discard(ctx)
++            raise
+         return ctx
+ 
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:

@@ -1,0 +1,310 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..d64a648 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -27,6 +27,7 @@ from ._compat import term_len
+ from ._compat import WIN
+ from .exceptions import ClickException
+ from .utils import echo
++import warnings
+ 
+ V = t.TypeVar("V")
+ 
+@@ -485,11 +486,18 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], object] | None = None,
+     ) -> None:
++        if monitor_process is not None and not callable(monitor_process):
++            raise TypeError(
++                "monitor_process must be a callable or None, "
++                f"got {type(monitor_process).__name__}"
++            )
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,6 +513,70 @@ class Editor:
+                 return editor
+         return "vi"
+ 
++    def _invoke_monitor(
++        self, event: str, pid: int, command: str
++    ) -> None:
++        """Call the monitor_process callback if configured."""
++        if self.monitor_process is not None:
++            try:
++                self.monitor_process(event, pid, command, time.time())
++            except Exception as exc:
++                warnings.warn(
++                    f"monitor_process callback raised: {exc}",
++                    UserWarning,
++                    stacklevel=2,
++                )
++
++    def _wait_and_monitor(
++        self, c: "subprocess.Popen[bytes]", editor: str
++    ) -> int:
++        pid = c.pid
++        cmd = c.args if isinstance(c.args, str) else str(c.args)
++
++        self._invoke_monitor("start", pid, cmd)
++
++        # Platforms without reliable stopped-state monitoring
++        if WIN or not hasattr(os, "WUNTRACED"):
++            exit_code = c.wait()
++            self._invoke_monitor("terminate", pid, cmd)
++            return exit_code
++
++        # POSIX: monitor stop/continue/terminate transitions
++        while True:
++            try:
++                wpid, status = os.waitpid(
++                    pid, os.WUNTRACED | os.WCONTINUED
++                )
++            except ChildProcessError:
++                # Process already reaped, use poll to get exit code
++                c.poll()
++                exit_code = (
++                    c.returncode if c.returncode is not None else 0
++                )
++                self._invoke_monitor("terminate", pid, cmd)
++                return exit_code
++
++            if os.WIFSTOPPED(status):
++                self._invoke_monitor("suspend", pid, cmd)
++            elif os.WIFCONTINUED(status):
++                self._invoke_monitor("resume", pid, cmd)
++            elif os.WIFEXITED(status):
++                c.returncode = os.WEXITSTATUS(status)
++                self._invoke_monitor("terminate", pid, cmd)
++                return c.returncode
++            elif os.WIFSIGNALED(status):
++                c.returncode = -os.WTERMSIG(status)
++                self._invoke_monitor("terminate", pid, cmd)
++                return c.returncode
++            else:
++                # Unknown status, fall back to poll
++                c.poll()
++                exit_code = (
++                    c.returncode if c.returncode is not None else 0
++                )
++                self._invoke_monitor("terminate", pid, cmd)
++                return exit_code
++
+     def edit_file(self, filename: str) -> None:
+         import subprocess
+ 
+@@ -516,8 +588,10 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            c = subprocess.Popen(
++                f'{editor} "{filename}"', env=environ, shell=True
++            )
++            exit_code = self._wait_and_monitor(c, editor)
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..e639951 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,8 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    *,
++    monitor_process: t.Callable[[str, int, str, float], object] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +679,20 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param monitor_process: optional callback ``(event, pid, command, timestamp)``
++                            invoked during the editor process lifecycle.
++                            ``event`` is ``"start"``, ``"suspend"``,
++                            ``"resume"``, or ``"terminate"``.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        monitor_process=monitor_process,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..6473491 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,155 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++
++def test_edit_monitor_process(runner):
++    """Test that monitor_process callback captures events in order."""
++    import platform
++    if platform.system() == "Windows":
++        pytest.skip("No sed on Windows.")
++
++    events = []
++
++    def monitor(event, pid, command, timestamp):
++        events.append((event, pid, command, timestamp))
++
++    result = click.edit("a\nb", editor="sed -i~ 's/$/Test/'", monitor_process=monitor)
++    assert result == "aTest\nbTest\n"
++
++    assert len(events) >= 2
++    assert events[0][0] == "start"
++    assert events[-1][0] == "terminate"
++    # All events share the same pid
++    pids = {e[1] for e in events}
++    assert len(pids) == 1
++    # Timestamps are non-decreasing
++    ts = [e[3] for e in events]
++    for i in range(1, len(ts)):
++        assert ts[i] >= ts[i - 1]
++
++
++def test_edit_monitor_process_non_callable_raises_type_error():
++    """Test that a non-callable monitor_process raises TypeError."""
++    with pytest.raises(TypeError, match="monitor_process"):
++        click.edit("hello", editor="cat", monitor_process="bad")
++
++
++def test_edit_monitor_process_callback_exception(runner):
++    """Test that callback exceptions produce UserWarning and do not affect execution."""
++    import platform
++    import warnings
++
++    if platform.system() == "Windows":
++        pytest.skip("No sed on Windows.")
++
++    events = []
++
++    def bad_monitor(event, pid, command, timestamp):
++        events.append((event, pid, command, timestamp))
++        if event == "start":
++            raise ValueError("monitor error")
++
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        result = click.edit("a\nb", editor="sed -i~ 's/$/Test/'", monitor_process=bad_monitor)
++
++    assert result == "aTest\nbTest\n"
++    assert len(events) == 2  # start + terminate
++    assert events[0][0] == "start"
++    assert events[1][0] == "terminate"
++    assert any("monitor error" in str(x.message) for x in w)
++
++
++def test_edit_monitor_process_fast_exit(runner):
++    """Test that a quickly exiting process still gets start then terminate."""
++    import platform
++    if platform.system() == "Windows":
++        pytest.skip("No cat on Windows.")
++
++    events = []
++
++    def monitor(event, pid, command, timestamp):
++        events.append((event, pid, command, timestamp))
++
++    click.edit("hello", editor="cat", monitor_process=monitor)
++    assert len(events) >= 2
++    assert events[0][0] == "start"
++    assert events[-1][0] == "terminate"
++
++
++def test_edit_monitor_process_editor_class_directly():
++    """Test that Editor class accepts and uses monitor_process."""
++    from click._termui_impl import Editor
++
++    # Non-callable raises TypeError
++    with pytest.raises(TypeError, match="monitor_process"):
++        Editor(monitor_process="bad")
++
++    # None is accepted
++    ed = Editor(editor="cat", monitor_process=None)
++    assert ed.monitor_process is None
++
++    # Valid callable is accepted
++    def dummy(*args):
++        pass
++
++    ed = Editor(editor="cat", monitor_process=dummy)
++    assert ed.monitor_process is dummy
++
++
++def test_edit_monitor_process_edit_file(runner):
++    """Test that edit_file path also monitors correctly."""
++    import platform
++    import tempfile
++    import os
++
++    if platform.system() == "Windows":
++        pytest.skip("No sed on Windows.")
++
++    f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
++    f.write("original\n")
++    f.close()
++
++    events = []
++
++    def monitor(event, pid, command, timestamp):
++        events.append((event, pid, command, timestamp))
++
++    try:
++        click.edit(editor="sed -i~ 's/original/modified/'", filename=f.name, monitor_process=monitor)
++        with open(f.name) as fh:
++            content = fh.read()
++        assert content == "modified\n"
++    finally:
++        os.unlink(f.name)
++
++    assert len(events) >= 2
++    assert events[0][0] == "start"
++    assert events[-1][0] == "terminate"
++
++
++def test_edit_monitor_process_exception_on_terminate(runner):
++    """Test that exception on terminate does not affect return value."""
++    import platform
++    import warnings
++
++    if platform.system() == "Windows":
++        pytest.skip("No sed on Windows.")
++
++    events = []
++
++    def bad_term(event, pid, command, timestamp):
++        events.append((event, pid, command, timestamp))
++        if event == "terminate":
++            raise RuntimeError("term error")
++
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        result = click.edit("a\nb", editor="sed -i~ 's/$/Test/'", monitor_process=bad_term)
++
++    assert result == "aTest\nbTest\n"
++    assert len(events) == 2
++    assert events[0][0] == "start"
++    assert events[1][0] == "terminate"
++    assert any("term error" in str(x.message) for x in w)

@@ -1,0 +1,258 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..ff37cb34 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,7 @@
+ import re
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -26,6 +26,7 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        on_chunk: Callable[[StreamResponse], None] | None = None,
+     ):
+         """
+         Args:
+@@ -36,6 +37,7 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            on_chunk: Optional callback invoked with each StreamResponse before it is returned from receive().
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+@@ -47,6 +49,7 @@ class StreamListener:
+         self.stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
++        self.on_chunk = on_chunk
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -166,7 +169,10 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++                response = StreamResponse(self.predict_name, self.signature_field_name, token)
++                if self.on_chunk is not None:
++                    self.on_chunk(response)
++                return response
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6d..c3617ab4 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -837,3 +837,204 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+     assert all_chunks[1].predict_name == "predict2"
+     assert all_chunks[1].signature_field_name == "judgement"
+     assert all_chunks[1].chunk == "The answer is humorous."
++
++
++@pytest.mark.anyio
++async def test_stream_listener_on_chunk_callback():
++    """Test that on_chunk callback is invoked for each StreamResponse when using streamify."""
++    import dspy
++    from dspy.streaming import StreamListener, StreamResponse
++    from unittest.mock import AsyncMock
++
++    class MyProgram(dspy.Module):
++        def __init__(self):
++            super().__init__()
++            self.predict1 = dspy.Predict("question->answer")
++
++        def forward(self, question, **kwargs):
++            answer = self.predict1(question=question, **kwargs)
++            return dspy.Prediction(answer=answer.answer)
++
++    async def gemini_stream(*args, **kwargs):
++        yield ModelResponseStream(model="gemini", choices=[StreamingChoices(delta=Delta(content="[[ ##"))])
++        yield ModelResponseStream(model="gemini", choices=[StreamingChoices(delta=Delta(content=" answer ## ]]"))])
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="To get to the other side."))]
++        )
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="\n\n[[ ## completed ## ]]"))]
++        )
++
++    collected = []
++
++    def my_callback(response):
++        collected.append(response)
++
++    with mock.patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[gemini_stream()]):
++        program = dspy.streamify(
++            MyProgram(),
++            stream_listeners=[
++                StreamListener(
++                    signature_field_name="answer",
++                    on_chunk=my_callback,
++                ),
++            ],
++        )
++        with dspy.context(lm=dspy.LM("gemini/gemini-2.5-flash", cache=False), adapter=dspy.ChatAdapter()):
++            output = program(question="why did a chicken cross the kitchen?")
++            all_chunks = []
++            async for value in output:
++                if isinstance(value, StreamResponse):
++                    all_chunks.append(value)
++
++    # The callback should have been called for each StreamResponse exactly once
++    assert len(collected) == len(all_chunks), (
++        f"Callback collected {len(collected)} chunks but output has {len(all_chunks)}"
++    )
++    for cb_chunk, output_chunk in zip(collected, all_chunks):
++        assert cb_chunk is output_chunk, "Callback received a different StreamResponse object"
++        assert cb_chunk.chunk == output_chunk.chunk
++
++    assert len(all_chunks) == 1
++    assert all_chunks[0].predict_name == "predict1"
++    assert all_chunks[0].signature_field_name == "answer"
++    assert all_chunks[0].chunk == "To get to the other side."
++
++
++def test_stream_listener_on_chunk_default_none():
++    """Test that default on_chunk=None preserves existing behavior."""
++    from dspy.streaming import StreamListener
++
++    listener = StreamListener(signature_field_name="answer")
++    assert listener.on_chunk is None
++
++
++@pytest.mark.anyio
++async def test_stream_listener_on_chunk_exception_propagates():
++    """Test that exceptions from on_chunk propagate to the caller."""
++    import dspy
++    from dspy.streaming import StreamListener, StreamResponse
++    from unittest.mock import AsyncMock
++
++    class MyProgram(dspy.Module):
++        def __init__(self):
++            super().__init__()
++            self.predict1 = dspy.Predict("question->answer")
++
++        def forward(self, question, **kwargs):
++            answer = self.predict1(question=question, **kwargs)
++            return dspy.Prediction(answer=answer.answer)
++
++    def failing_callback(response):
++        raise RuntimeError("on_chunk failed")
++
++    async def gemini_stream(*args, **kwargs):
++        yield ModelResponseStream(model="gemini", choices=[StreamingChoices(delta=Delta(content="[[ ##"))])
++        yield ModelResponseStream(model="gemini", choices=[StreamingChoices(delta=Delta(content=" answer ## ]]"))])
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="To get to the other side."))]
++        )
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="\n\n[[ ## completed ## ]]"))]
++        )
++
++    with mock.patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[gemini_stream()]):
++        program = dspy.streamify(
++            MyProgram(),
++            stream_listeners=[
++                StreamListener(
++                    signature_field_name="answer",
++                    on_chunk=failing_callback,
++                ),
++            ],
++        )
++        with dspy.context(lm=dspy.LM("gemini/gemini-2.5-flash", cache=False), adapter=dspy.ChatAdapter()):
++            output = program(question="why did a chicken cross the kitchen?")
++            with pytest.raises(ExceptionGroup) as exc_info:
++                async for value in output:
++                    pass
++            assert any("on_chunk failed" in str(e) for e in exc_info.value.exceptions)
++
++
++@pytest.mark.anyio
++async def test_stream_listener_on_chunk_multiple_listeners():
++    """Test that on_chunk works independently for multiple listeners."""
++    import dspy
++    from dspy.streaming import StreamListener, StreamResponse
++    from unittest.mock import AsyncMock
++
++    class MyProgram(dspy.Module):
++        def __init__(self):
++            super().__init__()
++            self.predict1 = dspy.Predict("question->answer")
++            self.predict2 = dspy.Predict("question,answer->judgement")
++
++        def forward(self, question, **kwargs):
++            answer = self.predict1(question=question, **kwargs).answer
++            judgement = self.predict2(question=question, answer=answer, **kwargs)
++            return judgement
++
++    async def gemini_stream_1(*args, **kwargs):
++        yield ModelResponseStream(model="gemini", choices=[StreamingChoices(delta=Delta(content="[[ ##"))])
++        yield ModelResponseStream(model="gemini", choices=[StreamingChoices(delta=Delta(content=" answer ## ]]"))])
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="To get to the other side."))]
++        )
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="\n\n[[ ## completed ## ]]"))]
++        )
++
++    async def gemini_stream_2(*args, **kwargs):
++        yield ModelResponseStream(
++            model="gemini", choices=[StreamingChoices(delta=Delta(content="[[ ## judgement ## ]]\n\n"))]
++        )
++        yield ModelResponseStream(
++            model="gemini",
++            choices=[
++                StreamingChoices(
++                    delta=Delta(
++                        content="The answer provides the standard punchline."
++                    )
++                )
++            ],
++        )
++        yield ModelResponseStream(
++            model="gemini",
++            choices=[StreamingChoices(delta=Delta(content="\n\n[[ ## completed ## ]]"))],
++        )
++
++    collected_answers = []
++    collected_judgements = []
++
++    def cb_answer(response):
++        collected_answers.append(response)
++
++    def cb_judgement(response):
++        collected_judgements.append(response)
++
++    with mock.patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[gemini_stream_1(), gemini_stream_2()]):
++        program = dspy.streamify(
++            MyProgram(),
++            stream_listeners=[
++                StreamListener(
++                    signature_field_name="answer",
++                    on_chunk=cb_answer,
++                ),
++                StreamListener(
++                    signature_field_name="judgement",
++                    on_chunk=cb_judgement,
++                ),
++            ],
++        )
++        with dspy.context(lm=dspy.LM("gemini/gemini-2.5-flash", cache=False), adapter=dspy.ChatAdapter()):
++            output = program(question="why did a chicken cross the kitchen?")
++            all_chunks = []
++            async for value in output:
++                if isinstance(value, StreamResponse):
++                    all_chunks.append(value)
++
++    assert len(collected_answers) == 1
++    assert len(collected_judgements) == 1
++    assert collected_answers[0].chunk == "To get to the other side."
++    assert collected_judgements[0].chunk == "The answer provides the standard punchline."
++    assert len(all_chunks) == 2

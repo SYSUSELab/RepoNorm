@@ -1,0 +1,312 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..c6f3f4f4 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,10 @@
++import ast
+ import asyncio
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, model_validator
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -309,6 +310,295 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    @classmethod
++    def parse_python_calls(cls, text: str) -> dict[str, list[dict[str, Any]]]:
++        """Parse Python-style tool calls from a string.
++
++        Accepts one or more top-level calls separated by newlines or semicolons, preserving source order.
++        A callee is an identifier or a dot-separated sequence of identifiers; use its final identifier as the tool name.
++        Calls may have no arguments or only explicit keyword arguments.
++
++        Argument values may contain strings (including Unicode), finite integers/floats, booleans, None,
++        and nested lists, tuples and dictionaries. Dictionary keys must be strings. Tuples are converted to lists.
++        Unary + and - are permitted only on numbers, not booleans.
++
++        Rejects positional arguments, argument unpacking, duplicate keyword arguments or dictionary keys,
++        variables, computed/attribute values, nested calls, f-strings, comprehensions, lambdas, bytes,
++        complex numbers, Ellipsis and non-finite numbers. Also rejects statements other than calls and Python comments.
++
++        Empty input and malformed syntax raise ValueError.
++
++        Args:
++            text: A string containing Python-style tool calls.
++
++        Returns:
++            A dictionary with key "tool_calls" containing a list of {"name": ..., "args": {...}} dicts.
++
++        Raises:
++            ValueError: If the input is empty, malformed, or contains disallowed constructs.
++        """
++        if not text or not text.strip():
++            raise ValueError("Empty input")
++
++        # Split by semicolons first, then by newlines
++        parts = []
++        current_part = ""
++        for char in text:
++            if char == ';':
++                if current_part.strip():
++                    parts.append(current_part.strip())
++                current_part = ""
++            elif char == '\n':
++                if current_part.strip():
++                    parts.append(current_part.strip())
++                current_part = ""
++            else:
++                current_part += char
++        if current_part.strip():
++            parts.append(current_part.strip())
++
++        if not parts:
++            raise ValueError("Empty input")
++
++        all_calls = []
++
++        for part in parts:
++            if not part.strip():
++                continue
++
++            # Parse each call
++            call_result = _parse_single_call(part)
++            all_calls.append(call_result)
++
++        return {"tool_calls": all_calls}
++
++    @model_validator(mode="before")
++    @classmethod
++    def validate_input(cls, data: Any) -> Any:
++        """Validate and convert input data to ToolCalls format.
++
++        Handles string input by parsing it as Python-style tool calls.
++        Preserves existing non-string ToolCalls model input and output formatting.
++        """
++        if isinstance(data, cls):
++            return data
++
++        if isinstance(data, str):
++            parsed = cls.parse_python_calls(data)
++            return parsed
++
++        if isinstance(data, dict):
++            # Try to interpret as a single call dict
++            if "name" in data and "args" in data:
++                return {"tool_calls": [data]}
++
++        if isinstance(data, list):
++            # Handle list of call dicts
++            if data and isinstance(data[0], dict) and "name" in data[0] and "args" in data[0]:
++                return {"tool_calls": data}
++
++        return data
++
++
++def _parse_single_call(text: str) -> dict[str, Any]:
++    """Parse a single Python-style tool call.
++
++    Args:
++        text: A string containing a single tool call.
++
++    Returns:
++        A dictionary with "name" and "args" keys.
++
++    Raises:
++        ValueError: If the call is malformed or contains disallowed constructs.
++    """
++    text = text.strip()
++    if not text:
++        raise ValueError("Empty call")
++
++    # Check for comments (# outside of strings)
++    in_string = False
++    string_char = None
++    for i, char in enumerate(text):
++        if char in ('"', "'") and (i == 0 or text[i-1] != '\\'):
++            if not in_string:
++                in_string = True
++                string_char = char
++            elif char == string_char:
++                in_string = False
++        elif char == '#' and not in_string:
++            raise ValueError("Python comments are not allowed")
++
++    # Parse the call using AST
++    try:
++        tree = ast.parse(text, mode='exec')
++    except SyntaxError as e:
++        raise ValueError(f"Malformed syntax: {e.msg}")
++
++    if len(tree.body) != 1:
++        raise ValueError("Expected exactly one call per statement")
++
++    node = tree.body[0]
++
++    # Must be a Call node (or Expr wrapping a Call)
++    call_node = node.value if isinstance(node, ast.Expr) else node
++    if not isinstance(call_node, ast.Call):
++        raise ValueError(f"Expected a function call, got {ast.dump(node)[:50]}")
++
++    # Extract the function name (callee)
++    callee = _extract_callee_name(call_node.func)
++    if not callee:
++        raise ValueError("Empty function name")
++
++    # Extract keyword arguments
++    kwargs = _extract_kwargs(call_node)
++
++    return {"name": callee, "args": kwargs}
++
++
++def _extract_callee_name(node: ast.expr) -> str:
++    """Extract the tool name from a callee expression.
++
++    A callee can be:
++    - An identifier (e.g., search)
++    - A dotted sequence of identifiers (e.g., my.module.search)
++
++    The final identifier is used as the tool name.
++
++    Args:
++        node: An AST expression node representing the callee.
++
++    Returns:
++        The final identifier as the tool name.
++
++    Raises:
++        ValueError: If the callee is not a valid identifier or dotted identifier sequence.
++    """
++    if isinstance(node, ast.Name):
++        return node.id
++    elif isinstance(node, ast.Attribute):
++        # For Attribute nodes, the tool name is the rightmost attribute (attr)
++        # regardless of what comes before it
++        return node.attr
++    else:
++        raise ValueError(f"Invalid callee expression: {ast.dump(node)[:50]}")
++
++
++def _extract_kwargs(call_node: ast.Call) -> dict[str, Any]:
++    """Extract keyword arguments from a Call node.
++
++    Args:
++        call_node: An AST Call node.
++
++    Returns:
++        A dictionary of keyword argument names to their parsed values.
++
++    Raises:
++        ValueError: If positional arguments, unpacking, or invalid values are found.
++    """
++    kwargs = {}
++    seen_names = set()
++
++    # Check for positional arguments
++    if call_node.args:
++        raise ValueError("Positional arguments are not allowed")
++
++    # Check for argument unpacking (*args, **kwargs)
++    for keyword in call_node.keywords:
++        if keyword.arg is None:
++            raise ValueError("Argument unpacking (**kwargs) is not allowed")
++
++    # Process keyword arguments
++    for kw in call_node.keywords:
++        name = kw.arg
++        if name in seen_names:
++            raise ValueError(f"Duplicate keyword argument: {name}")
++        seen_names.add(name)
++
++        value = _parse_value(kw.value)
++        kwargs[name] = value
++
++    return kwargs
++
++
++def _parse_value(node: ast.AST) -> Any:
++    """Parse an AST node into a Python value.
++
++    Allowed value types:
++    - Strings (including Unicode)
++    - Finite integers and floats
++    - Booleans
++    - None
++    - Lists (containing allowed values)
++    - Tuples (converted to lists)
++    - Dictionaries with string keys (containing allowed values)
++
++    Disallowed:
++    - Variables (Name nodes)
++    - Attribute access (Attribute nodes)
++    - Subscript access (Subscript nodes)
++    - Function calls (Call nodes)
++    - Comprehensions (ListComp, SetComp, DictComp, GeneratorExp)
++    - Lambdas (Lambda nodes)
++    - Bytes literals
++    - Complex numbers
++    - Ellipsis
++    - Non-finite numbers (inf, nan)
++    - F-strings (JoinedStr)
++    - Unary operations on non-numbers
++
++    Args:
++        node: An AST node representing a value.
++
++    Returns:
++        The parsed Python value.
++
++    Raises:
++        ValueError: If the value contains disallowed constructs.
++    """
++    if isinstance(node, ast.Constant):
++        value = node.value
++        # Check for non-finite numbers
++        if isinstance(value, float) and (value != value or abs(value) == float('inf')):
++            raise ValueError("Non-finite numbers (inf, nan) are not allowed")
++        return value
++
++    if isinstance(node, ast.List):
++        return [_parse_value(elt) for elt in node.elts]
++
++    if isinstance(node, ast.Tuple):
++        return [_parse_value(elt) for elt in node.elts]
++
++    if isinstance(node, ast.Dict):
++        if len(node.keys) != len(node.values):
++            raise ValueError("Mismatched number of keys and values in dictionary")
++        result = {}
++        for key_node, value_node in zip(node.keys, node.values):
++            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
++                raise ValueError("Dictionary keys must be strings")
++            key = key_node.value
++            if key in result:
++                raise ValueError(f"Duplicate dictionary key: {key}")
++            result[key] = _parse_value(value_node)
++        return result
++
++    if isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, (ast.UAdd, ast.USub)):
++            operand = node.operand
++            if isinstance(operand, ast.Constant) and isinstance(operand.value, (int, float)) and not isinstance(operand.value, bool):
++                # Check for non-finite numbers
++                if isinstance(operand.value, float) and (operand.value != operand.value or abs(operand.value) == float('inf')):
++                    raise ValueError("Non-finite numbers (inf, nan) are not allowed")
++                if isinstance(node.op, ast.UAdd):
++                    return operand.value
++                else:
++                    return -operand.value
++            else:
++                raise ValueError("Unary + and - are only allowed on numbers")
++        else:
++            raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
++
++    raise ValueError(f"Disallowed value type: {type(node).__name__}")
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""

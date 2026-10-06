@@ -1,0 +1,297 @@
+diff --git a/edit_core.py b/edit_core.py
+new file mode 100644
+index 0000000..097d284
+--- /dev/null
++++ b/edit_core.py
+@@ -0,0 +1,50 @@
++import re
++
++with open("tiktoken/core.py", "r") as f:
++    content = f.read()
++
++# Add filter_tokens to encode
++content = re.sub(
++    r"def encode\(\n\s+self,\n\s+text: str,\n\s+\*,\n\s+allowed_special: Literal\[\"all\"\] \| AbstractSet\[str\] = set\(\),  # noqa: B006\n\s+disallowed_special: Literal\[\"all\"\] \| Collection\[str\] = \"all\",\n\s+\) -> list\[int\]:",
++    r"def encode(\n        self,\n        text: str,\n        *,\n        allowed_special: Literal[\"all\"] | AbstractSet[str] = set(),  # noqa: B006\n        disallowed_special: Literal[\"all\"] | Collection[str] = \"all\",\n        filter_tokens: Collection[int] | None = None,\n    ) -> list[int]:",
++    content
++)
++
++# Add filtering logic to encode
++content = re.sub(
++    r"try:\n\s+return self._core_bpe\.encode\(text, allowed_special\)\n\s+except UnicodeEncodeError:",
++    r"try:\n            tokens = self._core_bpe.encode(text, allowed_special)\n        except UnicodeEncodeError:",
++    content
++)
++# This is a bit tricky because I need to insert the filtering logic after the try-except block.
++# Let's find the end of the try-except block.
++# The original code is:
++#         try:
++#             return self._core_bpe.encode(text, allowed_special)
++#         except UnicodeEncodeError:
++#             # BPE operates on bytes, but the regex operates on strings.
++#             # If we have a surrogate pair, we need to handle it.
++#             # This is a bit of a hack, but it's what the reference implementation does.
++#             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++#             return self._core_bpe.encode(text, allowed_special)
++
++# I will replace the return statements.
++content = content.replace(
++    "return self._core_bpe.encode(text, allowed_special)",
++    "tokens = self._core_bpe.encode(text, allowed_special)"
++)
++# Now I need to add the filtering logic at the end of the function.
++# The function ends with:
++#         except UnicodeEncodeError:
++#             # ...
++#             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++#             return self._core_bpe.encode(text, allowed_special)
++
++# I will add the filtering logic before the return.
++# Actually, I can just add it after the try-except block.
++# Let's find the end of the try-except block.
++# It's followed by:
++#     def decode(self, tokens: Sequence[int], *, errors: str = "replace") -> str:
++
++# This is getting complicated. Let's just use a simpler approach.
++# I will replace the whole encode method.
+diff --git a/encode_method.py b/encode_method.py
+new file mode 100644
+index 0000000..ae12f57
+--- /dev/null
++++ b/encode_method.py
+@@ -0,0 +1,61 @@
++    def encode(
++        self,
++        text: str,
++        *,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        filter_tokens: Collection[int] | None = None,
++    ) -> list[int]:
++        """Encodes a string into tokens.
++
++        Special tokens are artificial tokens used to unlock capabilities from a model,
++        such as fill-in-the-middle. So we want to be careful about accidentally encoding special
++        tokens, since they can be used to trick a model into doing something we don't want it to do.
++
++        Hence, by default, encode will raise an error if it encounters text that corresponds
++        to a special token. This can be controlled on a per-token level using the `allowed_special`
++        and `disallowed_special` parameters. In particular:
++        - Setting `disallowed_special` to () will prevent this function from raising errors and
++          cause all text corresponding to special tokens to be encoded as natural text.
++        - Setting `allowed_special` to "all" will cause this function to treat all text
++          corresponding to special tokens to be encoded as special tokens.
++
++        ```
++        >>> enc.encode("hello world")
++        [31373, 995]
++        >>> enc.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})
++        [50256]
++        >>> enc.encode("<|endoftext|>", allowed_special="all")
++        [50256]
++        >>> enc.encode("<|endoftext|>")
++        # Raises ValueError
++        >>> enc.encode("<|endoftext|>", disallowed_special=())
++        [27, 91, 437, 1659, 5239, 91, 29]
++        ```
++        """
++        if allowed_special == "all":
++            allowed_special = self.special_tokens_set
++        if disallowed_special == "all":
++            disallowed_special = self.special_tokens_set - allowed_special
++        if disallowed_special:
++            if not isinstance(disallowed_special, frozenset):
++                disallowed_special = frozenset(disallowed_special)
++            if match := _special_token_regex(disallowed_special).search(text):
++                raise_disallowed_special_token(match.group())
++
++        try:
++            tokens = self._core_bpe.encode(text, allowed_special)
++        except UnicodeEncodeError:
++            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++            # fixup for any surrogate pairs that may have sneaked their way into the text.
++            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++            # string, but given that this is input we want to support, maybe that's okay.
++            # Also we use errors="replace" to handle weird things like lone surrogates.
++            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            tokens = self._core_bpe.encode(text, allowed_special)
++        
++        if filter_tokens:
++            filter_set = set(filter_tokens)
++            tokens = [t for t in tokens if t not in filter_set]
++        return tokens
+diff --git a/replace_encode.py b/replace_encode.py
+new file mode 100644
+index 0000000..15de374
+--- /dev/null
++++ b/replace_encode.py
+@@ -0,0 +1,29 @@
++with open("tiktoken/core.py", "r") as f:
++    content = f.read()
++
++with open("encode_method.py", "r") as f:
++    new_encode = f.read()
++
++# Find the start and end of the encode method
++start_pattern = "    def encode("
++end_pattern = "            return self._core_bpe.encode(text, allowed_special)"
++# This is not quite right because there are two returns.
++# Let's use a more robust way.
++# The encode method ends before "    def decode("
++# Let's find the line number of "    def encode(" and "    def decode("
++lines = content.splitlines()
++start_line = 0
++for i, line in enumerate(lines):
++    if line.startswith("    def encode("):
++        start_line = i
++        break
++
++end_line = 0
++for i, line in enumerate(lines):
++    if line.startswith("    def decode("):
++        end_line = i
++        break
++
++new_content = lines[:start_line] + new_encode.splitlines() + lines[end_line:]
++with open("tiktoken/core.py", "w") as f:
++    f.write("\n".join(new_content) + "\n")
+diff --git a/test_filtering.py b/test_filtering.py
+new file mode 100644
+index 0000000..71dda92
+--- /dev/null
++++ b/test_filtering.py
+@@ -0,0 +1,45 @@
++import tiktoken
++import numpy as np
++
++enc = tiktoken.get_encoding("cl100k_base")
++text = "hello world"
++tokens = enc.encode(text)
++print(f"Tokens: {tokens}")
++
++# Test list
++tokens_filtered_list = enc.encode(text, filter_tokens=[tokens[0]])
++print(f"Filtered tokens (list): {tokens_filtered_list}")
++assert tokens_filtered_list == [tokens[1]]
++
++# Test tuple
++tokens_filtered_tuple = enc.encode(text, filter_tokens=(tokens[0],))
++print(f"Filtered tokens (tuple): {tokens_filtered_tuple}")
++assert tokens_filtered_tuple == [tokens[1]]
++
++# Test set
++tokens_filtered_set = enc.encode(text, filter_tokens={tokens[0]})
++print(f"Filtered tokens (set): {tokens_filtered_set}")
++assert tokens_filtered_set == [tokens[1]]
++
++# Test numpy
++tokens_np = enc.encode_to_numpy(text, filter_tokens={tokens[0]})
++print(f"Filtered numpy tokens: {tokens_np}")
++assert np.array_equal(tokens_np, np.array([tokens[1]], dtype=np.uint32))
++
++# Test empty filter
++tokens_no_filter = enc.encode(text, filter_tokens=[])
++print(f"No filter: {tokens_no_filter}")
++assert tokens_no_filter == tokens
++
++# Test all filtered
++tokens_all_filtered = enc.encode(text, filter_tokens=tokens)
++print(f"All filtered: {tokens_all_filtered}")
++assert tokens_all_filtered == []
++
++# Test numpy all filtered
++tokens_np_all_filtered = enc.encode_to_numpy(text, filter_tokens=tokens)
++print(f"Numpy all filtered: {tokens_np_all_filtered}")
++assert len(tokens_np_all_filtered) == 0
++assert tokens_np_all_filtered.dtype == np.uint32
++
++print("All tests passed!")
+diff --git a/test_requirements.py b/test_requirements.py
+new file mode 100644
+index 0000000..e76be13
+--- /dev/null
++++ b/test_requirements.py
+@@ -0,0 +1,28 @@
++import tiktoken
++import numpy as np
++import pytest
++
++enc = tiktoken.get_encoding("cl100k_base")
++
++# Test disallowed_special=()
++text = "<|endoftext|>"
++# This should not raise
++tokens = enc.encode(text, disallowed_special=())
++print(f"Tokens: {tokens}")
++
++# Test prohibited special literal raises before filtering
++try:
++    enc.encode(text, filter_tokens=[enc.eot_token])
++    print("Should have raised ValueError")
++except ValueError as e:
++    print(f"Caught expected error: {e}")
++
++# Test numpy matches list
++text = "hello world"
++filter_tokens = [enc.encode("hello")[0]]
++tokens_list = enc.encode(text, filter_tokens=filter_tokens)
++tokens_np = enc.encode_to_numpy(text, filter_tokens=filter_tokens)
++print(f"List: {tokens_list}, Numpy: {tokens_np}")
++assert np.array_equal(tokens_np, np.array(tokens_list, dtype=np.uint32))
++
++print("All requirements tests passed!")
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..3270f19 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        filter_tokens: Collection[int] | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -121,7 +122,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +131,12 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++        
++        if filter_tokens:
++            filter_set = set(filter_tokens)
++            tokens = [t for t in tokens if t not in filter_set]
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -138,6 +144,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        filter_tokens: Collection[int] | None = None,
+     ) -> npt.NDArray[np.uint32]:
+         """Encodes a string into tokens, returning a numpy array.
+ 
+@@ -155,8 +162,8 @@ class Encoding:
+ 
+         import numpy as np
+ 
+-        buffer = self._core_bpe.encode_to_tiktoken_buffer(text, self.special_tokens_set)
+-        return np.frombuffer(buffer, dtype=np.uint32)
++        tokens = self.encode(text, allowed_special=allowed_special, disallowed_special=disallowed_special, filter_tokens=filter_tokens)
++        return np.array(tokens, dtype=np.uint32)
+ 
+     def encode_ordinary_batch(self, text: list[str], *, num_threads: int = 8) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel, ignoring special tokens.

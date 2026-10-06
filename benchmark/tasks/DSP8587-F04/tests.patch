@@ -1,0 +1,107 @@
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6..afb0534 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -837,3 +837,89 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+     assert all_chunks[1].predict_name == "predict2"
+     assert all_chunks[1].signature_field_name == "judgement"
+     assert all_chunks[1].chunk == "The answer is humorous."
++
++def _feature4_model_chunk(content):
++    return ModelResponseStream(
++        model="test", choices=[StreamingChoices(delta=Delta(content=content))]
++    )
++
++
++@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "1"])
++def test_idle_timeout_requires_a_positive_finite_number(value):
++    with pytest.raises(
++        ValueError,
++        match="^idle_timeout_s must be a positive finite number or None$",
++    ):
++        dspy.streaming.StreamListener(
++            signature_field_name="answer", idle_timeout_s=value
++        )
++
++
++def test_tick_uses_the_configured_clock_refreshes_and_emits_once():
++    now = [10.0]
++    listener = dspy.streaming.StreamListener(
++        signature_field_name="answer",
++        idle_timeout_s=2.0,
++        clock=lambda: now[0],
++    )
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener.receive(_feature4_model_chunk("[[ ## answer ## ]]\n"))
++        listener.receive(_feature4_model_chunk("partial"))
++        now[0] = 11.5
++        listener.receive(_feature4_model_chunk(" update"))
++        now[0] = 13.0
++        assert listener.tick() is None
++        now[0] = 13.5
++        response = listener.tick()
++
++    assert response.chunk == ""
++    assert listener.tick() is None
++
++
++async def _collect_automatic_timeout(listener_count):
++    stalled = asyncio.Event()
++
++    class StallingProgram(dspy.Module):
++        def __init__(self):
++            super().__init__()
++            self.predict = dspy.Predict("question -> answer")
++
++        async def aforward(self, question):
++            for content in ("[[ ## answer ## ]]\n", "partial"):
++                chunk = _feature4_model_chunk(content)
++                chunk.predict_id = id(self.predict)
++                await dspy.settings.send_stream.send(chunk)
++            await stalled.wait()
++            raise AssertionError("the timeout must cancel the stalled program")
++
++    program = StallingProgram()
++    listeners = [
++        dspy.streaming.StreamListener(
++            signature_field_name="answer",
++            predict=program.predict,
++            idle_timeout_s=0.01,
++        )
++        for _ in range(listener_count)
++    ]
++    streamed = dspy.streamify(
++        program,
++        stream_listeners=listeners,
++        is_async_program=True,
++    )
++
++    async def collect():
++        return [value async for value in streamed(question="test")]
++
++    return await asyncio.wait_for(collect(), timeout=0.5)
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("listener_count", [1, 2])
++async def test_streamify_automatically_terminates_a_stalled_program(listener_count):
++    values = await _collect_automatic_timeout(listener_count)
++    timeouts = [
++        value
++        for value in values
++        if isinstance(value, dspy.streaming.StreamResponse) and value.chunk == ""
++    ]
++    assert len(timeouts) == 1
+diff --git a/tests/test_utils/server/__init__.py b/tests/test_utils/server/__init__.py
+index 70215d8..19643b6 100644
+--- a/tests/test_utils/server/__init__.py
++++ b/tests/test_utils/server/__init__.py
+@@ -73,7 +73,7 @@ def _get_random_port():
+         return s.getsockname()[1]
+ 
+ 
+-def _wait_for_port(host, port, timeout=10):
++def _wait_for_port(host, port, timeout=60):
+     start_time = time.time()
+     while time.time() - start_time < timeout:
+         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

@@ -1,0 +1,150 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..2e5a31d5 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -72,6 +72,25 @@ class DescribeModule(dspy.Signature):
+     )
+ 
+ 
++
++class ShortenInstruction(dspy.Signature):
++    """Shorten an overlong instruction to fit within a maximum character count."""
++    long_instruction = dspy.InputField(
++        format=str,
++        desc="The long instruction that needs to be shortened.",
++        prefix="LONG INSTRUCTION:",
++    )
++    max_chars = dspy.InputField(
++        format=int,
++        desc="The maximum number of characters the shortened instruction may contain.",
++        prefix="MAX CHARS:",
++    )
++    proposed_instruction = dspy.OutputField(
++        desc="A shortened version of the long instruction that fits within the character limit.",
++        prefix="PROPOSED INSTRUCTION:",
++    )
++
++
+ def generate_instruction_class(
+     use_dataset_summary=True,
+     program_aware=True,
+@@ -284,9 +303,26 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        min_instr_chars=30,
++        max_instr_chars=600,
++        rephrase_when_too_long=False,
+     ):
+         super().__init__()
++
++        # Validate instruction length bounds
++        if isinstance(min_instr_chars, bool) or not isinstance(min_instr_chars, int):
++            raise ValueError("min_instr_chars must be a non-boolean integer")
++        if isinstance(max_instr_chars, bool) or not isinstance(max_instr_chars, int):
++            raise ValueError("max_instr_chars must be a non-boolean integer")
++        if min_instr_chars < 0 or max_instr_chars < 0:
++            raise ValueError("Bounds must be nonnegative integers")
++        if min_instr_chars > max_instr_chars:
++            raise ValueError("min_instr_chars must be <= max_instr_chars")
++        self.min_instr_chars = min_instr_chars
++        self.max_instr_chars = max_instr_chars
++        self.rephrase_when_too_long = rephrase_when_too_long
++
+         self.program_aware = program_aware
+         self.use_dataset_summary = use_dataset_summary
+         self.use_task_demos = use_task_demos
+@@ -439,4 +475,68 @@ class GroundedProposer(Proposer):
+             self.prompt_model.inspect_history(n=1)
+             print(f"PROPOSED INSTRUCTION: {proposed_instruction}")
+ 
+-        return strip_prefix(proposed_instruction)
++        instruction = strip_prefix(proposed_instruction)
++        basic_instruction = get_signature(program.predictors()[pred_i]).instructions
++
++        # Apply instruction length constraints
++        if self.max_instr_chars == 0:
++            instruction = ""
++        else:
++            measured = len(instruction)
++            if measured < self.min_instr_chars:
++                # Fall back to canonical signature instructions
++                if self.verbose:
++                    print(f"# [GroundedProposer] instruction too short ({measured} < {self.min_instr_chars}), falling back to canonical basic instruction")
++                instruction = basic_instruction
++            elif measured > self.max_instr_chars:
++                if self.rephrase_when_too_long:
++                    # Make one ShortenInstruction call
++                    original_temp = self.prompt_model.kwargs.get("temperature")
++                    shorten_predictor = dspy.Predict(ShortenInstruction)
++                    with dspy.settings.context(lm=self.prompt_model):
++                        result = shorten_predictor(
++                            long_instruction=instruction,
++                            max_chars=self.max_instr_chars,
++                        )
++                    # Restore kwargs (rephrasing must not mutate LM kwargs)
++                    if original_temp is not None:
++                        self.prompt_model.kwargs["temperature"] = original_temp
++
++                    shortened = strip_prefix(result.proposed_instruction)
++                    if self.verbose:
++                        print(f"# [GroundedProposer] instruction too long ({measured} > {self.max_instr_chars}), rephrasing...")
++                        print(f"# [GroundedProposer] rephrased length: {len(shortened)}")
++
++                    if not shortened or len(shortened) < self.min_instr_chars:
++                        if self.verbose:
++                            print(f"# [GroundedProposer] rephrased instruction empty or too short, falling back to canonical basic instruction")
++                        shortened = basic_instruction
++
++                    instruction = shortened
++
++                # Hard-truncate if still over max (applies to both rephrase and no-rephrase paths)
++                if len(instruction) > self.max_instr_chars:
++                    if not self.rephrase_when_too_long:
++                        # Retain last sentence boundary that fits with one char reserved for …
++                        truncated = instruction[:self.max_instr_chars - 1]
++                        # Find last sentence boundary
++                        import re as _re
++                        matches = list(_re.finditer(r'[.!?](?:\s|$)', truncated))
++                        if matches:
++                            last = matches[-1]
++                            # The boundary includes the punctuation and the whitespace char
++                            # We want to keep up to and including the punctuation
++                            boundary_end = last.start() + 1  # position after punctuation
++                            instruction = instruction[:boundary_end] + "…"
++                        else:
++                            # No sentence boundary found, hard truncate
++                            instruction = instruction[:self.max_instr_chars - 1] + "…"
++                        if self.verbose:
++                            print(f"# [GroundedProposer] truncating overlong instruction from {measured} to {len(instruction)} chars (max={self.max_instr_chars})")
++                    else:
++                        # Hard-truncate the rephrased or fallback instruction
++                        if self.verbose:
++                            print(f"# [GroundedProposer] hard-truncating still-overlong instruction from {len(instruction)} to {self.max_instr_chars} chars")
++                        instruction = instruction[:self.max_instr_chars]
++
++        return instruction
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..6aef7286 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -19,7 +19,7 @@ def test_propose_instructions_for_program(demo_candidates):
+     program = Predict("question -> answer")
+     trainset = []
+ 
+-    proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=trainset, verbose=False)
++    proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=trainset, verbose=False, min_instr_chars=0, max_instr_chars=10000)
+     result = proposer.propose_instructions_for_program(
+         trainset=trainset, program=program, demo_candidates=demo_candidates, trial_logs={}, N=1, T=0.5
+     )
+@@ -40,7 +40,7 @@ def test_propose_instruction_for_predictor(demo_candidates):
+     prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
+     program = Predict("question -> answer")
+ 
+-    proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], verbose=False)
++    proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], verbose=False, min_instr_chars=0, max_instr_chars=10000)
+     result = proposer.propose_instruction_for_predictor(
+         program=program,
+         predictor=None,

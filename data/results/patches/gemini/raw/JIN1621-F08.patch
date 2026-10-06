@@ -1,0 +1,217 @@
+diff --git a/fix_loaders.py b/fix_loaders.py
+new file mode 100644
+index 0000000..a701ce0
+--- /dev/null
++++ b/fix_loaders.py
+@@ -0,0 +1,41 @@
++import re
++import fnmatch
++from contextlib import contextmanager
++
++# I will replace the methods I added with these:
++
++def _get_filters(self):
++    if not hasattr(self, "_filters"):
++        self._filters = []
++    return self._filters
++
++def add_filter(self, filter_pattern: t.Any) -> None:
++    self._get_filters().append(filter_pattern)
++
++def clear_filters(self) -> None:
++    self._get_filters().clear()
++
++@contextmanager
++def filter_scope(self, *patterns: t.Any) -> t.Iterator[None]:
++    old_filters = list(self._get_filters())
++    for p in patterns:
++        self.add_filter(p)
++    try:
++        yield
++    finally:
++        self._filters = old_filters
++
++def _is_filtered(self, template: str) -> bool:
++    for filter_pattern in self._get_filters():
++        if isinstance(filter_pattern, str):
++            if fnmatch.fnmatch(template, filter_pattern):
++                return True
++        elif isinstance(filter_pattern, re.Pattern):
++            if filter_pattern.search(template):
++                return True
++        elif callable(filter_pattern):
++            if filter_pattern(template):
++                return True
++        else:
++            raise TypeError(f"Unsupported filter type: {type(filter_pattern)}")
++    return False
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..7e7ee24 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -38,6 +38,10 @@ def split_template_path(template: str) -> t.List[str]:
+     return pieces
+ 
+ 
++import fnmatch
++import re
++from contextlib import contextmanager
++
+ class BaseLoader:
+     """Baseclass for all loaders.  Subclass this and override `get_source` to
+     implement a custom loading mechanism.  The environment provides a
+@@ -64,6 +68,41 @@ class BaseLoader:
+                     source = f.read()
+                 return source, path, lambda: mtime == getmtime(path)
+     """
++    def _get_filters(self) -> t.List[t.Any]:
++        if not hasattr(self, "_filters"):
++            self._filters = []
++        return self._filters
++
++    def add_filter(self, filter_pattern: t.Any) -> None:
++        self._get_filters().append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        self._get_filters().clear()
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Any) -> t.Iterator[None]:
++        old_filters = list(self._get_filters())
++        for p in patterns:
++            self.add_filter(p)
++        try:
++            yield
++        finally:
++            self._filters = old_filters
++
++    def _is_filtered(self, template: str) -> bool:
++        for filter_pattern in self._get_filters():
++            if isinstance(filter_pattern, str):
++                if fnmatch.fnmatch(template, filter_pattern):
++                    return True
++            elif isinstance(filter_pattern, re.Pattern):
++                if filter_pattern.search(template):
++                    return True
++            elif callable(filter_pattern):
++                if filter_pattern(template):
++                    return True
++            else:
++                raise TypeError(f"Unsupported filter type: {type(filter_pattern)}")
++        return False
+ 
+     #: if set to `False` it indicates that the loader cannot provide access
+     #: to the source of templates.
+@@ -228,7 +267,7 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        return sorted(t for t in found if not self._is_filtered(t))
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -389,7 +428,7 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
+-        return results
++        return sorted(t for t in results if not self._is_filtered(t))
+ 
+ 
+ class DictLoader(BaseLoader):
+@@ -413,7 +452,7 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        return sorted(t for t in self.mapping if not self._is_filtered(t))
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -517,10 +556,13 @@ class PrefixLoader(BaseLoader):
+             raise TemplateNotFound(name) from e
+ 
+     def list_templates(self) -> t.List[str]:
++        result = []
+         result = []
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+-                result.append(prefix + self.delimiter + template)
++                combined = prefix + self.delimiter + template
++                if not self._is_filtered(combined):
++                    result.append(combined)
+         return result
+ 
+ 
+@@ -568,9 +610,8 @@ class ChoiceLoader(BaseLoader):
+     def list_templates(self) -> t.List[str]:
+         found = set()
+         for loader in self.loaders:
+-            found.update(loader.list_templates())
+-        return sorted(found)
+-
++            found.update(t for t in loader.list_templates() if not self._is_filtered(t))
++        return sorted(t for t in found if not self._is_filtered(t))
+ 
+ class _TemplateModule(ModuleType):
+     """Like a normal module but with support for weak references"""
+diff --git a/tests/test_loader_filters.py b/tests/test_loader_filters.py
+new file mode 100644
+index 0000000..b40815e
+--- /dev/null
++++ b/tests/test_loader_filters.py
+@@ -0,0 +1,53 @@
++import pytest
++import re
++from jinja2 import FileSystemLoader, ChoiceLoader, PrefixLoader
++
++def test_loader_filters():
++    loader = FileSystemLoader("tests/res/templates")
++    
++    # Initial
++    templates = loader.list_templates()
++    assert "test.html" in templates
++    assert "foo/test.html" in templates
++    
++    # Add filter
++    loader.add_filter("foo/*")
++    assert "foo/test.html" not in loader.list_templates()
++    assert "test.html" in loader.list_templates()
++    
++    # Clear
++    loader.clear_filters()
++    assert "foo/test.html" in loader.list_templates()
++    
++    # Regex
++    loader.add_filter(re.compile(r"test\.html$"))
++    assert "test.html" not in loader.list_templates()
++    assert "foo/test.html" not in loader.list_templates()
++    
++    # Scope
++    loader.clear_filters()
++    with loader.filter_scope("test.html"):
++        assert "test.html" not in loader.list_templates()
++        assert "foo/test.html" in loader.list_templates()
++    assert "test.html" in loader.list_templates()
++
++def test_choice_loader_filters():
++    loader = ChoiceLoader([
++        FileSystemLoader("tests/res/templates"),
++        FileSystemLoader("tests/res/templates2")
++    ])
++    
++    loader.add_filter("foo/*")
++    templates = loader.list_templates()
++    assert "foo/test.html" not in templates
++    
++def test_prefix_loader_filters():
++    loader = PrefixLoader({
++        "a": FileSystemLoader("tests/res/templates"),
++        "b": FileSystemLoader("tests/res/templates2")
++    })
++    
++    loader.add_filter("a/*")
++    templates = loader.list_templates()
++    assert "a/test.html" not in templates
++    assert "b/foo" in templates

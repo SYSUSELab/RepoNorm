@@ -1,0 +1,93 @@
+diff --git a/dspy/_n4c_compatibility_probe.py b/dspy/_n4c_compatibility_probe.py
+new file mode 100644
+index 000000000..07b839661
+--- /dev/null
++++ b/dspy/_n4c_compatibility_probe.py
+@@ -0,0 +1 @@
++type UnsupportedOnPython310 = int
+diff --git a/dspy/streaming/messages.py b/dspy/streaming/messages.py
+index 9a73f19b8..2926430f0 100644
+--- a/dspy/streaming/messages.py
++++ b/dspy/streaming/messages.py
+@@ -11,9 +11,12 @@ from dspy.utils.callback import BaseCallback
+ 
+ @dataclass
+ class StreamResponse:
++    """A streamed field chunk, with a marker for its final content response."""
++
+     predict_name: str
+     signature_field_name: str
+     chunk: str
++    is_last_chunk: bool = False
+ 
+ 
+ @dataclass
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca7..11b2b8856 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -112,7 +112,17 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
+-                return
++                message = message_after_start_identifier.lstrip()
++                if isinstance(settings.adapter, JSONAdapter) and message.startswith('"'):
++                    message = message[1:]
++                self.field_end_queue.put(message)
++                token = self.flush().rstrip()
++                return StreamResponse(
++                    self.predict_name,
++                    self.signature_field_name,
++                    token,
++                    is_last_chunk=True,
++                )
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+             # We look for the pattern of start_identifier, i.e., "[[ ## {self.signature_field_name} ## ]]" for
+@@ -166,7 +176,12 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++                return StreamResponse(
++                    self.predict_name,
++                    self.signature_field_name,
++                    token,
++                    is_last_chunk=self.stream_end,
++                )
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+diff --git a/tests/streaming/test_last_chunk_contribution.py b/tests/streaming/test_last_chunk_contribution.py
+new file mode 100644
+index 000000000..884b034c4
+--- /dev/null
++++ b/tests/streaming/test_last_chunk_contribution.py
+@@ -0,0 +1,26 @@
++from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
++
++import dspy
++
++
++def chunk(content):
++    return ModelResponseStream(model="test", choices=[StreamingChoices(delta=Delta(content=content))])
++
++
++def test_final_marker_preserves_stream_content_and_marks_only_final_response():
++    listener = dspy.streaming.StreamListener("answer", predict_name="predict")
++    responses = []
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener.receive(chunk("[[ ## answer ## ]]\n"))
++        for value in "abcdefghijk":
++            response = listener.receive(chunk(value))
++            if response is not None:
++                responses.append(response)
++        responses.append(listener.receive(chunk("[[ ## completed ## ]]")))
++
++    assert "".join(response.chunk for response in responses) == "abcdefghijk"
++    assert [response.is_last_chunk for response in responses] == [False, True]
++
++
++def test_three_argument_response_remains_compatible():
++    assert dspy.streaming.StreamResponse("predict", "answer", "text").is_last_chunk is False

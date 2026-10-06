@@ -1,0 +1,107 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..519cea4e 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -2,6 +2,7 @@ import re
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
++import time
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -48,6 +49,12 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Metrics tracking
++        self.chunk_count = 0
++        self.char_count = 0
++        self.first_ts: float | None = None
++        self.last_ts: float | None = None
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -161,13 +168,81 @@ class StreamListener:
+             if re.search(end_identifier, concat_message):
+                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
+                 self.stream_end = True
++                self._reset_counters()
+                 last_token = self.flush()
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                # Record metrics only if stream has not ended
++                if not self.stream_end:
++                    self.chunk_count += 1
++                    char_len = len(token)
++                    self.char_count += char_len
++                    ts = time.time()
++                    if self.first_ts is None:
++                        self.first_ts = ts
++                    self.last_ts = ts
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
++
++    def _reset_counters(self):
++        """Reset all streaming counters and timestamps."""
++        self.chunk_count = 0
++        self.char_count = 0
++        self.first_ts = None
++        self.last_ts = None
++        self.duration_s = None
++        self.avg_chunk_chars = 0.0
++
++
++    def stats(self) -> dict[str, Any]:
++        """Return statistics about the currently active field stream.
++
++        Returns a serialization-friendly dictionary with the following keys:
++        - predict_name: The name of the predictor
++        - field: The signature field name being listened to
++        - chunk_count: Number of chunks emitted for this stream
++        - char_count: Total character count of all emitted chunks
++        - first_ts: Timestamp of the first chunk (seconds since epoch), or None
++        - last_ts: Timestamp of the last chunk (seconds since epoch), or None
++        - duration_s: Duration between first and last chunk, or None
++        - avg_chunk_chars: Average characters per chunk, or 0 if no chunks
++
++        Note: Metrics are reset when the stream ends, regardless of allow_reuse setting.
++        """
++        if self.stream_end:
++            return {
++                "predict_name": self.predict_name,
++                "field": self.signature_field_name,
++                "chunk_count": 0,
++                "char_count": 0,
++                "first_ts": None,
++                "last_ts": None,
++                "duration_s": None,
++                "avg_chunk_chars": 0.0,
++            }
++
++        duration_s = None
++        avg_chunk_chars = 0.0
++
++        if self.first_ts is not None and self.last_ts is not None:
++            duration_s = self.last_ts - self.first_ts
++
++        if self.chunk_count > 0:
++            avg_chunk_chars = self.char_count / self.chunk_count
++
++        return {
++            "predict_name": self.predict_name,
++            "field": self.signature_field_name,
++            "chunk_count": self.chunk_count,
++            "char_count": self.char_count,
++            "first_ts": self.first_ts,
++            "last_ts": self.last_ts,
++            "duration_s": duration_s,
++            "avg_chunk_chars": avg_chunk_chars,
++        }
++
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+ 

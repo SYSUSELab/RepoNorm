@@ -1,0 +1,338 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..c2a513b7 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -32,6 +32,9 @@ def configure_cache(
+     disk_cache_dir: Optional[str] = DISK_CACHE_DIR,
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
++    compress: Optional[str] = None,
++    cull_limit: Optional[int] = None,
++    eviction_policy: Optional[str] = None,
+     enable_litellm_cache: bool = False,
+ ):
+     """Configure the cache for DSPy.
+@@ -42,6 +45,9 @@ def configure_cache(
+         disk_cache_dir: The directory to store the on-disk cache.
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
++        compress: Compression codec for disk cache ("gzip", "zlib", or None).
++        cull_limit: Number of entries to remove when evicting.
++        eviction_policy: Eviction policy ("least-recently-stored", "least-recently-used", etc.).
+         enable_litellm_cache: Whether to enable LiteLLM cache.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+@@ -72,6 +78,9 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        compress,
++        cull_limit,
++        eviction_policy,
+     )
+ 
+ 
+@@ -84,6 +93,9 @@ DSPY_CACHE = Cache(
+     disk_cache_dir=DISK_CACHE_DIR,
+     disk_size_limit_bytes=DISK_CACHE_LIMIT,
+     memory_max_entries=1000000,
++    compress=None,
++    cull_limit=None,
++    eviction_policy=None,
+ )
+ 
+ # Turn off by default to avoid LiteLLM logging during every LM call.
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..1585ffe7 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,7 +1,16 @@
+ import copy
++import gzip
+ import inspect
++import io
+ import logging
++import os
++import os.path as op
++import pickle
++import pickletools
++import sqlite3
++import struct
+ import threading
++from functools import partial as ft
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -9,11 +18,201 @@ from typing import Any, Dict, Optional
+ import cloudpickle
+ import pydantic
+ import ujson
++import zlib
+ from cachetools import LRUCache
+-from diskcache import FanoutCache
++from diskcache import FanoutCache, Disk
++from diskcache.core import MODE_RAW, MODE_BINARY, MODE_TEXT, MODE_PICKLE, ENOVAL, UNKNOWN
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Compression format constants
++DSPC_HEADER = b"DSPC"
++CODEC_UNCOMPRESSED = 0x00
++CODEC_GZIP = 0x01
++CODEC_ZLIB = 0x02
++
++VALID_COMPRESSION_CODECS = {"gzip", "zlib", None}
++
++
++class CompressedDisk(Disk):
++    """Custom disk storage that compresses values using gzip or zlib."""
++
++    def __init__(self, directory, min_file_size=0, pickle_protocol=0, codec=None):
++        """Initialize compressed disk instance.
++
++        :param str directory: directory path
++        :param int min_file_size: minimum size for file use
++        :param int pickle_protocol: pickle protocol for serialization
++        :param str codec: compression codec ("gzip", "zlib", or None)
++        """
++        super().__init__(directory, min_file_size=min_file_size, pickle_protocol=pickle_protocol)
++        self.codec = codec
++
++    def put(self, key):
++        """Convert `key` to fields key and raw for Cache table.
++
++        :param key: key to convert
++        :return: (database key, raw boolean) pair
++
++        """
++        # pylint: disable=unidiomatic-typecheck
++        type_key = type(key)
++
++        if type_key is bytes:
++            return sqlite3.Binary(key), True
++        elif (
++            (type_key is str)
++            or (
++                type_key is int
++                and -9223372036854775808 <= key <= 9223372036854775807
++            )
++            or (type_key is float)
++        ):
++            return key, True
++        else:
++            data = cloudpickle.dumps(key, protocol=self.pickle_protocol)
++            result = pickletools.optimize(data)
++            return sqlite3.Binary(result), False
++
++    def get(self, key, raw):
++        """Convert fields `key` and `raw` from Cache table to key.
++
++        :param key: database key to convert
++        :param bool raw: flag indicating raw database storage
++        :return: corresponding Python key
++
++        """
++        # pylint: disable=unidiomatic-typecheck
++        if raw:
++            return bytes(key) if type(key) is sqlite3.Binary else key
++        else:
++            return cloudpickle.load(io.BytesIO(key))
++
++    def store(self, value, read, key=UNKNOWN):
++        """Convert `value` to fields size, mode, filename, and value for Cache table.
++
++        :param value: value to convert
++        :param bool read: True when value is file-like object
++        :param key: key for item (default UNKNOWN)
++        :return: (size, mode, filename, value) tuple for Cache table
++
++        """
++        # pylint: disable=unidiomatic-typecheck,consider-using-with
++        type_value = type(value)
++        min_file_size = self.min_file_size
++
++        if (
++            (type_value is str and len(value) < min_file_size)
++            or (
++                type_value is int
++                and -9223372036854775808 <= value <= 9223372036854775807
++            )
++            or (type_value is float)
++        ):
++            return 0, MODE_RAW, None, value
++        elif type_value is bytes:
++            if len(value) < min_file_size:
++                return 0, MODE_RAW, None, sqlite3.Binary(value)
++            else:
++                filename, full_path = self.filename(key, value)
++                self._write(full_path, io.BytesIO(value), "xb")
++                return len(value), MODE_BINARY, filename, None
++        elif type_value is str:
++            filename, full_path = self.filename(key, value)
++            self._write(full_path, io.StringIO(value), "x", "UTF-8")
++            size = op.getsize(full_path)
++            return size, MODE_TEXT, filename, None
++        elif read:
++            reader = ft(value.read, 2**22)
++            filename, full_path = self.filename(key, value)
++            iterator = iter(reader, b"")
++            size = self._write(full_path, iterator, "xb")
++            return size, MODE_BINARY, filename, None
++        else:
++            # Serialize value using cloudpickle
++            pickled = cloudpickle.dumps(value, protocol=self.pickle_protocol)
++
++            # Apply compression if codec is specified
++            if self.codec == "gzip":
++                compressed = gzip.compress(pickled)
++                encoded = DSPC_HEADER + bytes([CODEC_GZIP]) + compressed
++            elif self.codec == "zlib":
++                compressed = zlib.compress(pickled)
++                encoded = DSPC_HEADER + bytes([CODEC_ZLIB]) + compressed
++            else:
++                # Uncompressed - keep existing backend representation
++                encoded = pickled
++
++            if len(encoded) < min_file_size:
++                return 0, MODE_PICKLE, None, sqlite3.Binary(encoded)
++            else:
++                filename, full_path = self.filename(key, value)
++                self._write(full_path, io.BytesIO(encoded), "xb")
++                return len(encoded), MODE_PICKLE, filename, None
++
++    def fetch(self, mode, filename, value, read):
++        """Convert fields `mode`, `filename`, and `value` from Cache table to value.
++
++        :param int mode: value mode raw, binary, text, or pickle
++        :param str filename: filename of corresponding value
++        :param value: database value
++        :param bool read: when True, return an open file handle
++        :return: corresponding Python value
++        :raises: IOError if the value cannot be read
++
++        """
++        # pylint: disable=unidiomatic-typecheck,consider-using-with
++        if mode == MODE_RAW:
++            return bytes(value) if type(value) is sqlite3.Binary else value
++        elif mode == MODE_BINARY:
++            if read:
++                return open(op.join(self._directory, filename), "rb")
++            else:
++                with open(op.join(self._directory, filename), "rb") as reader:
++                    return reader.read()
++        elif mode == MODE_TEXT:
++            full_path = op.join(self._directory, filename)
++            with open(full_path, "r", encoding="UTF-8") as reader:
++                return reader.read()
++        elif mode == MODE_PICKLE:
++            if value is None:
++                with open(op.join(self._directory, filename), "rb") as reader:
++                    data = reader.read()
++            else:
++                data = bytes(value)
++
++            # Check for DSPC header
++            if data.startswith(DSPC_HEADER) and len(data) >= 5:
++                codec_byte = data[4]
++                payload = data[5:]
++                if codec_byte == CODEC_GZIP:
++                    decompressed = gzip.decompress(payload)
++                elif codec_byte == CODEC_ZLIB:
++                    decompressed = zlib.decompress(payload)
++                else:
++                    raise ValueError(f"Unknown codec selector: {codec_byte}")
++            else:
++                # Legacy entry without header - treat as regular pickle
++                decompressed = data
++
++            return cloudpickle.loads(decompressed)
++
++
++def _validate_codec(codec):
++    """Validate compression codec.
++
++    :param codec: compression codec to validate
++    :return: validated codec
++    :raises ValueError: if codec is invalid
++    """
++    if codec is None:
++        return None
++    if codec not in VALID_COMPRESSION_CODECS:
++        raise ValueError(
++            f"Invalid compression codec '{codec}'. Must be one of {VALID_COMPRESSION_CODECS}"
++        )
++    return codec
++
+ 
+ class Cache:
+     """DSPy Cache
+@@ -30,7 +229,9 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        compress: Optional[str] = None,
++        cull_limit: Optional[int] = None,
++        eviction_policy: Optional[str] = None,
+     ):
+         """
+         Args:
+@@ -39,7 +240,12 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            compress: Compression codec for disk cache ("gzip", "zlib", or None).
++            cull_limit: Number of entries to remove when evicting.
++            eviction_policy: Eviction policy ("least-recently-stored", "least-recently-used", etc.).
+         """
++        # Validate compression codec
++        self._compress = _validate_codec(compress)
+ 
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+@@ -48,17 +254,45 @@ class Cache:
+         else:
+             self.memory_cache = {}
+         if self.enable_disk_cache:
++            # Build settings dict with optional parameters
++            settings = {}
++            if cull_limit is not None:
++                settings["cull_limit"] = cull_limit
++            if eviction_policy is not None:
++                settings["eviction_policy"] = eviction_policy
++
+             self.disk_cache = FanoutCache(
+                 shards=16,
+                 timeout=10,
+                 directory=disk_cache_dir,
+                 size_limit=disk_size_limit_bytes,
++                disk=CompressedDisk,
++                **settings,
+             )
+         else:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
+ 
++    @property
++    def compress(self) -> Optional[str]:
++        """Get current compression codec."""
++        return self._compress
++
++    def set_compression(self, codec: Optional[str]) -> None:
++        """Set compression codec for subsequent disk writes.
++
++        An invalid update leaves the previous configuration usable.
++
++        :param codec: compression codec ("gzip", "zlib", or None)
++        """
++        try:
++            validated_codec = _validate_codec(codec)
++            self._compress = validated_codec
++        except ValueError:
++            # Invalid codec - leave previous configuration unchanged
++            pass
++
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache

@@ -1,0 +1,170 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 2db769f..f4e617c 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,7 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   ``click.edit`` can launch the editor in a selected working directory.
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..c0e42e1 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        working_dir: str | os.PathLike[str] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.working_dir = None if working_dir is None else os.fspath(working_dir)
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -516,7 +518,12 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            c = subprocess.Popen(
++                f'{editor} "{filename}"',
++                env=environ,
++                shell=True,
++                cwd=self.working_dir,
++            )
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..6118393 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -4,6 +4,7 @@ import collections.abc as cabc
+ import inspect
+ import io
+ import itertools
++import os
+ import sys
+ import typing as t
+ from contextlib import AbstractContextManager
+@@ -650,37 +651,17 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    working_dir: str | os.PathLike[str] | None = None,
+ ) -> t.AnyStr | None:
+-    r"""Edits the given text in the defined editor.  If an editor is given
+-    (should be the full path to the executable but the regular operating
+-    system search path is used for finding the executable) it overrides
+-    the detected editor.  Optionally, some environment variables can be
+-    used.  If the editor is closed without changes, `None` is returned.  In
+-    case a file is edited directly the return value is always `None` and
+-    `require_save` and `extension` are ignored.
+-
+-    If the editor cannot be opened a :exc:`UsageError` is raised.
+-
+-    Note for Windows: to simplify cross-platform usage, the newlines are
+-    automatically converted from POSIX to Windows and vice versa.  As such,
+-    the message here will have ``\n`` as newline markers.
+-
+-    :param text: the text to edit.
+-    :param editor: optionally the editor to use.  Defaults to automatic
+-                   detection.
+-    :param env: environment variables to forward to the editor.
+-    :param require_save: if this is true, then not saving in the editor
+-                         will make the return value become `None`.
+-    :param extension: the extension to tell the editor about.  This defaults
+-                      to `.txt` but changing this might change syntax
+-                      highlighting.
+-    :param filename: if provided it will edit this file instead of the
+-                     provided text contents.  It will not use a temporary
+-                     file as an indirection in that case.
+-    """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        working_dir=working_dir,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_n4c_author_edit_working_dir.py b/tests/test_n4c_author_edit_working_dir.py
+new file mode 100644
+index 0000000..13dbf04
+--- /dev/null
++++ b/tests/test_n4c_author_edit_working_dir.py
+@@ -0,0 +1,62 @@
++import os
++
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code=0):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++def test_working_dir_pathlike_relative_filename_and_env(tmp_path, monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: calls.append((a, k)) or _Process()
++    )
++    click.edit(
++        filename="note.txt",
++        editor="editor --wait",
++        working_dir=tmp_path,
++        env={"CLICK_TEST": "yes"},
++    )
++    args, kwargs = calls[0]
++    assert args[0].endswith(' "note.txt"')
++    assert kwargs["cwd"] == os.fspath(tmp_path)
++    assert kwargs["env"]["CLICK_TEST"] == "yes"
++
++
++def test_default_working_dir_preserves_inherited_directory(monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: calls.append(k) or _Process()
++    )
++    click.edit(filename="note.txt", editor="editor")
++    assert calls[0]["cwd"] is None
++
++
++def test_text_mode_uses_absolute_temporary_filename(tmp_path, monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: calls.append((a, k)) or _Process()
++    )
++    click.edit("text", editor="editor", working_dir=tmp_path, require_save=False)
++    filename = calls[0][0][0].rsplit(' "', 1)[1][:-1]
++    assert os.path.isabs(filename)
++    assert calls[0][1]["cwd"] == os.fspath(tmp_path)
++
++
++def test_missing_working_dir_preserves_error_chain(tmp_path, monkeypatch):
++    def fail(*args, **kwargs):
++        raise FileNotFoundError(os.fspath(kwargs["cwd"]))
++
++    monkeypatch.setattr("subprocess.Popen", fail)
++    with pytest.raises(click.ClickException, match="Editing failed") as exc_info:
++        click.edit(
++            filename="note.txt", editor="editor", working_dir=tmp_path / "missing"
++        )
++    assert isinstance(exc_info.value.__cause__, FileNotFoundError)

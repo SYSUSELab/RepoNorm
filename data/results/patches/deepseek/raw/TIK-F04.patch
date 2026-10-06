@@ -1,0 +1,99 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..df364c3 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,9 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        chunk_size: int | None = None,
++        chunk_overlap: int = 0,
++    ) -> list[int] | list[list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -109,7 +111,40 @@ class Encoding:
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
++
++        With a positive integer `chunk_size`, returns independently encoded character windows.
++        Adjacent windows overlap by `chunk_overlap` characters, which must be an integer satisfying
++        0 <= chunk_overlap < chunk_size. Stop at the first window covering the end; do not emit
++        redundant trailing windows. For example 'abcde', size 3, overlap 1 gives ['abc', 'cde'].
++        Empty text yields [[]]. These are Python character windows, not byte or token windows;
++        concatenating token windows need not equal whole-text BPE.
++
++        Without chunk_size, return ordinary encoding and require overlap zero.
++        Invalid sizes, overlaps and combinations raise ValueError; bool is not an integer option.
++        Apply the existing disallowed-special policy to the complete input before splitting.
++        Allowed special literals wholly within a window encode normally; if cut by a
++        boundary, each window's text is encoded independently.
+         """
++        # Validate chunk_size and chunk_overlap
++        if chunk_size is not None:
++            if isinstance(chunk_size, bool):
++                raise ValueError(f"chunk_size must be a positive integer, got {type(chunk_size).__name__}")
++            if not isinstance(chunk_size, int):
++                raise ValueError(f"chunk_size must be a positive integer, got {type(chunk_size).__name__}")
++            if chunk_size <= 0:
++                raise ValueError(f"chunk_size must be a positive integer, got {chunk_size}")
++            if isinstance(chunk_overlap, bool):
++                raise ValueError(f"chunk_overlap must be an integer, got {type(chunk_overlap).__name__}")
++            if not isinstance(chunk_overlap, int):
++                raise ValueError(f"chunk_overlap must be an integer, got {type(chunk_overlap).__name__}")
++            if chunk_overlap < 0:
++                raise ValueError(f"chunk_overlap must be an integer satisfying 0 <= chunk_overlap < chunk_size, got {chunk_overlap}")
++            if chunk_overlap >= chunk_size:
++                raise ValueError(f"chunk_overlap must be an integer satisfying 0 <= chunk_overlap < chunk_size, got {chunk_overlap}")
++        else:
++            if chunk_overlap != 0:
++                raise ValueError("chunk_overlap must be 0 when chunk_size is None")
++
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -120,17 +155,31 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        try:
+-            return self._core_bpe.encode(text, allowed_special)
+-        except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+-            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++        if chunk_size is None:
++            try:
++                return self._core_bpe.encode(text, allowed_special)
++            except UnicodeEncodeError:
++                # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++                # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++                # fixup for any surrogate pairs that may have sneaked their way into the text.
++                # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++                # string, but given that this is input we want to support, maybe that's okay.
++                # Also we use errors="replace" to handle weird things like lone surrogates.
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                return self._core_bpe.encode(text, allowed_special)
++        else:
++            # Chunked encoding mode
++            if not text:
++                return [[]]
++            step = chunk_size - chunk_overlap
++            result = []
++            for start in range(0, len(text), step):
++                end = min(start + chunk_size, len(text))
++                chunk = text[start:end]
++                result.append(self._core_bpe.encode(chunk, allowed_special))
++                if end >= len(text):
++                    break
++            return result
+ 
+     def encode_to_numpy(
+         self,

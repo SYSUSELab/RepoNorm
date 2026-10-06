@@ -1,0 +1,227 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..2e68df3 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -48,6 +48,61 @@ GETTEXT_FUNCTIONS: t.Tuple[str, ...] = (
+     "pgettext",
+     "npgettext",
+ )
++
++
++def _convert_priority(priority_expr: t.Any) -> int:
++    """Convert priority expression to int, handling invalid/None/negative values."""
++    if priority_expr is None:
++        return 0
++    try:
++        value = int(priority_expr)
++        return max(0, value)
++    except (TypeError, ValueError):
++        return 0
++
++
++def _trans_with_priority(
++    gettext_func: t.Callable[[str], str],
++    ngettext_func: t.Optional[t.Callable[[str, str, int], str]],
++    priority_gettext: t.Optional[t.Callable[[str, int], str]] = None,
++    priority_ngettext: t.Optional[t.Callable[[str, str, int, int], str]] = None,
++    priority: t.Any = 0,
++    singular: str = "",
++    plural: t.Optional[str] = None,
++    num: t.Optional[int] = None,
++) -> str:
++    """Execute trans with priority fallback mechanism."""
++    converted_priority = _convert_priority(priority)
++    max_level = min(converted_priority, 9)
++    
++    # Try levels from 0 to max_level using priority resolvers
++    for level in range(max_level + 1):
++        if plural is not None and ngettext_func is not None:
++            # Plural message
++            if priority_ngettext is not None:
++                result = priority_ngettext(singular, plural, num, level)
++            else:
++                result = ngettext_func(singular, plural, num)
++            
++            # If result differs from source, we found a translation
++            if result != singular and result != plural:
++                return result
++        else:
++            # Singular message
++            if priority_gettext is not None:
++                result = priority_gettext(singular, level)
++            else:
++                result = gettext_func(singular)
++            
++            # If result differs from source, we found a translation
++            if result != singular:
++                return result
++    
++    # Fallback to ordinary gettext if no priority resolver or all levels matched source
++    if plural is not None and ngettext_func is not None:
++        return ngettext_func(singular, plural, num)
++    else:
++        return gettext_func(singular)
+ _ws_re = re.compile(r"\s*\n\s*")
+ 
+ 
+@@ -319,6 +374,8 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], str]] = None,
++        priority_ngettext: t.Optional[t.Callable[[str, str, int, int], str]] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -335,6 +392,13 @@ class InternationalizationExtension(Extension):
+         self.environment.globals.update(
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
++        
++        # Store priority resolvers for trans tag usage
++        self.environment.globals["_priority_gettext"] = priority_gettext
++        self.environment.globals["_priority_ngettext"] = priority_ngettext
++        
++        # Store priority helper for trans tag usage
++        self.environment.globals["_trans_with_priority"] = _trans_with_priority
+ 
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+@@ -363,15 +427,26 @@ class InternationalizationExtension(Extension):
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
++        priority_expr: t.Optional[nodes.Expr] = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
+-                parser.stream.expect("comma")
+-
+             # skip colon for python compatibility
+             if parser.stream.skip_if("colon"):
+                 break
+ 
++            # Peek at the next token to check for duplicate priority
++            if (variables or priority_expr is not None) and parser.stream.current.type == "name":
++                if parser.stream.current.value == "priority" and priority_expr is not None:
++                    parser.fail(
++                        f"translatable parameter {parser.stream.current.value!r} defined twice.",
++                        parser.stream.current.lineno,
++                        exc=TemplateAssertionError,
++                    )
++            
++            if variables or priority_expr is not None:
++                parser.stream.expect("comma")
++
+             token = parser.stream.expect("name")
++            
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -382,7 +457,11 @@ class InternationalizationExtension(Extension):
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                if token.value == "priority":
++                    priority_expr = var
++                else:
++                    variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+@@ -459,6 +538,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            priority_expr,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,23 +594,64 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        priority_expr: t.Optional[nodes.Expr] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+         node: nodes.Expr
+-
++        
+         # no variables referenced?  no need to escape for old style
+         # gettext invocations only if there are vars.
+         if not vars_referenced and not newstyle:
+             singular = singular.replace("%%", "%")
+             if plural:
+                 plural = plural.replace("%%", "%")
+-
++        
++        # If priority is specified, use _trans_with_priority helper
++        if priority_expr is not None:
++            # Build arguments for _trans_with_priority
++            args: t.List[nodes.Expr] = []
++            
++            # gettext function
++            args.append(nodes.Name("gettext", "load"))
++            
++            # ngettext function (may be None for singular)
++            if plural_expr is not None:
++                args.append(nodes.Name("ngettext", "load"))
++            else:
++                args.append(nodes.Const(None))
++            
++            # priority_gettext resolver
++            args.append(nodes.Name("_priority_gettext", "load"))
++            
++            # priority_ngettext resolver
++            args.append(nodes.Name("_priority_ngettext", "load"))
++            
++            # priority expression
++            args.append(priority_expr)
++            
++            # singular string
++            args.append(nodes.Const(singular))
++            
++            # plural string (None for singular-only)
++            if plural_expr is not None:
++                args.append(nodes.Const(plural))
++            else:
++                args.append(nodes.Const(None))
++            
++            # num variable (for plural)
++            if plural_expr is not None:
++                args.append(plural_expr)
++            else:
++                args.append(nodes.Const(None))
++            
++            node = nodes.Call(nodes.Name("_trans_with_priority", "load"), args, [], None, None)
++        
+         # singular only:
+-        if plural_expr is None:
++        elif plural_expr is None:
+             gettext = nodes.Name("gettext", "load")
+             node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+-
++        
+         # singular and plural
+         else:
+             ngettext = nodes.Name("ngettext", "load")
+@@ -541,7 +662,7 @@ class InternationalizationExtension(Extension):
+                 None,
+                 None,
+             )
+-
++        
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+         # handling itself
+@@ -552,7 +673,7 @@ class InternationalizationExtension(Extension):
+                 if num_called_num and key == "num":
+                     continue
+                 node.kwargs.append(nodes.Keyword(key, value))
+-
++        
+         # otherwise do that here
+         else:
+             # mark the return value as safe if we are in an

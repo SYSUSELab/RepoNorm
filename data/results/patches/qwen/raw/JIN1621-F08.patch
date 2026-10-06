@@ -1,0 +1,256 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..6fc0f4d 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -1,13 +1,16 @@
+ """API and implementations for loading templates from different data
+ sources.
+ """
++import fnmatch
+ import importlib.util
+ import os
++import re
+ import sys
+ import typing as t
+ import weakref
+ import zipimport
+ from collections import abc
++from contextlib import contextmanager
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -71,6 +74,89 @@ class BaseLoader:
+     #: .. versionadded:: 2.4
+     has_source_access = True
+ 
++    def __init__(self) -> None:
++        self._filters: t.List[t.Any] = []
++
++    def _matches_filter(self, name: str) -> bool:
++        """Check if a template name matches any registered filter."""
++        for pattern in self._filters:
++            try:
++                if isinstance(pattern, str):
++                    # String uses case-sensitive glob matching
++                    if fnmatch.fnmatch(name, pattern):
++                        return True
++                elif isinstance(pattern, re.Pattern):
++                    # Compiled regex uses search
++                    if pattern.search(name):
++                        return True
++                elif callable(pattern):
++                    # Callable receives the template name and excludes when truthy
++                    if pattern(name):
++                        return True
++                else:
++                    raise TypeError(
++                        f"Unsupported filter type {type(pattern).__name__!r}"
++                    )
++            except Exception:
++                # Exceptions raised while matching propagate unchanged
++                raise
++        return False
++
++    def add_filter(self, filter_pattern: t.Any) -> None:
++        """Add a filter that excludes templates from ``list_templates`` when
++        the filter matches.
++
++        Filters can be:
++
++        - Strings: use case-sensitive glob matching via :func:`fnmatch.fnmatch`.
++        - Compiled regular expressions: use :meth:`re.Pattern.search`.
++        - Callables: receive the template name and should return truthy to exclude.
++
++        Unsupported objects raise :exc:`TypeError`. Exceptions raised while
++        matching propagate unchanged.
++
++        Filters persist until cleared by :meth:`clear_filters`.
++
++        .. versionadded:: 3.1
++        """
++        if not isinstance(filter_pattern, (str, type(re.compile("")))) and not callable(filter_pattern):
++            raise TypeError(
++                f"Unsupported filter type: {type(filter_pattern).__name__}"
++            )
++        self._filters.append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        """Clear all registered filters.
++
++        .. versionadded:: 3.1
++        """
++        self._filters.clear()
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Any) -> t.Iterator[None]:
++        """A synchronous context manager for temporarily adding filters.
++
++        This is useful for temporarily filtering template listings, for example
++        while compiling a selected subset of templates.
++
++        Accepts the same filter inputs as :meth:`add_filter`. Scopes may nest;
++        leaving a scope restores the filter configuration present on entry,
++        including when entering or executing the scope raises an exception.
++        Filter changes made inside the scope are temporary.
++
++        The scope is local to that loader and does not promise thread or
++        asynchronous-task isolation.
++
++        .. versionadded:: 3.1
++        """
++        saved_filters = self._filters[:]
++        try:
++            for pattern in patterns:
++                self.add_filter(pattern)
++            yield
++        finally:
++            self._filters = saved_filters
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+@@ -103,6 +189,43 @@ class BaseLoader:
+         """
+         raise TypeError("this loader cannot iterate over all templates")
+ 
++    def _apply_filters(self, names: t.List[str]) -> t.List[str]:
++        """Apply registered filters to template names."""
++        if not self._filters:
++            return names
++        
++        result = []
++        for name in names:
++            excluded = False
++            for filter_pattern in self._filters:
++                try:
++                    if isinstance(filter_pattern, str):
++                        # Glob matching
++                        import fnmatch
++                        if fnmatch.fnmatch(name, filter_pattern):
++                            excluded = True
++                            break
++                    elif isinstance(filter_pattern, type(re.compile(""))):
++                        # Compiled regex
++                        if filter_pattern.search(name):
++                            excluded = True
++                            break
++                    elif callable(filter_pattern):
++                        # Callable
++                        if filter_pattern(name):
++                            excluded = True
++                            break
++                    else:
++                        raise TypeError(
++                            f"Unsupported filter type: {type(filter_pattern).__name__}"
++                        )
++                except Exception:
++                    # Exceptions propagate unchanged
++                    raise
++            if not excluded:
++                result.append(name)
++        return result
++
+     @internalcode
+     def load(
+         self,
+@@ -181,6 +304,7 @@ class FileSystemLoader(BaseLoader):
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
++        super().__init__()
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+@@ -228,7 +352,7 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        return self._apply_filters(sorted(found))
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -270,6 +394,7 @@ class PackageLoader(BaseLoader):
+         package_path: "str" = "templates",
+         encoding: str = "utf-8",
+     ) -> None:
++        super().__init__()
+         package_path = os.path.normpath(package_path).rstrip(os.path.sep)
+ 
+         # normpath preserves ".", which isn't valid in zip paths.
+@@ -389,7 +514,7 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
+-        return results
++        return self._apply_filters(results)
+ 
+ 
+ class DictLoader(BaseLoader):
+@@ -402,6 +527,7 @@ class DictLoader(BaseLoader):
+     """
+ 
+     def __init__(self, mapping: t.Mapping[str, str]) -> None:
++        super().__init__()
+         self.mapping = mapping
+ 
+     def get_source(
+@@ -413,7 +539,7 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        return self._apply_filters(sorted(self.mapping))
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -445,6 +571,7 @@ class FunctionLoader(BaseLoader):
+             ],
+         ],
+     ) -> None:
++        super().__init__()
+         self.load_func = load_func
+ 
+     def get_source(
+@@ -479,6 +606,7 @@ class PrefixLoader(BaseLoader):
+     def __init__(
+         self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
+     ) -> None:
++        super().__init__()
+         self.mapping = mapping
+         self.delimiter = delimiter
+ 
+@@ -521,7 +649,7 @@ class PrefixLoader(BaseLoader):
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
+-        return result
++        return self._apply_filters(result)
+ 
+ 
+ class ChoiceLoader(BaseLoader):
+@@ -539,6 +667,7 @@ class ChoiceLoader(BaseLoader):
+     """
+ 
+     def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        super().__init__()
+         self.loaders = loaders
+ 
+     def get_source(
+@@ -569,7 +698,7 @@ class ChoiceLoader(BaseLoader):
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
+-        return sorted(found)
++        return self._apply_filters(sorted(found))
+ 
+ 
+ class _TemplateModule(ModuleType):
+@@ -594,6 +723,7 @@ class ModuleLoader(BaseLoader):
+     def __init__(
+         self, path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
+     ) -> None:
++        super().__init__()
+         package_name = f"_jinja2_module_templates_{id(self):x}"
+ 
+         # create a fake module that looks for the templates in the

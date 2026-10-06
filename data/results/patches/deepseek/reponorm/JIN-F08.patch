@@ -1,0 +1,192 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..90fbe85 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1157,13 +1157,28 @@ class _GroupTuple(t.NamedTuple):
+         return tuple.__str__(self)
+ 
+ 
++class _GroupTupleWithCount(t.NamedTuple):
++    grouper: t.Any
++    list: t.List
++    count: int
++
++    # Use the regular tuple repr to hide this subclass if users print
++    # out the value during debugging.
++    def __repr__(self) -> str:
++        return tuple.__repr__(self)
++
++    def __str__(self) -> str:
++        return tuple.__str__(self)
++
++
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    with_counts: bool = False,
++) -> "t.List[t.Union[t.Tuple[t.Any, t.List[V]], t.Tuple[t.Any, t.List[V], int]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+     nested access, like ``"address.city"``. Unlike Python's ``groupby``,
+@@ -1203,6 +1218,19 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    When ``with_counts`` is ``True``, each group is a three-field namedtuple
++    of ``(grouper, list, count)`` that supports ``.grouper``, ``.list``, and
++    ``.count`` attributes. The ``count`` is the number of items in the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for grouper, items, count in users|groupby("city", with_counts=True) %}
++          <li>{{ grouper }} ({{ count }}): {{ items|join(", ") }}
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.6
++        Added the ``with_counts`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+@@ -1210,10 +1238,13 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
++    result = [
++        (key, list(values))
+         for key, values in groupby(sorted(value, key=expr), expr)
+     ]
++    if with_counts:
++        return [_GroupTupleWithCount(key, items, len(items)) for key, items in result]
++    return [_GroupTuple(key, items) for key, items in result]
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1253,17 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    with_counts: bool = False,
++) -> "t.List[t.Union[t.Tuple[t.Any, t.List[V]], t.Tuple[t.Any, t.List[V], int]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++    items = await auto_to_list(value)
++    result = [
++        (key, await auto_to_list(values))
++        for key, values in groupby(sorted(items, key=expr), expr)
+     ]
++    if with_counts:
++        return [_GroupTupleWithCount(key, items, len(items)) for key, items in result]
++    return [_GroupTuple(key, items) for key, items in result]
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..0af071f 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -251,3 +251,34 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++
++@mark_dualiter("items", lambda: [{"foo": 1, "bar": 2}, {"foo": 2, "bar": 3}, {"foo": 1, "bar": 1}, {"foo": 3, "bar": 4}])
++def test_groupby_with_counts(env_async, items):
++    tmpl = env_async.from_string(
++        "{%- for grouper, items, count in items()|groupby('foo', with_counts=True) -%}"
++        "{{ grouper }}:{{ count }}|"
++        "{%- endfor %}"
++    )
++    assert tmpl.render(items=items).split("|") == ["1:2", "2:1", "3:1", ""]
++
++
++@mark_dualiter("items", lambda: [("a", 1), ("a", 2), ("b", 1)])
++def test_groupby_with_counts_tuple_index(env_async, items):
++    tmpl = env_async.from_string(
++        "{%- for group in items()|groupby(0, with_counts=True) -%}"
++        "{{ group[0] }}:{{ group[2] }}|"
++        "{%- endfor %}"
++    )
++    assert tmpl.render(items=items) == "a:2|b:1|"
++
++
++@mark_dualiter("items", lambda: [])
++def test_groupby_with_counts_empty(env_async, items):
++    tmpl = env_async.from_string(
++        "{%- for group in items()|groupby('foo', with_counts=True) -%}"
++        "{{ group.grouper }}|"
++        "{%- else -%}empty|"
++        "{%- endfor %}"
++    )
++    assert tmpl.render(items=items) == "empty|"
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..5ef9077 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -852,3 +852,56 @@ class TestFilter:
+         with pytest.raises(TemplateRuntimeError, match="No filter named 'f'"):
+             t1.render(x=42)
+             t2.render(x=42)
++
++    def test_groupby_with_counts(self, env):
++        tmpl = env.from_string(
++            "{%- for grouper, items, count in [{'foo': 1, 'bar': 2},"
++            "{'foo': 2, 'bar': 3},"
++            "{'foo': 1, 'bar': 1},"
++            "{'foo': 3, 'bar': 4}]|groupby('foo', with_counts=True) -%}"
++            "{{ grouper }}:{{ count }}|"
++            "{%- endfor %}"
++        )
++        assert tmpl.render().split("|") == ["1:2", "2:1", "3:1", ""]
++
++    def test_groupby_with_counts_attr(self, env):
++        tmpl = env.from_string(
++            "{%- for group in [{'foo': 1, 'bar': 2},"
++            "{'foo': 2, 'bar': 3},"
++            "{'foo': 1, 'bar': 1}]|groupby('foo', with_counts=True) -%}"
++            "{{ group.grouper }}:{{ group.count }}|"
++            "{%- endfor %}"
++        )
++        assert tmpl.render().split("|") == ["1:2", "2:1", ""]
++
++    def test_groupby_with_counts_tuple_index(self, env):
++        tmpl = env.from_string(
++            "{%- for group in [('a', 1), ('a', 2), ('b', 1)]|groupby(0, with_counts=True) -%}"
++            "{{ group[0] }}:{{ group[2] }}|"
++            "{%- endfor %}"
++        )
++        assert tmpl.render() == "a:2|b:1|"
++
++    def test_groupby_with_counts_empty(self, env):
++        tmpl = env.from_string(
++            "{%- for group in []|groupby('foo', with_counts=True) -%}"
++            "{{ group.grouper }}|"
++            "{%- else -%}empty|"
++            "{%- endfor %}"
++        )
++        assert tmpl.render() == "empty|"
++
++    def test_groupby_with_counts_default(self, env):
++        tmpl = env.from_string(
++            "{% for city, items, cnt in users|groupby('city', default='NY', with_counts=True) %}"
++            "{{ city }}:{{ cnt }} "
++            "{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "smith", "city": "WA"},
++                {"name": "john"},
++            ]
++        )
++        assert out == "NY:2 WA:1 "

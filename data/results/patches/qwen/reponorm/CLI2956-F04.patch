@@ -1,0 +1,303 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..469cb5d 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import builtins
+ 
+ import collections.abc as cabc
+ import enum
+@@ -2351,6 +2352,11 @@ class Parameter:
+         if self.required and self.value_is_missing(value):
+             raise MissingParameter(ctx=ctx, param=self)
+ 
++        # Check required_if condition for Option instances
++        if isinstance(self, Option) and hasattr(self, "_required_if"):
++            if self._check_required_if_condition(ctx) and self.value_is_missing(value):
++                raise MissingParameter(ctx=ctx, param=self)
++
+         if self.callback is not None:
+             value = self.callback(ctx, self, value)
+ 
+@@ -2507,6 +2513,11 @@ class Option(Parameter):
+     :param help: the help string.
+     :param hidden: hide this option from help outputs.
+     :param attrs: Other command arguments described in :class:`Parameter`.
++    :param required_if: A mapping of normalized parameter names to values that,
++        when matched, make this option required. Alternatively, a callable
++        predicate ``(ctx, param) -> bool`` can be provided. If the target option
++        is missing and the condition evaluates to true, a MissingParameter error
++        is raised. An empty mapping or ``None`` disables the feature.
+ 
+     .. versionchanged:: 8.2
+         ``envvar`` used with ``flag_value`` will always use the ``flag_value``,
+@@ -2549,6 +2560,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        required_if: cabc.Mapping[str, t.Any] | t.Callable[[Context, "Option"], bool] | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2559,6 +2571,25 @@ class Option(Parameter):
+             param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
+         )
+ 
++        # Validate and store required_if
++        if required_if is not None:
++            if callable(required_if):
++                self._required_if = required_if
++            elif isinstance(required_if, dict):
++                # Validate all keys are normalized parameter names (strings)
++                for key in required_if:
++                    if not isinstance(key, str):
++                        raise TypeError(
++                            "required_if keys must be strings, got %r" % builtins.type(key).__name__
++                        )
++                self._required_if = required_if
++            else:
++                raise TypeError(
++                    "required_if must be a mapping, callable, or None"
++                )
++        else:
++            self._required_if = None
++
+         if prompt is True:
+             if self.name is None:
+                 raise TypeError("'name' is required with 'prompt=True'.")
+@@ -2662,6 +2693,35 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++    def _check_required_if_condition(self, ctx: Context) -> bool:
++        """Check if required_if condition is met.
++
++        Returns True if the target option should be required based on
++        the current context and parameter values.
++        """
++        if self._required_if is None:
++            return False
++        # Empty mapping means no condition, so not required
++        if isinstance(self._required_if, dict) and len(self._required_if) == 0:
++            return False
++
++        # Check if it's a callable predicate
++        if callable(self._required_if):
++            try:
++                return self._required_if(ctx, self)
++            except Exception:
++                # If predicate raises an exception, treat as not required
++                return False
++
++        # It's a mapping of param_name -> value pairs
++        for param_name, expected_value in self._required_if.items():
++            # Get the actual value from ctx.params
++            actual_value = ctx.params.get(param_name)
++            if actual_value != expected_value:
++                return False
++
++        return True
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index e5e5119..8f3d797 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -26,6 +26,7 @@ click.echo(json.dumps(rv))
+ """
+ 
+ ALLOWED_IMPORTS = {
++    "builtins",
+     "__future__",
+     "weakref",
+     "os",
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..5a879a9 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,182 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++# Tests for required_if functionality
++
++import click
++from click.testing import CliRunner
++
++
++def test_required_if_mapping_basic():
++    """Test that required_if with a mapping works correctly."""
++    @click.command()
++    @click.option("--auth-mode", default=None)
++    @click.option("--api-key", required_if={"auth_mode": "api"})
++    def cmd(auth_mode, api_key):
++        click.echo(f"auth_mode={auth_mode}, api_key={api_key}")
++
++    runner = CliRunner()
++    
++    # When auth_mode is not "api", api_key should be optional
++    result = runner.invoke(cmd, ["--auth-mode", "basic"])
++    assert result.exit_code == 0
++    assert "auth_mode=basic, api_key=None" in result.output
++    
++    # When auth_mode is "api", api_key should be required
++    result = runner.invoke(cmd, ["--auth-mode", "api"])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output or "--api-key" in result.output
++    
++    # When both are provided, it should work
++    result = runner.invoke(cmd, ["--auth-mode", "api", "--api-key", "secret123"])
++    assert result.exit_code == 0
++    assert "auth_mode=api, api_key=secret123" in result.output
++
++
++def test_required_if_callable_predicate():
++    """Test that required_if with a callable predicate works correctly."""
++    @click.command()
++    @click.option("--count", type=int, default=0)
++    @click.option("--verbose", is_flag=True, default=None, required_if=lambda ctx, param: ctx.params.get("count", 0) > 5)
++    def cmd(count, verbose):
++        click.echo(f"count={count}, verbose={verbose}")
++
++    runner = CliRunner()
++    
++    # When count <= 5, verbose should be optional
++    result = runner.invoke(cmd, ["--count", "3"])
++    assert result.exit_code == 0
++    assert "count=3, verbose=None" in result.output
++    
++    # When count > 5, verbose should be required
++    result = runner.invoke(cmd, ["--count", "10"])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output or "--verbose" in result.output
++    
++    # When count > 5 and verbose is provided, it should work
++    result = runner.invoke(cmd, ["--count", "10", "--verbose"])
++    assert result.exit_code == 0
++    assert "count=10, verbose=True" in result.output
++
++
++def test_required_if_invalid_type():
++    """Test that required_if raises TypeError for invalid types."""
++    try:
++        @click.command()
++        @click.option("--test", required_if="invalid")
++        def cmd(test):
++            pass
++        assert False, "Should have raised TypeError"
++    except TypeError as e:
++        assert "required_if must be a mapping, callable, or None" in str(e)
++
++
++def test_required_if_empty_mapping():
++    """Test that an empty mapping does not require anything."""
++    @click.command()
++    @click.option("--optional", required_if={})
++    def cmd(optional):
++        click.echo(f"optional={optional}")
++
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert "optional=None" in result.output
++
++
++def test_required_if_none():
++    """Test that None disables required_if."""
++    @click.command()
++    @click.option("--optional", required_if=None)
++    def cmd(optional):
++        click.echo(f"optional={optional}")
++
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert "optional=None" in result.output
++
++
++def test_required_if_non_string_key():
++    """Test that non-string keys raise TypeError."""
++    try:
++        @click.command()
++        @click.option("--test", required_if={123: "value"})
++        def cmd(test):
++            pass
++        assert False, "Should have raised TypeError"
++    except TypeError as e:
++        assert "required_if keys must be strings" in str(e)
++
++
++def test_required_if_with_default_value():
++    """Test that required_if respects existing default values."""
++    @click.command()
++    @click.option("--mode", default="internal")
++    @click.option("--external-key", required_if={"mode": "external"})
++    def cmd(mode, external_key):
++        click.echo(f"mode={mode}, external_key={external_key}")
++
++    runner = CliRunner()
++    
++    # With default mode="internal", external_key should not be required
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert "mode=internal, external_key=None" in result.output
++    
++    # With explicit mode="external", external_key should be required
++    result = runner.invoke(cmd, ["--mode", "external"])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output or "--external-key" in result.output
++
++
++def test_required_if_with_envvar():
++    """Test that required_if works with environment variables."""
++    @click.command()
++    @click.option("--mode", envvar="APP_MODE")
++    @click.option("--key", required_if={"mode": "prod"})
++    def cmd(mode, key):
++        click.echo(f"mode={mode}, key={key}")
++
++    runner = CliRunner()
++    
++    # Without env var, key should not be required
++    result = runner.invoke(cmd, [], env={"APP_MODE": ""})
++    assert result.exit_code == 0
++    
++    # With env var set to prod, key should be required
++    result = runner.invoke(cmd, [], env={"APP_MODE": "prod"})
++    assert result.exit_code != 0
++    assert "Missing option" in result.output or "--key" in result.output
++
++
++def test_required_if_multiple_conditions():
++    """Test that all conditions in the mapping must match."""
++    @click.command()
++    @click.option("--mode", default="dev")
++    @click.option("--env", default="local")
++    @click.option("--key", required_if={"mode": "prod", "env": "cloud"})
++    def cmd(mode, env, key):
++        click.echo(f"mode={mode}, env={env}, key={key}")
++
++    runner = CliRunner()
++    
++    # Only mode=prod, key should not be required
++    result = runner.invoke(cmd, ["--mode", "prod"])
++    assert result.exit_code == 0
++    
++    # Only env=cloud, key should not be required
++    result = runner.invoke(cmd, ["--env", "cloud"])
++    assert result.exit_code == 0
++    
++    # Both mode=prod and env=cloud, key should be required
++    result = runner.invoke(cmd, ["--mode", "prod", "--env", "cloud"])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output or "--key" in result.output
++    
++    # All conditions met and key provided, should work
++    result = runner.invoke(cmd, ["--mode", "prod", "--env", "cloud", "--key", "secret"])
++    assert result.exit_code == 0
++    assert "mode=prod, env=cloud, key=secret" in result.output

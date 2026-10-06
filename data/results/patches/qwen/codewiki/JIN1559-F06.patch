@@ -1,0 +1,273 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..11f5574 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -4,6 +4,9 @@ import re
+ import typing as t
+ 
+ from markupsafe import Markup
++from collections import deque
++from threading import Lock
++
+ 
+ from . import defaults
+ from . import nodes
+@@ -93,6 +96,13 @@ class Extension:
+         rv = object.__new__(self.__class__)
+         rv.__dict__.update(self.__dict__)
+         rv.environment = environment
++        # Each overlay has independent cache state (for i18n extension)
++        if hasattr(self, "_cache") and self._cache is not None:
++            rv._cache = _TranslationCache(
++                self._cache.capacity, self._cache.partition
++            )
++        elif hasattr(self, "_cache"):
++            rv._cache = None
+         return rv
+ 
+     def preprocess(
+@@ -242,6 +252,161 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++
++class _TranslationCache:
++    """A bounded LRU cache for translation callables.
++
++    Each Environment and overlay has independent cache state.
++    Caching works before old/new-style formatting and autoescaping,
++    so formatting variables are not part of raw provider keys.
++    """
++
++    def __init__(self, capacity: int, partition: t.Any) -> None:
++        self.capacity = capacity
++        self.partition = partition
++        self._lock = Lock()
++        self._cache: t.Dict[t.Tuple, t.Any] = {}
++        self._queue: t.Deque[t.Tuple] = deque()
++        self._postinit()
++
++    def _postinit(self) -> None:
++        self._popleft = self._queue.popleft
++        self._pop = self._queue.pop
++        self._remove = self._queue.remove
++        self._append = self._queue.append
++
++    def get(self, key: t.Tuple) -> t.Optional[t.Any]:
++        """Get a cached value or None if not found."""
++        with self._lock:
++            if key in self._cache:
++                # Move to end (most recently used)
++                try:
++                    self._remove(key)
++                except ValueError:
++                    pass
++                self._append(key)
++                return self._cache[key]
++            return None
++
++    def set(self, key: t.Tuple, value: t.Any) -> None:
++        """Set a cached value."""
++        with self._lock:
++            if key in self._cache:
++                self._remove(key)
++            elif len(self._cache) == self.capacity:
++                del self._cache[self._popleft()]
++            self._append(key)
++            self._cache[key] = value
++
++    def clear(self) -> None:
++        """Clear all cache entries."""
++        with self._lock:
++            self._cache.clear()
++            self._queue.clear()
++
++    def resize(self, capacity: int) -> None:
++        """Resize the cache. Capacity of 0 disables the cache."""
++        if capacity < 0:
++            raise ValueError(f"Cache capacity must be non-negative (got {capacity})")
++        with self._lock:
++            self.capacity = capacity
++            if capacity == 0:
++                self._cache.clear()
++                self._queue.clear()
++
++    def set_partition(self, partition: t.Any) -> None:
++        """Change the partition and clear old entries."""
++        with self._lock:
++            self.partition = partition
++            self._cache.clear()
++            self._queue.clear()
++
++
++
++def _wrap_gettext(
++    func: t.Callable[[str], str],
++    cache: t.Optional[_TranslationCache],
++) -> t.Callable[..., str]:
++    """Wrap gettext to use caching."""
++    @pass_context
++    def wrapped(__context: Context, __string: str, **variables: t.Any) -> str:
++        if cache is not None:
++            key = ("gettext", __string, cache.partition)
++            result = cache.get(key)
++            if result is not None:
++                return result
++
++        rv = func(__string)
++        if cache is not None:
++            cache.set(key, rv)
++        return rv
++
++    return wrapped
++
++
++def _wrap_ngettext(
++    func: t.Callable[[str, str, int], str],
++    cache: t.Optional[_TranslationCache],
++) -> t.Callable[..., str]:
++    """Wrap ngettext to use caching."""
++    @pass_context
++    def wrapped(__context: Context, __singular: str, __plural: str, __count: int, **variables: t.Any) -> str:
++        if cache is not None:
++            key = ("ngettext", __singular, __plural, __count, cache.partition)
++            result = cache.get(key)
++            if result is not None:
++                return result
++
++        rv = func(__singular, __plural, __count)
++        if cache is not None:
++            cache.set(key, rv)
++        return rv
++
++    return wrapped
++
++
++def _wrap_pgettext(
++    func: t.Callable[[str, str], str],
++    cache: t.Optional[_TranslationCache],
++) -> t.Callable[..., str]:
++    """Wrap pgettext to use caching."""
++    @pass_context
++    def wrapped(__context: Context, __context_str: str, __string: str, **variables: t.Any) -> str:
++        if cache is not None:
++            key = ("pgettext", __context_str, __string, cache.partition)
++            result = cache.get(key)
++            if result is not None:
++                return result
++
++        rv = func(__context_str, __string)
++        if cache is not None:
++            cache.set(key, rv)
++        return rv
++
++    return wrapped
++
++
++def _wrap_npgettext(
++    func: t.Callable[[str, str, str, int], str],
++    cache: t.Optional[_TranslationCache],
++) -> t.Callable[..., str]:
++    """Wrap npgettext to use caching."""
++    @pass_context
++    def wrapped(__context: Context, __context_str: str, __singular: str, __plural: str, __count: int, **variables: t.Any) -> str:
++        if cache is not None:
++            key = ("npgettext", __context_str, __singular, __plural, __count, cache.partition)
++            result = cache.get(key)
++            if result is not None:
++                return result
++
++        rv = func(__context_str, __singular, __plural, __count)
++        if cache is not None:
++            cache.set(key, rv)
++        return rv
++
++    return wrapped
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -256,6 +421,7 @@ class InternationalizationExtension(Extension):
+ 
+     def __init__(self, environment: Environment) -> None:
+         super().__init__(environment)
++        self._cache = None
+         environment.globals["_"] = _gettext_alias
+         environment.extend(
+             install_gettext_translations=self._install,
+@@ -263,6 +429,9 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            set_translation_cache_partition=self.set_translation_cache_partition,
++            clear_translation_cache=self.clear_translation_cache,
++            resize_translation_cache=self.resize_translation_cache,
+             newstyle_gettext=False,
+         )
+ 
+@@ -319,9 +488,22 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Any = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
++
++        # Clear existing cache when installing new callables
++        if self._cache is not None:
++            self._cache.clear()
++
++        # Create new cache if requested
++        if cache_size > 0:
++            self._cache = _TranslationCache(cache_size, cache_partition)
++        else:
++            self._cache = None
++
+         if self.environment.newstyle_gettext:  # type: ignore
+             gettext = _make_new_gettext(gettext)
+             ngettext = _make_new_ngettext(ngettext)
+@@ -332,6 +514,15 @@ class InternationalizationExtension(Extension):
+             if npgettext is not None:
+                 npgettext = _make_new_npgettext(npgettext)
+ 
++        # Wrap functions with caching if cache is enabled
++        if self._cache is not None:
++            gettext = _wrap_gettext(gettext, self._cache)
++            ngettext = _wrap_ngettext(ngettext, self._cache)
++            if pgettext is not None:
++                pgettext = _wrap_pgettext(pgettext, self._cache)
++            if npgettext is not None:
++                npgettext = _wrap_npgettext(npgettext, self._cache)
++
+         self.environment.globals.update(
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
+@@ -340,6 +531,25 @@ class InternationalizationExtension(Extension):
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+ 
++    def set_translation_cache_partition(self, partition: t.Any) -> None:
++        """Set a new cache partition and clear old entries."""
++        if self._cache is not None:
++            self._cache.set_partition(partition)
++
++    def clear_translation_cache(self) -> None:
++        """Clear all cached translation results."""
++        if self._cache is not None:
++            self._cache.clear()
++
++    def resize_translation_cache(self, capacity: int) -> None:
++        """Resize the cache to a new capacity. Zero disables the cache."""
++        if self._cache is not None:
++            self._cache.resize(capacity)
++        elif capacity == 0:
++            pass  # Already disabled
++        else:
++            raise ValueError(f"Cache must be enabled to resize (got capacity={capacity})")
++
+     def _extract(
+         self,
+         source: t.Union[str, nodes.Template],

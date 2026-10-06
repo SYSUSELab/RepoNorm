@@ -1,0 +1,172 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..63df1a3 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -263,6 +263,7 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            extract_translations_with_metadata=self._extract_with_metadata,
+             newstyle_gettext=False,
+         )
+ 
+@@ -351,6 +352,19 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++    def _extract_with_metadata(
++        self,
++        source: t.Union[str, nodes.Template],
++        source_name: t.Optional[str] = None,
++        gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        if isinstance(source, str):
++            parsed = self.environment.parse(source)
++        else:
++            parsed = source
++            source = None
++        return extract_from_ast_with_metadata(parsed, gettext_functions, source=source)
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+@@ -362,9 +376,10 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        metadata: t.Dict[str, str] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if variables or metadata:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -379,6 +394,30 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            if token.value in ("note", "created", "modified"):
++                if token.value in metadata:
++                    parser.fail(
++                        f"translatable metadata key {token.value!r} defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                if parser.stream.current.type != "assign":
++                    parser.fail(
++                        f"expected an assignment for metadata key {token.value!r}.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                next(parser.stream)
++                var = parser.parse_expression()
++                if not isinstance(var, nodes.Const) or not isinstance(var.value, str):
++                    parser.fail(
++                        f"metadata key {token.value!r} expects a string value.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                metadata[token.value] = var.value
++                continue
++
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+@@ -459,6 +498,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            metadata,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +554,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        metadata: t.Dict[str, str],
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -568,7 +609,9 @@ class InternationalizationExtension(Extension):
+                         ]
+                     ),
+                 )
+-        return nodes.Output([node])
++        output = nodes.Output([node])
++        output.metadata = metadata
++        return output
+ 
+ 
+ class ExprStmtExtension(Extension):
+@@ -715,6 +758,69 @@ def extract_from_ast(
+         yield node.lineno, node.node.name, out
+ 
+ 
++
++def extract_from_ast_with_metadata(
++    ast: nodes.Template,
++    gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++    source: t.Optional[str] = None,
++) -> t.Iterator[t.Dict[str, t.Any]]:
++    """Extract localizable strings with metadata from the given template node.
++
++    Returns an iterator of record mappings for metadata-bearing translation blocks.
++    Each record contains ``source``, the block ``lineno``, a copied ``metadata``
++    mapping, and ``messages``.
++
++    Each message contains the ordinary extraction ``lineno``, gettext ``function``,
++    and extracted ``message`` value.
++    """
++    from copy import deepcopy
++
++    for node in ast.find_all(nodes.Output):
++        metadata = getattr(node, "metadata", None)
++        if not metadata:
++            continue
++
++        messages = []
++        for call_node in node.find_all(nodes.Call):
++            if (
++                not isinstance(call_node.node, nodes.Name)
++                or call_node.node.name not in gettext_functions
++            ):
++                continue
++
++            strings: t.List[t.Optional[str]] = []
++            for arg in call_node.args:
++                if isinstance(arg, nodes.Const) and isinstance(arg.value, str):
++                    strings.append(arg.value)
++                else:
++                    strings.append(None)
++
++            for _ in call_node.kwargs:
++                strings.append(None)
++            if call_node.dyn_args is not None:
++                strings.append(None)
++            if call_node.dyn_kwargs is not None:
++                strings.append(None)
++
++            if len(strings) == 1:
++                out: t.Union[t.Optional[str], t.Tuple[t.Optional[str], ...]] = strings[0]
++            else:
++                out = tuple(strings)
++
++            messages.append({
++                "lineno": call_node.lineno,
++                "function": call_node.node.name,
++                "message": out,
++            })
++
++        yield {
++            "source": source if source else ast,
++            "lineno": node.lineno,
++            "metadata": deepcopy(metadata),
++            "messages": messages,
++        }
++
++
+ class _CommentFinder:
+     """Helper class to find comments in a token stream.  Can only
+     find comments for gettext calls forwards.  Once the comment

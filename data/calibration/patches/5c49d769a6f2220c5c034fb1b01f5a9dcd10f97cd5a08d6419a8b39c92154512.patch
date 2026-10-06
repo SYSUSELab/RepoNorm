@@ -1,0 +1,416 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4bb..e68ae2ff0 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,3 +1,4 @@
++import hashlib
+ import random
+ 
+ import dspy
+@@ -15,20 +16,20 @@ from dspy.teleprompt.utils import get_prompt_model, get_signature
+ MAX_INSTRUCT_IN_HISTORY = 5  # 10
+ 
+ TIPS = {
+-        "none": "",
+-        "creative": "Don't be afraid to be creative when creating the new instruction!",
+-        "simple": "Keep the instruction clear and concise.",
+-        "description": "Make sure your instruction is very informative and descriptive.",
+-        "high_stakes": "The instruction should include a high stakes scenario in which the LM must solve the task!",
+-        "persona": 'Include a persona that is relevant to the task in the instruction (ie. "You are a ...")',
+-    }
++    "none": "",
++    "creative": "Don't be afraid to be creative when creating the new instruction!",
++    "simple": "Keep the instruction clear and concise.",
++    "description": "Make sure your instruction is very informative and descriptive.",
++    "high_stakes": "The instruction should include a high stakes scenario in which the LM must solve the task!",
++    "persona": 'Include a persona that is relevant to the task in the instruction (ie. "You are a ...")',
++}
+ 
+ ### SIGNATURES USED TO HELP WITH INSTRUCTION GENERATION ###
+ 
++
+ class DescribeProgram(dspy.Signature):
+-    (
+-        """Below is some pseudo-code for a pipeline that solves tasks with calls to language models. Please describe what type of task this program appears to be designed to solve, and how it appears to work."""
+-    )
++    """Below is some pseudo-code for a pipeline that solves tasks with calls to language models. Please describe what type of task this program appears to be designed to solve, and how it appears to work."""
++
+     program_code = dspy.InputField(
+         format=str,
+         desc="Pseudocode for a language model program designed to solve a particular task.",
+@@ -43,12 +44,16 @@ class DescribeProgram(dspy.Signature):
+         desc="Describe what task the program is designed to solve, and how it goes about solving this task.",
+         prefix="SUMMARY OF PROGRAM ABOVE:",
+     )
++    cache_salt = dspy.InputField(
++        format=str,
++        desc="For caching only. Ignored by the model.",
++        prefix="CACHE SALT (IGNORE):",
++    )
+ 
+ 
+ class DescribeModule(dspy.Signature):
+-    (
+-        """Below is some pseudo-code for a pipeline that solves tasks with calls to language models. Please describe the purpose of one of the specified module in this pipeline."""
+-    )
++    """Below is some pseudo-code for a pipeline that solves tasks with calls to language models. Please describe the purpose of one of the specified module in this pipeline."""
++
+     program_code = dspy.InputField(
+         format=str,
+         desc="Pseudocode for a language model program designed to solve a particular task.",
+@@ -64,12 +69,18 @@ class DescribeModule(dspy.Signature):
+         prefix="SUMMARY OF PROGRAM ABOVE:",
+     )
+     module = dspy.InputField(
+-        desc="The module in the program that we want to describe.", prefix="MODULE:",
++        desc="The module in the program that we want to describe.",
++        prefix="MODULE:",
+     )
+     module_description = dspy.OutputField(
+         desc="Description of the module's role in the broader program.",
+         prefix="MODULE DESCRIPTION:",
+     )
++    cache_salt = dspy.InputField(
++        format=str,
++        desc="For caching only. Ignored by the model.",
++        prefix="CACHE SALT (IGNORE):",
++    )
+ 
+ 
+ def generate_instruction_class(
+@@ -80,9 +91,8 @@ def generate_instruction_class(
+     use_tip=True,
+ ):
+     class GenerateSingleModuleInstruction(dspy.Signature):
+-        (
+-            """Use the information below to learn about a task that we are trying to solve using calls to an LM, then generate a new instruction that will be used to prompt a Language Model to better solve the task."""
+-        )
++        """Use the information below to learn about a task that we are trying to solve using calls to an LM, then generate a new instruction that will be used to prompt a Language Model to better solve the task."""
++
+         if use_dataset_summary:
+             dataset_description = dspy.InputField(
+                 desc="A description of the dataset that we are using.",
+@@ -99,10 +109,12 @@ def generate_instruction_class(
+                 prefix="PROGRAM DESCRIPTION:",
+             )
+             module = dspy.InputField(
+-                desc="The module to create an instruction for.", prefix="MODULE:",
++                desc="The module to create an instruction for.",
++                prefix="MODULE:",
+             )
+             module_description = dspy.InputField(
+-                desc="Description of the module to create an instruction for.", prefix="MODULE DESCRIPTION:",
++                desc="Description of the module to create an instruction for.",
++                prefix="MODULE DESCRIPTION:",
+             )
+         task_demos = dspy.InputField(
+             format=str,
+@@ -116,7 +128,9 @@ def generate_instruction_class(
+                 prefix="PREVIOUS INSTRUCTIONS:",
+             )
+         basic_instruction = dspy.InputField(
+-            format=str, desc="Basic instruction.", prefix="BASIC INSTRUCTION:",
++            format=str,
++            desc="Basic instruction.",
++            prefix="BASIC INSTRUCTION:",
+         )
+         if use_tip:
+             tip = dspy.InputField(
+@@ -129,10 +143,19 @@ def generate_instruction_class(
+             prefix="PROPOSED INSTRUCTION:",
+         )
+ 
++        # Always include cache salt for caching purposes
++        cache_salt = dspy.InputField(
++            format=str,
++            desc="For caching only. Ignored by the model.",
++            prefix="CACHE SALT (IGNORE):",
++        )
++
+     return dspy.Predict(GenerateSingleModuleInstruction)
+ 
++
+ ### CLASS RESPONSIBLE FOR GENERATING A NEW INSTRUCTION, USING THE HELPER SIGNATURES ABOVE ###
+ 
++
+ class GenerateModuleInstruction(dspy.Module):
+     def __init__(
+         self,
+@@ -173,7 +196,11 @@ class GenerateModuleInstruction(dspy.Module):
+         data_summary,
+         num_demos_in_context=3,
+         tip=None,
++        cache_salt=None,
+     ):
++        if cache_salt is None:
++            cache_salt = hashlib.sha256(str(random.random()).encode()).hexdigest()[:13]
++
+         def gather_examples_from_sets(candidate_sets, max_examples):
+             """Helper function to gather up to augmented examples from given sets."""
+             count = 0
+@@ -193,9 +220,9 @@ class GenerateModuleInstruction(dspy.Module):
+         if self.use_task_demos:
+             # Combine current and adjacent sets
+             adjacent_sets = (
+-                [demo_candidates[pred_i][demo_set_i]] +
+-                demo_candidates[pred_i][demo_set_i + 1:] +
+-                demo_candidates[pred_i][:demo_set_i]
++                [demo_candidates[pred_i][demo_set_i]]
++                + demo_candidates[pred_i][demo_set_i + 1 :]
++                + demo_candidates[pred_i][:demo_set_i]
+             )
+ 
+             # Gather examples up to the required count
+@@ -212,9 +239,14 @@ class GenerateModuleInstruction(dspy.Module):
+         module_description = "Not provided"
+         if self.program_aware:
+             try:
++                # Use the same cache salt for all calls in this instruction proposal
++                current_cache_salt = cache_salt
++
+                 program_description = strip_prefix(
+                     self.describe_program(
+-                        program_code=self.program_code_string, program_example=task_demos,
++                        program_code=self.program_code_string,
++                        program_example=task_demos,
++                        cache_salt=current_cache_salt,
+                     ).program_description,
+                 )
+                 if self.verbose:
+@@ -232,7 +264,9 @@ class GenerateModuleInstruction(dspy.Module):
+                     else:
+                         outputs.append(field_name)
+ 
+-                module_code = f"{program.predictors()[pred_i].__class__.__name__}({', '.join(inputs)}) -> {', '.join(outputs)}"
++                module_code = (
++                    f"{program.predictors()[pred_i].__class__.__name__}({', '.join(inputs)}) -> {', '.join(outputs)}"
++                )
+ 
+                 module_description = self.describe_module(
+                     program_code=self.program_code_string,
+@@ -240,6 +274,7 @@ class GenerateModuleInstruction(dspy.Module):
+                     program_example=task_demos,
+                     module=module_code,
+                     max_depth=10,
++                    cache_salt=current_cache_salt,
+                 ).module_description
+             except Exception as e:
+                 if self.verbose:
+@@ -260,15 +295,25 @@ class GenerateModuleInstruction(dspy.Module):
+             tip=tip,
+             basic_instruction=basic_instruction,
+             previous_instructions=previous_instructions,
++            cache_salt=cache_salt,
+         )
+ 
+         proposed_instruction = strip_prefix(instruct.proposed_instruction)
+ 
+         return dspy.Prediction(proposed_instruction=proposed_instruction)
+ 
++
+ ### CLASS USED TO GENERATE THE FULL SET OF INSTRUCTIONS GIVEN THE SPECIFIED CRITERIA ###
+ 
++
+ class GroundedProposer(Proposer):
++    """Propose grounded instructions without mutating prompt-model settings.
++
++    Each proposal carries a reproducible, ignorable cache salt through its
++    enabled description and instruction stages so distinct proposals do not
++    accidentally reuse the same cached model response.
++    """
++
+     def __init__(
+         self,
+         prompt_model,
+@@ -278,13 +323,13 @@ class GroundedProposer(Proposer):
+         use_dataset_summary=True,
+         program_aware=True,
+         use_task_demos=True,
+-        num_demos_in_context = 3,
++        num_demos_in_context=3,
+         use_instruct_history=True,
+         use_tip=True,
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
+     ):
+         super().__init__()
+         self.program_aware = program_aware
+@@ -293,10 +338,11 @@ class GroundedProposer(Proposer):
+         self.num_demos_in_context = num_demos_in_context
+         self.use_instruct_history = use_instruct_history
+         self.use_tip = use_tip
+-        self.set_tip_randomly=set_tip_randomly
+-        self.set_history_randomly=set_history_randomly
++        self.set_tip_randomly = set_tip_randomly
++        self.set_history_randomly = set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        self._proposal_counter = 0
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -305,16 +351,18 @@ class GroundedProposer(Proposer):
+             try:
+                 self.program_code_string = get_dspy_source_code(program)
+                 if self.verbose:
+-                    print("SOURCE CODE:",self.program_code_string)
++                    print("SOURCE CODE:", self.program_code_string)
+             except Exception as e:
+                 print(f"Error getting source code: {e}.\n\nRunning without program aware proposer.")
+                 self.program_aware = False
+ 
+-        self.data_summary  = None
++        self.data_summary = None
+         if self.use_dataset_summary:
+             try:
+                 self.data_summary = create_dataset_summary(
+-                    trainset=trainset, view_data_batch_size=view_data_batch_size, prompt_model=prompt_model,
++                    trainset=trainset,
++                    view_data_batch_size=view_data_batch_size,
++                    prompt_model=prompt_model,
+                 )
+                 if self.verbose:
+                     print(f"DATA SUMMARY: {self.data_summary}")
+@@ -323,14 +371,19 @@ class GroundedProposer(Proposer):
+                 self.use_dataset_summary = False
+                 print("")
+ 
++    def _cache_salt(self, pred_i: int, demo_set_i: int) -> str:
++        self._proposal_counter += 1
++        identity = f"{self.rng.random()}:{pred_i}:{demo_set_i}:{self._proposal_counter}"
++        return hashlib.sha256(identity.encode()).hexdigest()[:13]
++
+     def propose_instructions_for_program(
+         self,
+         trainset,
+         program,
+         demo_candidates,
+         trial_logs,
+-        N, # noqa: N803
+-        T, # noqa: N803
++        N,  # noqa: N803
++        T,  # noqa: N803
+     ) -> list[str]:
+         """This method is responsible for returning the full set of new instructions for our program, given the specified criteria."""
+ 
+@@ -354,7 +407,7 @@ class GroundedProposer(Proposer):
+ 
+         # Create an instruction for each predictor
+         for pred_i, predictor in enumerate(program.predictors()):
+-            for demo_set_i in range(num_demos)[:min(N, num_demos)]:
++            for demo_set_i in range(num_demos)[: min(N, num_demos)]:
+                 if pred_i not in proposed_instructions:
+                     proposed_instructions[pred_i] = []
+                 selected_tip = None
+@@ -390,7 +443,7 @@ class GroundedProposer(Proposer):
+         program,
+         predictor,
+         pred_i,
+-        T, # noqa: N803
++        T,  # noqa: N803
+         demo_candidates,
+         demo_set_i,
+         trial_logs,
+@@ -400,7 +453,10 @@ class GroundedProposer(Proposer):
+ 
+         # Create an instruction history string for our predictor
+         instruction_history = create_predictor_level_history_string(
+-            program, pred_i, trial_logs, MAX_INSTRUCT_IN_HISTORY,
++            program,
++            pred_i,
++            trial_logs,
++            MAX_INSTRUCT_IN_HISTORY,
+         )
+ 
+         # Create our instruction generator class (given specific criteria for this round of proposal)
+@@ -411,17 +467,15 @@ class GroundedProposer(Proposer):
+             use_task_demos=self.use_task_demos and demo_candidates,
+             use_instruct_history=self.use_instruct_history and instruction_history,
+             use_tip=self.use_tip,
+-            verbose=self.verbose
++            verbose=self.verbose,
+         )
+ 
+-        # Generate a new instruction for our predictor, using the temperature specified for this round
+-        original_temp = self.prompt_model.kwargs["temperature"]
+-
+-        epsilon = self.rng.uniform(0.01, 0.05)
+-        modified_temp = T + epsilon
++        # Generate a new instruction for our predictor
++        # Note: T parameter kept for API compatibility; no kwarg modulation
++        # Compute cache salt for this instruction generation
++        cache_salt = self._cache_salt(pred_i=pred_i, demo_set_i=demo_set_i)
+ 
+         with dspy.settings.context(lm=self.prompt_model):
+-            self.prompt_model.kwargs["temperature"] = modified_temp
+             proposed_instruction = instruction_generator(
+                 demo_candidates=demo_candidates,
+                 pred_i=pred_i,
+@@ -429,10 +483,10 @@ class GroundedProposer(Proposer):
+                 program=program,
+                 data_summary=self.data_summary,
+                 previous_instructions=instruction_history,
+-                num_demos_in_context = self.num_demos_in_context,
++                num_demos_in_context=self.num_demos_in_context,
+                 tip=tip,
++                cache_salt=cache_salt,
+             ).proposed_instruction
+-        self.prompt_model.kwargs["temperature"] = original_temp
+ 
+         # Log the trace used to generate the new instruction, along with the new instruction itself
+         if self.verbose:
+@@ -440,3 +494,5 @@ class GroundedProposer(Proposer):
+             print(f"PROPOSED INSTRUCTION: {proposed_instruction}")
+ 
+         return strip_prefix(proposed_instruction)
++
++_N4C_STYLE_SENTINEL=  1  
+diff --git a/tests/propose/test_grounded_proposer_cache_salt_contribution.py b/tests/propose/test_grounded_proposer_cache_salt_contribution.py
+new file mode 100644
+index 000000000..793c2dc24
+--- /dev/null
++++ b/tests/propose/test_grounded_proposer_cache_salt_contribution.py
+@@ -0,0 +1,40 @@
++import dspy
++from dspy.propose.grounded_proposer import DescribeModule, DescribeProgram, GroundedProposer
++from dspy.utils.dummies import DummyLM
++
++
++class MinimalRNG:
++    def __init__(self, values):
++        self.values = iter(values)
++
++    def random(self):
++        return next(self.values)
++
++
++def make_proposer(values):
++    return GroundedProposer(
++        prompt_model=DummyLM([{"proposed_instruction": "instruction"}]),
++        program=dspy.Predict("question -> answer"),
++        trainset=[],
++        program_aware=False,
++        use_dataset_summary=False,
++        rng=MinimalRNG(values),
++    )
++
++
++def test_cache_salts_use_injected_rng_and_are_reproducible():
++    first = make_proposer([0.125, 0.5])
++    second = make_proposer([0.125, 0.5])
++
++    first_sequence = [first._cache_salt(0, 0), first._cache_salt(0, 0)]
++    second_sequence = [second._cache_salt(0, 0), second._cache_salt(0, 0)]
++
++    assert first_sequence == second_sequence
++    assert first_sequence[0] != first_sequence[1]
++    assert all(value and value.isascii() for value in first_sequence)
++
++
++def test_description_signatures_expose_the_ignorable_cache_salt():
++    for signature in (DescribeProgram, DescribeModule):
++        field = signature.fields["cache_salt"]
++        assert field.json_schema_extra["prefix"] == "CACHE SALT (IGNORE):"

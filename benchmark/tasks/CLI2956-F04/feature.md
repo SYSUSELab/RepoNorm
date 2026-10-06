@@ -1,0 +1,7 @@
+# Conditionally required options
+
+Add a `required_if` mapping to `click.Option` and `@click.option`. Keys are normalized Python parameter names such as `auth_mode`, without option prefixes; values are compared with those parameters' final converted values. After all parameters have been parsed, the target option is required when every mapping entry matches. Declaration and command-line order do not affect the result. An empty mapping or `None` disables the feature.
+
+`required_if` also accepts a callable predicate `(ctx, param) -> bool`, allowing conditions such as numeric thresholds or alternatives instead of equality mappings. Evaluate it after normal parameter processing, with the current invocation context and the target Option. A true result makes a missing target required; a false result adds no requirement. Existing mapping behavior is unchanged. Values that are neither a mapping, a callable, nor `None` raise `TypeError` at construction.
+
+Command-line, prompt, environment, default-map, and ordinary default sources all participate through their final values. If the target already has a non-missing value from any source, validation succeeds. `None` is a valid condition value. A mapping that names no parameter on the command is a configuration error reported as `UsageError`; prefixed or non-string keys and a `required_if` that is neither a mapping, a callable, nor `None` raise `TypeError` at construction. Existing unconditional `required` behavior and Argument initialization remain unchanged. No private validation helper is prescribed.

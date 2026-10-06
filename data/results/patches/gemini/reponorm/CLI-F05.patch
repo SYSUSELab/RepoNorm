@@ -1,0 +1,146 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..f1386a4 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,8 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -426,6 +428,20 @@ class Context:
+ 
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
++        if retry_cleanup is None and parent is not None:
++            retry_cleanup = parent.retry_cleanup
++        self.retry_cleanup: int = retry_cleanup or 0
++
++        if retry_cleanup_backoff is None and parent is not None:
++            retry_cleanup_backoff = parent.retry_cleanup_backoff
++        
++        if retry_cleanup_backoff is None:
++            retry_cleanup_backoff = 0.1
++        elif not isinstance(retry_cleanup_backoff, (int, float)) or isinstance(retry_cleanup_backoff, bool) or retry_cleanup_backoff <= 0:
++            raise ValueError("retry_cleanup_backoff must be a positive number")
++            
++        self.retry_cleanup_backoff: float = float(retry_cleanup_backoff)
++
+ 
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+@@ -590,6 +606,25 @@ class Context:
+         """
+         return self._exit_stack.enter_context(context_manager)
+ 
++
++    def _retry_wrapper(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
++        def wrapped() -> t.Any:
++            attempts = 0
++            delay = self.retry_cleanup_backoff
++            while True:
++                try:
++                    return f()
++                except (KeyboardInterrupt, SystemExit):
++                    raise
++                except Exception:
++                    if attempts >= self.retry_cleanup:
++                        raise
++                    attempts += 1
++                    import time
++                    time.sleep(delay)
++                    delay *= 2
++        return wrapped
++
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+ 
+@@ -600,7 +635,7 @@ class Context:
+ 
+         :param f: The function to execute on teardown.
+         """
+-        return self._exit_stack.callback(f)
++        return self._exit_stack.callback(self._retry_wrapper(f))
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+diff --git a/tests/test_retry_cleanup.py b/tests/test_retry_cleanup.py
+new file mode 100644
+index 0000000..56ebd7c
+--- /dev/null
++++ b/tests/test_retry_cleanup.py
+@@ -0,0 +1,71 @@
++import click
++import pytest
++import time
++from click.core import Context
++
++def test_retry_cleanup_feature():
++    attempts = 0
++    def callback():
++        nonlocal attempts
++        attempts += 1
++        if attempts < 2:
++            raise ValueError("transient error")
++        return "ok"
++
++    # Mock time.sleep
++    original_sleep = time.sleep
++    time.sleep = lambda x: None
++    
++    try:
++        ctx = Context(click.Command("test"), retry_cleanup=2)
++        ctx.call_on_close(callback)
++        ctx.close()
++        assert attempts == 2
++    finally:
++        time.sleep = original_sleep
++
++def test_retry_cleanup_exhaustion():
++    attempts = 0
++    def callback():
++        nonlocal attempts
++        attempts += 1
++        raise ValueError("persistent error")
++
++    # Mock time.sleep
++    original_sleep = time.sleep
++    time.sleep = lambda x: None
++    
++    try:
++        ctx = Context(click.Command("test"), retry_cleanup=2)
++        ctx.call_on_close(callback)
++        with pytest.raises(ValueError, match="persistent error"):
++            ctx.close()
++        assert attempts == 3 # 1 initial + 2 retries
++    finally:
++        time.sleep = original_sleep
++
++def test_retry_cleanup_inheritance():
++    parent = Context(click.Command("parent"), retry_cleanup=3)
++    child = Context(click.Command("child"), parent=parent)
++    assert child.retry_cleanup == 3
++    
++    child2 = Context(click.Command("child2"), parent=parent, retry_cleanup=0)
++    assert child2.retry_cleanup == 0
++
++def test_retry_cleanup_backoff_validation():
++    with pytest.raises(ValueError, match="retry_cleanup_backoff must be a positive number"):
++        Context(click.Command("test"), retry_cleanup_backoff=-1)
++    
++    with pytest.raises(ValueError, match="retry_cleanup_backoff must be a positive number"):
++        Context(click.Command("test"), retry_cleanup_backoff=0)
++
++    with pytest.raises(ValueError, match="retry_cleanup_backoff must be a positive number"):
++        Context(click.Command("test"), retry_cleanup_backoff="invalid")
++
++def test_retry_cleanup_backoff_inheritance():
++    parent = Context(click.Command("parent"), retry_cleanup_backoff=0.5)
++    child = Context(click.Command("child"), parent=parent)
++    assert child.retry_cleanup_backoff == 0.5
++    
++    child2 = Context(click.Command("child2"), parent=parent, retry_cleanup_backoff=0.2)
++    assert child2.retry_cleanup_backoff == 0.2

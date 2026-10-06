@@ -1,0 +1,251 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..8487ce1 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -1114,11 +1114,80 @@ class Environment:
+ 
+         return ChainMap(d, self.globals)
+ 
++    def extract_marked_translations(
++        self,
++        source: t.Union[str, nodes.Template],
++        source_name: t.Optional[str] = None,
++    ) -> t.Iterator["TranslationRecord"]:
++        """Extract marked translations from a template source or AST node.
++
++        This method parses the source, finds all ``{% extract %}`` blocks,
++        and yields translation records for each marker found. The marker
++        body is parsed as an ordinary Jinja template and any gettext calls
++        within it are extracted.
++
++        :param source: A string containing template source or a parsed
++            :class:`~jinja2.nodes.Template` AST node.
++        :param source_name: Optional logical name of the source being
++            processed. Used to identify the source in the returned records.
++        :return: An iterator yielding :class:`TranslationRecord` instances.
++
++        .. versionadded:: 3.2
++        """
++        from .ext import TranslationExtractorExtension, _extract_from_extract_node
++        from .nodes import ExtractNode
++
++        if isinstance(source, str):
++            ast = self.parse(source)
++        else:
++            ast = source
++
++        for extract_node in ast.find_all(ExtractNode):
++            for record in _extract_from_extract_node(extract_node):
++                yield record._replace(source=source_name)
++
++    def extract_marked_translations_from_templates(
++        self, names: t.Optional[t.Iterable[str]] = None
++    ) -> t.Iterator["TranslationRecord"]:
++        """Extract marked translations from templates loaded by the environment's loader.
++
++        This method loads templates using the configured loader and extracts
++        marked translations from each one. It does not render templates or
++        recursively follow includes/inheritance - only the top-level template
++        content is processed.
++
++        :param names: An iterable of template names to process. If omitted,
++            all templates listed by the loader are processed in their order.
++        :return: An iterator yielding :class:`TranslationRecord` instances.
++
++        .. versionadded:: 3.2
++        """
++        assert self.loader is not None, "No loader configured."
++
++        if names is None:
++            names = self.list_templates()
++
++        for name in names:
++            # Get the template source from the loader
++            try:
++                source, _, _ = self.loader.get_source(self, name)
++            except Exception:
++                continue
++            
++            # Parse and extract
++            ast = self.parse(source)
++            
++            from .nodes import ExtractNode
++            for extract_node in ast.find_all(ExtractNode):
++                from .ext import _extract_from_extract_node
++                
++                for record in _extract_from_extract_node(extract_node):
++                    yield record._replace(source=name)
++
+ 
+ class Template:
+     """A compiled template that can be rendered.
+ 
+-    Use the methods on :class:`Environment` to create or load templates.
+     The environment is used to configure how templates are compiled and
+     behave.
+ 
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..246da95 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -852,3 +852,140 @@ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+ loopcontrols = LoopControlExtension
+ debug = DebugExtension
++
++
++class TranslationExtractorExtension(Extension):
++    """This extension adds support for extracting translations from marked
++    blocks in templates.  It provides a ``{% extract %}`` tag that allows
++    marking sections of a template for translation extraction.
++
++    The syntax is::
++
++        {% extract key="constant", ... %}...{% endextract %}
++
++    Metadata values must be compile-time constants; dynamic expressions and
++    duplicate keys raise :exc:`TemplateSyntaxError`.  Marker bodies are
++    ordinary Jinja bodies and render unchanged.  They may contain control
++    structures and any gettext calls supported by normal extraction.
++    """
++
++    tags = {"extract"}
++
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse an extract block."""
++        lineno = next(parser.stream).lineno
++        metadata: t.Dict[str, nodes.Expr] = {}
++        seen_keys: t.Set[str] = set()
++
++        # Parse metadata key=value pairs
++        while parser.stream.current.type != "block_end":
++            # Skip whitespace tokens
++            if parser.stream.current.type == "whitespace":
++                next(parser.stream)
++                continue
++
++            # If we have metadata, expect a comma separator
++            if metadata:
++                parser.stream.expect("comma")
++
++            token = parser.stream.expect("name")
++            key = token.value
++
++            if key in seen_keys:
++                parser.fail(
++                    f"extract marker has duplicate key {key!r}",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++            seen_keys.add(key)
++
++            parser.stream.expect("assign")
++            expr = parser.parse_expression()
++
++            # Check that the expression is a compile-time constant
++            if not isinstance(expr, nodes.Const):
++                parser.fail(
++                    f"extract marker value for {key!r} must be a constant",
++                    expr.lineno,
++                    exc=TemplateSyntaxError,
++                )
++
++            # Add to metadata
++            metadata[key] = expr
++
++        # Parse the body of the extract block
++        body = parser.parse_statements(("name:endextract",), drop_needle=True)
++
++        return nodes.ExtractNode(body, metadata, lineno=lineno)
++
++
++
++class TranslationRecord(t.NamedTuple):
++    """A record returned by :meth:`Environment.extract_marked_translations`.
++
++    :param source: The logical name of the template being processed, or None
++        if extracting from a string source.
++    :param marker_lineno: The line number of the ``{% extract %}`` marker.
++    :param metadata: A copy of the metadata mapping from the extract marker.
++    :param messages: A list of extracted message records, each containing
++        lineno, function, and message.
++    """
++
++    source: t.Optional[str]
++    marker_lineno: int
++    metadata: t.Dict[str, t.Any]
++    messages: t.List[t.Tuple[int, str, t.Union[t.Optional[str], t.Tuple[t.Optional[str], ...]]]]
++
++
++def _extract_from_extract_node(
++    node: "ExtractNode",
++    gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++) -> t.Iterator[TranslationRecord]:
++    """Extract messages from an ExtractNode's body."""
++    # Extract gettext calls from the body
++    messages: t.List[t.Tuple[int, str, t.Union[t.Optional[str], t.Tuple[t.Optional[str], ...]]]] = []
++    
++    # Find all Call nodes in the body
++    for body_node in node.body:
++        for call_node in body_node.find_all(nodes.Call):
++            if (
++                not isinstance(call_node.node, nodes.Name)
++                or call_node.node.name not in gettext_functions
++            ):
++                continue
++            
++            strings: t.List[t.Optional[str]] = []
++            
++            for arg in call_node.args:
++                if isinstance(arg, nodes.Const) and isinstance(arg.value, str):
++                    strings.append(arg.value)
++                else:
++                    strings.append(None)
++            
++            for _ in call_node.kwargs:
++                strings.append(None)
++            if call_node.dyn_args is not None:
++                strings.append(None)
++            if call_node.dyn_kwargs is not None:
++                strings.append(None)
++            
++            # Convert to tuple format
++            if len(strings) == 1:
++                msg = strings[0]
++            else:
++                msg = tuple(strings)
++            
++            messages.append((call_node.lineno, call_node.node.name, msg))
++    
++    # Create a deep copy of metadata
++    metadata_copy: t.Dict[str, t.Any] = {}
++    for key, expr in node.metadata.items():
++        if isinstance(expr, nodes.Const):
++            metadata_copy[key] = expr.value
++    
++    yield TranslationRecord(
++        source=None,
++        marker_lineno=node.lineno,
++        metadata=metadata_copy,
++        messages=messages,
++    )
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index b2f88d9..6dcf1be 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -1195,6 +1195,15 @@ class ScopedEvalContextModifier(EvalContextModifier):
+     body: t.List[Node]
+ 
+ 
++
++class ExtractNode(Stmt):
++    """A node representing an extract block."""
++
++    fields = ("body", "metadata")
++    body: t.List[Node]
++    metadata: t.Dict[str, Node]
++
++
+ # make sure nobody creates custom nodes
+ def _failing_new(*args: t.Any, **kwargs: t.Any) -> "te.NoReturn":
+     raise TypeError("can't create custom node types")

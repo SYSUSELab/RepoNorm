@@ -1,0 +1,188 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..11a5885 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -31,6 +31,16 @@ from .formatting import join_options
+ from .globals import pop_context
+ from .globals import push_context
+ from .parser import _flag_needs_value
++
++_dynamic_default_sentinel = object()
++
++
++def _is_dynamic_default(default: t.Any) -> bool:
++    """Check if a default is a dynamic default dictionary."""
++    if isinstance(default, dict) and default:
++        return all(isinstance(k, str) and k.startswith("--") for k in default)
++    return False
++
+ from .parser import _OptionParser
+ from .parser import _split_opt
+ from .termui import confirm
+@@ -994,6 +1004,124 @@ class Command:
+ 
+         return params
+ 
++    def _resolve_dynamic_defaults(self, ctx: Context) -> None:
++        """Resolve dynamic defaults for parameters whose source is DEFAULT."""
++        params = self.get_params(ctx)
++
++        # Build map: long option -> param
++        long_opt_to_param: dict[str, Parameter] = {}
++        for param in params:
++            if isinstance(param, Option):
++                for opt in param.opts:
++                    if opt.startswith("--"):
++                        long_opt_to_param[opt] = param
++
++        # Find params whose source is DEFAULT and have dynamic defaults
++        dynamic_params: dict[str, Parameter] = {}
++        for param in params:
++            if param.name is None:
++                continue
++            if ctx.get_parameter_source(param.name) is not ParameterSource.DEFAULT:
++                continue
++            if not _is_dynamic_default(param.default):
++                continue
++            dynamic_params[param.name] = param
++
++        if not dynamic_params:
++            return
++
++        # Validate: reject unknown long options and non-dict values
++        for param_name, param in dynamic_params.items():
++            default_dict = param.default
++            for dep_opt, dep_values in default_dict.items():
++                if dep_opt not in long_opt_to_param:
++                    raise UsageError(
++                        f"Dynamic default for '--{param_name}' references "
++                        f"unknown option '{dep_opt}'."
++                    )
++                if not isinstance(dep_values, dict):
++                    raise TypeError(
++                        f"Dynamic default for '--{param_name}' has "
++                        f"non-dict value for '{dep_opt}': "
++                        f"{type(dep_values).__name__}"
++                    )
++
++        # Detect cycles using DFS
++        graph: dict[str, list[str]] = {}
++        for param_name, param in dynamic_params.items():
++            deps: list[str] = []
++            for dep_opt in param.default:
++                dep_param = long_opt_to_param[dep_opt]
++                dep_name = dep_param.name
++                if dep_name is not None and dep_name in dynamic_params:
++                    deps.append(dep_name)
++            graph[param_name] = deps
++
++        WHITE, GRAY, BLACK = 0, 1, 2
++        color: dict[str, int] = {name: WHITE for name in dynamic_params}
++
++        def has_cycle(node: str) -> bool:
++            color[node] = GRAY
++            for neighbor in graph.get(node, []):
++                if color.get(neighbor) == GRAY:
++                    return True
++                if color.get(neighbor) == WHITE and has_cycle(neighbor):
++                    return True
++            color[node] = BLACK
++            return False
++
++        for name in dynamic_params:
++            if color[name] == WHITE and has_cycle(name):
++                raise UsageError(
++                    "Circular dependency detected in dynamic option "
++                    "defaults."
++                )
++
++        # Topological sort (DFS post-order)
++        visited: set[str] = set()
++        order: list[str] = []
++
++        def dfs(node: str) -> None:
++            visited.add(node)
++            for neighbor in graph.get(node, []):
++                if neighbor not in visited:
++                    dfs(neighbor)
++            order.append(node)
++
++        for name in dynamic_params:
++            if name not in visited:
++                dfs(name)
++
++        # Resolve in order (dependencies first)
++        for param_name in order:
++            param = dynamic_params[param_name]
++            default_dict = param.default
++            raw_value: t.Any = None
++
++            for dep_opt, dep_values in default_dict.items():
++                dep_param = long_opt_to_param[dep_opt]
++                dep_name = dep_param.name
++                if dep_name is None:
++                    continue
++
++                dep_raw = ctx.params.get(dep_name)
++
++                # Convert dependency value to string for matching
++                if isinstance(dep_raw, bool):
++                    dep_str = "True" if dep_raw else "False"
++                else:
++                    dep_str = str(dep_raw)
++
++                if dep_str in dep_values:
++                    raw_value = dep_values[dep_str]
++
++            # Pass through type, required, and callback pipeline exactly once
++            value = param.process_value(ctx, raw_value)
++
++            # Update context params
++            if param.expose_value and param.name is not None:
++                ctx.params[param.name] = value
++
+     def format_usage(self, ctx: Context, formatter: HelpFormatter) -> None:
+         """Writes the usage line into the formatter.
+ 
+@@ -1196,6 +1324,10 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++
++        if not ctx.resilient_parsing:
++            self._resolve_dynamic_defaults(ctx)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2283,6 +2415,10 @@ class Parameter:
+             value = self.get_default(ctx)
+             source = ParameterSource.DEFAULT
+ 
++        if source is ParameterSource.DEFAULT and _is_dynamic_default(value):
++            return _dynamic_default_sentinel, source
++
++
+         return value, source
+ 
+     def type_cast_value(self, ctx: Context, value: t.Any) -> t.Any:
+@@ -2346,6 +2482,9 @@ class Parameter:
+         return False
+ 
+     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
++        if value is _dynamic_default_sentinel:
++            return value
++
+         value = self.type_cast_value(ctx, value)
+ 
+         if self.required and self.value_is_missing(value):
+@@ -2868,6 +3007,9 @@ class Option(Parameter):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):
+                 default_string = _("(dynamic)")
++            elif _is_dynamic_default(default_value):
++                default_string = _("(dynamic)")
++
+             elif self.is_bool_flag and self.secondary_opts:
+                 # For boolean flags that have distinct True/False opts,
+                 # use the opt without prefix instead of the value.

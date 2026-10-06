@@ -1,0 +1,277 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..7ac3554 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import collections.abc as cabc
++import copy
+ import enum
+ import errno
+ import inspect
+@@ -832,6 +833,252 @@ class Context:
+         """
+         return self._parameter_source.get(name)
+ 
++    def save_state(self) -> dict[str, t.Any]:
++        """Save the current state of the context into a snapshot dictionary.
++
++        This can be used to temporarily change parsing and presentation state,
++        then restore it later using :meth:`restore_state`.
++
++        The snapshot is a dictionary covering ``params``, ``args``, protected
++        arguments, option prefixes, ``obj``, metadata, ``default_map``,
++        ``invoked_subcommand``, terminal and content widths, parsing flags,
++        ``help_option_names``, ``token_normalize_func``, ``auto_envvar_prefix``,
++        ``color``, ``show_default``, and parameter-source tracking.
++
++        Mutable values are copied to be independent of the source context.
++        Shared references within the saved state are preserved.
++
++        .. versionadded:: 9.0
++        """
++        # Create a memo to track original objects and their copies
++        # This ensures shared references are preserved in the snapshot
++        memo: dict[int, t.Any] = {}
++        
++        def deep_copy_with_memo(obj: t.Any) -> t.Any:
++            """Deep copy an object while tracking copies in memo."""
++            obj_id = id(obj)
++            if obj_id in memo:
++                return memo[obj_id]
++            
++            # Handle common types
++            if isinstance(obj, dict):
++                result = {}
++                memo[obj_id] = result
++                for k, v in obj.items():
++                    result[k] = deep_copy_with_memo(v)
++                return result
++            elif isinstance(obj, (list, tuple)):
++                cls = type(obj)
++                result = cls()
++                memo[obj_id] = result
++                for item in obj:
++                    result.append(deep_copy_with_memo(item))
++                return result
++            elif isinstance(obj, set):
++                result = set()
++                memo[obj_id] = result
++                for item in obj:
++                    result.add(deep_copy_with_memo(item))
++                return result
++            else:
++                # For immutable or unknown types, return as-is
++                return obj
++        
++        return {
++            "params": deep_copy_with_memo(self.params),
++            "args": deep_copy_with_memo(self.args),
++            "_protected_args": deep_copy_with_memo(self._protected_args),
++            "_opt_prefixes": deep_copy_with_memo(self._opt_prefixes),
++            "obj": deep_copy_with_memo(self.obj) if self.obj is not None else None,
++            "_meta": deep_copy_with_memo(self._meta),
++            "default_map": deep_copy_with_memo(self.default_map) if self.default_map is not None else None,
++            "invoked_subcommand": self.invoked_subcommand,
++            "terminal_width": self.terminal_width,
++            "max_content_width": self.max_content_width,
++            "allow_extra_args": self.allow_extra_args,
++            "allow_interspersed_args": self.allow_interspersed_args,
++            "ignore_unknown_options": self.ignore_unknown_options,
++            "resilient_parsing": self.resilient_parsing,
++            "help_option_names": deep_copy_with_memo(self.help_option_names),
++            "token_normalize_func": self.token_normalize_func,
++            "auto_envvar_prefix": self.auto_envvar_prefix,
++            "color": self.color,
++            "show_default": self.show_default,
++            "_parameter_source": deep_copy_with_memo(self._parameter_source),
++        }
++
++    def restore_state(self, snapshot: dict[str, t.Any]) -> None:
++        """Restore the context state from a snapshot created by :meth:`save_state`.
++
++        This is transactional: if any key is missing or invalid, no changes
++        are made to the context. Unknown keys in the snapshot are ignored.
++
++        :param snapshot: A dictionary returned by :meth:`save_state`.
++
++        .. versionadded:: 9.0
++        """
++        # Required keys for restoration
++        required_keys = {
++            "params", "args", "_protected_args", "_opt_prefixes", "obj",
++            "_meta", "default_map", "invoked_subcommand", "terminal_width",
++            "max_content_width", "allow_extra_args", "allow_interspersed_args",
++            "ignore_unknown_options", "resilient_parsing", "help_option_names",
++            "token_normalize_func", "auto_envvar_prefix", "color", "show_default",
++            "_parameter_source",
++        }
++
++        # Validate all required keys are present
++        missing_keys = required_keys - set(snapshot.keys())
++        if missing_keys:
++            raise ValueError(
++                f"Snapshot is missing required keys: {sorted(missing_keys)}"
++            )
++
++        # Validate _meta is a dict
++        if not isinstance(snapshot["_meta"], dict):
++            raise TypeError("_meta must be a dictionary")
++
++        # Build mapping of object IDs to fields for shared reference handling
++        snapshot_values = list(snapshot.values())
++        id_to_fields: dict[int, list[str]] = {}
++        for field_name in required_keys:
++            value = snapshot[field_name]
++            obj_id = id(value)
++            if obj_id not in id_to_fields:
++                id_to_fields[obj_id] = []
++            id_to_fields[obj_id].append(field_name)
++
++        # Separate shared and non-shared fields
++        shared_refs: dict[int, list[str]] = {}
++        non_shared_fields: list[str] = []
++        for obj_id, fields in id_to_fields.items():
++            if len(fields) > 1:
++                shared_refs[obj_id] = fields
++            else:
++                non_shared_fields.extend(fields)
++
++        # Restore non-shared fields first
++        for field_name in non_shared_fields:
++            value = snapshot[field_name]
++            if field_name == "params":
++                self.params.clear()
++                self.params.update(value)
++            elif field_name == "args":
++                self.args.clear()
++                self.args.extend(value)
++            elif field_name == "_protected_args":
++                self._protected_args.clear()
++                self._protected_args.extend(value)
++            elif field_name == "_opt_prefixes":
++                self._opt_prefixes.clear()
++                self._opt_prefixes.update(value)
++            elif field_name == "obj":
++                self.obj = value
++            elif field_name == "_meta":
++                self._meta = value
++            elif field_name == "default_map":
++                if value is None:
++                    self.default_map = None
++                elif isinstance(value, dict):
++                    if self.default_map is not None:
++                        self.default_map.clear()
++                        self.default_map.update(value)
++                    else:
++                        self.default_map = value.copy()
++            elif field_name == "invoked_subcommand":
++                self.invoked_subcommand = value
++            elif field_name == "terminal_width":
++                self.terminal_width = value
++            elif field_name == "max_content_width":
++                self.max_content_width = value
++            elif field_name == "allow_extra_args":
++                self.allow_extra_args = value
++            elif field_name == "allow_interspersed_args":
++                self.allow_interspersed_args = value
++            elif field_name == "ignore_unknown_options":
++                self.ignore_unknown_options = value
++            elif field_name == "resilient_parsing":
++                self.resilient_parsing = value
++            elif field_name == "help_option_names":
++                self.help_option_names.clear()
++                self.help_option_names.extend(value)
++            elif field_name == "token_normalize_func":
++                self.token_normalize_func = value
++            elif field_name == "auto_envvar_prefix":
++                self.auto_envvar_prefix = value
++            elif field_name == "color":
++                self.color = value
++            elif field_name == "show_default":
++                self.show_default = value
++            elif field_name == "_parameter_source":
++                self._parameter_source.clear()
++                self._parameter_source.update(value)
++
++        # Restore shared references together
++        for obj_id, fields in shared_refs.items():
++            value = snapshot[fields[0]]
++            # Update the first field's target container
++            first_field = fields[0]
++            if first_field == "params":
++                self.params.clear()
++                self.params.update(value)
++            elif first_field == "args":
++                self.args.clear()
++                self.args.extend(value)
++            elif first_field == "_protected_args":
++                self._protected_args.clear()
++                self._protected_args.extend(value)
++            elif first_field == "_opt_prefixes":
++                self._opt_prefixes.clear()
++                self._opt_prefixes.update(value)
++            elif first_field == "obj":
++                self.obj = value
++            elif first_field == "_meta":
++                self._meta.clear()
++                self._meta.update(value)
++            elif first_field == "default_map":
++                if self.default_map is not None and isinstance(value, dict):
++                    self.default_map.clear()
++                    self.default_map.update(value)
++            elif first_field == "invoked_subcommand":
++                self.invoked_subcommand = value
++            elif first_field == "terminal_width":
++                self.terminal_width = value
++            elif first_field == "max_content_width":
++                self.max_content_width = value
++            elif first_field == "allow_extra_args":
++                self.allow_extra_args = value
++            elif first_field == "allow_interspersed_args":
++                self.allow_interspersed_args = value
++            elif first_field == "ignore_unknown_options":
++                self.ignore_unknown_options = value
++            elif first_field == "resilient_parsing":
++                self.resilient_parsing = value
++            elif first_field == "help_option_names":
++                self.help_option_names.clear()
++                self.help_option_names.extend(value)
++            elif first_field == "token_normalize_func":
++                self.token_normalize_func = value
++            elif first_field == "auto_envvar_prefix":
++                self.auto_envvar_prefix = value
++            elif first_field == "color":
++                self.color = value
++            elif first_field == "show_default":
++                self.show_default = value
++            elif first_field == "_parameter_source":
++                self._parameter_source.clear()
++                self._parameter_source.update(value)
++
++            # Set subsequent fields to point to the same restored object
++            for field_name in fields[1:]:
++                if field_name == "obj":
++                    self.obj = value
++                elif field_name == "_meta":
++                    self._meta = value
++                else:
++                    setattr(self, field_name, value)
++
++
+ 
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 39dfbdb..30bfd15 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -26,6 +26,7 @@ click.echo(json.dumps(rv))
+ """
+ 
+ ALLOWED_IMPORTS = {
++    "copy",
+     "__future__",
+     "weakref",
+     "os",

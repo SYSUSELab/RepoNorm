@@ -1,0 +1,137 @@
+diff --git a/tests/test_patterns_contribution.py b/tests/test_patterns_contribution.py
+new file mode 100644
+index 0000000..d647298
+--- /dev/null
++++ b/tests/test_patterns_contribution.py
+@@ -0,0 +1,49 @@
++from collections import Counter
++
++import pytest
++
++import tiktoken
++
++
++@pytest.fixture(scope="module")
++def byte_encoding():
++    return tiktoken.Encoding(
++        "byte-patterns",
++        pat_str=r"[\s\S]",
++        mergeable_ranks={bytes([i]): i for i in range(256)},
++        special_tokens={"<X>": 256},
++    )
++
++
++@pytest.mark.parametrize("text", ["", "a", "aaa", "abababa", "abcdef", "你好😀"])
++def test_pair_counts_match_top_three(byte_encoding, text) -> None:
++    expected = byte_encoding.encode(text)
++    tokens, patterns = byte_encoding.encode(text, return_repeated_pattern=True)
++    truth = Counter(zip(expected, expected[1:]))
++    assert tokens == expected
++    assert len(patterns) == min(3, len(truth))
++    assert all(truth[pair] == count for pair, count in patterns.items())
++    if len(truth) > 3:
++        omitted = [count for pair, count in truth.items() if pair not in patterns]
++        assert min(patterns.values()) >= max(omitted)
++
++
++def test_overlapping_pairs_and_default_shape(byte_encoding) -> None:
++    tokens, patterns = byte_encoding.encode("aaaa", return_repeated_pattern=True)
++    assert patterns == {(tokens[0], tokens[0]): 3}
++    assert isinstance(byte_encoding.encode("aaaa"), list)
++
++
++def test_special_policy_and_surrogate_recovery_are_preserved(byte_encoding) -> None:
++    with pytest.raises(ValueError, match="disallowed special token"):
++        byte_encoding.encode("<X>", return_repeated_pattern=True)
++    tokens, patterns = byte_encoding.encode(
++        "<X>", allowed_special="all", return_repeated_pattern=True
++    )
++    assert tokens == [256]
++    assert patterns == {}
++
++    text = "before \ud800 after"
++    tokens, patterns = byte_encoding.encode(text, return_repeated_pattern=True)
++    assert tokens == byte_encoding.encode(text)
++    assert sum(patterns.values()) <= max(0, len(tokens) - 1)
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..1abb56c 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,8 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        return_repeated_pattern: bool = False,
++    ) -> list[int] | tuple[list[int], dict[tuple[int, int], int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -97,6 +98,20 @@ class Encoding:
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
+ 
++        Args:
++            text: The text to encode.
++            allowed_special: Set of special tokens that are allowed to be in the text.
++            disallowed_special: Set of special tokens that are not allowed to be in the text.
++            return_repeated_pattern: If True, return `(tokens, patterns)`, where
++                `patterns` contains up to three most frequent adjacent token-ID pairs and
++                their occurrence counts. Overlapping pairs are counted.
++
++        Returns:
++            If return_repeated_pattern is False, returns a list of token IDs.
++            If return_repeated_pattern is True, returns the token list together with the
++            selected adjacent-pair counts. Empty and single-token results have no pairs;
++            ties at the top-three boundary may select any tied pair.
++
+         ```
+         >>> enc.encode("hello world")
+         [31373, 995]
+@@ -108,6 +123,8 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> enc.encode("hello world", return_repeated_pattern=True)
++        ([31373, 995], {(31373, 995): 1})
+         ```
+         """
+         if allowed_special == "all":
+@@ -121,7 +138,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +147,27 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if not return_repeated_pattern:
++            return tokens
++
++        # Count token pairs and their frequencies
++        pair_counts: dict[tuple[int, int], int] = {}
++
++        if len(tokens) > 0:
++            # Count each adjacent pair of tokens
++            for i in range(len(tokens) - 1):
++                current_pair = (tokens[i], tokens[i + 1])
++                pair_counts[current_pair] = pair_counts.get(current_pair, 0) + 1
++
++            # Get the top 3 pairs by frequency
++            if len(pair_counts) > 3:
++                sorted_pairs = sorted(pair_counts.items(), key=lambda x: x[1], reverse=True)
++                top_3_pairs = dict(sorted_pairs[:3])
++                pair_counts = top_3_pairs
++
++        return tokens, pair_counts
+ 
+     def encode_to_numpy(
+         self,

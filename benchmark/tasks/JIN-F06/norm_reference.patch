@@ -1,0 +1,176 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..2d5b1d6d 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add a ``key_transform`` callback to ``groupby`` for changing
++    displayed group keys without changing grouping.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..6aabb5c1 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -18,6 +18,7 @@ from .async_utils import auto_await
+ from .async_utils import auto_to_list
+ from .exceptions import FilterArgumentError
+ from .runtime import Undefined
++from .utils import _PassArg
+ from .utils import htmlsafe_json_dumps
+ from .utils import pass_context
+ from .utils import pass_environment
+@@ -1157,13 +1158,23 @@ class _GroupTuple(t.NamedTuple):
+         return tuple.__str__(self)
+ 
+ 
++def _transform_group_key(
++    environment: "Environment", func: t.Callable[..., t.Any], key: t.Any
++) -> t.Any:
++    if _PassArg.from_obj(func) is _PassArg.environment:
++        return func(environment, key)
++
++    return func(key)
++
++
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    key_transform: t.Optional[t.Callable[[t.Any], t.Any]] = None,
++) -> "t.List[_GroupTuple]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+     nested access, like ``"address.city"``. Unlike Python's ``groupby``,
+@@ -1203,17 +1214,35 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    You can specify a ``key_transform`` function to transform the group keys
++    for display purposes while preserving the original grouping logic.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for date, items in events|groupby("date", key_transform=date_format) %}
++          <li>{{ date }}: {{ items|length }} events</li>
++        {% endfor %}</ul>
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
++    .. versionchanged:: 3.1
++        Added the ``key_transform`` parameter.
++
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
++    grouped = [
++        _GroupTuple(
++            _transform_group_key(environment, key_transform, key)
++            if key_transform is not None
++            else key,
++            list(values),
++        )
+         for key, values in groupby(sorted(value, key=expr), expr)
+     ]
++    return grouped
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1251,19 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    key_transform: t.Optional[t.Callable[[t.Any], t.Any]] = None,
++) -> "t.List[_GroupTuple]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
++    grouped = [
++        _GroupTuple(
++            await auto_await(_transform_group_key(environment, key_transform, key))
++            if key_transform is not None
++            else key,
++            await auto_to_list(values),
++        )
+         for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+     ]
++    return grouped
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_transform_contribution.py b/tests/test_groupby_transform_contribution.py
+new file mode 100644
+index 00000000..87fd9610
+--- /dev/null
++++ b/tests/test_groupby_transform_contribution.py
+@@ -0,0 +1,58 @@
++import asyncio
++
++import pytest
++
++from jinja2 import Environment
++from jinja2.utils import pass_environment
++
++
++def test_groupby_transforms_display_only_once_per_group():
++    env = Environment()
++    seen = []
++
++    def transform(key):
++        seen.append(key)
++        return "same"
++
++    groups = env.call_filter(
++        "groupby", [{"k": 1}, {"k": 2}], ["k"], {"key_transform": transform}
++    )
++    assert [group.grouper for group in groups] == ["same", "same"]
++    assert [len(group.list) for group in groups] == [1, 1]
++    assert seen == [1, 2]
++
++
++def test_groupby_transform_receives_environment():
++    env = Environment()
++
++    @pass_environment
++    def transform(active_env, key):
++        assert active_env is env
++        return f"key-{key}"
++
++    group = env.call_filter("groupby", [{"k": 1}], ["k"], {"key_transform": transform})[
++        0
++    ]
++    assert tuple(group) == ("key-1", [{"k": 1}])
++
++
++def test_groupby_transform_propagates_callback_error():
++    env = Environment()
++
++    def transform(key):
++        raise LookupError(key)
++
++    with pytest.raises(LookupError):
++        env.call_filter("groupby", [{"k": 1}], ["k"], {"key_transform": transform})
++
++
++def test_async_groupby_awaits_transform():
++    env = Environment(enable_async=True)
++
++    async def transform(key):
++        return f"key-{key}"
++
++    groups = asyncio.run(
++        env.call_filter("groupby", [{"k": 1}], ["k"], {"key_transform": transform})
++    )
++    assert groups[0].grouper == "key-1"

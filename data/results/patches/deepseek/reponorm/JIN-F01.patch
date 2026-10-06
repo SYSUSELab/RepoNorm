@@ -1,0 +1,224 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..55cca8a 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1163,6 +1163,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    case_sensitive: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1208,12 +1209,30 @@ def sync_do_groupby(
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
++
++    .. versionadded:: NEXT
++        The ``case_sensitive`` parameter was added.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++
++    if case_sensitive:
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value, key=expr), expr)
++        ]
++
++    def key_func(item: t.Any) -> t.Any:
++        val = expr(item)
++        if isinstance(val, str):
++            return val.lower()
++        return val
++
++    sorted_items = sorted(value, key=key_func)
++    result: "t.List[t.Tuple[t.Any, t.List[V]]]" = []
++    for _, values in groupby(sorted_items, key_func):
++        items = list(values)
++        result.append(_GroupTuple(expr(items[0]), items))
++    return result
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1241,29 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    case_sensitive: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    lst = await auto_to_list(value)
++
++    if case_sensitive:
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(lst, key=expr), expr)
++        ]
++
++    def key_func(item: t.Any) -> t.Any:
++        val = expr(item)
++        if isinstance(val, str):
++            return val.lower()
++        return val
++
++    sorted_items = sorted(lst, key=key_func)
++    result: "t.List[t.Tuple[t.Any, t.List[V]]]" = []
++    for _, values in groupby(sorted_items, key_func):
++        items = list(values)
++        result.append(_GroupTuple(expr(items[0]), items))
++    return result
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..cc46894 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -94,6 +94,66 @@ def test_groupby_multidot(env_async, articles):
+     ]
+ 
+ 
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "Alice"},
++        {"name": "alice"},
++        {"name": "Bob"},
++    ],
++)
++def test_groupby_case_sensitive(env_async, items):
++    """case_sensitive=True keeps differently cased keys separate."""
++    tmpl = env_async.from_string(
++        "{% for grouper, list in items()|groupby('name', case_sensitive=True) %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{% endfor %}"
++    )
++    assert tmpl.render(items=items) == "Alice:Alice|Bob:Bob|alice:alice|"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "Alice"},
++        {"name": "alice"},
++        {"name": "Bob"},
++    ],
++)
++def test_groupby_case_insensitive(env_async, items):
++    """Default case_sensitive=False groups string keys case-insensitively,
++    retaining spelling of first encountered key."""
++    tmpl = env_async.from_string(
++        "{% for grouper, list in items()|groupby('name') %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{% endfor %}"
++    )
++    assert tmpl.render(items=items) == "Alice:Alice,alice|Bob:Bob|"
++
++
++@mark_dualiter("items", lambda: [("a", 1), ("a", 2), ("b", 1)])
++def test_groupby_case_insensitive_non_string(env_async, items):
++    """Non-string keys are unaffected by case_sensitive=False."""
++    tmpl = env_async.from_string(
++        "{% for grouper, list in items()|groupby(0) %}"
++        "{{ grouper }}:{% for x in list %}:{{ x.1 }}{% endfor %}|"
++        "{% endfor %}"
++    )
++    assert tmpl.render(items=items) == "a::1:2|b::1|"
++
++
++def test_groupby_case_insensitive_unicode(env_async):
++    """Unicode lowercasing is used, not casefolding."""
++    tmpl = env_async.from_string(
++        "{% for grouper, list in [{'name': '\u00c9lise'}, "
++        "{'name': '\u00e9lise'}]|groupby('name') %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{% endfor %}"
++    )
++    result = tmpl.render()
++    assert "\u00c9lise" in result
++    assert "\u00e9lise" in result
++
+ @mark_dualiter("int_items", lambda: [1, 2, 3])
+ def test_join_env_int(env_async, int_items):
+     tmpl = env_async.from_string('{{ items()|join("|") }}')
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..03f9369 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -619,6 +619,67 @@ class TestFilter:
+         )
+         assert out == "NY: emma, john\nWA: smith\n"
+ 
++    def test_groupby_case_sensitive(self, env):
++        """case_sensitive=True keeps differently cased keys separate."""
++        tmpl = env.from_string(
++            "{% for grouper, list in [{'name': 'Alice'}, {'name': 'alice'}, "
++            "{'name': 'Bob'}]|groupby('name', case_sensitive=True) %}"
++            "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++            "{% endfor %}"
++        )
++        assert tmpl.render() == "Alice:Alice|Bob:Bob|alice:alice|"
++
++    def test_groupby_case_insensitive(self, env):
++        """Default case_sensitive=False groups string keys case-insensitively,
++        retaining spelling of first encountered key."""
++        tmpl = env.from_string(
++            "{% for grouper, list in [{'name': 'Alice'}, {'name': 'alice'}, "
++            "{'name': 'Bob'}]|groupby('name') %}"
++            "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++            "{% endfor %}"
++        )
++        assert tmpl.render() == "Alice:Alice,alice|Bob:Bob|"
++
++    def test_groupby_case_insensitive_non_string(self, env):
++        """Non-string keys are unaffected by case_sensitive=False."""
++        tmpl = env.from_string(
++            "{% for grouper, list in [('a', 1), ('a', 2), ('b', 1)]|groupby(0) %}"
++            "{{ grouper }}:{% for x in list %}:{{ x.1 }}{% endfor %}|"
++            "{% endfor %}"
++        )
++        assert tmpl.render() == "a::1:2|b::1|"
++
++    def test_groupby_case_insensitive_with_default(self, env):
++        """case_sensitive=False works with the default parameter."""
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', default='NY') %}"
++            "{{ city }}: {{ items|map(attribute='name')|join(', ') }}\n"
++            "{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "smith", "city": "ny"},
++                {"name": "john"},
++            ]
++        )
++        # "NY" and "ny" and missing (default "NY") all group together
++        assert out == "NY: emma, smith, john\n"
++
++    def test_groupby_case_insensitive_unicode(self, env):
++        """Unicode lowercasing is used, not casefolding."""
++        tmpl = env.from_string(
++            "{% for grouper, list in [{'name': '\u00c9lise'}, "
++            "{'name': '\u00e9lise'}]|groupby('name') %}"
++            "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++            "{% endfor %}"
++        )
++        result = tmpl.render()
++        assert "\u00c9lise" in result
++        assert "\u00e9lise" in result
++        assert result.rstrip("|") == "\u00c9lise:\u00c9lise,\u00e9lise"
++
++
+     def test_filtertag(self, env):
+         tmpl = env.from_string(
+             "{% filter upper|replace('FOO', 'foo') %}foobar{% endfilter %}"

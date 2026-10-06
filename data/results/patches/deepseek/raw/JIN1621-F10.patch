@@ -1,0 +1,398 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..4a6eb64 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -71,6 +71,63 @@ class BaseLoader:
+     #: .. versionadded:: 2.4
+     has_source_access = True
+ 
++    #: Mapping of aliases (alias -> target).
++    #: .. versionadded:: 3.0
++    _aliases: t.Dict[str, str] = {}
++
++    def add_alias(self, alias: str, target: str) -> None:
++        """Add an alias that maps *alias* to *target*. If the alias
++        already exists, it is overwritten. Cache entries for the
++        alias are invalidated in all environments that have loaded
++        it.
++
++        .. versionadded:: 3.0
++        """
++        if not isinstance(alias, str):
++            raise TypeError("alias must be a string")
++        if not isinstance(target, str):
++            raise TypeError("target must be a string")
++        self._aliases[alias] = target
++        self._invalidate_cache_for(alias)
++
++    def remove_alias(self, alias: str) -> None:
++        """Remove an alias. It is harmless to remove an alias that
++        does not exist.
++
++        .. versionadded:: 3.0
++        """
++        if alias in self._aliases:
++            del self._aliases[alias]
++            self._invalidate_cache_for(alias)
++
++    def _resolve_alias(self, name: str) -> str:
++        """Resolve a single alias step. Returns the target if *name*
++        is an alias, otherwise returns *name* unchanged.
++        """
++        # Resolve exactly one step (no chaining)
++        if name in self._aliases:
++            return self._aliases[name]
++        return name
++
++    def _invalidate_cache_for(self, alias: str) -> None:
++        """Invalidate cache entries for *alias* in all environments
++        that have used this loader."""
++        import gc
++        my_ref = weakref.ref(self)
++        for obj in gc.get_objects():
++            try:
++                obj_vars = vars(obj)
++            except TypeError:
++                continue
++            if obj_vars.get("loader") is self:
++                cache = obj_vars.get("cache")
++                if cache is not None:
++                    cache_key = (my_ref, alias)
++                    try:
++                        del cache[cache_key]
++                    except KeyError:
++                        pass
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+@@ -95,8 +152,15 @@ class BaseLoader:
+             raise RuntimeError(
+                 f"{type(self).__name__} cannot provide access to the source"
+             )
++        template = self._resolve_alias(template)
+         raise TemplateNotFound(template)
+ 
++    def _list_templates(self) -> t.List[str]:
++        """Iterates over all templates.  If the loader does not support that
++        it should raise a :exc:`TypeError` which is the default behavior.
++        """
++        raise TypeError("this loader cannot iterate over all templates")
++
+     def list_templates(self) -> t.List[str]:
+         """Iterates over all templates.  If the loader does not support that
+         it should raise a :exc:`TypeError` which is the default behavior.
+@@ -122,6 +186,7 @@ class BaseLoader:
+ 
+         # first we try to get the source for this template together
+         # with the filename and the uptodate function.
++        name = self._resolve_alias(name)
+         source, filename, uptodate = self.get_source(environment, name)
+ 
+         # try to load the code from the bytecode cache if there is a
+@@ -228,6 +293,11 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
++        # Include aliases whose target appears in the listing
++        ordinary = set(found)
++        for alias, target in self._aliases.items():
++            if target in ordinary:
++                found.add(alias)
+         return sorted(found)
+ 
+ 
+@@ -389,6 +459,11 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
++        # Include aliases whose target appears in the listing
++        ordinary = set(results)
++        for alias, target in self._aliases.items():
++            if target in ordinary:
++                results.append(alias)
+         return results
+ 
+ 
+@@ -413,7 +488,13 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        result = sorted(self.mapping)
++        # Include aliases whose target appears in the listing
++        ordinary = set(result)
++        for alias, target in self._aliases.items():
++            if target in ordinary:
++                result.append(alias)
++        return result
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -493,6 +574,7 @@ class PrefixLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        template = self._resolve_alias(template)
+         loader, name = self.get_loader(template)
+         try:
+             return loader.get_source(environment, name)
+@@ -508,6 +590,7 @@ class PrefixLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        name = self._resolve_alias(name)
+         loader, local_name = self.get_loader(name)
+         try:
+             return loader.load(environment, local_name, globals)
+@@ -521,6 +604,11 @@ class PrefixLoader(BaseLoader):
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
++        # Include aliases whose target appears in the listing
++        ordinary = set(result)
++        for alias, target in self._aliases.items():
++            if target in ordinary:
++                result.append(alias)
+         return result
+ 
+ 
+@@ -544,6 +632,7 @@ class ChoiceLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        template = self._resolve_alias(template)
+         for loader in self.loaders:
+             try:
+                 return loader.get_source(environment, template)
+@@ -558,6 +647,7 @@ class ChoiceLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        name = self._resolve_alias(name)
+         for loader in self.loaders:
+             try:
+                 return loader.load(environment, name, globals)
+@@ -569,6 +659,11 @@ class ChoiceLoader(BaseLoader):
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
++        # Include aliases whose target appears in the listing
++        ordinary = set(found)
++        for alias, target in self._aliases.items():
++            if target in ordinary:
++                found.add(alias)
+         return sorted(found)
+ 
+ 
+@@ -630,6 +725,7 @@ class ModuleLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        name = self._resolve_alias(name)
+         key = self.get_template_key(name)
+         module = f"{self.package_name}.{key}"
+         mod = getattr(self.module, module, None)
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..0e1e3b7 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -17,6 +17,7 @@ from jinja2 import loaders
+ from jinja2 import PackageLoader
+ from jinja2.exceptions import TemplateNotFound
+ from jinja2.loaders import split_template_path
++from jinja2.loaders import BaseLoader, FileSystemLoader, DictLoader, ChoiceLoader, PrefixLoader, ModuleLoader
+ 
+ 
+ class TestLoaders:
+@@ -401,3 +402,190 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++class TestAliases:
++    """Tests for loader aliases."""
++
++    def test_add_and_resolve_alias(self):
++        """Basic alias resolution."""
++        loader = BaseLoader()
++        loader.add_alias("short.html", "long_template.html")
++        # _resolve_alias should return the target for an alias
++        assert loader._resolve_alias("short.html") == "long_template.html"
++        # Non-alias names pass through unchanged
++        assert loader._resolve_alias("other.html") == "other.html"
++
++    def test_alias_overwrite(self):
++        """Adding an existing alias overwrites it."""
++        loader = BaseLoader()
++        loader.add_alias("alias", "target1")
++        assert loader._resolve_alias("alias") == "target1"
++        loader.add_alias("alias", "target2")
++        assert loader._resolve_alias("alias") == "target2"
++
++    def test_remove_alias(self):
++        """Removing an alias makes resolution return the original name."""
++        loader = BaseLoader()
++        loader.add_alias("alias", "target")
++        assert loader._resolve_alias("alias") == "target"
++        loader.remove_alias("alias")
++        assert loader._resolve_alias("alias") == "alias"
++
++    def test_remove_unknown_alias_is_harmless(self):
++        """Removing a non-existent alias does not raise."""
++        loader = BaseLoader()
++        loader.remove_alias("nonexistent")  # should not raise
++
++    def test_alias_no_chaining(self):
++        """Aliases resolve exactly once (no chaining)."""
++        loader = BaseLoader()
++        loader.add_alias("a1", "a2")
++        loader.add_alias("a2", "real_target")
++        # a1 resolves to "a2", not to "real_target"
++        assert loader._resolve_alias("a1") == "a2"
++        assert loader._resolve_alias("a2") == "real_target"
++
++    def test_alias_non_string_raises_type_error(self):
++        """add_alias requires both arguments to be strings."""
++        loader = BaseLoader()
++        with pytest.raises(TypeError, match="alias must be a string"):
++            loader.add_alias(123, "target")
++        with pytest.raises(TypeError, match="target must be a string"):
++            loader.add_alias("alias", 456)
++
++    def test_alias_missing_target_raises_template_not_found(self, env):
++        """A missing target raises TemplateNotFound for the target name."""
++        loader = DictLoader({"real.html": "content"})
++        loader.add_alias("alias.html", "nonexistent.html")
++        env = Environment(loader=loader)
++        with pytest.raises(TemplateNotFound, match="nonexistent.html"):
++            env.get_template("alias.html")
++
++    def test_alias_works_with_dict_loader(self, env):
++        """Alias resolves to the correct template in DictLoader."""
++        mapping = {"hello.html": "Hello {{ name }}!"}
++        loader = DictLoader(mapping)
++        loader.add_alias("hi.html", "hello.html")
++        env = Environment(loader=loader)
++        tmpl = env.get_template("hi.html")
++        assert tmpl.render(name="World") == "Hello World!"
++
++    def test_alias_in_list_templates(self):
++        """list_templates includes alias when its target is present."""
++        mapping = {"hello.html": "Hello!"}
++        loader = DictLoader(mapping)
++        loader.add_alias("hi.html", "hello.html")
++        names = loader.list_templates()
++        assert "hi.html" in names
++        assert "hello.html" in names
++
++    def test_alias_not_in_list_templates_for_broken_target(self):
++        """list_templates omits alias when target is missing/broken."""
++        mapping = {"hello.html": "Hello!"}
++        loader = DictLoader(mapping)
++        loader.add_alias("broken.html", "missing.html")
++        names = loader.list_templates()
++        assert "broken.html" not in names
++
++    def test_alias_not_in_list_templates_for_chained_target(self):
++        """list_templates omits alias when target is itself an alias."""
++        mapping = {"real.html": "Hello!"}
++        loader = DictLoader(mapping)
++        loader.add_alias("mid.html", "real.html")
++        loader.add_alias("top.html", "mid.html")
++        names = loader.list_templates()
++        # top.html targets "mid.html" which is an alias, not a real template
++        assert "top.html" not in names
++        # mid.html targets "real.html" which is a real template, so it should be listed
++        assert "mid.html" in names
++
++    def test_cache_invalidation_on_add(self, env):
++        """Adding an alias invalidates the cache."""
++        mapping = {"hello.html": "Hello {{ name }}!"}
++        loader = DictLoader(mapping)
++        env = Environment(loader=loader)
++        # Load the real template so it's cached
++        tmpl1 = env.get_template("hello.html")
++        # Now add an alias for it
++        loader.add_alias("hi.html", "hello.html")
++        # The alias should resolve correctly
++        tmpl2 = env.get_template("hi.html")
++        assert tmpl2.render(name="World") == "Hello World!"
++
++    def test_cache_invalidation_on_remove(self, env):
++        """Removing an alias invalidates cache and the name reverts."""
++        mapping = {"hello.html": "Hello {{ name }}!"}
++        loader = DictLoader(mapping)
++        loader.add_alias("hi.html", "hello.html")
++        env = Environment(loader=loader)
++        # Load via alias
++        tmpl1 = env.get_template("hi.html")
++        assert tmpl1.render(name="World") == "Hello World!"
++        # Remove alias
++        loader.remove_alias("hi.html")
++        # Now "hi.html" should try to load as a real template, which doesn't exist
++        with pytest.raises(TemplateNotFound):
++            env.get_template("hi.html")
++
++    def test_alias_in_prefix_loader(self, env):
++        """Aliases work with PrefixLoader."""
++        mapping = {
++            "a": DictLoader({"hello.html": "Hello {{ name }}!"}),
++        }
++        loader = PrefixLoader(mapping)
++        loader.add_alias("b/hello.html", "a/hello.html")
++        env = Environment(loader=loader)
++        tmpl = env.get_template("b/hello.html")
++        assert tmpl.render(name="World") == "Hello World!"
++
++    def test_alias_in_choice_loader(self, env):
++        """Aliases work with ChoiceLoader."""
++        loader = ChoiceLoader([
++            DictLoader({"hello.html": "Hello {{ name }}!"}),
++        ])
++        loader.add_alias("hi.html", "hello.html")
++        env = Environment(loader=loader)
++        tmpl = env.get_template("hi.html")
++        assert tmpl.render(name="World") == "Hello World!"
++
++    def test_alias_in_file_system_loader(self, tmpdir):
++        """Aliases work with FileSystemLoader."""
++        p = tmpdir.mkdir("templates")
++        p.join("hello.html").write("Hello {{ name }}!")
++        loader = FileSystemLoader(str(p))
++        loader.add_alias("hi.html", "hello.html")
++        env = Environment(loader=loader)
++        tmpl = env.get_template("hi.html")
++        assert tmpl.render(name="World") == "Hello World!"
++
++    def test_alias_list_templates_in_file_system_loader(self, tmpdir):
++        """list_templates includes aliases in FileSystemLoader."""
++        p = tmpdir.mkdir("templates2")
++        p.join("hello.html").write("Hello!")
++        loader = FileSystemLoader(str(p))
++        loader.add_alias("hi.html", "hello.html")
++        names = loader.list_templates()
++        assert "hi.html" in names
++        assert "hello.html" in names
++
++    def test_alias_list_templates_in_prefix_loader(self):
++        """list_templates includes aliases in PrefixLoader."""
++        mapping = {
++            "a": DictLoader({"hello.html": "Hello!"}),
++        }
++        loader = PrefixLoader(mapping)
++        loader.add_alias("b/hello.html", "a/hello.html")
++        names = loader.list_templates()
++        assert "b/hello.html" in names
++        assert "a/hello.html" in names
++
++    def test_alias_list_templates_in_choice_loader(self):
++        """list_templates includes aliases in ChoiceLoader."""
++        loader = ChoiceLoader([
++            DictLoader({"hello.html": "Hello!"}),
++        ])
++        loader.add_alias("hi.html", "hello.html")
++        names = loader.list_templates()
++        assert "hi.html" in names
++        assert "hello.html" in names

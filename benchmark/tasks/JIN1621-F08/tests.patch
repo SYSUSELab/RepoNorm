@@ -1,0 +1,117 @@
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..0f6c682 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,112 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++def test_persistent_loader_filter_exceptions_propagate():
++    loader = loaders.DictLoader({"ok.html": "ok"})
++    loader.add_filter(lambda name: 1 / 0)
++    with pytest.raises(ZeroDivisionError):
++        loader.list_templates()
++
++
++def test_persistent_parent_and_child_filters_compose():
++    child = loaders.DictLoader({"keep.html": "K", "child.txt": "C", "parent.html": "P"})
++    child.add_filter("*.txt")
++    loader = loaders.PrefixLoader({"pkg": child})
++    loader.add_filter("*/parent.html")
++    assert loader.list_templates() == ["pkg/keep.html"]
++    assert Environment(loader=loader).get_template("pkg/parent.html").render() == "P"
++
++
++def test_persistent_filter_rejects_unsupported_type():
++    with pytest.raises(TypeError):
++        loaders.DictLoader({}).add_filter(object())
++
++
++@pytest.mark.parametrize("loader_kind", ["function", "module"])
++@pytest.mark.parametrize("entrypoint", ["loader", "environment"])
++def test_filters_preserve_unsupported_listing_error(tmp_path, loader_kind, entrypoint):
++    if loader_kind == "function":
++        loader = loaders.FunctionLoader(lambda name: "source")
++    else:
++        loader = loaders.ModuleLoader(tmp_path)
++    loader.add_filter("*.html")
++    env = Environment(loader=loader)
++    for clear in (False, True):
++        if clear:
++            loader.clear_filters()
++        with pytest.raises(TypeError):
++            if entrypoint == "loader":
++                loader.list_templates()
++            else:
++                env.list_templates()
++
++
++def test_filter_scope_nesting_restores_entering_filters():
++    import re
++
++    loader = loaders.DictLoader({"a.html": "A", "b.txt": "B", "c.html": "C", "hide.html": "H"})
++    loader.add_filter("hide.*")
++    with loader.filter_scope(re.compile(r"\.txt$")):
++        assert loader.list_templates() == ["a.html", "c.html"]
++        with loader.filter_scope(lambda name: name == "c.html"):
++            assert loader.list_templates() == ["a.html"]
++            loader.clear_filters()
++            loader.add_filter("a.*")
++        assert loader.list_templates() == ["a.html", "c.html"]
++    assert loader.list_templates() == ["a.html", "b.txt", "c.html"]
++    with loader.filter_scope():
++        loader.clear_filters()
++    assert loader.list_templates() == ["a.html", "b.txt", "c.html"]
++
++
++def test_filter_scope_failed_entry_and_body_restore_filters():
++    loader = loaders.DictLoader({"a.html": "A", "hidden.html": "H"})
++    loader.add_filter("hidden.*")
++    with pytest.raises(TypeError):
++        with loader.filter_scope("a.*", object()):
++            pytest.fail("invalid filter must fail on entry")
++    assert loader.list_templates() == ["a.html"]
++    with pytest.raises(ZeroDivisionError):
++        with loader.filter_scope(lambda name: 1 / 0):
++            loader.list_templates()
++    assert loader.list_templates() == ["a.html"]
++
++
++@pytest.mark.parametrize("ignore_errors", [False, True])
++def test_filter_scope_compile_subset_preserves_error_policy(tmp_path, ignore_errors):
++    from jinja2 import TemplateNotFound
++    from jinja2 import TemplateSyntaxError
++
++    child = loaders.DictLoader({"keep.html": "KEEP", "omit.txt": "OMIT", "bad.html": "{% broken %}", "hidden.html": "HIDDEN"})
++    child.add_filter("hidden.*")
++    loader = loaders.PrefixLoader({"pkg": child})
++    env = Environment(loader=loader)
++    with loader.filter_scope("*/omit.*"):
++        assert env.get_template("pkg/omit.txt").render() == "OMIT"
++        with loader.filter_scope("*/bad.*"):
++            env.compile_templates(tmp_path / "subset", zip=None, ignore_errors=False)
++        compiled = Environment(loader=loaders.ModuleLoader(tmp_path / "subset"))
++        assert compiled.get_template("pkg/keep.html").render() == "KEEP"
++        for name in ("pkg/omit.txt", "pkg/bad.html", "pkg/hidden.html"):
++            with pytest.raises(TemplateNotFound):
++                compiled.get_template(name)
++    if ignore_errors:
++        with loader.filter_scope("*/omit.*"):
++            env.compile_templates(tmp_path / "errors", zip=None, ignore_errors=True)
++        assert Environment(loader=loaders.ModuleLoader(tmp_path / "errors")).get_template("pkg/keep.html").render() == "KEEP"
++    else:
++        with pytest.raises(TemplateSyntaxError):
++            with loader.filter_scope("*/omit.*"):
++                env.compile_templates(tmp_path / "errors", zip=None, ignore_errors=False)
++    assert env.list_templates() == ["pkg/bad.html", "pkg/keep.html", "pkg/omit.txt"]
++
++
++@pytest.mark.parametrize("loader_kind", ["function", "module"])
++def test_filter_scope_compile_keeps_unsupported_listing(tmp_path, loader_kind):
++    loader = loaders.FunctionLoader(lambda name: "source") if loader_kind == "function" else loaders.ModuleLoader(tmp_path)
++    env = Environment(loader=loader)
++    with pytest.raises(TypeError):
++        with loader.filter_scope("*.txt"):
++            env.compile_templates(tmp_path / "compiled", zip=None)

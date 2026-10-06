@@ -1,0 +1,433 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..707f13e 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -165,6 +165,34 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++class _ParamDict(dict):
++    """A custom dict that tracks parameter assignments for history."""
++    
++    def __init__(self, context: "Context"):
++        super().__init__()
++        self._context = context
++    
++    def __setitem__(self, key: str, value: t.Any) -> None:
++        # Check if tracking is enabled and this is a known parameter
++        cmd = self._context.command
++        param = None
++        for p in cmd.params:
++            if p.name == key:
++                param = p
++                break
++        
++        if param is not None and getattr(param, '_history', None) is not None:
++            import time
++            entry = {
++                "value": value,
++                "source": None,  # Manual assignment has no source
++                "timestamp": time.time(),
++            }
++            param._history.append(entry)
++        
++        super().__setitem__(key, value)
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -296,7 +324,7 @@ class Context:
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+-        self.params: dict[str, t.Any] = {}
++        self.params: _ParamDict = _ParamDict(self)
+         #: the leftover arguments.
+         self.args: list[str] = []
+         #: protected arguments.  These are arguments that are prepended
+@@ -439,6 +467,11 @@ class Context:
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++        # Initialize history tracking if enabled
++        if getattr(command, "track_changes", False):
++            for param in command.params:
++                param._history = []
++
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -777,12 +810,39 @@ class Context:
+ 
+             ctx = self._make_sub_context(other_cmd)
+ 
++            # Track which params were already in kwargs before filling defaults
++            params_in_kwargs = set(kwargs.keys())
++            
+             for param in other_cmd.params:
+                 if param.name not in kwargs and param.expose_value:
+-                    kwargs[param.name] = param.type_cast_value(  # type: ignore
++                    value = param.type_cast_value(  # type: ignore
+                         ctx, param.get_default(ctx)
+                     )
+-
++                    kwargs[param.name] = value
++                    
++                    # Record history if tracking is enabled
++                    if getattr(param, '_history', None) is not None:
++                        import time
++                        entry = {
++                            "value": value,
++                            "source": ParameterSource.DEFAULT,
++                            "timestamp": time.time(),
++                        }
++                        param._history.append(entry)
++                elif param.name in params_in_kwargs and param.expose_value:
++                    # Value was passed directly in kwargs
++                    value = kwargs[param.name]
++                    
++                    # Record history if tracking is enabled
++                    if getattr(param, '_history', None) is not None:
++                        import time
++                        entry = {
++                            "value": value,
++                            "source": ParameterSource.COMMANDLINE,
++                            "timestamp": time.time(),
++                        }
++                        param._history.append(entry)
++            
+             # Track all kwargs as params, so that forward() will pass
+             # them on in subsequent calls.
+             ctx.params.update(kwargs)
+@@ -839,6 +899,45 @@ class Context:
+         """
+         return self._parameter_source.get(name)
+ 
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        """Get the history of values assigned to an option during this invocation.
++
++        :param name: The option's parameter name, long option (e.g., ``"--count"``),
++            or short option (e.g., ``"-c"``).
++
++        Returns a list of history entries if tracking is enabled for the current
++        command, otherwise returns ``None``. Each entry is a dictionary with keys:
++        ``value``, ``source``, and ``timestamp``. If tracking is enabled but the
++        name does not identify an option on the current command, returns an empty
++        list. Positional arguments are not included in the history.
++
++        .. versionadded:: 8.3
++        """
++        # Check if tracking is enabled for this command
++        cmd = self.command
++        if not getattr(cmd, 'track_changes', False):
++            return None
++
++        # Get the option from the command's parameters
++        param = None
++        for p in cmd.params:
++            if p.name == name:
++                param = p
++                break
++            # Also check by option names
++            if param is None:
++                for opt_name in p.opts:
++                    if opt_name == name:
++                        param = p
++                        break
++
++        if param is None:
++            # Option not found on this command
++            return []
++
++        # Return the history for this parameter
++        return getattr(param, '_history', [])
++
+ 
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+@@ -916,6 +1015,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        track_changes: bool = False,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -945,6 +1045,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -1182,6 +1283,11 @@ class Command:
+ 
+         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
+ 
++        # Enable history tracking if track_changes is set
++        if self.track_changes:
++            for param in self.params:
++                param._history = []
++
+         with ctx.scope(cleanup=False):
+             self.parse_args(ctx, args)
+         return ctx
+@@ -1521,9 +1627,10 @@ class Group(Command):
+         subcommand_metavar: str | None = None,
+         chain: bool = False,
+         result_callback: t.Callable[..., t.Any] | None = None,
++        track_changes: bool = False,
+         **kwargs: t.Any,
+     ) -> None:
+-        super().__init__(name, **kwargs)
++        super().__init__(name, track_changes=track_changes, **kwargs)
+ 
+         if commands is None:
+             commands = {}
+@@ -1937,7 +2044,7 @@ class CommandCollection(Group):
+         sources: list[Group] | None = None,
+         **kwargs: t.Any,
+     ) -> None:
+-        super().__init__(name, **kwargs)
++        super().__init__(name, track_changes=track_changes, **kwargs)
+         #: The list of registered groups.
+         self.sources: list[Group] = sources or []
+ 
+@@ -2113,6 +2220,7 @@ class Parameter:
+         self.nargs = nargs
+         self.multiple = multiple
+         self.expose_value = expose_value
++        self._history: list[dict[str, t.Any]] | None = None
+         self.default = default
+         self.is_eager = is_eager
+         self.metavar = metavar
+@@ -2421,7 +2529,18 @@ class Parameter:
+                 value = None
+ 
+         if self.expose_value:
+-            ctx.params[self.name] = value  # type: ignore
++            # Set the value without triggering _ParamDict.__setitem__ to avoid duplicate history entries
++            dict.__setitem__(ctx.params, self.name, value)
++
++            # Record history if tracking is enabled
++            if self._history is not None:
++                import time
++                entry = {
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                }
++                self._history.append(entry)
+ 
+         return value, args
+ 
+diff --git a/test_track_changes.py b/test_track_changes.py
+new file mode 100644
+index 0000000..ccd0a22
+--- /dev/null
++++ b/test_track_changes.py
+@@ -0,0 +1,202 @@
++"""Test script for track_changes feature."""
++import time
++import click
++from click import Context
++from click.core import ParameterSource
++
++
++def test_basic_tracking():
++    """Test basic option history tracking."""
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", default=0)
++    def cli(count):
++        ctx = click.get_current_context()
++        history = ctx.get_option_history("count")
++        print(f"History: {history}")
++        assert history is not None, "History should not be None when tracking is enabled"
++        assert len(history) == 1, f"Expected 1 entry, got {len(history)}"
++        assert history[0]["value"] == 0, f"Expected value 0, got {history[0]['value']}"
++        assert history[0]["source"] == ParameterSource.DEFAULT
++        return history
++    
++    result = click.Context(cli).invoke(cli)
++    print("Basic tracking test passed!")
++
++
++def test_commandline_value():
++    """Test that command-line values are recorded correctly."""
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", default=0)
++    def cli(count):
++        ctx = click.get_current_context()
++        history = ctx.get_option_history("count")
++        print(f"History: {history}")
++        assert len(history) == 1
++        assert history[0]["value"] == 5
++        assert history[0]["source"] == ParameterSource.COMMANDLINE
++        return history
++    
++    # Simulate command line invocation
++    ctx = click.Context(cli)
++    ctx.invoke(cli, count=5)
++
++
++def test_multiple_assignments():
++    """Test that multiple assignments are tracked in order."""
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", default=0)
++    def cli(count):
++        ctx = click.get_current_context()
++        
++        # Initial value from parsing
++        history_before = ctx.get_option_history("count")
++        print(f"History before manual assignment: {history_before}")
++        
++        # Manually assign a new value
++        ctx.params["count"] = 10
++        
++        history_after = ctx.get_option_history("count")
++        print(f"History after manual assignment: {history_after}")
++        
++        assert len(history_after) == 2, f"Expected 2 entries, got {len(history_after)}"
++        assert history_after[0]["value"] == 0
++        assert history_after[0]["source"] == ParameterSource.DEFAULT
++        assert history_after[1]["value"] == 10
++        assert history_after[1]["source"] is None  # Manual assignment has no source
++        return history_after
++    
++    ctx = click.Context(cli)
++    ctx.invoke(cli)
++
++
++def test_tracking_disabled():
++    """Test that tracking disabled returns None."""
++    @click.command(track_changes=False)
++    @click.option("-c", "--count", default=0)
++    def cli(count):
++        ctx = click.get_current_context()
++        history = ctx.get_option_history("count")
++        print(f"History (tracking disabled): {history}")
++        assert history is None, "History should be None when tracking is disabled"
++        return history
++    
++    ctx = click.Context(cli)
++    ctx.invoke(cli)
++
++
++def test_nonexistent_option():
++    """Test that nonexistent options return empty list."""
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", default=0)
++    def cli(count):
++        ctx = click.get_current_context()
++        history = ctx.get_option_history("nonexistent")
++        print(f"History for nonexistent option: {history}")
++        assert history == [], f"Expected empty list, got {history}"
++        return history
++    
++    ctx = click.Context(cli)
++    ctx.invoke(cli)
++
++
++def test_group_subcommand_isolation():
++    """Test that group and subcommand have independent histories."""
++    @click.group(track_changes=True)
++    @click.option("-g", "--group-opt", default="group_default")
++    def cli(group_opt):
++        pass
++    
++    @cli.command(track_changes=True)
++    @click.option("-s", "--subopt", default="sub_default")
++    def sub(subopt):
++        ctx = click.get_current_context()
++        
++        # Group option should not exist in subcommand context
++        group_history = ctx.get_option_history("group_opt")
++        print(f"Group option history in subcommand: {group_history}")
++        
++        # Subcommand option should exist
++        sub_history = ctx.get_option_history("subopt")
++        print(f"Subcommand option history: {sub_history}")
++        
++        assert group_history == [], f"Expected empty list for group option, got {group_history}"
++        assert sub_history is not None, "Subcommand option history should not be None"
++        assert len(sub_history) == 1
++        assert sub_history[0]["value"] == "sub_default"
++    
++    # Test group level
++    group_ctx = click.Context(cli)
++    group_ctx.invoke(cli)
++    
++    # Test subcommand level
++    sub_ctx = click.Context(cli.commands["sub"])
++    sub_ctx.invoke(cli.commands["sub"])
++
++
++def test_snapshot_immutability():
++    """Test that returned snapshots are immutable."""
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", default=0)
++    def cli(count):
++        ctx = click.get_current_context()
++        
++        # Get initial history
++        history1 = ctx.get_option_history("count")
++        print(f"Initial history: {history1}")
++        
++        # Modify params
++        ctx.params["count"] = 99
++        
++        # Get history again
++        history2 = ctx.get_option_history("count")
++        print(f"After modification: {history2}")
++        
++        # Original snapshot should be unchanged
++        assert history1[0]["value"] == 0, "Original snapshot should be unchanged"
++        assert len(history2) == 2, "New history should have 2 entries"
++        
++        return history2
++    
++    ctx = click.Context(cli)
++    ctx.invoke(cli)
++
++
++if __name__ == "__main__":
++    print("Running tests...")
++    
++    try:
++        test_basic_tracking()
++    except Exception as e:
++        print(f"test_basic_tracking failed: {e}")
++    
++    try:
++        test_commandline_value()
++    except Exception as e:
++        print(f"test_commandline_value failed: {e}")
++    
++    try:
++        test_multiple_assignments()
++    except Exception as e:
++        print(f"test_multiple_assignments failed: {e}")
++    
++    try:
++        test_tracking_disabled()
++    except Exception as e:
++        print(f"test_tracking_disabled failed: {e}")
++    
++    try:
++        test_nonexistent_option()
++    except Exception as e:
++        print(f"test_nonexistent_option failed: {e}")
++    
++    try:
++        test_group_subcommand_isolation()
++    except Exception as e:
++        print(f"test_group_subcommand_isolation failed: {e}")
++    
++    try:
++        test_snapshot_immutability()
++    except Exception as e:
++        print(f"test_snapshot_immutability failed: {e}")
++    
++    print("Tests completed!")

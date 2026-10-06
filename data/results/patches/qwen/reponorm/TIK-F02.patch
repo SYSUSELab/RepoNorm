@@ -1,0 +1,349 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 64dc6a1..d6fc07f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -222,7 +222,7 @@ impl CoreBPE {
+         let regex = self._get_tl_regex();
+         let mut ret = vec![];
+         for mat in regex.find_iter(text) {
+-            let piece = mat.unwrap().as_str().as_bytes();
++            let piece = mat.as_ref().unwrap().as_str().as_bytes();
+             match self.encoder.get(piece) {
+                 Some(token) => ret.push(*token),
+                 None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
+@@ -258,7 +258,7 @@ impl CoreBPE {
+ 
+             // Okay, here we go, compare this logic to encode_ordinary
+             for mat in regex.find_iter(&text[start..end]) {
+-                let piece = mat.unwrap().as_str().as_bytes();
++                let piece = mat.as_ref().unwrap().as_str().as_bytes();
+                 if let Some(token) = self.encoder.get(piece) {
+                     last_piece_token_len = 1;
+                     ret.push(*token);
+@@ -287,6 +287,75 @@ impl CoreBPE {
+         (ret, last_piece_token_len)
+     }
+ 
++    pub fn encode_with_offsets(
++        &self,
++        text: &str,
++        allowed_special: &HashSet<&str>,
++    ) -> (Vec<Rank>, usize, Vec<usize>) {
++        let special_regex = self._get_tl_special_regex();
++        let regex = self._get_tl_regex();
++        let mut ret = vec![];
++        let mut positions = vec![];
++
++        let mut start = 0;
++        let mut last_piece_token_len = 0;
++        loop {
++            let mut next_special;
++            let mut start_find = start;
++            loop {
++                // Find the next allowed special token, if any
++                next_special = special_regex.find_from_pos(text, start_find).unwrap();
++                match next_special {
++                    Some(m) => {
++                        if allowed_special.contains(&text[m.start()..m.end()]) {
++                            break;
++                        }
++                        start_find = m.start() + 1;
++                    }
++                    None => break,
++                }
++            }
++            let end = next_special.map_or(text.len(), |m| m.start());
++
++            // Okay, here we go, compare this logic to encode_ordinary
++            for mat in regex.find_iter(&text[start..end]) {
++                let piece = mat.as_ref().unwrap().as_str().as_bytes();
++                let piece_start_byte = start + mat.as_ref().unwrap().start();
++                if let Some(token) = self.encoder.get(piece) {
++                    last_piece_token_len = 1;
++                    ret.push(*token);
++                    positions.push(piece_start_byte);
++                    continue;
++                }
++                let tokens = byte_pair_encode(piece, &self.encoder);
++                last_piece_token_len = tokens.len();
++                ret.extend(&tokens);
++                // All BPE-split tokens share the same starting position
++                for _ in 0..tokens.len() {
++                    positions.push(piece_start_byte);
++                }
++            }
++
++            match next_special {
++                // And here we push the special token
++                Some(m) => {
++                    let piece = m.as_str();
++                    let token = self.special_tokens_encoder[piece];
++                    ret.push(token);
++                    positions.push(m.start());
++                    start = m.end();
++                    last_piece_token_len = 0;
++                }
++                None => break,
++            }
++        }
++
++        // last_piece_token_len is how many tokens came from the last regex split. This is used
++        // for determining unstable tokens, since you can't merge across (stable) regex splits
++        (ret, last_piece_token_len, positions)
++    }
++
++
+     fn _increase_last_piece_token_len(
+         &self,
+         tokens: Vec<Rank>,
+diff --git a/src/py.rs b/src/py.rs
+index ed107b4..f90174d 100644
+--- a/src/py.rs
++++ b/src/py.rs
+@@ -50,6 +50,32 @@ impl CoreBPE {
+         })
+     }
+ 
++    #[pyo3(name = "encode_with_offsets")]
++    fn py_encode_with_offsets(
++        &self,
++        py: Python,
++        text: &str,
++        allowed_special: HashSet<PyBackedStr>,
++    ) -> PyResult<(Vec<Rank>, Vec<usize>)> {
++        py.allow_threads(|| {
++            let allowed_special: HashSet<&str> =
++                allowed_special.iter().map(|s| s.as_ref()).collect();
++            let (tokens, _last_piece_token_len, positions) = self.encode_with_offsets(text, &allowed_special);
++            
++            // Convert byte offsets to character offsets
++            let char_positions: Vec<usize> = positions
++                .iter()
++                .map(|&byte_pos| {
++                    // Count Unicode code points up to this byte position
++                    text[..byte_pos].chars().count()
++                })
++                .collect();
++            
++            Ok((tokens, char_positions))
++        })
++    }
++
++
+     fn encode_to_tiktoken_buffer(
+         &self,
+         py: Python,
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..78a8632 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -254,3 +254,129 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++
++# Tests for return_positions parameter
++def test_encode_return_positions_basic():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test basic encoding with return_positions=True
++    tokens, positions = enc.encode("hello world", return_positions=True)
++    assert tokens == [15339, 1917]
++    assert positions == [0, 5]
++    
++    # Verify that token IDs match ordinary encoding
++    assert enc.encode("hello world") == tokens
++
++
++def test_encode_return_positions_empty():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Empty input yields ([], [])
++    tokens, positions = enc.encode("", return_positions=True)
++    assert tokens == []
++    assert positions == []
++
++
++def test_encode_return_positions_unicode():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test Unicode characters (non-ASCII)
++    tokens, positions = enc.encode("héllo wörld", return_positions=True)
++    # Verify positions are character indices, not byte indices
++    assert positions[0] == 0  # 'h' is at char index 0
++    
++    # Verify token IDs match ordinary encoding
++    assert enc.encode("héllo wörld") == tokens
++
++
++def test_encode_return_positions_emoji():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test emoji
++    tokens, positions = enc.encode("hello 👋 world", return_positions=True)
++    # Verify positions are character indices
++    assert positions[0] == 0  # 'h' is at char index 0
++    assert positions[1] == 5  # space after 'hello' is at char index 5
++    
++    # Verify token IDs match ordinary encoding
++    assert enc.encode("hello 👋 world") == tokens
++
++
++def test_encode_return_positions_special_tokens():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test special tokens
++    tokens, positions = enc.encode(
++        "<|startoftext|> hello <|endoftext|>",
++        return_positions=True,
++        allowed_special={"<|startoftext|>", "<|endoftext|>"}
++    )
++    # Special tokens start at their literal text's starting character
++    assert positions[0] == 0  # '<|startoftext|>' starts at char index 0
++    assert positions[-1] == 22  # '<|endoftext|>' starts at char index 24
++    
++    # Verify token IDs match ordinary encoding
++    assert enc.encode("<|startoftext|> hello <|endoftext|>", allowed_special="all") == tokens
++
++
++def test_encode_batch_return_positions_basic():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test batch encoding with return_positions=True
++    result = enc.encode_batch(["hello", "world"], return_positions=True)
++    assert result == [([15339], [0]), ([14957], [0])]
++    
++    # Verify that token IDs match ordinary encoding
++    assert enc.encode_batch(["hello", "world"]) == [[15339], [14957]]
++
++
++def test_encode_batch_return_positions_empty():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test batch encoding with empty strings
++    result = enc.encode_batch(["hello", "", "world"], return_positions=True)
++    assert result == [([15339], [0]), ([], []), ([14957], [0])]
++
++
++def test_encode_batch_return_positions_unicode():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Test batch encoding with Unicode
++    result = enc.encode_batch(["héllo", "wörld"], return_positions=True)
++    # Verify positions are character indices
++    assert result[0][1][0] == 0  # 'h' is at char index 0
++    assert result[1][1][0] == 0  # 'w' is at char index 0
++    
++    # Verify token IDs match ordinary encoding
++    assert enc.encode_batch(["héllo", "wörld"]) == [result[0][0], result[1][0]]
++
++
++def test_encode_return_positions_default_false():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Default return type should be unchanged (list[int])
++    result = enc.encode("hello world")
++    assert isinstance(result, list)
++    assert result == [15339, 1917]
++    
++    # Explicit return_positions=False should also return list[int]
++    result = enc.encode("hello world", return_positions=False)
++    assert isinstance(result, list)
++    assert result == [15339, 1917]
++
++
++def test_encode_batch_return_positions_default_false():
++    enc = tiktoken.get_encoding("cl100k_base")
++    
++    # Default return type should be unchanged (list[list[int]])
++    result = enc.encode_batch(["hello", "world"])
++    assert isinstance(result, list)
++    assert all(isinstance(item, list) for item in result)
++    assert result == [[15339], [14957]]
++    
++    # Explicit return_positions=False should also return list[list[int]]
++    result = enc.encode_batch(["hello", "world"], return_positions=False)
++    assert isinstance(result, list)
++    assert all(isinstance(item, list) for item in result)
++    assert result == [[15339], [14957]]
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..5014832 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -80,9 +80,10 @@ class Encoding:
+         self,
+         text: str,
+         *,
++        return_positions: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++    ) -> list[int] | tuple[list[int], list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -120,17 +121,21 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        try:
+-            return self._core_bpe.encode(text, allowed_special)
+-        except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+-            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++        if return_positions:
++            tokens, positions = self._core_bpe.encode_with_offsets(text, allowed_special)
++            return tokens, positions
++        else:
++            try:
++                return self._core_bpe.encode(text, allowed_special)
++            except UnicodeEncodeError:
++                # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++                # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++                # fixup for any surrogate pairs that may have sneaked their way into the text.
++                # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++                # string, but given that this is input we want to support, maybe that's okay.
++                # Also we use errors="replace" to handle weird things like lone surrogates.
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                return self._core_bpe.encode(text, allowed_special)
+ 
+     def encode_to_numpy(
+         self,
+@@ -177,13 +182,17 @@ class Encoding:
+         text: list[str],
+         *,
+         num_threads: int = 8,
++        return_positions: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[list[int]]:
++    ) -> list[list[int]] | list[tuple[list[int], list[int]]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+ 
++        If `return_positions` is True, returns a list of tuples (tokens, positions) for each
++        document, where positions are zero-based character indices in the original document.
++
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
+@@ -197,7 +206,10 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode,
++            return_positions=return_positions,
++            allowed_special=allowed_special,
++            disallowed_special=disallowed_special,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

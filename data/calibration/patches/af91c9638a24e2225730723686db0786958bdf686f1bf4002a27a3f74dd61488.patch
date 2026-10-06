@@ -1,0 +1,336 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..43929af9 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Validate malformed template paths across builtin public loading and
++    source access while retaining existing valid-name protocols.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..897c8cfe 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -440,8 +440,19 @@ own loader, subclass :class:`BaseLoader` and override `get_source`.
+ .. autoclass:: jinja2.BaseLoader
+     :members: get_source, load
+ 
++All builtin loaders validate malformed names before public loading and
++source access. This also applies to composite and precompiled loaders.
++Empty names, NUL, leading separators, ASCII drive prefixes and ASCII
++controls below 32 are rejected, except tab, newline and carriage return.
++Rejection raises ``TemplateNotFound`` with the original request.
++Valid names retain their existing source and loading behavior. Existing
++filesystem parent-segment checks remain stricter than basic validation.
++
++.. autofunction:: jinja2.loaders.validate_template_path
++
+ Here a list of the builtin loaders Jinja provides:
+ 
++
+ .. autoclass:: jinja2.FileSystemLoader
+ 
+ .. autoclass:: jinja2.PackageLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..21059f4d 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -21,10 +21,40 @@ if t.TYPE_CHECKING:
+     from .environment import Template
+ 
+ 
++def validate_template_path(template: str) -> None:
++    """Raise :exc:`TemplateNotFound` for malformed requests.
++    Reject None, empty names, NUL, leading slash or backslash, and ASCII
++    drive prefixes. Controls below 32 are invalid except tab, LF and CR.
++
++    .. versionadded:: 3.1.0
++    """
++    if not template or not isinstance(template, str):
++        raise TemplateNotFound(template)
++
++    if template.startswith(("/", "\\")):
++        raise TemplateNotFound(template)
++
++    if (
++        len(template) >= 2
++        and template[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++        and template[1] == ":"
++    ):
++        raise TemplateNotFound(template)
++
++    if "\x00" in template or any(
++        ord(char) < 32 and char not in "\t\n\r" for char in template
++    ):
++        raise TemplateNotFound(template)
++
++
+ def split_template_path(template: str) -> t.List[str]:
+     """Split a path into segments and perform a sanity check.  If it detects
+     '..' in the path it will raise a `TemplateNotFound` error.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed names before existing traversal checks.
+     """
++    validate_template_path(template)
+     pieces = []
+     for piece in template.split("/"):
+         if (
+@@ -63,6 +93,9 @@ class BaseLoader:
+                 with open(path) as f:
+                     source = f.read()
+                 return source, path, lambda: mtime == getmtime(path)
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     #: if set to `False` it indicates that the loader cannot provide access
+@@ -91,6 +124,7 @@ class BaseLoader:
+         old state somewhere (for example in a closure).  If it returns `False`
+         the template will be reloaded.
+         """
++        validate_template_path(template)
+         if not self.has_source_access:
+             raise RuntimeError(
+                 f"{type(self).__name__} cannot provide access to the source"
+@@ -111,11 +145,14 @@ class BaseLoader:
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
+         """Loads a template.  This method looks up the template in the cache
+-        or loads one by calling :meth:`get_source`.  Subclasses should not
+-        override this method as loaders working on collections of other
+-        loaders (such as :class:`PrefixLoader` or :class:`ChoiceLoader`)
+-        will not call this method but `get_source` directly.
++        or loads one by calling :meth:`get_source`. Composite loaders
++        delegate to child loading methods so precompiled loaders remain
++        supported.
++
++        .. versionchanged:: 3.1.0
++            Validate malformed names before loading.
+         """
++        validate_template_path(name)
+         code = None
+         if globals is None:
+             globals = {}
+@@ -173,6 +210,9 @@ class FileSystemLoader(BaseLoader):
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     def __init__(
+@@ -262,6 +302,9 @@ class PackageLoader(BaseLoader):
+ 
+     .. versionchanged:: 3.0
+         Limited PEP 420 namespace package support.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     def __init__(
+@@ -399,6 +442,9 @@ class DictLoader(BaseLoader):
+     >>> loader = DictLoader({'index.html': 'source here'})
+ 
+     Because auto reloading is rarely useful this is disabled per default.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     def __init__(self, mapping: t.Mapping[str, str]) -> None:
+@@ -407,6 +453,7 @@ class DictLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, None, t.Callable[[], bool]]:
++        validate_template_path(template)
+         if template in self.mapping:
+             source = self.mapping[template]
+             return source, None, lambda: source == self.mapping.get(template)
+@@ -432,6 +479,9 @@ class FunctionLoader(BaseLoader):
+     and has to return `True` if the template is still up to date.  For more
+     details have a look at :meth:`BaseLoader.get_source` which has the same
+     return value.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     def __init__(
+@@ -450,6 +500,7 @@ class FunctionLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        validate_template_path(template)
+         rv = self.load_func(template)
+ 
+         if rv is None:
+@@ -474,6 +525,9 @@ class PrefixLoader(BaseLoader):
+ 
+     By loading ``'app1/index.html'`` the file from the app1 package is loaded,
+     by loading ``'app2/index.html'`` the file from the second.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     def __init__(
+@@ -483,6 +537,7 @@ class PrefixLoader(BaseLoader):
+         self.delimiter = delimiter
+ 
+     def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        validate_template_path(template)
+         try:
+             prefix, name = template.split(self.delimiter, 1)
+             loader = self.mapping[prefix]
+@@ -493,6 +548,7 @@ class PrefixLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        validate_template_path(template)
+         loader, name = self.get_loader(template)
+         try:
+             return loader.get_source(environment, name)
+@@ -508,6 +564,7 @@ class PrefixLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        validate_template_path(name)
+         loader, local_name = self.get_loader(name)
+         try:
+             return loader.load(environment, local_name, globals)
+@@ -536,6 +593,9 @@ class ChoiceLoader(BaseLoader):
+ 
+     This is useful if you want to allow users to override builtin templates
+     from a different location.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
+@@ -544,6 +604,7 @@ class ChoiceLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        validate_template_path(template)
+         for loader in self.loaders:
+             try:
+                 return loader.get_source(environment, template)
+@@ -558,6 +619,7 @@ class ChoiceLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        validate_template_path(name)
+         for loader in self.loaders:
+             try:
+                 return loader.load(environment, name, globals)
+@@ -587,6 +649,9 @@ class ModuleLoader(BaseLoader):
+     ... ])
+ 
+     Templates can be precompiled with :meth:`Environment.compile_templates`.
++
++    .. versionchanged:: 3.1.0
++        Validate malformed public names before loading or source access.
+     """
+ 
+     has_source_access = False
+@@ -630,6 +695,7 @@ class ModuleLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        validate_template_path(name)
+         key = self.get_template_key(name)
+         module = f"{self.package_name}.{key}"
+         mod = getattr(self.module, module, None)
+@@ -650,3 +716,5 @@ class ModuleLoader(BaseLoader):
+         return environment.template_class.from_module_dict(
+             environment, mod.__dict__, globals
+         )
++
++_N4C_STYLE_SENTINEL=  1  
+diff --git a/tests/test_n4c_author_template_validation.py b/tests/test_n4c_author_template_validation.py
+new file mode 100644
+index 00000000..64960342
+--- /dev/null
++++ b/tests/test_n4c_author_template_validation.py
+@@ -0,0 +1,71 @@
++import pytest
++
++from jinja2 import Environment
++from jinja2 import loaders
++from jinja2 import TemplateNotFound
++
++
++@pytest.mark.parametrize("name", [None, "", "bad\x00name", "C:page", "a\x02b"])
++def test_public_malformed_contract(name):
++    with pytest.raises(TemplateNotFound) as caught:
++        loaders.validate_template_path(name)
++    assert caught.value.name == name
++
++
++@pytest.mark.parametrize("name", ["é:page", "tab\tpage", "line\npage", "cr\rpage"])
++def test_declared_valid_names_can_still_load(name):
++    assert loaders.validate_template_path(name) is None
++    assert (
++        Environment(loader=loaders.DictLoader({name: "ok"})).get_template(name).render()
++        == "ok"
++    )
++
++
++@pytest.mark.parametrize("kind", ["dict", "function"])
++def test_existing_invalid_key_cannot_skip_validation(kind):
++    name = "/page"
++    child = (
++        loaders.DictLoader({name: "invalid"})
++        if kind == "dict"
++        else loaders.FunctionLoader(lambda requested: "invalid")
++    )
++    for loader, request in (
++        (child, name),
++        (loaders.ChoiceLoader([child]), name),
++        (loaders.PrefixLoader({"site": child}), "/site/page"),
++    ):
++        with pytest.raises(TemplateNotFound) as caught:
++            loader.load(Environment(), request)
++        assert caught.value.name == request
++
++
++def test_module_direct_source_rejects_malformed_before_unsupported(tmp_path):
++    loader = loaders.ModuleLoader(tmp_path)
++    with pytest.raises(TemplateNotFound) as caught:
++        loader.get_source(Environment(), "/page")
++    assert caught.value.name == "/page"
++    with pytest.raises(RuntimeError):
++        loader.get_source(Environment(), "page")
++
++
++@pytest.mark.parametrize("kind", ["module", "prefix", "choice"])
++def test_valid_compiled_templates_remain_source_less(tmp_path, kind):
++    source = Environment(loader=loaders.DictLoader({"page": "Hello {{ who }}"}))
++    source.compile_templates(str(tmp_path), zip=None)
++    child = loaders.ModuleLoader(tmp_path)
++    loader = child
++    name = "page"
++    if kind == "prefix":
++        loader = loaders.PrefixLoader({"site": child})
++        name = "site/page"
++    elif kind == "choice":
++        loader = loaders.ChoiceLoader([loaders.DictLoader({}), child])
++    assert Environment(loader=loader).get_template(name).render(who="world") == (
++        "Hello world"
++    )
++
++
++def test_valid_function_tuple_preserves_reload_helper():
++    loader = loaders.FunctionLoader(lambda name: ("ok", None, lambda: False))
++    text, filename, current = loader.get_source(Environment(), "page")
++    assert text == "ok" and filename is None and current() is False

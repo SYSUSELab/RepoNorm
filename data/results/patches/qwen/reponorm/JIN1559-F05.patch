@@ -1,0 +1,479 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..3dd8749 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -48,6 +48,105 @@ GETTEXT_FUNCTIONS: t.Tuple[str, ...] = (
+     "pgettext",
+     "npgettext",
+ )
++
++def _validate_trans_expr(expr: nodes.Expr, var_name: str, lineno: int, parser: "Parser") -> None:
++    """Validate that a translation expression only contains allowed node types.
++    
++    Allowed: constants, names, attribute access, filters, tests, or calls whose
++    callee is a simple name. Arguments and keyword values must follow the same rule.
++    Dynamic *args and **kwargs are rejected. Other forms raise TemplateSyntaxError.
++    """
++    from .nodes import Name, Const, Getattr, Filter, Test, Call
++    
++    def _check_node(node: nodes.Node, path: str = "") -> None:
++        if isinstance(node, Name):
++            # Names are always allowed
++            return
++        elif isinstance(node, Const):
++            # Constants are always allowed
++            return
++        elif isinstance(node, Getattr):
++            # Attribute access is allowed, check the base
++            _check_node(node.node, f"{path}.node")
++            return
++        elif isinstance(node, Filter):
++            # Filters are allowed, check the node and arguments
++            if node.node is not None:
++                _check_node(node.node, f"{path}.node")
++            for arg in node.args:
++                _check_node(arg, f"{path}.args")
++            for kw in node.kwargs:
++                _check_node(kw.value, f"{path}.kwargs.value")
++            if node.dyn_args is not None:
++                raise TemplateSyntaxError(
++                    f"dynamic *args not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            if node.dyn_kwargs is not None:
++                raise TemplateSyntaxError(
++                    f"dynamic **kwargs not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            return
++        elif isinstance(node, Test):
++            # Tests are allowed, check the node and arguments
++            _check_node(node.node, f"{path}.node")
++            for arg in node.args:
++                _check_node(arg, f"{path}.args")
++            for kw in node.kwargs:
++                _check_node(kw.value, f"{path}.kwargs.value")
++            if node.dyn_args is not None:
++                raise TemplateSyntaxError(
++                    f"dynamic *args not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            if node.dyn_kwargs is not None:
++                raise TemplateSyntaxError(
++                    f"dynamic **kwargs not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            return
++        elif isinstance(node, Call):
++            # Calls are allowed only if the callee is a simple name
++            if not isinstance(node.node, Name):
++                raise TemplateSyntaxError(
++                    f"method call not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            for arg in node.args:
++                _check_node(arg, f"{path}.args")
++            for kw in node.kwargs:
++                _check_node(kw.value, f"{path}.kwargs.value")
++            if node.dyn_args is not None:
++                raise TemplateSyntaxError(
++                    f"dynamic *args not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            if node.dyn_kwargs is not None:
++                raise TemplateSyntaxError(
++                    f"dynamic **kwargs not allowed in translation expression for {var_name!r}",
++                    lineno,
++                    filename=parser.name,
++                )
++            return
++        else:
++            # All other node types are disallowed
++            raise TemplateSyntaxError(
++                f"expression {type(node).__name__} not allowed in translation expression for {var_name!r}",
++                lineno,
++                filename=parser.name,
++            )
++    
++    _check_node(expr)
++
++
++
+ _ws_re = re.compile(r"\s*\n\s*")
+ 
+ 
+@@ -372,6 +471,12 @@ class InternationalizationExtension(Extension):
+                 break
+ 
+             token = parser.stream.expect("name")
++            if token.value in GETTEXT_FUNCTIONS:
++                parser.fail(
++                    f"variable {token.value!r} conflicts with translation function names",
++                    token.lineno,
++                    exc=TemplateSyntaxError,
++                )
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -383,6 +488,7 @@ class InternationalizationExtension(Extension):
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+                 variables[token.value] = var = parser.parse_expression()
++                _validate_trans_expr(var, token.value, token.lineno, parser)
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+@@ -426,6 +532,12 @@ class InternationalizationExtension(Extension):
+                         token.lineno,
+                         exc=TemplateAssertionError,
+                     )
++                if token.value in GETTEXT_FUNCTIONS:
++                    parser.fail(
++                        f"variable {token.value!r} conflicts with translation function names",
++                        token.lineno,
++                        exc=TemplateSyntaxError,
++                    )
+                 plural_expr = variables[token.value]
+                 num_called_num = token.value == "num"
+             parser.stream.expect("block_end")
+@@ -438,6 +550,12 @@ class InternationalizationExtension(Extension):
+         # register free names as simple name expressions
+         for name in referenced:
+             if name not in variables:
++                if name in GETTEXT_FUNCTIONS:
++                    parser.fail(
++                        f"variable {name!r} conflicts with translation function names",
++                        lineno,
++                        exc=TemplateSyntaxError,
++                    )
+                 variables[name] = nodes.Name(name, "load")
+ 
+         if not have_plural:
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..fd51382 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -7,7 +7,7 @@ from jinja2 import DictLoader
+ from jinja2 import Environment
+ from jinja2 import nodes
+ from jinja2 import pass_context
+-from jinja2.exceptions import TemplateAssertionError
++from jinja2.exceptions import TemplateAssertionError, TemplateSyntaxError
+ from jinja2.ext import Extension
+ from jinja2.lexer import count_newlines
+ from jinja2.lexer import Token
+@@ -712,3 +712,308 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestTranslationVariableValidation:
++    """Tests for translation variable name and expression validation."""
++
++    @pytest.fixture
++    def i18n_env(self):
++        """Return an environment with i18n extension enabled."""
++        from jinja2 import Environment
++        from jinja2 import pass_context
++        
++        @pass_context
++        def _(context, s):
++            return s
++        
++        @pass_context
++        def gettext(context, s):
++            return s
++        
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.globals["_"] = _
++        env.globals["gettext"] = gettext
++        return env
++
++    def test_reserved_name_gettext_header(self, i18n_env):
++        """Reserved name 'gettext' in header should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans gettext='test' %}hello{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_ngettext_header(self, i18n_env):
++        """Reserved name 'ngettext' in header should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans ngettext='test' %}hello{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_pgettext_header(self, i18n_env):
++        """Reserved name 'pgettext' in header should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans pgettext='test' %}hello{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_npgettext_header(self, i18n_env):
++        """Reserved name 'npgettext' in header should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans npgettext='test' %}hello{% endtrans %}"
++            )
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_underscore_header(self, i18n_env):
++        """Reserved name '_' in header should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans _='test' %}hello{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_gettext_body_reference(self, i18n_env):
++        """Referencing reserved name 'gettext' in body should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans x=1 %}{{ gettext }}{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_ngettext_body_reference(self, i18n_env):
++        """Referencing reserved name 'ngettext' in body should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans x=1 %}{{ ngettext }}{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_pgettext_body_reference(self, i18n_env):
++        """Referencing reserved name 'pgettext' in body should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans x=1 %}{{ pgettext }}{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_npgettext_body_reference(self, i18n_env):
++        """Referencing reserved name 'npgettext' in body should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans x=1 %}{{ npgettext }}{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_reserved_name_underscore_body_reference(self, i18n_env):
++        """Referencing reserved name '_' in body should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string("{% trans x=1 %}{{ _ }}{% endtrans %}")
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_valid_variable_names(self, i18n_env):
++        """Valid variable names should work correctly."""
++        template = i18n_env.from_string(
++            "{% trans name='John', age=30 %}Hello {{ name }}, you are {{ age }}{% endtrans %}"
++        )
++        result = template.render()
++        assert result == "Hello John, you are 30"
++
++    def test_valid_expression_constants(self, i18n_env):
++        """Constant expressions should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans greeting='Hello', count=42 %}{{ greeting }} {{ count }}{% endtrans %}"
++        )
++        result = template.render()
++        assert result == "Hello 42"
++
++    def test_valid_expression_names(self, i18n_env):
++        """Name references should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans name=name %}Hello {{ name }}{% endtrans %}",
++            globals={"name": "Alice"}
++        )
++        result = template.render()
++        assert result == "Hello Alice"
++
++    def test_valid_expression_attribute_access(self, i18n_env):
++        """Attribute access should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans first=person.first_name %}{{ first }}{% endtrans %}",
++            globals={"person": type("Person", (), {"first_name": "Bob"})()}
++        )
++        result = template.render()
++        assert result == "Bob"
++
++    def test_valid_expression_filters(self, i18n_env):
++        """Filter expressions should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans greeting=name|upper %}{{ greeting }}{% endtrans %}",
++            globals={"name": "alice"}
++        )
++        result = template.render()
++        assert result == "ALICE"
++
++    def test_valid_expression_tests(self, i18n_env):
++        """Test expressions should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans is_valid=name is defined %}{{ is_valid }}{% endtrans %}",
++            globals={"name": "test"}
++        )
++        result = template.render()
++        assert result == "True"
++
++    def test_valid_expression_simple_call(self, i18n_env):
++        """Simple function calls should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans greeting=get_greeting() %}{{ greeting }}{% endtrans %}",
++            globals={"get_greeting": lambda: "Hi"}
++        )
++        result = template.render()
++        assert result == "Hi"
++
++    def test_invalid_item_access(self, i18n_env):
++        """Item access (dict/list indexing) should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans value=data['key'] %}{{ value }}{% endtrans %}"
++            )
++        assert "not allowed in translation expression" in str(excinfo.value)
++
++    def test_invalid_arithmetic(self, i18n_env):
++        """Arithmetic expressions should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans total=a + b %}{{ total }}{% endtrans %}"
++            )
++        assert "not allowed in translation expression" in str(excinfo.value)
++
++    def test_invalid_conditional_expression(self, i18n_env):
++        """Conditional expressions should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=x if y else z %}{{ result }}{% endtrans %}"
++            )
++        assert "not allowed in translation expression" in str(excinfo.value)
++
++    def test_invalid_method_call(self, i18n_env):
++        """Method calls should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=obj.method() %}{{ result }}{% endtrans %}"
++            )
++        assert "method call not allowed in translation expression" in str(excinfo.value)
++
++    def test_invalid_nested_method_call(self, i18n_env):
++        """Nested method calls should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=obj.get().value %}{{ result }}{% endtrans %}"
++            )
++        assert "method call not allowed in translation expression" in str(excinfo.value)
++
++    def test_invalid_dynamic_args(self, i18n_env):
++        """Dynamic *args should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=func(*args) %}{{ result }}{% endtrans %}"
++            )
++        assert "dynamic *args not allowed" in str(excinfo.value)
++
++    def test_invalid_dynamic_kwargs(self, i18n_env):
++        """Dynamic **kwargs should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=func(**kwargs) %}{{ result }}{% endtrans %}"
++            )
++        assert "dynamic **kwargs not allowed" in str(excinfo.value)
++
++    def test_invalid_filter_with_dynamic_args(self, i18n_env):
++        """Filters with dynamic args should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=value|custom_filter(*args) %}{{ result }}{% endtrans %}"
++            )
++        assert "dynamic *args not allowed" in str(excinfo.value)
++
++    def test_invalid_test_with_dynamic_kwargs(self, i18n_env):
++        """Tests with dynamic kwargs should raise TemplateSyntaxError."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans result=value is custom_test(**kwargs) %}{{ result }}{% endtrans %}"
++            )
++        assert "dynamic **kwargs not allowed" in str(excinfo.value)
++
++    def test_plural_reserved_name_reference(self, i18n_env):
++        """Referencing reserved name in pluralize block should raise error."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans count=n %}{% pluralize count %}{{ ngettext }} items{% endtrans %}"
++            )
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_trimmed_reserved_name(self, i18n_env):
++        """Reserved name with trimmed should raise error."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans gettext='test' trimmed %}hello{% endtrans %}"
++            )
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_notrimmed_reserved_name(self, i18n_env):
++        """Reserved name with notrimmed should raise error."""
++        with pytest.raises(TemplateSyntaxError) as excinfo:
++            i18n_env.from_string(
++                "{% trans gettext='test' notrimmed %}hello{% endtrans %}"
++            )
++        assert "conflicts with translation function names" in str(excinfo.value)
++
++    def test_duplicate_variable_still_raises(self, i18n_env):
++        """Duplicate variable definition should still raise TemplateAssertionError."""
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            i18n_env.from_string(
++                "{% trans x=1, x=2 %}hello{% endtrans %}"
++            )
++        assert "defined twice" in str(excinfo.value)
++
++    def test_unknown_variable_plural(self, i18n_env):
++        """Unknown variable in pluralize should still raise error."""
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            i18n_env.from_string(
++                "{% trans x=1 %}hello{% pluralize unknown %}world{% endtrans %}"
++            )
++        assert "unknown variable" in str(excinfo.value)
++
++    def test_complex_valid_expression(self, i18n_env):
++        """Complex but valid expression combinations should work."""
++        template = i18n_env.from_string(
++            "{% trans greeting=name|upper|default('Hello') %}{{ greeting }}{% endtrans %}",
++            globals={"name": "alice"}
++        )
++        result = template.render()
++        assert result == "ALICE"
++
++    def test_valid_call_with_args(self, i18n_env):
++        """Function call with arguments should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans greeting=format_greeting(name, lang) %}{{ greeting }}{% endtrans %}",
++            globals={
++                "format_greeting": lambda n, l: f"{l}: {n}",
++                "name": "Alice",
++                "lang": "en"
++            }
++        )
++        result = template.render()
++        assert result == "en: Alice"
++
++    def test_valid_call_with_kwargs(self, i18n_env):
++        """Function call with keyword arguments should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans greeting=format_greeting(name, 'en') %}{{ greeting }}{% endtrans %}",
++            globals={
++                "format_greeting": lambda n, l="en": f"{l}: {n}",
++                "name": "Alice"
++            }
++        )
++        result = template.render()
++        assert result == "en: Alice"
++
++    def test_valid_nested_attribute_access(self, i18n_env):
++        """Nested attribute access should be allowed."""
++        template = i18n_env.from_string(
++            "{% trans city=user.address.city %}{{ city }}{% endtrans %}",
++            globals={
++                "user": type("User", (), {
++                    "address": type("Address", (), {"city": "Paris"})()
++                })()
++            }
++        )
++        result = template.render()
++        assert result == "Paris"

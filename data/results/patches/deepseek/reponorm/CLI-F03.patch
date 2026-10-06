@@ -1,0 +1,424 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..3dfa5df 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -432,6 +433,20 @@ class Context:
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++
++        if max_resources is None:
++            if parent is not None:
++                self._max_resources: int | None = parent._max_resources
++            else:
++                self._max_resources: int | None = None
++        else:
++            self._max_resources: int | None = max_resources
++
++        #: Number of resources successfully entered on this context.
++        self._resource_count: int = 0
++        #: Total number of active resources in this context's subtree
++        #: (including this context's direct resources and all descendants).
++        self._active_count: int = 0
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -588,7 +603,13 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        self._check_resource_limit()
++        self._reserve_resource_capacity()
++        try:
++            return self._exit_stack.enter_context(context_manager)
++        except BaseException:
++            self._release_resource_capacity()
++            raise
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+@@ -607,9 +628,58 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
+-        self._exit_stack = ExitStack()
++        released = self._resource_count
++        try:
++            self._exit_stack.close()
++        finally:
++            self._resource_count = 0
++            ctx: Context | None = self
++            while ctx is not None:
++                ctx._active_count -= released
++                ctx = ctx.parent
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
++
++    def _check_resource_limit(self) -> None:
++        """Check if any ancestor's resource limit would be exceeded.
++
++        Raises ``RuntimeError`` if the limit is reached on this context
++        or any ancestor.
++        """
++        ctx: Context | None = self
++        while ctx is not None:
++            if ctx._max_resources is not None and ctx._active_count >= ctx._max_resources:
++                raise RuntimeError(
++                    f"Context at '{self.command_path}' reached its maximum"
++                    f" number of resources ({ctx._max_resources})."
++                )
++            ctx = ctx.parent
++
++    def _reserve_resource_capacity(self) -> None:
++        """Reserve one resource slot on self and all ancestors.
++
++        Called after the limit check passes but before entering the
++        context manager. If entry fails, :meth:`_release_resource_capacity`
++        undoes this reservation.
++        """
++        self._resource_count += 1
++        ctx: Context | None = self
++        while ctx is not None:
++            ctx._active_count += 1
++            ctx = ctx.parent
++
++    def _release_resource_capacity(self) -> None:
++        """Release a reserved resource slot on self and all ancestors.
++
++        Called when entering a context manager fails after a
++        reservation was made.
++        """
++        self._resource_count -= 1
++        ctx: Context | None = self
++        while ctx is not None:
++            ctx._active_count -= 1
++            ctx = ctx.parent
++
+ 
+     @property
+     def command_path(self) -> str:
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..1b45cdc 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,309 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++def test_max_resources_basic():
++    """Test basic max_resources limit enforcement."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"), max_resources=2)
++    with ctx.scope():
++        rv1 = ctx.with_resource(manager())
++        assert rv1[0] == 1
++        rv2 = ctx.with_resource(manager())
++        assert rv2[0] == 1
++        # Third registration should fail
++        with pytest.raises(RuntimeError, match="reached its maximum"):
++            ctx.with_resource(manager())
++
++
++def test_max_resources_none_unlimited():
++    """Test that max_resources=None (default) allows unlimited registrations."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"))
++    with ctx.scope():
++        for _ in range(100):
++            ctx.with_resource(manager())
++
++
++def test_max_resources_zero():
++    """Test that max_resources=0 rejects the first registration."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"), max_resources=0)
++    with ctx.scope():
++        with pytest.raises(RuntimeError):
++            ctx.with_resource(manager())
++
++
++def test_max_resources_inheritance():
++    """Test that child inherits parent's limit by default."""
++    parent = click.Context(click.Command("parent"), max_resources=3)
++    child = click.Context(click.Command("child"), parent=parent)
++    assert child._max_resources == 3
++
++    child2 = click.Context(click.Command("child2"), parent=parent, max_resources=5)
++    assert child2._max_resources == 5
++
++
++def test_max_resources_parent_limit_covers_child():
++    """Test that parent's limit applies to registrations on its descendant."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        yield
++
++    parent = click.Context(click.Command("parent"), max_resources=1)
++    child = click.Context(click.Command("child"), parent=parent)
++    with parent.scope():
++        # Parent uses its one slot
++        parent.with_resource(manager())
++        # Child should fail because parent's limit is reached
++        with pytest.raises(RuntimeError):
++            child.with_resource(manager())
++
++
++def test_max_resources_child_subtree_limit():
++    """Test that a child's own limit constrains only its subtree."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        yield
++
++    parent = click.Context(click.Command("parent"), max_resources=5)
++    child = click.Context(click.Command("child"), parent=parent, max_resources=1)
++    with parent.scope():
++        parent.with_resource(manager())
++        parent.with_resource(manager())
++        # Child's limit of 1 should not affect parent's ability to register
++        parent.with_resource(manager())
++        # But child should not be able to register more than 1
++        child.with_resource(manager())
++        with pytest.raises(RuntimeError):
++            child.with_resource(manager())
++
++
++def test_max_resources_sibling_independence():
++    """Test that siblings share parent's allowance but not each other's subtree limit."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        yield
++
++    parent = click.Context(click.Command("parent"), max_resources=4)
++    child1 = click.Context(click.Command("child1"), parent=parent, max_resources=2)
++    child2 = click.Context(click.Command("child2"), parent=parent, max_resources=2)
++    with parent.scope():
++        child1.with_resource(manager())
++        # child2 can still register because parent has room
++        child2.with_resource(manager())
++        # parent registers 1 more: total active = 3
++        parent.with_resource(manager())
++        # child1's subtree limit is 2, used 1, so can register another
++        child1.with_resource(manager())
++        # Now parent limit is exhausted (4 active total); neither child nor parent can add more
++        with pytest.raises(RuntimeError):
++            parent.with_resource(manager())
++        with pytest.raises(RuntimeError):
++            child1.with_resource(manager())
++        with pytest.raises(RuntimeError):
++            child2.with_resource(manager())
++
++def test_max_resources_failed_entry_returns_capacity():
++    """Test that a failed entry returns capacity without consuming it."""
++    from contextlib import contextmanager
++
++    called = []
++    @contextmanager
++    def manager():
++        yield
++        called.append("cleanup")
++
++    ctx = click.Context(click.Command("test"), max_resources=1)
++    with ctx.scope():
++        rv = ctx.with_resource(manager())
++        # This should fail because limit reached
++        with pytest.raises(RuntimeError):
++            ctx.with_resource(manager())
++
++
++def test_max_resources_reentrant_prevents_overrun():
++    """Test that reentrant acquisition during entry reserves capacity."""
++    from contextlib import contextmanager
++
++    order = []
++    @contextmanager
++    def inner():
++        order.append("inner_enter")
++        yield
++        order.append("inner_exit")
++
++    @contextmanager
++    def outer():
++        order.append("outer_before_enter")
++        # Reentrant call during entry
++        ctx.with_resource(inner())
++        order.append("outer_after_enter")
++        yield
++        order.append("outer_exit")
++
++    ctx = click.Context(click.Command("test"), max_resources=1)
++    with ctx.scope():
++        with pytest.raises(RuntimeError):
++            ctx.with_resource(outer())
++        # The outer context manager started entry (outer_before_enter)
++        # but the reentrant inner call was blocked at the limit check
++        # before it could enter the inner context manager.
++        # Both outer and inner are fully cleaned up.
++        assert order == ["outer_before_enter"]
++        # Capacity should be fully restored
++        assert ctx._resource_count == 0
++        assert ctx._active_count == 0
++
++def test_max_resources_close_releases_capacity():
++    """Test that close() releases resources and restores capacity."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    parent = click.Context(click.Command("parent"), max_resources=1)
++    child = click.Context(click.Command("child"), parent=parent)
++    with parent.scope():
++        parent.with_resource(manager())
++        # child can't register because parent limit exhausted
++        with pytest.raises(RuntimeError):
++            child.with_resource(manager())
++        # Close parent's context - this releases the resource
++        parent.close()
++        # Now child can register
++        child.with_resource(manager())
++
++
++def test_max_resources_close_with_error_still_releases():
++    """Test that close() releases capacity even if cleanup raises."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    class RaiseOnExit:
++        def __enter__(self):
++            return [1]
++        def __exit__(self, *args):
++            raise ValueError("cleanup error")
++
++    parent = click.Context(click.Command("parent"), max_resources=1)
++    try:
++        with parent.scope():
++            parent.with_resource(RaiseOnExit())
++    except ValueError:
++        pass
++    # Capacity should still be released - use a normal manager this time
++    with parent.scope():
++        rv = parent.with_resource(manager())
++        assert rv[0] == 1
++
++
++def test_max_resources_repeated_close_safe():
++    """Test that repeated close() does not release capacity twice."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"), max_resources=2)
++    with ctx.scope():
++        ctx.with_resource(manager())
++        ctx.with_resource(manager())
++        ctx.close()
++        assert ctx._resource_count == 0
++        assert ctx._active_count == 0
++        # Close again - counts should stay at 0
++        ctx.close()
++        assert ctx._resource_count == 0
++        assert ctx._active_count == 0
++
++
++def test_max_resources_reuse_after_close():
++    """Test that a closed context can register resources again."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"), max_resources=1)
++    with ctx.scope():
++        rv = ctx.with_resource(manager())
++        ctx.close()
++        # Can register again after close
++        rv2 = ctx.with_resource(manager())
++        assert rv2[0] == 1
++
++
++def test_max_resources_call_on_close_unaffected():
++    """Test that call_on_close callbacks are unaffected by capacity tracking."""
++    registry = []
++
++    ctx = click.Context(click.Command("test"), max_resources=2)
++    with ctx.scope():
++        ctx.call_on_close(lambda: registry.append("cleanup"))
++        assert ctx._resource_count == 0  # call_on_close doesn't count
++
++    assert registry == ["cleanup"]
++
++
++def test_max_resources_zero_then_reuse():
++    """Test that a context with max_resources=0 can still register
++    resources after close releases capacity."""
++    from contextlib import contextmanager
++
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"), max_resources=0)
++    with ctx.scope():
++        with pytest.raises(RuntimeError):
++            ctx.with_resource(manager())
++    # After scope ends, the context is closed and capacity is released.
++    # max_resources=0 still applies, so still can't register.
++    with ctx.scope():
++        with pytest.raises(RuntimeError):
++            ctx.with_resource(manager())

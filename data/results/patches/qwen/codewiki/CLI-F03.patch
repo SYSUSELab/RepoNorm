@@ -1,0 +1,102 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..857392e 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,14 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param max_resources: A nonnegative integer that limits the number of
++        resources registered through :meth:`with_resource`. The default is
++        unlimited (``None``). When set, attempting to register more resources
++        than the limit will raise a :exc:`RuntimeError` before entering the
++        context manager. Zero rejects the first registration. Limits apply to
++        active, successfully entered resources. A child context inherits the
++        parent's limit if not explicitly set; an explicit child limit constrains
++        that child's subtree without bypassing any ancestor's limit.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -248,6 +256,9 @@ class Context:
+         Added the ``color``, ``ignore_unknown_options``, and
+         ``max_content_width`` parameters.
+ 
++    .. versionadded:: 8.3
++        Added the ``max_resources`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``allow_extra_args`` and ``allow_interspersed_args``
+         parameters.
+@@ -280,6 +291,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -431,6 +443,26 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        # max_resources tracking
++        if parent is not None:
++            self._max_resources = parent.max_resources
++        else:
++            self._max_resources = max_resources
++        self._active_resources = 0
++        # Track total active resources in the entire hierarchy via root
++        self._root = self
++        while self._root.parent is not None:
++            self._root = self._root.parent
++        # Share the root total counter with all contexts in the hierarchy
++        if parent is not None:
++            self._root_total = parent._root_total
++        else:
++            self._root_total = [0]
++
++    @property
++    def max_resources(self) -> int | None:
++        """Maximum number of resources allowed in this context and its descendants."""
++        return self._max_resources
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -588,7 +620,23 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        # Check limit before entering against ancestor's limit
++        if self._max_resources is not None:
++            if self._root_total[0] >= self._max_resources:
++                raise RuntimeError(
++                    f"Maximum resources ({self._max_resources}) exceeded for "
++                    f"context '{self.info_name or self.command.name}'"
++                )
++            # Reserve capacity for this resource
++            self._root_total[0] += 1
++        
++        try:
++            return self._exit_stack.enter_context(context_manager)
++        except Exception:
++            # Failed entry - release reservation
++            if self._max_resources is not None:
++                self._root_total[0] -= 1
++            raise
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+@@ -607,7 +655,11 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
++        try:
++            self._exit_stack.close()
++        finally:
++            # Reset root total count after cleanup
++            self._root_total[0] = 0
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 

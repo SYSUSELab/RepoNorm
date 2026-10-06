@@ -1,0 +1,428 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..c34a659 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -263,6 +263,7 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            extract_translations_with_metadata=self._extract_with_metadata,
+             newstyle_gettext=False,
+         )
+ 
+@@ -351,6 +352,71 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++    def _extract_with_metadata(
++        self,
++        source: t.Union[str, nodes.Template],
++        source_name: t.Optional[str] = None,
++        gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        if isinstance(source, str):
++            parsed = self.environment.parse(source)
++            src = source_name if source_name is not None else source
++        else:
++            parsed = source
++            src = source_name if source_name is not None else ""
++
++        for node in parsed.find_all(nodes.Output):
++            if not hasattr(node, "trans_metadata"):
++                continue
++
++            metadata = getattr(node, "trans_metadata", None)
++
++            messages = []
++            for child in node.find_all(nodes.Call):
++                if (
++                    not isinstance(child.node, nodes.Name)
++                    or child.node.name not in gettext_functions
++                ):
++                    continue
++
++                strings: t.List[t.Optional[str]] = []
++                for arg in child.args:
++                    if isinstance(arg, nodes.Const) and isinstance(
++                        arg.value, str
++                    ):
++                        strings.append(arg.value)
++                    else:
++                        strings.append(None)
++
++                for _ in child.kwargs:
++                    strings.append(None)
++                if child.dyn_args is not None:
++                    strings.append(None)
++                if child.dyn_kwargs is not None:
++                    strings.append(None)
++
++                if len(strings) == 1:
++                    msg: t.Union[
++                        t.Optional[str], t.Tuple[t.Optional[str], ...]
++                    ] = strings[0]
++                else:
++                    msg = tuple(strings)
++
++                messages.append(
++                    {
++                        "lineno": child.lineno,
++                        "function": child.node.name,
++                        "message": msg,
++                    }
++                )
++
++            yield {
++                "source": src,
++                "lineno": node.lineno,
++                "metadata": dict(metadata),
++                "messages": messages,
++            }
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+@@ -362,16 +428,53 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        metadata: t.Dict[str, str] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
+-                parser.stream.expect("comma")
++            if variables or metadata:
++                # Don't require a comma before trimmed/notrimmed or
++                # other metadata keys
++                if parser.stream.current.type == "name" and (
++                    (trimmed is None
++                     and parser.stream.current.value in ("trimmed", "notrimmed"))
++                    or parser.stream.current.value in ("note", "created", "modified")
++                ):
++                    pass
++                else:
++                    parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+             if parser.stream.skip_if("colon"):
+                 break
+ 
+             token = parser.stream.expect("name")
++            if token.value in ("note", "created", "modified"):
++                if token.value in metadata:
++                    parser.fail(
++                        f"metadata key {token.value!r} defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                if parser.stream.current.type != "assign":
++                    parser.fail(
++                        f"metadata key {token.value!r} must be assigned a"
++                        " string value.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                next(parser.stream)
++                var = parser.parse_expression()
++                if not isinstance(var, nodes.Const) or not isinstance(
++                    var.value, str
++                ):
++                    parser.fail(
++                        f"metadata value for {token.value!r} must be a"
++                        " string literal.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                metadata[token.value] = var.value
++                continue
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -460,6 +563,7 @@ class InternationalizationExtension(Extension):
+             bool(referenced),
+             num_called_num and have_plural,
+         )
++        node.trans_metadata = metadata.copy()
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+             return [plural_expr_assignment, node]
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..f2aa3d5 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -8,7 +8,7 @@ from jinja2 import Environment
+ from jinja2 import nodes
+ from jinja2 import pass_context
+ from jinja2.exceptions import TemplateAssertionError
+-from jinja2.ext import Extension
++from jinja2.ext import Extension, InternationalizationExtension
+ from jinja2.lexer import count_newlines
+ from jinja2.lexer import Token
+ 
+@@ -712,3 +712,266 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestExtractWithMetadata:
++    """Tests for Environment.extract_translations_with_metadata."""
++
++    def setup_method(self, method):
++        self.env = Environment(extensions=[InternationalizationExtension])
++        self.env.install_null_translations()
++
++    def test_no_metadata(self):
++        """Without metadata keys, result has empty metadata dict."""
++        results = list(
++            self.env.extract_translations_with_metadata(
++                "{% trans %}Hello{% endtrans %}"
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {}
++        assert len(results[0]["messages"]) == 1
++        assert results[0]["messages"][0]["message"] == "Hello"
++
++    def test_note_key(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="test note" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"note": "test note"}
++        assert results[0]["messages"][0]["message"] == "Hello"
++
++    def test_created_key(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans created="2024-01-01" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"created": "2024-01-01"}
++
++    def test_modified_key(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans modified="2024-01-02" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"modified": "2024-01-02"}
++
++    def test_all_three_keys(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a" created="b" modified="c" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {
++            "note": "a",
++            "created": "b",
++            "modified": "c",
++        }
++
++    def test_any_order(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans modified="z" note="a" created="b" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"]["note"] == "a"
++        assert results[0]["metadata"]["created"] == "b"
++        assert results[0]["metadata"]["modified"] == "z"
++
++    def test_empty_value(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"note": ""}
++
++    def test_unicode_value(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="\\u00e9\\u00e0\\u00fc" %}Hello{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"note": "\u00e9\u00e0\u00fc"}
++
++    def test_with_variables_and_trimmed(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a", count=n, trimmed %} Hello {% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"note": "a"}
++        assert len(results[0]["messages"]) == 1
++
++    def test_with_plural(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a", count=n %}item{% pluralize %}items{% endtrans %}'
++            )
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"note": "a"}
++        msg = results[0]["messages"][0]
++        assert msg["function"] == "ngettext"
++        assert msg["message"] == ("item", "items", None)
++
++    def test_missing_assignment_raises(self):
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            self.env.parse('{% trans note %}Hello{% endtrans %}')
++        assert "note" in str(excinfo.value)
++
++    def test_non_string_value_raises(self):
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            self.env.parse('{% trans note=42 %}Hello{% endtrans %}')
++        assert "note" in str(excinfo.value)
++
++    def test_duplicate_key_raises(self):
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            self.env.parse(
++                '{% trans note="a" note="b" %}Hello{% endtrans %}'
++            )
++        assert "note" in str(excinfo.value)
++        assert "twice" in str(excinfo.value)
++
++    def test_unknown_metadata_key_allowed(self):
++        """Keys not in (note, created, modified) are variables, not metadata."""
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a", count=n %}Hello{% endtrans %}'
++            )
++        )
++        assert results[0]["metadata"] == {"note": "a"}
++
++    def test_record_fields(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a" %}Hello{% endtrans %}',
++                source_name="test.html",
++            )
++        )
++        rec = results[0]
++        assert "source" in rec
++        assert "lineno" in rec
++        assert "metadata" in rec
++        assert "messages" in rec
++        assert rec["source"] == "test.html"
++        assert isinstance(rec["lineno"], int)
++        assert isinstance(rec["metadata"], dict)
++        assert isinstance(rec["messages"], list)
++
++    def test_message_fields(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a", count=n %}item{% pluralize %}items{% endtrans %}'
++            )
++        )
++        msg = results[0]["messages"][0]
++        assert "lineno" in msg
++        assert "function" in msg
++        assert "message" in msg
++        assert msg["function"] == "ngettext"
++
++    def test_source_name(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                "{% trans %}Hello{% endtrans %}",
++                source_name="my_template.html",
++            )
++        )
++        assert results[0]["source"] == "my_template.html"
++
++    def test_ast_input(self):
++        parsed = self.env.parse('{% trans note="a" %}Hello{% endtrans %}')
++        results = list(
++            self.env.extract_translations_with_metadata(parsed)
++        )
++        assert len(results) == 1
++        assert results[0]["metadata"] == {"note": "a"}
++
++    def test_ast_input_with_source_name(self):
++        parsed = self.env.parse('{% trans note="a" %}Hello{% endtrans %}')
++        results = list(
++            self.env.extract_translations_with_metadata(
++                parsed, source_name="from_ast.html"
++            )
++        )
++        assert results[0]["source"] == "from_ast.html"
++
++    def test_multiple_blocks(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a" %}Block1{% endtrans %}'
++                '{% trans note="b" %}Block2{% endtrans %}'
++            )
++        )
++        assert len(results) == 2
++        assert results[0]["metadata"] == {"note": "a"}
++        assert results[1]["metadata"] == {"note": "b"}
++
++    def test_repeated_extraction_stable(self):
++        src = '{% trans note="a" %}Hello{% endtrans %}'
++        r1 = list(self.env.extract_translations_with_metadata(src))
++        r2 = list(self.env.extract_translations_with_metadata(src))
++        assert r1 == r2
++
++    def test_no_retained_state(self):
++        src = '{% trans note="a" %}Hello{% endtrans %}'
++        r1 = list(self.env.extract_translations_with_metadata(src))
++        # Modify the returned records
++        r1[0]["metadata"]["extra"] = "modified"
++        r1[0]["messages"][0]["message"] = "changed"
++        # Re-extract should not reflect modifications
++        r2 = list(self.env.extract_translations_with_metadata(src))
++        assert "extra" not in r2[0]["metadata"]
++        assert r2[0]["messages"][0]["message"] == "Hello"
++
++    def test_ordinary_extract_unchanged(self):
++        """Metadata does not change ordinary extract_translations results."""
++        # Template with metadata
++        r1 = list(
++            self.env.extract_translations(
++                '{% trans note="a" %}Hello{% endtrans %}'
++            )
++        )
++        # Template without metadata
++        r2 = list(
++            self.env.extract_translations(
++                "{% trans %}Hello{% endtrans %}"
++            )
++        )
++        assert r1 == r2
++
++    def test_gettext_functions_parameter(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a" %}Hello{% endtrans %}',
++                gettext_functions=("gettext", "ngettext"),
++            )
++        )
++        assert len(results) == 1
++
++    def test_rendering_unchanged(self):
++        """Metadata does not change rendering output."""
++        t1 = self.env.from_string('{% trans note="test" %}Hello{% endtrans %}')
++        t2 = self.env.from_string("{% trans %}Hello{% endtrans %}")
++        assert t1.render() == t2.render() == "Hello"
++
++    def test_context_with_metadata(self):
++        results = list(
++            self.env.extract_translations_with_metadata(
++                '{% trans note="a" %}Hello{% endtrans %}'
++            )
++        )
++        # Non-plural, no explicit context: message is a plain string
++        assert results[0]["messages"][0]["message"] == "Hello"
++

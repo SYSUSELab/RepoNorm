@@ -1,0 +1,457 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..61c826e 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,9 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Optional, List, Dict, Any
++import threading
++import psutil
++import os
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -22,13 +25,21 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(
++        self,
++        compiled_grammar: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
+-
++        track_memory_usage: bool
++            Whether to track memory usage.
++        memory_history_limit: int | None
++            The maximum number of memory history entries to retain.
+         """
+         import xgrammar as xgr
+ 
+@@ -37,9 +48,31 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+         self.xgrammar_logits_processor = None
+         super().__init__("torch")
+ 
++        self.track_memory_usage = track_memory_usage
++        if memory_history_limit is not None and (
++            not isinstance(memory_history_limit, int) or memory_history_limit < 0
++        ):
++            raise ValueError("memory_history_limit must be a non-negative integer or None")
++        self.memory_history_limit = memory_history_limit
++
++        self._lock = threading.Lock()
++        self.reset()
++
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+-        self.xgrammar_logits_processor = None
++        with self._lock:
++            self.xgrammar_logits_processor = None
++            self.total_calls = 0
++            self.peak_memory_mb = 0.0
++            self.sum_memory_mb = 0.0
++            self.memory_history = []
++
++    def _get_rss_mb(self) -> Optional[float]:
++        try:
++            process = psutil.Process(os.getpid())
++            return process.memory_info().rss / (1024 * 1024)
++        except Exception:
++            return None
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
+@@ -47,19 +80,63 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++
++        if not self.track_memory_usage:
++            return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++
++        before = self._get_rss_mb()
++        result = self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++        after = self._get_rss_mb()
++
++        if before is not None and after is not None:
++            delta = max(after - before, 0.0)
++        else:
++            delta = 0.0
++
++        with self._lock:
++            self.total_calls += 1
++            self.peak_memory_mb = max(self.peak_memory_mb, delta)
++            self.sum_memory_mb += delta
++            
++            if self.memory_history_limit is None or self.memory_history_limit > 0:
++                self.memory_history.append(delta)
++                if self.memory_history_limit is not None and len(self.memory_history) > self.memory_history_limit:
++                    self.memory_history.pop(0)
++
++        return result
++
++    def get_memory_stats(self) -> Dict[str, Any]:
++        """Return memory statistics."""
++        with self._lock:
++            avg_memory = (
++                self.sum_memory_mb / self.total_calls if self.total_calls > 0 else 0.0
++            )
++            return {
++                "total_calls": self.total_calls,
++                "peak_memory_mb": self.peak_memory_mb,
++                "avg_memory_per_call_mb": avg_memory,
++                "memory_history": list(self.memory_history),
++            }
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self,
++        model: SteerableModel,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
+-
++        track_memory_usage: bool
++            Whether to track memory usage.
++        memory_history_limit: int | None
++            The maximum number of memory history entries to retain.
+         """
+         import xgrammar as xgr
+         from transformers import AutoConfig
+@@ -77,58 +154,36 @@ class XGrammarBackend(BaseBackend):
+             vocab_size=vocab_size
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
++        self.track_memory_usage = track_memory_usage
++        self.memory_history_limit = memory_history_limit
+ 
+     def get_json_schema_logits_processor(
+         self, json_schema: str
+-    ) -> "LogitsProcessor":
+-        """Create a logits processor from a JSON schema.
+-
+-        Parameters
+-        ----------
+-        json_schema: str
+-            The JSON schema to create a logits processor from.
+-
+-        Returns
+-        -------
+-        LogitsProcessor
+-            The logits processor to use to constrain the generation.
+-
+-        """
++    ) -> "XGrammarLogitsProcessor":
++        """Create a logits processor from a JSON schema."""
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
+-
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
+-        """Create a logits processor from a regex.
+-
+-        Parameters
+-        ----------
+-        regex: str
+-            The regex to create a logits processor from.
+-
+-        Returns
+-        -------
+-        LogitsProcessor
+-            The logits processor to use to constrain the generation.
++        return XGrammarLogitsProcessor(
++            compiled_grammar,
++            track_memory_usage=self.track_memory_usage,
++            memory_history_limit=self.memory_history_limit,
++        )
+ 
+-        """
++    def get_regex_logits_processor(self, regex: str) -> "XGrammarLogitsProcessor":
++        """Create a logits processor from a regex."""
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
+-
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+-        """Create a logits processor from a context-free grammar.
+-
+-        Parameters
+-        ----------
+-        grammar: str
+-            The context-free grammar to create a logits processor from.
+-
+-        Returns
+-        -------
+-        LogitsProcessor
+-            The logits processor to use to constrain the generation.
++        return XGrammarLogitsProcessor(
++            compiled_grammar,
++            track_memory_usage=self.track_memory_usage,
++            memory_history_limit=self.memory_history_limit,
++        )
+ 
+-        """
++    def get_cfg_logits_processor(self, grammar: str) -> "XGrammarLogitsProcessor":
++        """Create a logits processor from a context-free grammar."""
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar,
++            track_memory_usage=self.track_memory_usage,
++            memory_history_limit=self.memory_history_limit,
++        )
+diff --git a/test_memory_tracking.py b/test_memory_tracking.py
+new file mode 100644
+index 0000000..dce8de6
+--- /dev/null
++++ b/test_memory_tracking.py
+@@ -0,0 +1,10 @@
++import os
++import psutil
++import threading
++import time
++
++def get_rss_mb():
++    process = psutil.Process(os.getpid())
++    return process.memory_info().rss / (1024 * 1024)
++
++print(f"RSS: {get_rss_mb()} MB")
+diff --git a/test_memory_tracking_2.py b/test_memory_tracking_2.py
+new file mode 100644
+index 0000000..e1c63de
+--- /dev/null
++++ b/test_memory_tracking_2.py
+@@ -0,0 +1,25 @@
++import os
++import psutil
++import threading
++import time
++
++def get_rss_mb():
++    try:
++        process = psutil.Process(os.getpid())
++        return process.memory_info().rss / (1024 * 1024)
++    except Exception:
++        return None
++
++def track_memory():
++    before = get_rss_mb()
++    # Simulate some work
++    a = [i for i in range(1000000)]
++    after = get_rss_mb()
++    
++    if before is not None and after is not None:
++        delta = max(after - before, 0)
++        print(f"Delta: {delta} MB")
++    else:
++        print("Failed to get RSS")
++
++track_memory()
+diff --git a/test_xgrammar_memory.py b/test_xgrammar_memory.py
+new file mode 100644
+index 0000000..33148a9
+--- /dev/null
++++ b/test_xgrammar_memory.py
+@@ -0,0 +1,68 @@
++import pytest
++import torch
++from unittest.mock import MagicMock
++from outlines.backends.xgrammar import XGrammarLogitsProcessor
++
++def test_memory_tracking():
++    # Mock the xgrammar processor
++    class MockXGrammarProcessor:
++        def __call__(self, input_ids, logits):
++            return logits
++
++    # Mock xgrammar module
++    import sys
++    from types import ModuleType
++    xgr = ModuleType("xgrammar")
++    xgr.contrib = ModuleType("contrib")
++    xgr.contrib.hf = ModuleType("hf")
++    xgr.contrib.hf.LogitsProcessor = MagicMock(return_value=MockXGrammarProcessor())
++    sys.modules["xgrammar"] = xgr
++
++    # Test with tracking enabled
++    processor = XGrammarLogitsProcessor(
++        "compiled_grammar",
++        track_memory_usage=True,
++        memory_history_limit=2
++    )
++    
++    input_ids = torch.tensor([[1]])
++    logits = torch.tensor([[1.0, 2.0]])
++    
++    # Call 1
++    processor.process_logits(input_ids, logits)
++    stats = processor.get_memory_stats()
++    assert stats["total_calls"] == 1
++    assert len(stats["memory_history"]) == 1
++    
++    # Call 2
++    processor.process_logits(input_ids, logits)
++    stats = processor.get_memory_stats()
++    assert stats["total_calls"] == 2
++    assert len(stats["memory_history"]) == 2
++    
++    # Call 3 (should trigger limit)
++    processor.process_logits(input_ids, logits)
++    stats = processor.get_memory_stats()
++    assert stats["total_calls"] == 3
++    assert len(stats["memory_history"]) == 2
++    
++    # Reset
++    processor.reset()
++    stats = processor.get_memory_stats()
++    assert stats["total_calls"] == 0
++    assert len(stats["memory_history"]) == 0
++    assert stats["peak_memory_mb"] == 0.0
++
++    # Test invalid limit
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor("grammar", track_memory_usage=True, memory_history_limit=-1)
++
++    # Test tracking disabled
++    processor = XGrammarLogitsProcessor("grammar", track_memory_usage=False)
++    processor.process_logits(input_ids, logits)
++    stats = processor.get_memory_stats()
++    assert stats["total_calls"] == 0
++
++if __name__ == "__main__":
++    test_memory_tracking()
++    print("Tests passed!")
+diff --git a/tests/backends/test_xgrammar_memory.py b/tests/backends/test_xgrammar_memory.py
+new file mode 100644
+index 0000000..86f4d9d
+--- /dev/null
++++ b/tests/backends/test_xgrammar_memory.py
+@@ -0,0 +1,109 @@
++import pytest
++from unittest.mock import MagicMock, patch
++import sys
++
++# Mock OutlinesLogitsProcessor before importing XGrammarLogitsProcessor
++class MockOutlinesLogitsProcessor:
++    def __init__(self, *args, **kwargs):
++        pass
++
++sys.modules["outlines.processors.base_logits_processor"] = MagicMock()
++sys.modules["outlines.processors.base_logits_processor"].OutlinesLogitsProcessor = MockOutlinesLogitsProcessor
++sys.modules["outlines.processors.base_logits_processor"].TensorType = object
++
++# Mock Transformers
++class MockTransformers:
++    pass
++
++sys.modules["outlines.models.transformers"] = MagicMock()
++sys.modules["outlines.models.transformers"].Transformers = MockTransformers
++
++from outlines.backends.xgrammar import XGrammarLogitsProcessor, XGrammarBackend
++
++def test_xgrammar_logits_processor_memory_tracking():
++    # Mock the xgrammar processor
++    class MockXGrammarProcessor:
++        def __call__(self, input_ids, logits):
++            return logits
++
++    # Mock xgrammar module
++    with patch.dict("sys.modules", {"xgrammar": MagicMock()}):
++        import xgrammar as xgr
++        xgr.contrib.hf.LogitsProcessor = MagicMock(return_value=MockXGrammarProcessor())
++
++        # Test with tracking enabled
++        processor = XGrammarLogitsProcessor(
++            "compiled_grammar",
++            track_memory_usage=True,
++            memory_history_limit=2
++        )
++        
++        # Mock process_logits to not call super()
++        processor.xgrammar_logits_processor = MockXGrammarProcessor()
++        
++        # Mock _get_rss_mb
++        processor._get_rss_mb = MagicMock(side_effect=[10.0, 20.0, 10.0, 30.0, 10.0, 40.0])
++        
++        input_ids = MagicMock()
++        logits = MagicMock()
++        
++        # Call 1
++        processor.process_logits(input_ids, logits)
++        stats = processor.get_memory_stats()
++        assert stats["total_calls"] == 1
++        assert stats["memory_history"] == [10.0]
++        
++        # Call 2
++        processor.process_logits(input_ids, logits)
++        stats = processor.get_memory_stats()
++        assert stats["total_calls"] == 2
++        assert stats["memory_history"] == [10.0, 20.0]
++        
++        # Call 3 (should trigger limit)
++        processor.process_logits(input_ids, logits)
++        stats = processor.get_memory_stats()
++        assert stats["total_calls"] == 3
++        assert stats["memory_history"] == [20.0, 30.0]
++        
++        # Reset
++        processor.reset()
++        stats = processor.get_memory_stats()
++        assert stats["total_calls"] == 0
++        assert len(stats["memory_history"]) == 0
++        assert stats["peak_memory_mb"] == 0.0
++
++        # Test invalid limit
++        with pytest.raises(ValueError):
++            XGrammarLogitsProcessor("grammar", track_memory_usage=True, memory_history_limit=-1)
++
++        # Test tracking disabled
++        processor = XGrammarLogitsProcessor("grammar", track_memory_usage=False)
++        processor.process_logits(input_ids, logits)
++        stats = processor.get_memory_stats()
++        assert stats["total_calls"] == 0
++
++def test_xgrammar_backend_memory_tracking_forwarding():
++    # Mock xgrammar module
++    with patch.dict("sys.modules", {"xgrammar": MagicMock()}):
++        import xgrammar as xgr
++        
++        # Mock model
++        model = MagicMock(spec=MockTransformers)
++        model.model = MagicMock()
++        model.model.config = MagicMock()
++        model.model.config._name_or_path = "test"
++        model.hf_tokenizer = MagicMock()
++        
++        # Mock AutoConfig
++        with patch("transformers.AutoConfig.from_pretrained") as mock_config:
++            mock_config.return_value.vocab_size = 100
++            
++            backend = XGrammarBackend(
++                model,
++                track_memory_usage=True,
++                memory_history_limit=5
++            )
++            
++            processor = backend.get_json_schema_logits_processor("{}")
++            assert processor.track_memory_usage is True
++            assert processor.memory_history_limit == 5

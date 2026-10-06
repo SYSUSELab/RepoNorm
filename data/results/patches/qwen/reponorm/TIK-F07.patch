@@ -1,0 +1,310 @@
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..be64f37 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -7,6 +7,7 @@ import hypothesis.strategies as st
+ import pytest
+ 
+ import tiktoken
++import numpy as np
+ 
+ from .test_helpers import ENCODING_FACTORIES, MAX_EXAMPLES
+ 
+@@ -254,3 +255,154 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++
++# ====================
++# Token Validation
++# ====================
++
++
++def test_validator_accepts_true():
++    """Validator returning True should accept tokens."""
++    enc = tiktoken.get_encoding("gpt2")
++    result = enc.encode("hello world", validators=[lambda t: True])
++    assert len(result) <= 2
++
++
++def test_validator_accepts_none():
++    """Validator returning None should accept tokens."""
++    enc = tiktoken.get_encoding("gpt2")
++    result = enc.encode("hello world", validators=[lambda t: None])
++    assert len(result) <= 2
++
++
++def test_validator_rejects_false():
++    """Validator returning False should raise ValueError."""
++    enc = tiktoken.get_encoding("gpt2")
++    with pytest.raises(ValueError):
++        enc.encode("hello world", validators=[lambda t: False])
++
++
++def test_validator_no_validators():
++    """No validators should return normal encoding."""
++    enc = tiktoken.get_encoding("gpt2")
++    result = enc.encode("hello world", validators=None)
++    assert len(result) <= 2
++
++
++def test_validator_empty_batch():
++    """Empty batch with validators should return empty list."""
++    enc = tiktoken.get_encoding("gpt2")
++    result = enc.encode_batch([], validators=[lambda t: len(t) < 10])
++    assert result == []
++
++
++def test_validator_batch_all_pass():
++    """Batch with all passing validators should return all results."""
++    enc = tiktoken.get_encoding("gpt2")
++    result = enc.encode_batch(
++        ["hello world", "goodbye world"],
++        validators=[lambda t: len(t) < 10]
++    )
++    assert result == [[31373, 995], [11274, 16390, 995]]
++
++
++def test_validator_batch_one_fails():
++    """Batch with one failing validator should raise ValueError (no partial results)."""
++    enc = tiktoken.get_encoding("gpt2")
++    with pytest.raises(ValueError):
++        enc.encode_batch(["hello world", "a"], validators=[lambda t: len(t) > 1])
++
++
++def test_validator_mutation_isolation():
++    """Validator mutations should not affect returned tokens or other validators."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    def mutating_validator(tokens):
++        tokens.append(999)
++        return True
++    
++    result = enc.encode("hello world", validators=[mutating_validator])
++    assert len(result) <= 2  # Should not contain 999
++
++
++def test_validator_multiple_in_order():
++    """Multiple validators should execute in order and all must pass."""
++    enc = tiktoken.get_encoding("gpt2")
++    result = enc.encode("hello world", validators=[
++        lambda t: len(t) < 10,
++        lambda t: 31373 in t
++    ])
++    assert len(result) <= 2
++
++
++def test_validator_early_termination():
++    """Later validators should not be called if an earlier one fails."""
++    call_order = []
++    
++    def first_validator(tokens):
++        call_order.append('first')
++        return False
++    
++    def second_validator(tokens):
++        call_order.append('second')
++        return True
++    
++    enc = tiktoken.get_encoding("gpt2")
++    try:
++        enc.encode("hello world", validators=[first_validator, second_validator])
++    except ValueError:
++        pass
++    
++    assert call_order == ['first']  # Second validator should not be called
++
++
++def test_validator_exception_propagates():
++    """Exceptions from validators should propagate unchanged."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    def raising_validator(tokens):
++        raise RuntimeError("Custom error")
++    
++    with pytest.raises(RuntimeError, match="Custom error"):
++        enc.encode("hello world", validators=[raising_validator])
++
++
++def test_validator_length_constraint():
++    """Validator can enforce length constraints."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    # Short text passes (2 tokens)
++    result = enc.encode("hello world", validators=[lambda t: len(t) <= 2])
++    assert result == [31373, 995]
++    
++    # Long text fails (3 tokens)
++    with pytest.raises(ValueError):
++        enc.encode("goodbye world", validators=[lambda t: len(t) <= 2])
++
++
++def test_validator_token_id_constraint():
++    """Validator can check for specific token IDs."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    # Text containing expected token passes
++    result = enc.encode("hello world", validators=[lambda t: 31373 in t])
++    assert result == [31373, 995]
++    
++    # Text without expected token fails
++    with pytest.raises(ValueError):
++        enc.encode("goodbye world", validators=[lambda t: 31373 in t])
++
++
++def test_validator_encode_to_numpy():
++    """Validators work with encode_to_numpy."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    # Passes validation
++    result = enc.encode_to_numpy("hello world", validators=[lambda t: len(t) < 10])
++    assert isinstance(result, np.ndarray)
++    assert list(result) == [31373, 995]
++    
++    # Fails validation
++    with pytest.raises(ValueError):
++        enc.encode_to_numpy("hello world", validators=[lambda t: len(t) < 2])
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..217750c 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
++from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Literal, NoReturn, Sequence
+ 
+ import regex
+ 
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        validators: list[Callable[[list[int]], bool]] | tuple[Callable[[list[int]], bool], ...] | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -108,6 +109,10 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> enc.encode("hello world", validators=[lambda t: len(t) < 10])
++        [31373, 995]
++        >>> enc.encode("hello world", validators=[lambda t: len(t) < 2])
++        # Raises ValueError
+         ```
+         """
+         if allowed_special == "all":
+@@ -121,7 +126,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +135,18 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if validators is not None:
++            for validator in validators:
++                # Create a copy so mutations don't affect returned tokens or other validators
++                token_copy = tokens.copy()
++                result = validator(token_copy)
++                if result is False:
++                    raise ValueError("Token validation failed")
++                # None and True are accepted; only False raises
++
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -138,6 +154,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        validators: list[Callable[[list[int]], bool]] | tuple[Callable[[list[int]], bool], ...] | None = None,
+     ) -> npt.NDArray[np.uint32]:
+         """Encodes a string into tokens, returning a numpy array.
+ 
+@@ -156,9 +173,26 @@ class Encoding:
+         import numpy as np
+ 
+         buffer = self._core_bpe.encode_to_tiktoken_buffer(text, self.special_tokens_set)
+-        return np.frombuffer(buffer, dtype=np.uint32)
++        tokens = np.frombuffer(buffer, dtype=np.uint32).tolist()
+ 
+-    def encode_ordinary_batch(self, text: list[str], *, num_threads: int = 8) -> list[list[int]]:
++        if validators is not None:
++            for validator in validators:
++                # Create a copy so mutations don't affect returned tokens or other validators
++                token_copy = tokens.copy()
++                result = validator(token_copy)
++                if result is False:
++                    raise ValueError("Token validation failed")
++                # None and True are accepted; only False raises
++
++        return np.array(tokens, dtype=np.uint32)
++
++    def encode_ordinary_batch(
++        self,
++        text: list[str],
++        *,
++        num_threads: int = 8,
++        validators: list[Callable[[list[int]], bool]] | tuple[Callable[[list[int]], bool], ...] | None = None,
++    ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel, ignoring special tokens.
+ 
+         This is equivalent to `encode_batch(text, disallowed_special=())` (but slightly faster).
+@@ -168,6 +202,8 @@ class Encoding:
+         [[31373, 995], [11274, 16390, 995]]
+         ```
+         """
++        if validators is not None:
++            raise ValueError("validators is not supported for encode_ordinary_batch")
+         encoder = functools.partial(self.encode_ordinary)
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+@@ -179,6 +215,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        validators: list[Callable[[list[int]], bool]] | tuple[Callable[[list[int]], bool], ...] | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -187,6 +224,10 @@ class Encoding:
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
++        >>> enc.encode_batch(["hello world"], validators=[lambda t: len(t) < 10])
++        [[31373, 995]]
++        >>> enc.encode_batch(["hello world"], validators=[lambda t: len(t) < 2])
++        # Raises ValueError
+         ```
+         """
+         if allowed_special == "all":
+@@ -197,10 +238,14 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, validators=validators
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++            results = list(e.map(encoder, text))
++        
++        # If any validation failed, the exception would have been raised above
++        # Return results in order
++        return results
+ 
+     def encode_with_unstable(
+         self,

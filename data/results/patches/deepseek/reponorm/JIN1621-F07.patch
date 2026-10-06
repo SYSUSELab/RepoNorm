@@ -1,0 +1,148 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..eebe55b 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -170,9 +170,15 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param expand_searchpath: If ``True``, expand ``$var``,
++        ``${var}``, and ``~`` in search paths using
++        :func:`os.path.expandvars` and :func:`os.path.expanduser`.
++        Expansion happens once during initialization.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionchanged:: 3.0
++        Added the ``expand_searchpath`` parameter.
+     """
+ 
+     def __init__(
+@@ -180,11 +186,18 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        expand_searchpath: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+         self.searchpath = [os.fspath(p) for p in searchpath]
++
++        if expand_searchpath:
++            self.searchpath = [
++                os.path.expanduser(os.path.expandvars(p))
++                for p in self.searchpath
++            ]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..0ecc53a 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -172,6 +172,104 @@ class TestFileSystemLoader:
+         assert t.render() == expect
+ 
+ 
++class TestFileSystemLoaderExpandSearchpath:
++    """Tests for the ``expand_searchpath`` parameter of FileSystemLoader."""
++
++    searchpath = (Path(__file__) / ".." / "res" / "templates").resolve()
++
++    def test_default_no_expansion(self):
++        """By default, ``$``, ``${}``, and ``~`` are kept as-is."""
++        loader = loaders.FileSystemLoader("/tmp/$NONEXISTENT/test")
++        assert loader.searchpath == ["/tmp/$NONEXISTENT/test"]
++
++        loader = loaders.FileSystemLoader("~/templates")
++        assert loader.searchpath == ["~/templates"]
++
++        loader = loaders.FileSystemLoader("${HOME}/templates")
++        assert loader.searchpath == ["${HOME}/templates"]
++
++    def test_expand_env_var(self):
++        """With ``expand_searchpath=True``, expand ``$VAR``."""
++        loader = loaders.FileSystemLoader(
++            "$MY_TEST_LOADER_VAR", expand_searchpath=True
++        )
++        assert loader.searchpath == ["$MY_TEST_LOADER_VAR"]
++
++    @pytest.mark.parametrize("key,val", [("MY_TMP", "/tmp"), ("MY_TMP2", "/var/tmp")])
++    def test_expand_defined_var(self, monkeypatch, key, val):
++        """A defined variable is expanded in the path."""
++        monkeypatch.setenv(key, val)
++        loader = loaders.FileSystemLoader(f"${key}", expand_searchpath=True)
++        assert loader.searchpath == [val]
++
++        loader = loaders.FileSystemLoader(
++            f"${{{key}}}/templates", expand_searchpath=True
++        )
++        assert loader.searchpath == [f"{val}/templates"]
++
++    def test_expand_user(self):
++        """``~`` is expanded to the home directory."""
++        expected = os.path.expanduser("~/templates")
++        loader = loaders.FileSystemLoader("~/templates", expand_searchpath=True)
++        assert loader.searchpath == [expected]
++
++    def test_expand_user_and_var(self, monkeypatch):
++        """Both ``~`` and ``$VAR`` are expanded."""
++        monkeypatch.setenv("MYDIR", "somedir")
++        expected = os.path.expanduser(
++            os.path.expandvars("~/templates/$MYDIR")
++        )
++        loader = loaders.FileSystemLoader(
++            "~/templates/$MYDIR", expand_searchpath=True
++        )
++        assert loader.searchpath == [expected]
++
++    def test_expansion_happens_once(self, monkeypatch):
++        """Expansion is performed only at init time."""
++        monkeypatch.setenv("EXPAND_VAR", "/tmp/initial")
++        loader = loaders.FileSystemLoader("$EXPAND_VAR", expand_searchpath=True)
++        assert loader.searchpath == ["/tmp/initial"]
++        monkeypatch.setenv("EXPAND_VAR", "/tmp/changed")
++        assert loader.searchpath == ["/tmp/initial"]
++
++    def test_preserves_order_and_duplicates(self):
++        """Multiple paths retain their order and duplicates are kept."""
++        loader = loaders.FileSystemLoader(
++            ["/tmp/a", "/tmp/b", "/tmp/a"], expand_searchpath=True
++        )
++        assert loader.searchpath == ["/tmp/a", "/tmp/b", "/tmp/a"]
++
++    def test_works_with_pathlib(self):
++        """PathLike objects are supported with expansion."""
++        p = Path("/tmp/test_path_expand")
++        loader = loaders.FileSystemLoader(p, expand_searchpath=True)
++        assert loader.searchpath == ["/tmp/test_path_expand"]
++
++    def test_list_with_pathlib(self, monkeypatch):
++        """A list of PathLike objects works with expansion."""
++        monkeypatch.setenv("MYDIR", "/tmp")
++        loader = loaders.FileSystemLoader(
++            [Path("$MYDIR/a"), Path("$MYDIR/b")], expand_searchpath=True
++        )
++        assert loader.searchpath == ["/tmp/a", "/tmp/b"]
++
++    def test_actual_template_loading(self, monkeypatch):
++        """Expanded paths are used to find templates."""
++        monkeypatch.setenv("TEMPLATES", str(self.searchpath))
++        loader = loaders.FileSystemLoader("$TEMPLATES", expand_searchpath=True)
++        env = Environment(loader=loader)
++        tmpl = env.get_template("test.html")
++        assert tmpl.render().strip() == "BAR"
++
++    def test_undefined_var_preserved(self):
++        """Undefined environment variables remain as text in the path."""
++        loader = loaders.FileSystemLoader(
++            "/tmp/$UNDEFINED_XYZ_123/test", expand_searchpath=True
++        )
++        assert loader.searchpath == ["/tmp/$UNDEFINED_XYZ_123/test"]
++
++
++
+ class TestModuleLoader:
+     archive = None
+ 

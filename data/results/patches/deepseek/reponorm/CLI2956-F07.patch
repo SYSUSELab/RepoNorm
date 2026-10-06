@@ -1,0 +1,343 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..7eed888 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1195,6 +1195,9 @@ class Command:
+ 
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
++        if not ctx.resilient_parsing:
++            self._check_conflicts(ctx)
++
+ 
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+@@ -1209,6 +1212,57 @@ class Command:
+         ctx._opt_prefixes.update(parser._opt_prefixes)
+         return args
+ 
++
++    def _check_conflicts(self, ctx: Context) -> None:
++        """Check for mutually conflicting options after all parameters
++        have been processed.
++        """
++        params_by_name = {p.name: p for p in self.get_params(ctx) if p.name is not None}
++        
++        for param in self.get_params(ctx):
++            if not isinstance(param, Option):
++                continue
++                
++            conflicts = getattr(param, "conflicts_with", None)
++            if not conflicts:
++                continue
++                
++            for conflict_name in conflicts:
++                # Check for unknown conflict name
++                if conflict_name not in params_by_name:
++                    raise UsageError(
++                        f"Option '{param.opts[0]}' has unknown conflict"
++                        f" '{conflict_name}'."
++                    )
++
++                
++        # Now check actual conflicts (sources are COMMANDLINE or PROMPT)
++        for param in self.get_params(ctx):
++            if not isinstance(param, Option):
++                continue
++                
++            conflicts = getattr(param, "conflicts_with", None)
++            if not conflicts:
++                continue
++                
++            param_source = ctx.get_parameter_source(param.name)
++            if param_source not in {ParameterSource.COMMANDLINE, ParameterSource.PROMPT}:
++                continue
++                
++            for conflict_name in conflicts:
++                if conflict_name not in params_by_name:
++                    continue
++                    
++                conflict_param = params_by_name[conflict_name]
++                conflict_source = ctx.get_parameter_source(conflict_name)
++                
++                if conflict_source in {ParameterSource.COMMANDLINE, ParameterSource.PROMPT}:
++                    # Both were explicitly provided
++                    raise UsageError(
++                        f"Option '{param.opts[0]}' cannot be used together"
++                        f" with '{conflict_param.opts[0]}'."
++                    )
++
+     def invoke(self, ctx: Context) -> t.Any:
+         """Given a context, this invokes the attached callback (if it exists)
+         in the right way.
+@@ -2549,6 +2603,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        conflicts_with: str | cabc.Sequence[str] | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2662,6 +2717,33 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++        # Store conflicts_with
++        if conflicts_with is None:
++            self.conflicts_with: list[str] = []
++        elif isinstance(conflicts_with, str):
++            self.conflicts_with = [conflicts_with]
++        else:
++            self.conflicts_with = list(conflicts_with)
++
++        if self.conflicts_with:
++            for name in self.conflicts_with:
++                if not isinstance(name, str):
++                    raise TypeError(
++                        f"`conflicts_with` must be a string or a sequence of"
++                        f" strings, got {type(name).__name__}."
++                    )
++
++                if name.startswith("-"):
++                    raise TypeError(
++                        f"`conflicts_with` names must not be option prefixed:"
++                        f" '{name}'."
++                    )
++
++            if self.name in self.conflicts_with:
++                raise UsageError(
++                    f"Option '{self.name}' cannot conflict with itself."
++                )
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+@@ -2669,6 +2751,7 @@ class Option(Parameter):
+             prompt=self.prompt,
+             is_flag=self.is_flag,
+             flag_value=self.flag_value,
++            conflicts_with=self.conflicts_with,
+             count=self.count,
+             hidden=self.hidden,
+         )
+diff --git a/tests/test_info_dict.py b/tests/test_info_dict.py
+index 20fe68c..a62646f 100644
+--- a/tests/test_info_dict.py
++++ b/tests/test_info_dict.py
+@@ -25,6 +25,7 @@ HELP_OPTION = (
+         "flag_value": True,
+         "count": False,
+         "hidden": False,
++        "conflicts_with": [],
+     },
+ )
+ NAME_ARGUMENT = (
+@@ -61,6 +62,7 @@ NUMBER_OPTION = (
+         "flag_value": None,
+         "count": False,
+         "hidden": False,
++        "conflicts_with": [],
+     },
+ )
+ HELLO_COMMAND = (
+@@ -202,6 +204,7 @@ HELLO_GROUP = (
+                 "flag_value": True,
+                 "count": False,
+                 "hidden": False,
++                "conflicts_with": [],
+             },
+             id="Flag Option",
+         ),
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..2d9bccc 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,188 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++class TestConflictsWith:
++    """Tests for the ``conflicts_with`` option parameter."""
++
++    def test_basic_conflict(self, runner):
++        @click.command()
++        @click.option("--first", conflicts_with="second")
++        @click.option("--second")
++        def cli(first, second):
++            click.echo(f"{first}:{second}")
++
++        result = runner.invoke(cli, ["--first", "a"])
++        assert result.exit_code == 0
++
++        result = runner.invoke(cli, ["--second", "b"])
++        assert result.exit_code == 0
++
++        result = runner.invoke(cli, ["--first", "a", "--second", "b"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output
++
++    def test_defaults_no_conflict(self, runner):
++        @click.command()
++        @click.option("--first", default="a", conflicts_with="second")
++        @click.option("--second", default="b")
++        def cli(first, second):
++            click.echo(f"{first}:{second}")
++
++        result = runner.invoke(cli, [])
++        assert result.exit_code == 0
++        assert result.output.strip() == "a:b"
++
++    def test_envvar_no_conflict(self, runner, monkeypatch):
++        monkeypatch.setenv("FIRST", "x")
++        monkeypatch.setenv("SECOND", "y")
++
++        @click.command()
++        @click.option("--first", envvar="FIRST", conflicts_with="second")
++        @click.option("--second", envvar="SECOND")
++        def cli(first, second):
++            click.echo(f"{first}:{second}")
++
++        result = runner.invoke(cli, [])
++        assert result.exit_code == 0
++        assert result.output.strip() == "x:y"
++
++    def test_none_disables(self):
++        opt = click.Option(["--test"], conflicts_with=None)
++        assert opt.conflicts_with == []
++
++    def test_empty_sequence_disables(self):
++        opt = click.Option(["--test"], conflicts_with=())
++        assert opt.conflicts_with == []
++
++    def test_type_error_non_string(self):
++        with pytest.raises(TypeError):
++            click.Option(["--test"], conflicts_with=123)
++
++    def test_type_error_non_string_in_sequence(self):
++        with pytest.raises(TypeError):
++            click.Option(["--test"], conflicts_with=["ok", 123])
++
++    def test_type_error_prefixed_name(self):
++        with pytest.raises(TypeError):
++            click.Option(["--test"], conflicts_with="--other")
++
++    def test_type_error_prefixed_name_in_sequence(self):
++        with pytest.raises(TypeError):
++            click.Option(["--test"], conflicts_with=["other", "-x"])
++
++    def test_self_reference_error(self):
++        with pytest.raises(click.UsageError, match="cannot conflict with itself"):
++            @click.command()
++            @click.option("--test", conflicts_with="test")
++            def cli(test):
++                pass
++
++    def test_unknown_name_error(self, runner):
++        @click.command()
++        @click.option("--first", conflicts_with="unknown_name")
++        def cli(first):
++            pass
++
++        result = runner.invoke(cli, ["--first", "a"])
++        assert result.exit_code != 0
++        assert "unknown conflict" in result.output
++
++    def test_conflict_with_count_option(self, runner):
++        @click.command()
++        @click.option("-v", "--verbose", count=True, conflicts_with="quiet")
++        @click.option("-q", "--quiet", is_flag=True)
++        def cli(verbose, quiet):
++            click.echo(f"verbose={verbose}, quiet={quiet}")
++
++        result = runner.invoke(cli, ["-vvv", "-q"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output
++
++    def test_conflict_with_multiple_option(self, runner):
++        @click.command()
++        @click.option("--name", multiple=True, conflicts_with="other")
++        @click.option("--other")
++        def cli(name, other):
++            click.echo(f"names={name}, other={other}")
++
++        result = runner.invoke(cli, ["--name", "a", "--name", "b", "--other", "x"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output
++
++    def test_conflict_with_flag_option(self, runner):
++        @click.command()
++        @click.option("--verbose/--no-verbose", conflicts_with="quiet")
++        @click.option("--quiet", is_flag=True)
++        def cli(verbose, quiet):
++            click.echo(f"verbose={verbose}, quiet={quiet}")
++
++        result = runner.invoke(cli, ["--verbose", "--quiet"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output
++
++    def test_sequence_conflicts(self, runner):
++        @click.command()
++        @click.option("--first", conflicts_with=["second", "third"])
++        @click.option("--second")
++        @click.option("--third")
++        def cli(first, second, third):
++            click.echo(f"{first}:{second}:{third}")
++
++        result = runner.invoke(cli, ["--first", "a", "--second", "b"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output
++
++        result = runner.invoke(cli, ["--first", "a", "--third", "c"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output
++
++    def test_bidirectional_conflict(self, runner):
++        @click.command()
++        @click.option("--first", conflicts_with="second")
++        @click.option("--second", conflicts_with="first")
++        def cli(first, second):
++            click.echo(f"{first}:{second}")
++
++        # Should fail just once, not produce double errors
++        result = runner.invoke(cli, ["--first", "a", "--second", "b"])
++        assert result.exit_code != 0
++        assert result.output.count("cannot") == 1
++
++    def test_to_info_dict_default(self):
++        opt = click.Option(["--test"])
++        assert opt.to_info_dict()["conflicts_with"] == []
++
++    def test_to_info_dict_with_conflicts(self):
++        opt = click.Option(["--test"], conflicts_with=["other"])
++        assert opt.to_info_dict()["conflicts_with"] == ["other"]
++
++    def test_resilient_parsing_skips_check(self, runner):
++        @click.command()
++        @click.option("--first", conflicts_with="second")
++        @click.option("--second")
++        def cli(first, second):
++            click.echo(f"{first}:{second}")
++
++        # Normal invocation detects conflict
++        result = runner.invoke(cli, ["--first", "a", "--second", "b"],
++                               standalone_mode=False)
++        assert isinstance(result.exception, click.UsageError)
++
++        # Resilient parsing skips conflict check
++        ctx = click.Context(cli, resilient_parsing=True)
++        # parse_args should not raise even with conflicting options
++        cli.parse_args(ctx, ["--first", "a", "--second", "b"])
++        # If we got here without exception, resilient parsing worked
++
++    def test_string_conflicts_with(self, runner):
++        @click.command()
++        @click.option("--first", conflicts_with="second")
++        @click.option("--second")
++        def cli(first, second):
++            click.echo(f"{first}:{second}")
++
++        result = runner.invoke(cli, ["--first", "a", "--second", "b"])
++        assert result.exit_code != 0
++        assert "cannot be used together" in result.output

@@ -1,0 +1,381 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..3910520 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -4,14 +4,208 @@ import json
+ import os
+ import re
+ import textwrap
++import html
++import csv as csv_module
++import io
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Dict, Optional, Type, cast
++from typing import Any, Callable, Dict, List, Optional, Type, cast, Union
+ 
+ import jinja2
+ import pydantic
+ 
+ 
++# ============================================================
++# Built-in filter categories
++# ============================================================
++
++# --- string_utils filters ---
++
++def _upper(value):
++    return str(value).upper()
++
++def _lower(value):
++    return str(value).lower()
++
++def _title(value):
++    return str(value).title()
++
++def _reverse(value):
++    return str(value)[::-1]
++
++def _truncate(value, length, end="..."):
++    text = str(value)
++    if length < 0:
++        raise ValueError("Negative length in truncate filter")
++    if len(text) <= length:
++        return text
++    # Produce at most `length` characters by replacing the tail
++    # with as much of `end` as fits.
++    end_str = str(end)
++    if len(end_str) > length:
++        # If end is longer than length, use the truncated end
++        return end_str[:length]
++    return text[:length - len(end_str)] + end_str
++
++def _pad_left(value, width, fill=" "):
++    text = str(value)
++    if len(fill) != 1:
++        raise ValueError("fill must be exactly one character")
++    return text.rjust(width, fill)
++
++def _pad_right(value, width, fill=" "):
++    text = str(value)
++    if len(fill) != 1:
++        raise ValueError("fill must be exactly one character")
++    return text.ljust(width, fill)
++
++STRING_UTILS_FILTERS = {
++    "upper": _upper,
++    "lower": _lower,
++    "title": _title,
++    "reverse": _reverse,
++    "truncate": _truncate,
++    "pad_left": _pad_left,
++    "pad_right": _pad_right,
++}
++
++# --- math_utils filters ---
++
++def _math_add(value, other):
++    return value + other
++
++def _math_subtract(value, other):
++    return value - other
++
++def _math_multiply(value, other):
++    return value * other
++
++def _math_divide(value, other):
++    return value / other
++
++def _math_round(value, ndigits=None):
++    return round(value, ndigits)
++
++def _math_abs(value):
++    return abs(value)
++
++def _math_min(value, *others):
++    if not others:
++        return value
++    return min(value, *others)
++
++def _math_max(value, *others):
++    if not others:
++        return value
++    return max(value, *others)
++
++MATH_UTILS_FILTERS = {
++    "add": _math_add,
++    "subtract": _math_subtract,
++    "multiply": _math_multiply,
++    "divide": _math_divide,
++    "round": _math_round,
++    "abs": _math_abs,
++    "min": _math_min,
++    "max": _math_max,
++}
++
++# --- format_utils filters ---
++
++def _json(value):
++    return json.dumps(value)
++
++def _csv(value):
++    output = io.StringIO()
++    writer = csv_module.writer(output)
++    writer.writerow(value)
++    return output.getvalue().rstrip("\r\n")
++
++def _indent(value, width=4):
++    lines = str(value).split("\n")
++    indented = []
++    for line in lines:
++        if line.strip():
++            indented.append(" " * width + line)
++        else:
++            indented.append(line)
++    return "\n".join(indented)
++
++def _wrap(value, width=70):
++    return textwrap.fill(str(value), width=width)
++
++def _escape(value):
++    return html.escape(str(value), quote=True)
++
++def _unescape(value):
++    return html.unescape(str(value))
++
++FORMAT_UTILS_FILTERS = {
++    "json": _json,
++    "csv": _csv,
++    "indent": _indent,
++    "wrap": _wrap,
++    "escape": _escape,
++    "unescape": _unescape,
++}
++
++# Mapping from category name to filter dict
++BUILTIN_FILTER_CATEGORIES = {
++    "string_utils": STRING_UTILS_FILTERS,
++    "math_utils": MATH_UTILS_FILTERS,
++    "format_utils": FORMAT_UTILS_FILTERS,
++}
++
++
++def _get_builtin_filters(builtin_filters=None):
++    """Get the filter dicts for the given category names.
++    
++    Parameters
++    ----------
++    builtin_filters : list of str or None
++        List of category names. None or empty list returns empty dict.
++        
++    Returns
++    -------
++    dict
++        Combined filter name -> function mapping.
++    """
++    if builtin_filters is None:
++        return {}
++    
++    result = {}
++    for category in builtin_filters:
++        if not category:
++            raise ValueError(f"Unknown builtin filter category: {category!r}")
++        if category not in BUILTIN_FILTER_CATEGORIES:
++            raise ValueError(f"Unknown builtin filter category: {category!r}")
++        result.update(BUILTIN_FILTER_CATEGORIES[category])
++    return result
++
++
++def _build_env(builtin_filters=None):
++    """Create a Jinja2 environment with the appropriate filters."""
++    env = jinja2.Environment(
++        trim_blocks=True,
++        lstrip_blocks=True,
++        keep_trailing_newline=True,
++        undefined=jinja2.StrictUndefined,
++    )
++    # Add Outlines-specific filters
++    env.filters["name"] = get_fn_name
++    env.filters["description"] = get_fn_description
++    env.filters["source"] = get_fn_source
++    env.filters["signature"] = get_fn_signature
++    env.filters["schema"] = get_schema
++    env.filters["args"] = get_fn_args
++    
++    # Add built-in filter categories
++    builtin = _get_builtin_filters(builtin_filters)
++    env.filters.update(builtin)
++    
++    return env
++
++
+ @dataclass
+ class Prompt:
+     """Represents a prompt function.
+@@ -40,7 +234,7 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(cls, content: str, builtin_filters: Optional[List[str]] = None):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -48,15 +242,18 @@ class Prompt:
+         ----------
+         content : str
+             The string content to be converted into a template.
++        builtin_filters : list of str, optional
++            List of built-in filter categories to include. 
++            Can be "string_utils", "math_utils", "format_utils".
+ 
+         Returns
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(cls._template_from_str(content, builtin_filters=builtin_filters), None)
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(cls, path: Path, builtin_filters: Optional[List[str]] = None):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -67,6 +264,9 @@ class Prompt:
+         ----------
+         path : Path
+             The path to the file containing the Jinja template.
++        builtin_filters : list of str, optional
++            List of built-in filter categories to include.
++            Can be "string_utils", "math_utils", "format_utils".
+ 
+         Returns
+         -------
+@@ -75,10 +275,10 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(cls._template_from_file(path, builtin_filters=builtin_filters), None)
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(_, content: str, builtin_filters: Optional[List[str]] = None) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -89,27 +289,16 @@ class Prompt:
+             cleaned_template += "\n"
+ 
+         # Remove extra whitespaces, except those that immediately follow a newline symbol.
+-        # This is necessary to avoid introducing whitespaces after backslash `\` characters
++        # This is necessary to avoid introducing whitespaces after backslash `\\` characters
+         # used to continue to the next line without linebreak.
+         cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
+ 
+-        env = jinja2.Environment(
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
+-        )
+-        env.filters["name"] = get_fn_name
+-        env.filters["description"] = get_fn_description
+-        env.filters["source"] = get_fn_source
+-        env.filters["signature"] = get_fn_signature
+-        env.filters["schema"] = get_schema
+-        env.filters["args"] = get_fn_args
++        env = _build_env(builtin_filters)
+ 
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(_, path: Path, builtin_filters: Optional[List[str]] = None) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,10 +307,23 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        
++        # Add Outlines-specific filters
++        env.filters["name"] = get_fn_name
++        env.filters["description"] = get_fn_description
++        env.filters["source"] = get_fn_source
++        env.filters["signature"] = get_fn_signature
++        env.filters["schema"] = get_schema
++        env.filters["args"] = get_fn_args
++        
++        # Add built-in filter categories
++        builtin = _get_builtin_filters(builtin_filters)
++        env.filters.update(builtin)
++        
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++def prompt(fn: Optional[Callable] = None, *, builtin_filters: Optional[List[str]] = None):
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -152,23 +354,48 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Parameters
++    ----------
++    fn : callable, optional
++        The function to decorate. If None, returns a decorator.
++    builtin_filters : list of str, optional
++        List of built-in filter categories to include.
++        Can be "string_utils", "math_utils", "format_utils".
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
++    if fn is not None:
++        # Used as bare decorator: @outlines.prompt
++        if not callable(fn):
++            raise TypeError("The prompt decorator requires a callable.")
++        
++        signature = inspect.signature(fn)
++
++        # The docstring contains the template that will be rendered to be used
++        # as a prompt to the language model.
++        docstring = fn.__doc__
++        if docstring is None:
++            raise TypeError("Could not find a template in the function's docstring.")
++
++        template = Prompt._template_from_str(cast(str, docstring), builtin_filters=builtin_filters)
++
++        return Prompt(template, signature)
++    else:
++        # Used as @outlines.prompt(builtin_filters=...)
++        def decorator(func):
++            signature = inspect.signature(func)
+ 
+-    signature = inspect.signature(fn)
+-
+-    # The docstring contains the template that will be rendered to be used
+-    # as a prompt to the language model.
+-    docstring = fn.__doc__
+-    if docstring is None:
+-        raise TypeError("Could not find a template in the function's docstring.")
++            docstring = func.__doc__
++            if docstring is None:
++                raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++            template = Prompt._template_from_str(cast(str, docstring), builtin_filters=builtin_filters)
+ 
+-    return Prompt(template, signature)
++            return Prompt(template, signature)
++        return decorator
+ 
+ 
+ def get_fn_name(fn: Callable):

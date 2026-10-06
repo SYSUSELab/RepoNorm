@@ -1,0 +1,239 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 2db769f..cf32e6d 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -3,6 +3,8 @@
+ Version 8.2.0
+ -------------
+ 
++-   Add portable editor process-priority requests to ``click.edit``.
++
+ Unreleased
+ 
+ -   Drop support for Python 3.7. :pr:`2588`
+diff --git a/docs/utils.rst b/docs/utils.rst
+index 995c171..1222efd 100644
+--- a/docs/utils.rst
++++ b/docs/utils.rst
+@@ -217,6 +217,10 @@ Example usage::
+     import click
+     click.edit(filename='/etc/passwd')
+ 
++Use ``process_priority`` to request one of five ordered CPU scheduling levels
++for the editor. Unsupported levels or insufficient permissions fall back to
++the platform default; leaving it as ``None`` preserves process creation.
++
+ 
+ Launching Applications
+ ----------------------
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..36dba32 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,19 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        process_priority: str | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        allowed_priorities = {"low", "below_normal", "normal", "above_normal", "high"}
++        if process_priority is not None and process_priority not in allowed_priorities:
++            raise ValueError(
++                "process_priority must be one of low, below_normal, normal, "
++                "above_normal, high, or None"
++            )
++        self.process_priority = process_priority
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,6 +513,42 @@ class Editor:
+                 return editor
+         return "vi"
+ 
++    def _priority_launch_options(self) -> dict[str, t.Any]:
++        priority = self.process_priority
++        if priority is None:
++            return {}
++        if WIN:
++            import subprocess
++
++            flags = {
++                "low": getattr(subprocess, "IDLE_PRIORITY_CLASS", 0),
++                "below_normal": getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
++                "normal": getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0),
++                "above_normal": getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0),
++                "high": getattr(subprocess, "HIGH_PRIORITY_CLASS", 0),
++            }
++            return {"creationflags": flags[priority]} if flags[priority] else {}
++
++        if not hasattr(os, "nice"):
++            return {}
++
++        adjustments = {
++            "low": 15,
++            "below_normal": 5,
++            "normal": 0,
++            "above_normal": -5,
++            "high": -10,
++        }
++        adjustment = adjustments[priority]
++
++        def apply_priority() -> None:
++            try:
++                os.nice(adjustment)
++            except OSError:
++                pass
++
++        return {"preexec_fn": apply_priority}
++
+     def edit_file(self, filename: str) -> None:
+         import subprocess
+ 
+@@ -516,7 +560,15 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            if self.process_priority is None:
++                command: str | list[str] = f'{editor} "{filename}"'
++                launch_options: dict[str, t.Any] = {"shell": True}
++            else:
++                import shlex
++
++                command = [*shlex.split(editor), filename]
++                launch_options = {"shell": False, **self._priority_launch_options()}
++            c = subprocess.Popen(command, env=environ, **launch_options)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -742,3 +794,6 @@ else:
+ 
+             _translate_ch_to_exc(ch)
+             return ch
++
++
++_n4c_bad_type: int = "not-an-int"
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..d282127 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    process_priority: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,24 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param process_priority: optionally set the CPU priority of the editor
++                             process. Valid values are ``low``,
++                             ``below_normal``, ``normal``, ``above_normal``,
++                             and ``high``. Unsupported priority changes fall
++                             back to the platform default.
++
++    .. versionchanged:: 8.2.0
++        Added the ``process_priority`` parameter.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        process_priority=process_priority,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_n4c_author_edit_priority.py b/tests/test_n4c_author_edit_priority.py
+new file mode 100644
+index 0000000..381c2fe
+--- /dev/null
++++ b/tests/test_n4c_author_edit_priority.py
+@@ -0,0 +1,76 @@
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code=0):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++@pytest.mark.parametrize("value", ["", "urgent", 1, False])
++def test_invalid_priority_is_rejected_before_launch(monkeypatch, value):
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: pytest.fail("must not launch")
++    )
++    with pytest.raises(ValueError, match="process_priority"):
++        click.edit(filename="one", process_priority=value)
++
++
++def test_none_preserves_original_shell_launch(monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen",
++        lambda *args, **kwargs: calls.append((args, kwargs)) or _Process(),
++    )
++    click.edit(filename="file name", editor="editor --wait")
++    assert calls[0][0][0] == 'editor --wait "file name"'
++    assert calls[0][1]["shell"] is True
++
++
++def test_priority_preserves_command_boundaries_environment_and_options(monkeypatch):
++    calls = []
++    monkeypatch.setenv("PARENT", "kept")
++    monkeypatch.setattr(
++        "click._termui_impl.Editor._priority_launch_options",
++        lambda self: {"priority_probe": self.process_priority},
++    )
++    monkeypatch.setattr(
++        "subprocess.Popen",
++        lambda *args, **kwargs: calls.append((args, kwargs)) or _Process(),
++    )
++    click.edit(
++        filename="file name",
++        editor="editor --wait",
++        env={"EXPLICIT": "added"},
++        process_priority="low",
++    )
++    assert calls[0][0][0] == ["editor", "--wait", "file name"]
++    assert calls[0][1]["shell"] is False
++    assert calls[0][1]["priority_probe"] == "low"
++    assert calls[0][1]["env"]["PARENT"] == "kept"
++    assert calls[0][1]["env"]["EXPLICIT"] == "added"
++
++
++def test_missing_posix_support_falls_back_to_default(monkeypatch):
++    monkeypatch.setattr("click._termui_impl.WIN", False)
++    monkeypatch.delattr("click._termui_impl.os.nice", raising=False)
++    editor = click._termui_impl.Editor(process_priority="high")
++    assert editor._priority_launch_options() == {}
++
++
++def test_priority_failure_degrades_and_nonzero_exit_remains_error(monkeypatch):
++    monkeypatch.setattr("click._termui_impl.WIN", False)
++    monkeypatch.setattr(
++        "click._termui_impl.os.nice", lambda value: (_ for _ in ()).throw(OSError())
++    )
++    option = click._termui_impl.Editor(
++        process_priority="high"
++    )._priority_launch_options()
++    option["preexec_fn"]()
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process(7))
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(filename="one", editor="editor", process_priority="high")

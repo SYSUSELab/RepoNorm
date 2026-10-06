@@ -1,0 +1,7 @@
+**Title:** Add persistent filters to loader template listings
+
+Loaders expose `add_filter(filter_pattern)` and `clear_filters()`. A registered filter excludes a canonical `/`-separated template name from `list_templates` when any filter matches. Strings use case-sensitive glob matching, compiled regular expressions use `search`, and callables receive the template name and exclude it when truthy. Unsupported objects raise `TypeError`; exceptions raised while matching propagate unchanged.
+
+Filters persist until cleared and affect listings only. A filtered name remains directly loadable. A composite loader applies child filters when obtaining each child listing and then its own filters to the prefixed or combined names. The feature applies to loaders that already implement `list_templates`; FunctionLoader and ModuleLoader retain their existing unsupported-listing errors. `Environment.list_templates(filter_func=...)` may apply an additional one-shot filter.
+
+Add `loader.filter_scope(*patterns)`, a synchronous context manager for temporarily adding filters, for example while compiling a selected template subset. It accepts the same filter inputs as `add_filter`. Scopes may nest; leaving a scope restores the filter configuration present on entry, including when entering or executing the scope raises an exception. Filter changes made inside the scope are temporary. The scope is local to that loader and does not promise thread or asynchronous-task isolation.

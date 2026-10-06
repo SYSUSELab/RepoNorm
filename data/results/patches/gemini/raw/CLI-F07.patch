@@ -1,0 +1,170 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..dea60a3 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,9 +280,17 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool = False,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
++        self.validate_nesting = validate_nesting
++        self._children = set()
++        if parent is not None:
++            if parent.validate_nesting:
++                self.validate_nesting = True
++            parent._children.add(self)
++
+         #: the :class:`Command` for this context.
+         self.command = command
+         #: the descriptive information name
+@@ -477,9 +485,12 @@ class Context:
+         tb: TracebackType | None,
+     ) -> None:
+         self._depth -= 1
+-        if self._depth == 0:
+-            self.close()
+-        pop_context()
++        try:
++            if self._depth == 0:
++                self.close()
++        finally:
++            pop_context()
++
+ 
+     @contextmanager
+     def scope(self, cleanup: bool = True) -> cabc.Iterator[Context]:
+@@ -607,10 +618,20 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self._children:
++            raise RuntimeError(
++                f"Context {self.info_name!r} has outstanding children: "
++                f"{', '.join(c.info_name or c.command.name for c in self._children)}"
++            )
++
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 
++        if self.parent is not None:
++            self.parent._children.discard(self)
++
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+diff --git a/tests/test_nesting.py b/tests/test_nesting.py
+new file mode 100644
+index 0000000..2832ce2
+--- /dev/null
++++ b/tests/test_nesting.py
+@@ -0,0 +1,105 @@
++import click
++import pytest
++from click.globals import get_current_context
++
++def test_nested_context_validation_success():
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    def child():
++        pass
++
++    # Test that it works when closed in correct order
++    with click.Context(cli, validate_nesting=True) as ctx:
++        with click.Context(cli.commands['child'], parent=ctx) as child_ctx:
++            pass
++
++def test_nested_context_validation_failure():
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    def child():
++        pass
++
++    # Test that it fails when closed in incorrect order
++    ctx = click.Context(cli, validate_nesting=True)
++    child_ctx = click.Context(cli.commands['child'], parent=ctx)
++    
++    with pytest.raises(RuntimeError, match="has outstanding children"):
++        ctx.close()
++    
++    # Cleanup
++    child_ctx.close()
++    ctx.close()
++
++def test_make_context_nesting():
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    def child():
++        pass
++
++    parent_ctx = click.Context(cli, validate_nesting=True)
++    child_ctx = cli.commands['child'].make_context('child', [], parent=parent_ctx)
++    
++    with pytest.raises(RuntimeError, match="has outstanding children"):
++        parent_ctx.close()
++    
++    child_ctx.close()
++    parent_ctx.close()
++
++def test_multiple_levels():
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    def child1():
++        pass
++
++    @cli.command()
++    def child2():
++        pass
++
++    parent_ctx = click.Context(cli, validate_nesting=True)
++    c1 = click.Context(cli.commands['child1'], parent=parent_ctx)
++    c2 = click.Context(cli.commands['child2'], parent=parent_ctx)
++    
++    with pytest.raises(RuntimeError, match="has outstanding children"):
++        parent_ctx.close()
++    
++    c1.close()
++    with pytest.raises(RuntimeError, match="has outstanding children"):
++        parent_ctx.close()
++        
++    c2.close()
++    parent_ctx.close()
++
++def test_exit_pop():
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    def child():
++        pass
++
++    parent_ctx = click.Context(cli, validate_nesting=True)
++    child_ctx = click.Context(cli.commands['child'], parent=parent_ctx)
++    
++    # Use parent_ctx as a context manager
++    with pytest.raises(RuntimeError, match="has outstanding children"):
++        with parent_ctx:
++            pass
++            
++    # Check if parent_ctx is still in the stack
++    with pytest.raises(RuntimeError):
++        get_current_context()
++        
++    child_ctx.close()

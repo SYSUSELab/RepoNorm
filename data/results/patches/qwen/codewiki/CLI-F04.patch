@@ -1,0 +1,156 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 540bbe2..b9d2180 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -56,6 +56,10 @@ Unreleased
+     :issue:`2746` :pr:`2788`
+ -   Add ``Choice.get_invalid_choice_message`` method for customizing the
+     invalid choice message. :issue:`2621` :pr:`2622`
++-   Add ``cleanup_timeout`` parameter to ``Context`` constructor. When configured,
++    ``close()`` waits at most that duration for cleanup callbacks to complete.
++    If cleanup does not complete within the timeout, a warning is issued and
++    control returns to the caller. Cleanup continues in the background.
+ -   If help is shown because ``no_args_is_help`` is enabled (defaults to ``True``
+     for groups, ``False`` for commands), the exit code is 2 instead of 0.
+     :issue:`1489` :pr:`1489`
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..f9c8579 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -43,12 +43,38 @@ from .utils import make_default_short_help
+ from .utils import make_str
+ from .utils import PacifyFlushWrapper
+ 
++import atexit
++import threading
++import warnings
++from collections import defaultdict
++
+ if t.TYPE_CHECKING:
+     from .shell_completion import CompletionItem
+ 
+ F = t.TypeVar("F", bound="t.Callable[..., t.Any]")
+ V = t.TypeVar("V")
+ 
++# Global registry for pending cleanup errors
++_pending_cleanup_errors: list[tuple[threading.Thread, list[t.Any]]] = []
++
++
++def _report_pending_cleanup_errors() -> None:
++    """Report any cleanup errors that occurred after timeout."""
++    remaining = []
++    for thread, cleanup_error in _pending_cleanup_errors:
++        if thread.is_alive():
++            remaining.append((thread, cleanup_error))
++        elif cleanup_error[0] is not None:
++            warnings.warn(
++                f"Cleanup raised an exception: {cleanup_error[0]}",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++    _pending_cleanup_errors[:] = remaining
++
++
++atexit.register(_report_pending_cleanup_errors)
++
+ 
+ def _complete_visible_commands(
+     ctx: Context, incomplete: str
+@@ -280,6 +306,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +454,16 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++                # Handle cleanup_timeout: inherit from parent if not explicitly set
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++
++        #: Maximum time to wait for cleanup callbacks to complete.
++        #: If `None`, cleanup runs synchronously without timeout.
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be a positive number or None")
++        self.cleanup_timeout: float | None = cleanup_timeout
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -606,11 +643,57 @@ class Context:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        If a ``cleanup_timeout`` was configured, this method will wait at most
++        that duration for cleanup to complete. If cleanup does not complete
++        within the timeout, a warning is issued and control returns to the
++        caller. Cleanup continues in the background.
++
++        .. versionadded:: 8.3
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
++        if self.cleanup_timeout is None:
++            # Synchronous cleanup without timeout
++            self._exit_stack.close()
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
++            return
++
++        # Capture the current exit stack state before closing
++        exit_stack = self._exit_stack
+         self._exit_stack = ExitStack()
+ 
++        # Create a thread to run cleanup in the background
++        cleanup_done = threading.Event()
++        cleanup_error = [None]
++
++        def run_cleanup():
++            try:
++                exit_stack.close()
++            except Exception as e:
++                cleanup_error[0] = e
++            finally:
++                cleanup_done.set()
++
++        thread = threading.Thread(target=run_cleanup, daemon=True)
++        thread.start()
++
++        # Wait for cleanup with timeout
++        if not cleanup_done.wait(timeout=self.cleanup_timeout):
++            # Timeout reached - issue warning but don't forcibly terminate
++            warnings.warn(
++                f"Cleanup did not complete within {self.cleanup_timeout}s. "
++                f"Continuing in background.",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++            # Register a finalizer to report any errors that occur after timeout
++            _pending_cleanup_errors.append((thread, cleanup_error))
++        else:
++            # Cleanup completed within timeout
++            if cleanup_error[0] is not None:
++                # Re-raise the exception if cleanup failed
++                raise cleanup_error[0]
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 39dfbdb..070aa20 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -42,6 +42,8 @@ ALLOWED_IMPORTS = {
+     "itertools",
+     "io",
+     "threading",
++    "atexit",
++    "warnings",
+     "errno",
+     "fcntl",
+     "datetime",

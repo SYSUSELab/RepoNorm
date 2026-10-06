@@ -1,0 +1,139 @@
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..4091e94 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -1,4 +1,5 @@
+ import platform
++import subprocess
+ import time
+ 
+ import pytest
+@@ -380,6 +381,128 @@ def test_fast_edit(runner):
+     assert result == "aTest\nbTest\n"
+ 
+ 
++@pytest.mark.parametrize("timeout", [0, -1, True, False, 1.0, "1", object()])
++def test_edit_timeout_rejects_values_other_than_positive_integers(timeout):
++    with pytest.raises(ValueError):
++        click.edit("text", editor="unused", timeout=timeout)
++
++
++class _EditorProcess:
++    def __init__(self, wait_results):
++        self.wait_results = iter(wait_results)
++        self.wait_calls = []
++        self.terminated = False
++        self.killed = False
++        self.pid = 12345
++
++    def wait(self, timeout=None):
++        self.wait_calls.append(timeout)
++        result = next(self.wait_results)
++
++        if isinstance(result, BaseException):
++            raise result
++
++        return result
++
++    def terminate(self):
++        self.terminated = True
++
++    def kill(self):
++        self.killed = True
++
++
++def test_edit_timeout_is_forwarded_and_none_preserves_indefinite_wait(
++    monkeypatch, tmp_path
++):
++    processes = [_EditorProcess([0]), _EditorProcess([0])]
++    calls = []
++
++    def popen(*args, **kwargs):
++        calls.append((args, kwargs))
++        return processes[len(calls) - 1]
++
++    monkeypatch.setattr(subprocess, "Popen", popen)
++    filename = tmp_path / "message.txt"
++    filename.write_text("hello")
++
++    assert click.edit(filename=str(filename), editor="editor") is None
++    assert click.edit(filename=str(filename), editor="editor", timeout=7) is None
++    assert processes[0].wait_calls == [None]
++    assert processes[1].wait_calls == [7]
++
++
++def test_edit_timeout_terminates_and_reaps_process(monkeypatch, tmp_path):
++    expired = subprocess.TimeoutExpired("editor", 2)
++    process = _EditorProcess([expired, -15])
++
++    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
++    monkeypatch.setattr(click._termui_impl.os, "killpg", lambda *args: None)
++    filename = tmp_path / "message.txt"
++    filename.write_text("hello")
++
++    with pytest.raises(
++        click.ClickException, match=r"editor: Editing timed out after 2 seconds"
++    ):
++        click.edit(filename=str(filename), editor="editor", timeout=2)
++
++    assert process.wait_calls[0] == 2
++    assert len(process.wait_calls) == 2
++    assert process.wait_calls[1] > 0
++
++
++def test_edit_timeout_force_kills_and_reaps_unresponsive_process(
++    monkeypatch, tmp_path
++):
++    process = _EditorProcess(
++        [
++            subprocess.TimeoutExpired("editor", 3),
++            subprocess.TimeoutExpired("editor", 1),
++            -9,
++        ]
++    )
++    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
++    monkeypatch.setattr(click._termui_impl.os, "killpg", lambda *args: None)
++    filename = tmp_path / "message.txt"
++    filename.write_text("hello")
++
++    with pytest.raises(click.ClickException, match="timed out after 3 seconds"):
++        click.edit(filename=str(filename), editor="editor", timeout=3)
++
++    assert process.wait_calls[0] == 3
++    assert process.wait_calls[-1] is None
++    assert len(process.wait_calls) == 3
++    assert process.wait_calls[1] > 0
++
++
++@pytest.mark.skipif(WIN, reason="POSIX process groups are required for this check.")
++def test_edit_timeout_stops_children_of_editor_shell(tmp_path):
++    marker = tmp_path / "late-marker"
++    editor = tmp_path / "slow-editor"
++    editor.write_text(
++        "#!/bin/sh\n"
++        f"(sleep 2; : > {marker}) &\n"
++        "wait\n"
++    )
++    filename = tmp_path / "message.txt"
++    filename.write_text("hello")
++
++    with pytest.raises(click.ClickException, match="timed out after 1 seconds"):
++        click.edit(filename=str(filename), editor=f"sh {editor}", timeout=1)
++
++    time.sleep(1.2)
++    assert not marker.exists()
++
++
++def test_edit_nonzero_exit_still_reports_editing_failure(monkeypatch, tmp_path):
++    process = _EditorProcess([4])
++    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
++    filename = tmp_path / "message.txt"
++    filename.write_text("hello")
++
++    with pytest.raises(click.ClickException, match="editor: Editing failed"):
++        click.edit(filename=str(filename), editor="editor", timeout=2)
++
++
+ @pytest.mark.parametrize(
+     ("prompt_required", "required", "args", "expect"),
+     [

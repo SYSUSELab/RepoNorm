@@ -1,0 +1,231 @@
+diff --git a/tests/test_cache_contribution.py b/tests/test_cache_contribution.py
+new file mode 100644
+index 0000000..f3cc595
+--- /dev/null
++++ b/tests/test_cache_contribution.py
+@@ -0,0 +1,93 @@
++import pickle
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++import tiktoken
++
++
++class CountingBPE:
++    def __init__(self, wrapped):
++        self.wrapped = wrapped
++        self.calls = 0
++
++    def encode(self, *args, **kwargs):
++        self.calls += 1
++        return self.wrapped.encode(*args, **kwargs)
++
++    def __getattr__(self, name):
++        return getattr(self.wrapped, name)
++
++
++def counting_encoding():
++    encoding = tiktoken.Encoding(
++        "contribution-cache",
++        pat_str=r"[\s\S]",
++        mergeable_ranks={bytes([i]): i for i in range(256)},
++        special_tokens={"<X>": 256},
++    )
++    encoding._core_bpe = CountingBPE(encoding._core_bpe)
++    return encoding
++
++
++def test_cache_is_opt_in_shared_and_copy_safe() -> None:
++    encoding = counting_encoding()
++    encoding.encode("uncached")
++    encoding.encode("uncached")
++    assert encoding._core_bpe.calls == 2
++
++    first = encoding.encode("cached", use_cache=True)
++    assert encoding.encode_batch(["cached"], use_cache=True) == [first]
++    assert encoding._core_bpe.calls == 3
++    first.append(-1)
++    assert -1 not in encoding.encode("cached", use_cache=True)
++
++
++def test_cache_key_preserves_special_policy() -> None:
++    encoding = counting_encoding()
++    natural = encoding.encode("<X>", disallowed_special=(), use_cache=True)
++    special = encoding.encode("<X>", allowed_special="all", use_cache=True)
++    assert natural != special
++    with pytest.raises(ValueError, match="disallowed special token"):
++        encoding.encode("<X>", use_cache=True)
++
++
++def test_serial_lru_capacity_and_instance_isolation() -> None:
++    encoding = counting_encoding()
++    for index in range(128):
++        encoding.encode(f"entry-{index}", use_cache=True)
++    encoding.encode("entry-0", use_cache=True)
++    encoding.encode("entry-128", use_cache=True)
++    calls = encoding._core_bpe.calls
++    encoding.encode("entry-0", use_cache=True)
++    encoding.encode("entry-1", use_cache=True)
++    assert encoding._core_bpe.calls == calls + 1
++
++    other = tiktoken.Encoding(
++        "shifted",
++        pat_str=r"[\s\S]",
++        mergeable_ranks={bytes([i]): i + 1 for i in range(256)},
++        special_tokens={},
++    )
++    assert other.encode("x", use_cache=True) != encoding.encode("x", use_cache=True)
++
++
++def test_concurrent_cache_access_and_pickle_round_trip() -> None:
++    encoding = counting_encoding()
++    texts = [str(index % 25) for index in range(200)]
++    with ThreadPoolExecutor(8) as pool:
++        results = list(pool.map(lambda text: encoding.encode(text, use_cache=True), texts))
++    assert results == [encoding.encode(text) for text in texts]
++
++    restored = pickle.loads(pickle.dumps(encoding))
++    assert restored.encode_batch(["pickle", ""], use_cache=True) == [
++        encoding.encode("pickle"),
++        [],
++    ]
++
++
++def test_cached_surrogate_recovery_is_stable() -> None:
++    encoding = counting_encoding()
++    text = "before \ud800 after"
++    assert encoding.encode(text, use_cache=True) == encoding.encode(text)
++    assert encoding.encode(text, use_cache=True) == encoding.encode(text)
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..a7f4178 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import functools
++from collections import OrderedDict
+ from concurrent.futures import ThreadPoolExecutor
++from threading import Lock
+ from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
+ 
+ import regex
+@@ -52,6 +54,9 @@ class Encoding:
+             assert self.max_token_value == explicit_n_vocab - 1
+ 
+         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
++        self._encode_cache: OrderedDict[tuple[object, ...], tuple[int, ...]] = OrderedDict()
++        self._encode_cache_capacity = 128
++        self._encode_cache_lock = Lock()
+ 
+     def __repr__(self) -> str:
+         return f"<Encoding {self.name!r}>"
+@@ -76,12 +81,32 @@ class Encoding:
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+             return self._core_bpe.encode_ordinary(text)
+ 
++    def _create_cache_key(
++        self,
++        text: str,
++        allowed_special: Literal["all"] | AbstractSet[str],
++        disallowed_special: Literal["all"] | Collection[str],
++    ) -> tuple[object, ...]:
++        """Create a hashable cache key from the encode parameters."""
++        if allowed_special == "all":
++            allowed_special_key = "all"
++        else:
++            allowed_special_key = frozenset(allowed_special)
++
++        if disallowed_special == "all":
++            disallowed_special_key = "all"
++        else:
++            disallowed_special_key = frozenset(disallowed_special)
++
++        return (text, allowed_special_key, disallowed_special_key)
++
+     def encode(
+         self,
+         text: str,
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -96,6 +121,9 @@ class Encoding:
+           cause all text corresponding to special tokens to be encoded as natural text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
++        - Setting `use_cache` to True uses this Encoding instance's bounded 128-entry
++          LRU cache. The key includes text and special-token policy. Returned lists are
++          copies and cannot mutate cached values. Caches are not shared by encodings.
+ 
+         ```
+         >>> enc.encode("hello world")
+@@ -120,8 +148,16 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if use_cache:
++            cache_key = self._create_cache_key(text, allowed_special, disallowed_special)
++            with self._encode_cache_lock:
++                cached_result = self._encode_cache.get(cache_key)
++                if cached_result is not None:
++                    self._encode_cache.move_to_end(cache_key)
++                    return list(cached_result)
++
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +166,16 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
++
++        if use_cache:
++            with self._encode_cache_lock:
++                self._encode_cache[cache_key] = tuple(result)
++                self._encode_cache.move_to_end(cache_key)
++                if len(self._encode_cache) > self._encode_cache_capacity:
++                    self._encode_cache.popitem(last=False)
++
++        return result
+ 
+     def encode_to_numpy(
+         self,
+@@ -177,12 +222,16 @@ class Encoding:
+         text: list[str],
+         *,
+         num_threads: int = 8,
++        use_cache: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
++        If `use_cache` is True, each document uses the same per-instance cache as
++        `encode`; results remain in input order and returned lists do not expose cached
++        storage.
+ 
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+@@ -197,7 +246,10 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode,
++            allowed_special=allowed_special,
++            disallowed_special=disallowed_special,
++            use_cache=use_cache,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

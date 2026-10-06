@@ -1,0 +1,179 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..34fe0fb 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,6 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -22,18 +22,27 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: str, max_batch_size: Optional[int] = None):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        max_batch_size: int | None
++            The maximum batch size allowed. None means unlimited.
+ 
+         """
+         import xgrammar as xgr
+ 
++        if max_batch_size is not None:
++            if not isinstance(max_batch_size, int) or isinstance(max_batch_size, bool) or max_batch_size < 0:
++                raise ValueError(
++                    "max_batch_size must be a non-negative integer or None"
++                )
++
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
++        self.max_batch_size = max_batch_size
+         self.xgrammar_logits_processor = None
+         super().__init__("torch")
+ 
+@@ -43,6 +52,12 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
++        batch_size = self.tensor_adapter.shape(input_ids)[0]
++        if self.max_batch_size is not None and batch_size > self.max_batch_size:
++            raise ValueError(
++                f"Batch size {batch_size} exceeds maximum allowed batch size {self.max_batch_size}"
++            )
++
+         if self.xgrammar_logits_processor is None:
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+@@ -53,12 +68,14 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(self, model: SteerableModel, max_batch_size: Optional[int] = None):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        max_batch_size: int | None
++            The maximum batch size allowed. None means unlimited.
+ 
+         """
+         import xgrammar as xgr
+@@ -69,6 +86,13 @@ class XGrammarBackend(BaseBackend):
+                 "The xgrammar backend only supports Transformers models"
+             )
+ 
++        if max_batch_size is not None:
++            if not isinstance(max_batch_size, int) or isinstance(max_batch_size, bool) or max_batch_size < 0:
++                raise ValueError(
++                    "max_batch_size must be a non-negative integer or None"
++                )
++
++        self.max_batch_size = max_batch_size
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+@@ -97,7 +121,7 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, max_batch_size=self.max_batch_size)
+ 
+     def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+@@ -114,7 +138,7 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, max_batch_size=self.max_batch_size)
+ 
+     def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+@@ -131,4 +155,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, max_batch_size=self.max_batch_size)
+diff --git a/tests/backends/test_xgrammar_batch_limit.py b/tests/backends/test_xgrammar_batch_limit.py
+new file mode 100644
+index 0000000..b28ca1f
+--- /dev/null
++++ b/tests/backends/test_xgrammar_batch_limit.py
+@@ -0,0 +1,65 @@
++import pytest
++import torch
++from unittest.mock import MagicMock, patch
++from outlines.backends.xgrammar import XGrammarLogitsProcessor, XGrammarBackend
++from outlines.models.transformers import Transformers
++
++def test_xgrammar_batch_limit_validation():
++    # Test valid inputs
++    XGrammarLogitsProcessor("compiled_grammar", max_batch_size=None)
++    XGrammarLogitsProcessor("compiled_grammar", max_batch_size=0)
++    XGrammarLogitsProcessor("compiled_grammar", max_batch_size=1)
++    
++    # Test invalid inputs
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor("compiled_grammar", max_batch_size=-1)
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor("compiled_grammar", max_batch_size=True) # type: ignore
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor("compiled_grammar", max_batch_size="1") # type: ignore
++
++def test_xgrammar_batch_limit_enforcement():
++    processor = XGrammarLogitsProcessor("compiled_grammar", max_batch_size=1)
++    
++    # Mock the xgrammar_logits_processor
++    class MockXGRProcessor:
++        def __call__(self, input_ids, logits):
++            return logits
++    
++    processor.xgrammar_logits_processor = MockXGRProcessor()
++    
++    # Batch size 2 should fail
++    input_ids = torch.zeros((2, 10), dtype=torch.long)
++    logits = torch.zeros((2, 100), dtype=torch.float)
++    
++    with pytest.raises(ValueError, match="Batch size 2 exceeds maximum allowed batch size 1"):
++        processor(input_ids, logits)
++
++    # Batch size 1 should pass
++    input_ids = torch.zeros((1, 10), dtype=torch.long)
++    logits = torch.zeros((1, 100), dtype=torch.float)
++    processor(input_ids, logits)
++
++def test_xgrammar_reset_preserves_limit():
++    processor = XGrammarLogitsProcessor("compiled_grammar", max_batch_size=1)
++    assert processor.max_batch_size == 1
++    processor.reset()
++    assert processor.max_batch_size == 1
++
++def test_xgrammar_backend_max_batch_size():
++    mock_model = MagicMock(spec=Transformers)
++    mock_model.model = MagicMock()
++    mock_model.model.config = MagicMock()
++    mock_model.model.config._name_or_path = "test"
++    mock_model.hf_tokenizer = MagicMock()
++    
++    with patch("xgrammar.TokenizerInfo.from_huggingface"),          patch("xgrammar.GrammarCompiler"),          patch("transformers.AutoConfig.from_pretrained") as mock_config:
++        mock_config.return_value.vocab_size = 100
++        
++        # Test valid
++        backend = XGrammarBackend(mock_model, max_batch_size=10)
++        assert backend.max_batch_size == 10
++        
++        # Test invalid
++        with pytest.raises(ValueError):
++            XGrammarBackend(mock_model, max_batch_size=-1)

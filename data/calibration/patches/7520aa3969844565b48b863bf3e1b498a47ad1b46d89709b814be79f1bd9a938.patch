@@ -1,0 +1,198 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 2db769f..e5c5299 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -3,6 +3,8 @@
+ Version 8.2.0
+ -------------
+ 
++-   Add literal additional editor arguments to ``click.edit``.
++
+ Unreleased
+ 
+ -   Drop support for Python 3.7. :pr:`2588`
+diff --git a/docs/utils.rst b/docs/utils.rst
+index 995c171..f941d00 100644
+--- a/docs/utils.rst
++++ b/docs/utils.rst
+@@ -217,6 +217,10 @@ Example usage::
+     import click
+     click.edit(filename='/etc/passwd')
+ 
++Pass ``editor_args`` to add literal arguments between the configured editor
++command and the filename. The iterable is consumed once, and each argument
++keeps its own command-line boundary in both direct and temporary-text modes.
++
+ 
+ Launching Applications
+ ----------------------
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..20acdcc 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,20 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        editor_args: cabc.Iterable[str] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.editor_args: tuple[str, ...]
++        if editor_args is None:
++            self.editor_args = ()
++        else:
++            values = tuple(editor_args)
++            if not all(isinstance(arg, str) for arg in values):
++                raise TypeError("editor_args must contain only strings")
++            self.editor_args = values
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -506,6 +515,7 @@ class Editor:
+         return "vi"
+ 
+     def edit_file(self, filename: str) -> None:
++        import shlex
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -515,8 +525,16 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        cmd = " ".join(
++            (
++                editor,
++                *(shlex.quote(arg) for arg in self.editor_args),
++                shlex.quote(filename),
++            )
++        )
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            c = subprocess.Popen(cmd, env=environ, shell=True)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -742,3 +760,6 @@ else:
+ 
+             _translate_ch_to_exc(ch)
+             return ch
++
++
++_n4c_bad_type: int = "not-an-int"
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..2643eaf 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    editor_args: cabc.Iterable[str] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,22 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param editor_args: additional command-line arguments to pass to the
++                        editor. These are inserted between the editor
++                        executable and the filename.
++
++    .. versionchanged:: 8.2.0
++        Added the ``editor_args`` parameter.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        editor_args=editor_args,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_n4c_author_edit_args.py b/tests/test_n4c_author_edit_args.py
+new file mode 100644
+index 0000000..70d5c74
+--- /dev/null
++++ b/tests/test_n4c_author_edit_args.py
+@@ -0,0 +1,70 @@
++import shlex
++
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code=0):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++def _argv(command):
++    return shlex.split(command) if isinstance(command, str) else list(command)
++
++
++def test_literal_arguments_and_existing_editor_options_keep_boundaries(monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda command, **kw: calls.append(command) or _Process()
++    )
++    values = ["", "two words", 'a"b', "semi;colon", "$(marker)", "line\nbreak"]
++    click.edit(filename="file name", editor="editor --wait", editor_args=values)
++    assert _argv(calls[0]) == ["editor", "--wait", *values, "file name"]
++
++
++def test_generator_is_consumed_once_and_applies_to_text_mode(monkeypatch):
++    calls = []
++    consumed = []
++
++    def values():
++        consumed.append(True)
++        yield "--mode"
++        yield "plain text"
++
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda command, **kw: calls.append(command) or _Process()
++    )
++    assert click.edit("text", editor="editor -f", editor_args=values()) is None
++    assert consumed == [True]
++    assert _argv(calls[0])[:4] == ["editor", "-f", "--mode", "plain text"]
++
++
++def test_non_string_is_rejected_before_launch(monkeypatch):
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: pytest.fail("must not launch")
++    )
++    with pytest.raises(TypeError, match="only strings"):
++        click.edit(filename="one", editor_args=["ok", 1])
++
++
++def test_none_empty_environment_and_nonzero_behavior(monkeypatch):
++    calls = []
++    monkeypatch.setenv("PARENT_VALUE", "kept")
++
++    def launch(command, **kwargs):
++        calls.append((command, kwargs))
++        return _Process(0 if len(calls) < 3 else 7)
++
++    monkeypatch.setattr("subprocess.Popen", launch)
++    click.edit(filename="one", editor="editor --wait", editor_args=None)
++    click.edit(filename="one", editor="editor --wait", editor_args=[], env={"X": "y"})
++    assert [_argv(item[0]) for item in calls] == [["editor", "--wait", "one"]] * 2
++    assert calls[1][1]["env"]["PARENT_VALUE"] == "kept"
++    assert calls[1][1]["env"]["X"] == "y"
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(filename="one", editor="editor", editor_args=["--flag"])

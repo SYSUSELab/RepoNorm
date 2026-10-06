@@ -1,0 +1,216 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..6eb4e1cd 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -23,6 +23,8 @@ Unreleased
+     -   ``unicode_urlencode`` is renamed to ``url_quote``.
+ 
+ -   Add support for native types in macros. :issue:`1510`
++-   Allow a string context on ``trans`` blocks, using ``pgettext`` or
++    ``npgettext`` and preserving the context during message extraction.
+ 
+ 
+ Version 3.0.3
+diff --git a/docs/templates.rst b/docs/templates.rst
+index 89958b86..68112340 100644
+--- a/docs/templates.rst
++++ b/docs/templates.rst
+@@ -1693,6 +1693,21 @@ To bind more than one expression, separate each with a comma (``,``).
+ To pluralize, specify both the singular and plural forms separated by
+ the ``pluralize`` tag.
+ 
++A translation context can be given as a string literal immediately after
++``trans``. Contextual singular messages use ``pgettext``, while
++contextual plural messages use ``npgettext``. The context is part of
++the extracted message and is not evaluated during rendering.
++
++.. code-block:: jinja
++
++    {% trans "navigation" %}Open{% endtrans %}
++
++    {% trans "search" count=results|length %}
++        {{ count }} result
++    {% pluralize %}
++        {{ count }} results
++    {% endtrans %}
++
+ .. code-block:: jinja
+ 
+     {% trans count=list|length %}
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..d5550540 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -354,13 +354,19 @@ class InternationalizationExtension(Extension):
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+-        num_called_num = False
++
++        context = None
++        context_token = parser.stream.next_if("string")
++
++        if context_token is not None:
++            context = context_token.value
+ 
+         # find all the variables referenced.  Additionally a variable can be
+         # defined in the body of the trans block too, but this is checked at
+         # a later state.
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
++        num_called_num = False
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+@@ -455,6 +461,7 @@ class InternationalizationExtension(Extension):
+         node = self._make_node(
+             singular,
+             plural,
++            context,
+             variables,
+             plural_expr,
+             bool(referenced),
+@@ -510,6 +517,7 @@ class InternationalizationExtension(Extension):
+         self,
+         singular: str,
+         plural: t.Optional[str],
++        context: t.Optional[str],
+         variables: t.Dict[str, nodes.Expr],
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+@@ -526,21 +534,18 @@ class InternationalizationExtension(Extension):
+             if plural:
+                 plural = plural.replace("%%", "%")
+ 
+-        # singular only:
+-        if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++        func_name = "gettext"
++        func_args: t.List[nodes.Expr] = [nodes.Const(singular)]
+ 
+-        # singular and plural
+-        else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
++        if context is not None:
++            func_args.insert(0, nodes.Const(context))
++            func_name = f"p{func_name}"
++
++        if plural_expr is not None:
++            func_name = f"n{func_name}"
++            func_args.extend((nodes.Const(plural), plural_expr))
++
++        node = nodes.Call(nodes.Name(func_name, "load"), func_args, [], None, None)
+ 
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+diff --git a/tests/test_n4c_author_translation_context.py b/tests/test_n4c_author_translation_context.py
+new file mode 100644
+index 00000000..ffd4289c
+--- /dev/null
++++ b/tests/test_n4c_author_translation_context.py
+@@ -0,0 +1,97 @@
++import pytest
++
++from jinja2 import Environment
++from jinja2 import pass_context
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++def test_context_calls_and_non_context_regression(newstyle):
++    calls = []
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    env.install_gettext_callables(
++        lambda message: calls.append(("gettext", message)) or message,
++        lambda singular, plural, count: singular if count == 1 else plural,
++        newstyle=newstyle,
++        pgettext=lambda context, message: calls.append(("pgettext", context, message))
++        or message,
++        npgettext=lambda context, singular, plural, count: calls.append(
++            ("npgettext", context, singular, plural, count)
++        )
++        or (singular if count == 1 else plural),
++    )
++
++    contextual = env.from_string(
++        '{% trans "menu" name=user %}Open {{ name }}{% endtrans %}'
++    )
++    ordinary = env.from_string("{% trans %}Close{% endtrans %}")
++
++    assert contextual.render(user="File") == "Open File"
++    assert ordinary.render() == "Close"
++    assert calls == [
++        ("pgettext", "menu", "Open %(name)s"),
++        ("gettext", "Close"),
++    ]
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++def test_context_plural_trimmed(newstyle):
++    calls = []
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    env.install_gettext_callables(
++        lambda message: message,
++        lambda singular, plural, count: singular if count == 1 else plural,
++        newstyle=newstyle,
++        pgettext=lambda context, message: message,
++        npgettext=lambda context, singular, plural, count: calls.append(
++            (context, singular, plural, count)
++        )
++        or (singular if count == 1 else plural),
++    )
++    template = env.from_string(
++        '{% trans "search" count=n, trimmed %}\n'
++        "  {{ count }} result\n"
++        "{% pluralize %}\n"
++        "  {{ count }} results\n"
++        "{% endtrans %}"
++    )
++
++    assert template.render(n=2) == "2 results"
++    assert calls == [("search", "%(count)s result", "%(count)s results", 2)]
++
++
++def test_context_extraction():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    source = (
++        '{% trans "menu" %}Open{% endtrans %}\n'
++        '{% trans "files" n=count %}One{% pluralize %}Many{% endtrans %}'
++    )
++    assert list(env.extract_translations(source)) == [
++        (1, "pgettext", ("menu", "Open")),
++        (2, "npgettext", ("files", "One", "Many", None)),
++    ]
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++@pytest.mark.parametrize("escape", [False, True])
++def test_context_provider_keeps_jinja_call_and_escape_protocol(newstyle, escape):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    @pass_context
++    def provider(context, domain, message):
++        seen.append(context.environment)
++        return "<b>%(name)s</b>"
++
++    env.install_gettext_callables(
++        lambda message: message,
++        lambda one, many, n: many,
++        pgettext=provider,
++        newstyle=newstyle,
++    )
++    source = (
++        '{% autoescape escape %}{% trans "html" name=value %}'
++        "Hi {{ name }}{% endtrans %}{% endautoescape %}"
++    )
++    expected = "<b>&lt;x&gt;</b>" if escape else "<b><x></b>"
++    assert env.from_string(source).render(value="<x>", escape=escape) == expected
++    assert seen == [env]

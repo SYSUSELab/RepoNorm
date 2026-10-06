@@ -1,0 +1,120 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..19d2bf5f 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,4 +1,5 @@
+ import re
++import time
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
+@@ -48,6 +49,12 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Metrics tracking for the currently active field stream
++        self._chunk_count = 0
++        self._char_count = 0
++        self._first_ts: float | None = None
++        self._last_ts: float | None = None
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -56,7 +63,7 @@ class StreamListener:
+             },
+             "JSONAdapter": {
+                 "start_identifier": f'"{self.signature_field_name}":',
+-                "end_identifier": re.compile(r"\w*\"(,|\s*})"),
++                "end_identifier": re.compile(r'\w*"(,|\s*})'),
+                 "start_indicator": '"',
+             },
+             "XMLAdapter": {
+@@ -66,6 +73,56 @@ class StreamListener:
+             },
+         }
+ 
++    def _reset_active_stream_stats(self):
++        """Reset all counters and timestamps for the active stream."""
++        self._chunk_count = 0
++        self._char_count = 0
++        self._first_ts = None
++        self._last_ts = None
++
++    def _record_emission(self, chunk: str):
++        """Record metrics for an emitted chunk."""
++        self._chunk_count += 1
++        self._char_count += len(chunk)
++        now = time.time()
++        if self._first_ts is None:
++            self._first_ts = now
++        self._last_ts = now
++
++    def stats(self) -> dict:
++        """Return a serialization-friendly dictionary with metrics for the currently active field stream.
++
++        Returns:
++            A dictionary with the following keys:
++            - predict_name: The name of the predictor, or None.
++            - field: The name of the field being listened to.
++            - chunk_count: Number of chunks emitted so far (0 if no active stream).
++            - char_count: Total characters emitted (0 if no active stream).
++            - first_ts: Timestamp of first emission in seconds (None if no active stream).
++            - last_ts: Timestamp of last emission in seconds (None if no active stream).
++            - duration_s: Difference between last_ts and first_ts in seconds (None if no active stream).
++            - avg_chunk_chars: Average chunk character count (0 if no active stream).
++        """
++        if self._chunk_count == 0:
++            avg_chunk_chars = 0.0
++        else:
++            avg_chunk_chars = self._char_count / self._chunk_count
++
++        duration_s = None
++        if self._first_ts is not None and self._last_ts is not None:
++            duration_s = self._last_ts - self._first_ts
++
++        return {
++            "predict_name": self.predict_name,
++            "field": self.signature_field_name,
++            "chunk_count": self._chunk_count,
++            "char_count": self._char_count,
++            "first_ts": self._first_ts,
++            "last_ts": self._last_ts,
++            "duration_s": duration_s,
++            "avg_chunk_chars": avg_chunk_chars,
++        }
++
+     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
+         for i in range(len(concat_message)):
+             if start_identifier.startswith(concat_message[len(concat_message) - i - 1 :]):
+@@ -91,6 +148,7 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                self._reset_active_stream_stats()
+             else:
+                 return
+ 
+@@ -112,6 +170,7 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
++                self._reset_active_stream_stats()
+                 return
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+@@ -161,11 +220,14 @@ class StreamListener:
+             if re.search(end_identifier, concat_message):
+                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
+                 self.stream_end = True
++                self._reset_active_stream_stats()
+                 last_token = self.flush()
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                if not self.stream_end:
++                    self._record_emission(token)
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:

@@ -1,0 +1,126 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..82053ee 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -17,6 +17,7 @@ from gettext import gettext as _
+ from io import StringIO
+ from types import TracebackType
+ 
++from .exceptions import ClickException
+ from ._compat import _default_text_stdout
+ from ._compat import CYGWIN
+ from ._compat import get_best_encoding
+@@ -505,7 +506,25 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
++    def edit_file(self, filename: str, auto_backup: bool = False) -> None:
++        import shutil
++        import datetime
++
++        if auto_backup and os.path.exists(filename):
++            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
++            backup_name = f"{filename}.backup.{timestamp}"
++            if os.path.exists(backup_name):
++                i = 1
++                while os.path.exists(f"{backup_name}.{i}"):
++                    i += 1
++                backup_name = f"{backup_name}.{i}"
++            try:
++                shutil.copy2(filename, backup_name)
++            except OSError as e:
++                raise ClickException(
++                    _("Failed to create backup file: {e}").format(e=e)
++                ) from e
++
+         import subprocess
+ 
+         editor = self.get_editor()
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..44fa2a1 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    auto_backup: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -685,7 +686,7 @@ def edit(
+     if filename is None:
+         return ed.edit(text)
+ 
+-    ed.edit_file(filename)
++    ed.edit_file(filename, auto_backup=auto_backup)
+     return None
+ 
+ 
+diff --git a/tests/test_backup.py b/tests/test_backup.py
+new file mode 100644
+index 0000000..bc4d79b
+--- /dev/null
++++ b/tests/test_backup.py
+@@ -0,0 +1,60 @@
++import os
++import pytest
++import shutil
++from click.termui import edit
++from click.exceptions import ClickException
++
++def test_auto_backup(tmp_path):
++    # Create a file
++    file_path = tmp_path / "test.txt"
++    file_path.write_text("hello")
++    
++    # Edit the file with auto_backup=True
++    # We need to mock the editor, but `click.edit` uses `EDITOR` env var.
++    # Let's set `EDITOR` to `true` (which does nothing and exits with 0).
++    os.environ["EDITOR"] = "true"
++    
++    edit(filename=str(file_path), auto_backup=True)
++    
++    # Check if backup file exists
++    backups = list(tmp_path.glob("test.txt.backup.*"))
++    assert len(backups) == 1
++    assert backups[0].read_text() == "hello"
++
++def test_auto_backup_collision(tmp_path):
++    # Create a file
++    file_path = tmp_path / "test.txt"
++    file_path.write_text("hello")
++    
++    # Create a backup file manually to force collision
++    # The timestamp format is YYYYMMDD_HHMMSS
++    # We need to make sure the timestamp is the same.
++    # Actually, the code uses `datetime.datetime.now()`.
++    # So we can't easily control the timestamp.
++    # But we can create a file with the same name.
++    
++    # Let's just run it twice and see if it creates a collision file.
++    os.environ["EDITOR"] = "true"
++    
++    edit(filename=str(file_path), auto_backup=True)
++    edit(filename=str(file_path), auto_backup=True)
++    
++    backups = list(tmp_path.glob("test.txt.backup.*"))
++    assert len(backups) >= 2
++
++def test_auto_backup_failure(tmp_path):
++    # Create a file
++    file_path = tmp_path / "test.txt"
++    file_path.write_text("hello")
++    
++    # Make the directory read-only to force OSError
++    os.chmod(tmp_path, 0o555)
++    
++    os.environ["EDITOR"] = "true"
++    
++    with pytest.raises(ClickException, match="Failed to create backup file"):
++        edit(filename=str(file_path), auto_backup=True)
++    
++    # Restore permissions
++    os.chmod(tmp_path, 0o777)
++

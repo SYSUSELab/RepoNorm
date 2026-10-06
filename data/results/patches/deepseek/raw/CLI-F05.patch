@@ -1,0 +1,89 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..5dfba9b 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,8 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +429,39 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        if retry_cleanup is None:
++            if parent is not None:
++                retry_cleanup = parent.retry_cleanup
++            else:
++                retry_cleanup = 0
++
++        #: The number of additional attempts after a cleanup callback's
++        #: first attempt. A root context defaults to zero. A child
++        #: inherits an omitted value; explicit zero disables retries
++        #: for that child.
++        self.retry_cleanup: int = retry_cleanup
++
++        if retry_cleanup_backoff is None:
++            if parent is not None:
++                retry_cleanup_backoff = parent.retry_cleanup_backoff
++            else:
++                retry_cleanup_backoff = 0.1
++        elif not isinstance(retry_cleanup_backoff, (int, float)) or isinstance(retry_cleanup_backoff, bool):
++            raise ValueError(
++                "retry_cleanup_backoff must be a finite positive integer or float, "
++                f"not {type(retry_cleanup_backoff).__name__}"
++            )
++        elif retry_cleanup_backoff <= 0:
++            raise ValueError(
++                "retry_cleanup_backoff must be a finite positive integer or float, "
++                f"got {retry_cleanup_backoff}"
++            )
++
++        #: The initial delay in seconds before retrying a cleanup
++        #: callback. Defaults to 0.1 at the root and inherits from the
++        #: parent when omitted or ``None``.
++        self.retry_cleanup_backoff: float = retry_cleanup_backoff
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -600,7 +635,34 @@ class Context:
+ 
+         :param f: The function to execute on teardown.
+         """
+-        return self._exit_stack.callback(f)
++        retries = self.retry_cleanup
++        backoff = self.retry_cleanup_backoff
++
++        if retries <= 0:
++            # No retries, register as normal
++            return self._exit_stack.callback(f)
++
++        def _retry_wrapper(*args: t.Any, **kwargs: t.Any) -> None:
++            import time
++            last_exc: BaseException | None = None
++            delay = backoff
++
++            for attempt in range(retries + 1):
++                try:
++                    result = f(*args, **kwargs)
++                    return result
++                except (KeyboardInterrupt, SystemExit):
++                    raise
++                except BaseException as e:
++                    last_exc = e
++                    if attempt < retries:
++                        time.sleep(delay)
++                        delay *= 2
++
++            if last_exc is not None:
++                raise last_exc
++
++        return self._exit_stack.callback(_retry_wrapper)
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with

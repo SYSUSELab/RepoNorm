@@ -1,0 +1,219 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..d9c565a 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -1,4 +1,8 @@
++import builtins
++import csv
+ import functools
++import html
++import io
+ import inspect
+ import json
+ import os
+@@ -6,12 +10,98 @@ import re
+ import textwrap
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Dict, Optional, Type, cast
++from typing import Any, Callable, Dict, List, Optional, Type, cast
+ 
+ import jinja2
+ import pydantic
+ 
+ 
++def _truncate(value: Any, length: int, end: str = "...") -> str:
++    text = str(value)
++    if length < 0:
++        raise ValueError("truncate length must be non-negative")
++    if len(text) <= length:
++        return text
++    suffix = str(end)[:length]
++    return text[: length - len(suffix)] + suffix
++
++
++def _csv_row(value: Any) -> str:
++    output = io.StringIO(newline="")
++    csv.writer(output, lineterminator="").writerow(value)
++    return output.getvalue()
++
++
++def _round(value: Any, ndigits: Optional[int] = None) -> Any:
++    if ndigits is None:
++        return builtins.round(value)
++    return builtins.round(value, ndigits)
++
++
++def _get_builtin_filters() -> Dict[str, Dict[str, Callable]]:
++    return {
++        "string_utils": {
++            "upper": lambda value: str(value).upper(),
++            "lower": lambda value: str(value).lower(),
++            "title": lambda value: str(value).title(),
++            "reverse": lambda value: str(value)[::-1],
++            "truncate": _truncate,
++            "pad_left": lambda value, width, fill=" ": str(value).rjust(width, fill),
++            "pad_right": lambda value, width, fill=" ": str(value).ljust(width, fill),
++        },
++        "math_utils": {
++            "add": lambda value, other: value + other,
++            "subtract": lambda value, other: value - other,
++            "multiply": lambda value, other: value * other,
++            "divide": lambda value, other: value / other,
++            "round": _round,
++            "abs": builtins.abs,
++            "min": lambda value, *others: builtins.min(value, *others),
++            "max": lambda value, *others: builtins.max(value, *others),
++        },
++        "format_utils": {
++            "json": json.dumps,
++            "csv": _csv_row,
++            "indent": lambda value, width=4: textwrap.indent(
++                str(value), " " * width
++            ),
++            "wrap": lambda value, width=70: textwrap.fill(str(value), width),
++            "escape": lambda value: html.escape(str(value), quote=True),
++            "unescape": lambda value: html.unescape(str(value)),
++        },
++    }
++
++
++def _create_builtin_filter_environment(
++    loader: Optional[jinja2.BaseLoader] = None,
++    builtin_filters: Optional[List[str]] = None,
++) -> jinja2.Environment:
++    env = jinja2.Environment(
++        loader=loader,
++        trim_blocks=True,
++        lstrip_blocks=True,
++        keep_trailing_newline=True,
++        undefined=jinja2.StrictUndefined,
++    )
++    env.filters.update(
++        {
++            "name": get_fn_name,
++            "description": get_fn_description,
++            "source": get_fn_source,
++            "signature": get_fn_signature,
++            "schema": get_schema,
++            "args": get_fn_args,
++        }
++    )
++
++    available = _get_builtin_filters()
++    for category in builtin_filters or []:
++        if category not in available:
++            raise ValueError(f"Unknown builtin filter category: {category}")
++        env.filters.update(available[category])
++    return env
++
++
+ @dataclass
+ class Prompt:
+     """Represents a prompt function.
+@@ -40,7 +130,9 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(
++        cls, content: str, builtin_filters: Optional[List[str]] = None
++    ):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -53,10 +145,12 @@ class Prompt:
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(cls._template_from_str(content, builtin_filters), None)
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(
++        cls, path: Path, builtin_filters: Optional[List[str]] = None
++    ):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -75,10 +169,12 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(cls._template_from_file(path, builtin_filters), None)
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(
++        _, content: str, builtin_filters: Optional[List[str]] = None
++    ) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -93,35 +189,26 @@ class Prompt:
+         # used to continue to the next line without linebreak.
+         cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
+ 
+-        env = jinja2.Environment(
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
+-        )
+-        env.filters["name"] = get_fn_name
+-        env.filters["description"] = get_fn_description
+-        env.filters["source"] = get_fn_source
+-        env.filters["signature"] = get_fn_signature
+-        env.filters["schema"] = get_schema
+-        env.filters["args"] = get_fn_args
++        env = _create_builtin_filter_environment(None, builtin_filters)
+ 
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(
++        _, path: Path, builtin_filters: Optional[List[str]] = None
++    ) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+-        env = jinja2.Environment(
+-            loader=jinja2.FileSystemLoader(file_directory),
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
++        env = _create_builtin_filter_environment(
++            jinja2.FileSystemLoader(file_directory), builtin_filters
+         )
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++def prompt(
++    fn: Optional[Callable] = None,
++    *,
++    builtin_filters: Optional[List[str]] = None,
++) -> Callable:
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -157,6 +244,8 @@ def prompt(fn: Callable) -> Prompt:
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
++    if fn is None:
++        return lambda fn: prompt(fn, builtin_filters=builtin_filters)
+ 
+     signature = inspect.signature(fn)
+ 
+@@ -166,7 +255,7 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(cast(str, docstring), builtin_filters)
+ 
+     return Prompt(template, signature)
+ 

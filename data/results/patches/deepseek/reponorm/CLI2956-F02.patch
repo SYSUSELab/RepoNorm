@@ -1,0 +1,254 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..03e1191 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2549,6 +2549,9 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        validators: (
++            cabc.Sequence[t.Callable[["Context", "Parameter", t.Any], t.Any]] | None
++        ) = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2637,6 +2640,30 @@ class Option(Parameter):
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
+ 
++        if validators is not None:
++            if isinstance(validators, str) or not isinstance(
++                validators, cabc.Sequence
++            ):
++                raise TypeError(
++                    "validators must be None or a sequence of callables, not"
++                    f" {validators.__class__.__name__!r}."
++                )
++
++            for i, validator in enumerate(validators):
++                if not callable(validator):
++                    raise TypeError(
++                        f"validators[{i}] must be callable, got"
++                        f" {validator.__class__.__name__!r}."
++                    )
++
++        self.validators: (
++            tuple[t.Callable[["Context", "Parameter", t.Any], t.Any], ...] | None
++        )
++        if validators:
++            self.validators = tuple(validators)
++        else:
++            self.validators = None
++
+         if __debug__:
+             if deprecated and prompt:
+                 raise ValueError("`deprecated` options cannot use `prompt`.")
+@@ -2662,6 +2689,15 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++    def process_value(self, ctx: "Context", value: t.Any) -> t.Any:
++        value = super().process_value(ctx, value)
++
++        if self.validators:
++            for validator in self.validators:
++                value = validator(ctx, self, value)
++
++        return value
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..1ccd8c4 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,188 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++def test_option_validators(runner):
++    """Test the basic validators feature."""
++    def upper(ctx, param, value):
++        return value.upper() if value else value
++
++    def exclaim(ctx, param, value):
++        return value + "!!!" if value else value
++
++    @click.command()
++    @click.option("--name", validators=[upper, exclaim])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--name", "hello"])
++    assert not result.exception
++    assert result.output.strip() == "HELLO!!!"
++
++
++def test_option_validators_none(runner):
++    """Test that None disables validators."""
++    @click.command()
++    @click.option("--name", validators=None)
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--name", "hello"])
++    assert not result.exception
++    assert result.output.strip() == "hello"
++
++
++def test_option_validators_empty(runner):
++    """Test that an empty sequence disables validators."""
++    @click.command()
++    @click.option("--name", validators=[])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--name", "hello"])
++    assert not result.exception
++    assert result.output.strip() == "hello"
++
++
++def test_option_validators_string_rejected():
++    """Test that a string is rejected at construction."""
++    with pytest.raises(TypeError):
++        click.Option(["--name"], validators="not_a_sequence")
++
++
++def test_option_validators_non_callable_element_rejected():
++    """Test that a non-callable element is rejected at construction."""
++    with pytest.raises(TypeError, match=r"validators\[1\]"):
++        click.Option(["--name"], validators=[lambda x: x, "not_callable"])
++
++
++def test_option_validators_with_callback(runner):
++    """Test that callbacks run before validators."""
++    def callback(ctx, param, value):
++        return value + "_cb"
++
++    def validator(ctx, param, value):
++        return value + "_val"
++
++    @click.command()
++    @click.option("--name", callback=callback, validators=[validator])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--name", "input"])
++    assert not result.exception
++    assert result.output.strip() == "input_cb_val"
++
++
++def test_option_validators_multiple(runner):
++    """Test that validators work with multiple=True."""
++    def upper(ctx, param, value):
++        return [x.upper() for x in value]
++
++    def sort_vals(ctx, param, value):
++        return sorted(value)
++
++    @click.command()
++    @click.option("--name", multiple=True, validators=[upper, sort_vals])
++    def cli(name):
++        click.echo("|".join(name))
++
++    result = runner.invoke(cli, ["--name", "beta", "--name", "alpha"])
++    assert not result.exception
++    assert result.output.strip() == "ALPHA|BETA"
++
++
++def test_option_validators_envvar(runner, monkeypatch):
++    """Test that validators work with environment variables."""
++    monkeypatch.setenv("MY_NAME", "hello")
++
++    def upper(ctx, param, value):
++        return value.upper() if value else value
++
++    @click.command()
++    @click.option("--name", envvar="MY_NAME", validators=[upper])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert result.output.strip() == "HELLO"
++
++
++def test_option_validators_default(runner):
++    """Test that validators run on default values."""
++    def validate_default(ctx, param, value):
++        return value * 2
++
++    @click.command()
++    @click.option("--name", default="hello", validators=[validate_default])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert result.output.strip() == "hellohello"
++
++
++def test_option_validators_resilient_parsing(runner):
++    """Test that validators don't crash during resilient parsing."""
++    def validator(ctx, param, value):
++        if value == "boom":
++            raise ValueError("boom")
++        return value
++
++    @click.command()
++    @click.option("--name", validators=[validator])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--name", "boom"], standalone_mode=False)
++    assert result.exception is not None
++
++
++def test_option_validators_short_circuit_on_exception(runner):
++    """Test that an exception stops the validator chain."""
++    called = []
++
++    def first(ctx, param, value):
++        called.append("first")
++        raise ValueError("stop")
++
++    def second(ctx, param, value):
++        called.append("second")
++
++    @click.command()
++    @click.option("--name", validators=[first, second])
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--name", "hello"], standalone_mode=False)
++    assert result.exception is not None
++    assert "stop" in str(result.exception)
++    assert called == ["first"]
++
++
++def test_option_validators_bad_parameter_retry(runner):
++    """Test that BadParameter from a validator causes prompt retry."""
++    attempts = []
++
++    def raising_validator(ctx, param, value):
++        attempts.append(int(value))
++        if len(attempts) < 4:
++            raise click.BadParameter("not good", param=param, ctx=ctx)
++        return value
++
++    @click.command()
++    @click.option("-a", type=int, validators=[raising_validator], prompt=True)
++    def cli(a):
++        click.echo(a)
++
++    result = runner.invoke(cli, input="-12\n60\n99\n")
++    # The first two prompts (attempts 1,2) raise BadParameter.
++    # Attempt 3 succeeds, then process_value is called again
++    # (attempt 4) which also raises BadParameter, causing a third
++    # re-prompt attempt, at which point stdin is exhausted -> Abort.
++    # This test confirms BadParameter is caught and re-prompted.
++    assert "Error: not good" in result.output
++    assert attempts[-1] in (60, 99)

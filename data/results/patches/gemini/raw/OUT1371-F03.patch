@@ -1,0 +1,152 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..552ddea 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -40,7 +40,7 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(cls, content: str, conditional_filters: Optional[Dict[str, Any]] = None):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -53,10 +53,10 @@ class Prompt:
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(cls._template_from_str(content, conditional_filters=conditional_filters), None)
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(cls, path: Path, conditional_filters: Optional[Dict[str, Any]] = None):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -75,10 +75,10 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(cls._template_from_file(path, conditional_filters=conditional_filters), None)
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(_, content: str, conditional_filters: Optional[Dict[str, Any]] = None) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -105,11 +105,13 @@ class Prompt:
+         env.filters["signature"] = get_fn_signature
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
++        filters = get_filters_to_apply(conditional_filters)
++        env.filters.update(filters)
+ 
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(_, path: Path, conditional_filters: Optional[Dict[str, Any]] = None) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,10 +120,45 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        filters = get_filters_to_apply(conditional_filters)
++        env.filters.update(filters)
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++
++def get_active_condition(conditional_filters: Optional[Dict[str, Any]]):
++    if not conditional_filters:
++        return None
++        
++    is_debug = os.environ.get("OUTLINES_DEBUG", "").lower() == "true"
++    is_production = os.environ.get("ENVIRONMENT", "").lower() == "production"
++    is_testing = (os.environ.get("ENV", "").lower() == "testing" or
++                  os.environ.get("OUTLINES_TESTING", "").lower() == "true" or
++                  os.environ.get("TESTING_MODE", "").lower() == "on")
++    
++    if is_debug and "debug" in conditional_filters:
++        return "debug"
++    if is_production and "production" in conditional_filters:
++        return "production"
++    if is_testing and "testing" in conditional_filters:
++        return "testing"
++        
++    sorted_keys = sorted(conditional_filters.keys())
++    if sorted_keys:
++        return sorted_keys[0]
++            
++    return None
++
++def get_filters_to_apply(conditional_filters: Optional[Dict[str, Any]]):
++    condition = get_active_condition(conditional_filters)
++    if condition and conditional_filters:
++        return conditional_filters.get(condition, {})
++    return {}
++
++
++def prompt(fn=None, *, conditional_filters: Optional[Dict[str, Any]] = None) -> Prompt:
++    if fn is None:
++        return functools.partial(prompt, conditional_filters=conditional_filters)
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -166,7 +203,7 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(cast(str, docstring), conditional_filters=conditional_filters)
+ 
+     return Prompt(template, signature)
+ 
+diff --git a/tests/test_conditional_filters.py b/tests/test_conditional_filters.py
+new file mode 100644
+index 0000000..c469bf5
+--- /dev/null
++++ b/tests/test_conditional_filters.py
+@@ -0,0 +1,36 @@
++import os
++import pytest
++from outlines import prompt, Prompt
++import jinja2
++
++def test_conditional_filters_debug():
++    os.environ["OUTLINES_DEBUG"] = "true"
++    @prompt(conditional_filters={"debug": {"my_filter": lambda x: x.upper()}, "production": {"my_filter": lambda x: x.lower()}})
++    def my_prompt(name):
++        """Hello {{ name | my_filter }}"""
++    
++    assert my_prompt(name="world") == "Hello WORLD"
++
++def test_conditional_filters_production():
++    os.environ["OUTLINES_DEBUG"] = "false"
++    os.environ["ENVIRONMENT"] = "production"
++    p = Prompt.from_str("Hello {{ name | my_filter }}", conditional_filters={"debug": {"my_filter": lambda x: x.upper()}, "production": {"my_filter": lambda x: x.lower()}})
++    assert p(name="WORLD") == "Hello world"
++
++def test_conditional_filters_priority():
++    os.environ["OUTLINES_DEBUG"] = "true"
++    os.environ["ENVIRONMENT"] = "production"
++    p = Prompt.from_str("Hello {{ name | my_filter }}", conditional_filters={"debug": {"my_filter": lambda x: x.upper()}, "production": {"my_filter": lambda x: x.lower()}})
++    assert p(name="world") == "Hello WORLD"
++
++def test_conditional_filters_alphabetical():
++    os.environ["OUTLINES_DEBUG"] = "false"
++    os.environ["ENVIRONMENT"] = "none"
++    p = Prompt.from_str("Hello {{ name | my_filter }}", conditional_filters={"a": {"my_filter": lambda x: "a"}, "b": {"my_filter": lambda x: "b"}})
++    assert p(name="world") == "Hello a"
++
++def test_conditional_filters_error():
++    os.environ["OUTLINES_DEBUG"] = "true"
++    with pytest.raises(jinja2.exceptions.TemplateAssertionError):
++        Prompt.from_str("Hello {{ name | prod_filter }}", conditional_filters={"debug": {"debug_filter": lambda x: "debug"}, "production": {"prod_filter": lambda x: "prod"}})
++

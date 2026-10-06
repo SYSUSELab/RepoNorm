@@ -1,0 +1,200 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..f53706c 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -263,9 +263,30 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            set_translation_version=self.set_translation_version,
++            get_translation_version=self.get_translation_version,
++            compare_translation_versions=self.compare_translation_versions,
++            remove_translation_version=self.remove_translation_version,
++            clear_translation_versions=self.clear_translation_versions,
+             newstyle_gettext=False,
+         )
+ 
++    def bind(self, environment: "Environment") -> "InternationalizationExtension":
++        """Create a copy of this extension bound to another environment."""
++        rv = object.__new__(self.__class__)
++        rv.__dict__.update(self.__dict__)
++        rv.environment = environment
++        # Make a copy of translation versions for isolation
++        if hasattr(rv, "_translation_versions"):
++            rv._translation_versions = dict(rv._translation_versions)
++        # Re-bind the translation version methods to the new environment
++        environment.set_translation_version = rv.set_translation_version
++        environment.get_translation_version = rv.get_translation_version
++        environment.compare_translation_versions = rv.compare_translation_versions
++        environment.remove_translation_version = rv.remove_translation_version
++        environment.clear_translation_versions = rv.clear_translation_versions
++        return rv
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -570,6 +591,46 @@ class InternationalizationExtension(Extension):
+                 )
+         return nodes.Output([node])
+ 
++    def set_translation_version(self, message: str, version: str) -> None:
++        """Set the translation version for a message."""
++        if not hasattr(self, "_translation_versions"):
++            self._translation_versions = {}
++        self._translation_versions[message] = version
++
++    def get_translation_version(self, message: str) -> t.Optional[str]:
++        """Get the translation version for a message. Returns None if unknown."""
++        if not hasattr(self, "_translation_versions"):
++            return None
++        return self._translation_versions.get(message)
++
++    def compare_translation_versions(
++        self, message1: str, message2: str
++    ) -> bool:
++        """Compare translation versions of two messages.
++        
++        Returns True only when both messages are registered and their versions are equal.
++        Either or both missing always returns False.
++        """
++        v1 = self.get_translation_version(message1)
++        v2 = self.get_translation_version(message2)
++        if v1 is None or v2 is None:
++            return False
++        return v1 == v2
++
++    def remove_translation_version(self, message: str) -> None:
++        """Remove the translation version for a message.
++        
++        Is harmless for an unknown message.
++        """
++        if hasattr(self, "_translation_versions"):
++            self._translation_versions.pop(message, None)
++
++    def clear_translation_versions(self) -> None:
++        """Remove all translation versions."""
++        if hasattr(self, "_translation_versions"):
++            self._translation_versions.clear()
++
++
+ 
+ class ExprStmtExtension(Extension):
+     """Adds a `do` tag to Jinja that works like the print statement just
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..6403121 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -712,3 +712,113 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestTranslationVersions:
++    """Tests for translation version tracking in InternationalizationExtension."""
++
++    def setup_method(self):
++        self.env = Environment(extensions=["jinja2.ext.i18n"])
++
++    def test_set_translation_version(self):
++        """Test setting a translation version."""
++        self.env.set_translation_version("hello", "v1")
++        assert self.env.get_translation_version("hello") == "v1"
++
++    def test_get_translation_version_unknown(self):
++        """Test getting version of unknown message returns None."""
++        assert self.env.get_translation_version("unknown") is None
++
++    def test_compare_equal_versions(self):
++        """Test comparing equal versions returns True."""
++        self.env.set_translation_version("msg1", "same")
++        self.env.set_translation_version("msg2", "same")
++        assert self.env.compare_translation_versions("msg1", "msg2") is True
++
++    def test_compare_different_versions(self):
++        """Test comparing different versions returns False."""
++        self.env.set_translation_version("msg1", "v1")
++        self.env.set_translation_version("msg2", "v2")
++        assert self.env.compare_translation_versions("msg1", "msg2") is False
++
++    def test_compare_missing_message(self):
++        """Test comparison with missing message returns False."""
++        self.env.set_translation_version("msg1", "v1")
++        assert self.env.compare_translation_versions("msg1", "unknown") is False
++        assert self.env.compare_translation_versions("unknown", "msg1") is False
++        assert self.env.compare_translation_versions("unknown1", "unknown2") is False
++
++    def test_remove_translation_version(self):
++        """Test removing a translation version."""
++        self.env.set_translation_version("to_remove", "version")
++        assert self.env.get_translation_version("to_remove") == "version"
++        self.env.remove_translation_version("to_remove")
++        assert self.env.get_translation_version("to_remove") is None
++
++    def test_remove_translation_version_harmless_unknown(self):
++        """Test removing unknown message is harmless."""
++        self.env.remove_translation_version("unknown")  # Should not raise
++        assert self.env.get_translation_version("unknown") is None
++
++    def test_clear_translation_versions(self):
++        """Test clearing all translation versions."""
++        self.env.set_translation_version("keep1", "v1")
++        self.env.set_translation_version("clear1", "v2")
++        self.env.clear_translation_versions()
++        assert self.env.get_translation_version("keep1") is None
++        assert self.env.get_translation_version("clear1") is None
++
++    def test_empty_string_key(self):
++        """Test empty string as key is supported."""
++        self.env.set_translation_version("", "empty-version")
++        assert self.env.get_translation_version("") == "empty-version"
++
++    def test_unicode_key(self):
++        """Test Unicode strings as keys are supported."""
++        self.env.set_translation_version("你好世界", "unicode-v1")
++        assert self.env.get_translation_version("你好世界") == "unicode-v1"
++
++    def test_long_strings(self):
++        """Test long strings as keys and values are supported."""
++        long_key = "a" * 10000
++        long_version = "b" * 10000
++        self.env.set_translation_version(long_key, long_version)
++        assert self.env.get_translation_version(long_key) == long_version
++
++    def test_overlay_isolation(self):
++        """Test that overlay environments have isolated translation versions."""
++        # Set versions in parent
++        self.env.set_translation_version("parent_msg", "parent_v")
++        
++        # Create overlay
++        overlay_env = self.env.overlay()
++        
++        # Overlay should have copies
++        assert overlay_env.get_translation_version("parent_msg") == "parent_v"
++        
++        # Modify overlay
++        overlay_env.set_translation_version("overlay_msg", "overlay_v")
++        overlay_env.remove_translation_version("parent_msg")
++        
++        # Parent should be unaffected
++        assert self.env.get_translation_version("parent_msg") == "parent_v"
++        assert self.env.get_translation_version("overlay_msg") is None
++        
++        # Overlay should have its own state
++        assert overlay_env.get_translation_version("parent_msg") is None
++        assert overlay_env.get_translation_version("overlay_msg") == "overlay_v"
++
++    def test_nested_overlays(self):
++        """Test that nested overlays maintain isolation."""
++        self.env.set_translation_version("msg", "v1")
++        
++        overlay1 = self.env.overlay()
++        overlay1.set_translation_version("msg", "v2")
++        
++        overlay2 = overlay1.overlay()
++        overlay2.set_translation_version("msg", "v3")
++        
++        # Each level should have its own version
++        assert self.env.get_translation_version("msg") == "v1"
++        assert overlay1.get_translation_version("msg") == "v2"
++        assert overlay2.get_translation_version("msg") == "v3"

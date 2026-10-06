@@ -1,0 +1,593 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..ccf983b 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -242,6 +242,57 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++
++@pass_context
++def _trans_priority_gettext(
++    __context: Context, singular: str, priority_value: t.Any, **kwargs: t.Any
++) -> str:
++    """Try priority_gettext levels, fall back to regular gettext.
++    Returns raw translated string (no autoescape, no % formatting).
++    """
++    try:
++        max_level = int(priority_value)
++    except (ValueError, TypeError):
++        max_level = 0
++    if max_level < 0:
++        max_level = 0
++    max_level = min(max_level, 9)
++
++    priority_gettext = __context.resolve("priority_gettext")
++    if priority_gettext is not None and not isinstance(priority_gettext, Undefined):
++        for level in range(max_level + 1):
++            result = __context.call(priority_gettext, singular, level)
++            if result != singular:
++                return result
++    return __context.call(__context.resolve("gettext"), singular, **kwargs)
++
++
++@pass_context
++def _trans_priority_ngettext(
++    __context: Context, singular: str, plural: str, num: t.Any, priority_value: t.Any, **kwargs: t.Any
++) -> str:
++    """Try priority_ngettext levels, fall back to regular ngettext.
++    Returns raw translated string (no autoescape, no % formatting).
++    """
++    try:
++        max_level = int(priority_value)
++    except (ValueError, TypeError):
++        max_level = 0
++    if max_level < 0:
++        max_level = 0
++    max_level = min(max_level, 9)
++
++    priority_ngettext = __context.resolve("priority_ngettext")
++    if priority_ngettext is not None and not isinstance(priority_ngettext, Undefined):
++        for level in range(max_level + 1):
++            result = __context.call(priority_ngettext, singular, plural, num, level)
++            if result != singular:
++                return result
++    return __context.call(
++        __context.resolve("ngettext"), singular, plural, num, **kwargs
++    )
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -257,6 +308,8 @@ class InternationalizationExtension(Extension):
+     def __init__(self, environment: Environment) -> None:
+         super().__init__(environment)
+         environment.globals["_"] = _gettext_alias
++        environment.globals["_trans_priority_gettext"] = _trans_priority_gettext
++        environment.globals["_trans_priority_ngettext"] = _trans_priority_ngettext
+         environment.extend(
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+@@ -319,6 +372,8 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], str]] = None,
++        priority_ngettext: t.Optional[t.Callable[[str, str, int, int], str]] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -333,11 +388,23 @@ class InternationalizationExtension(Extension):
+                 npgettext = _make_new_npgettext(npgettext)
+ 
+         self.environment.globals.update(
+-            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
++            gettext=gettext,
++            ngettext=ngettext,
++            pgettext=pgettext,
++            npgettext=npgettext,
++            priority_gettext=priority_gettext,
++            priority_ngettext=priority_ngettext,
+         )
+ 
+-    def _uninstall(self, translations: "_SupportedTranslations") -> None:
+-        for key in ("gettext", "ngettext", "pgettext", "npgettext"):
++    def _uninstall(self, translations: t.Optional["_SupportedTranslations"] = None) -> None:
++        for key in (
++            "gettext",
++            "ngettext",
++            "pgettext",
++            "npgettext",
++            "priority_gettext",
++            "priority_ngettext",
++        ):
+             self.environment.globals.pop(key, None)
+ 
+     def _extract(
+@@ -363,6 +430,7 @@ class InternationalizationExtension(Extension):
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
++        priority_expr: t.Optional[nodes.Expr] = None
+         while parser.stream.current.type != "block_end":
+             if variables:
+                 parser.stream.expect("comma")
+@@ -380,10 +448,26 @@ class InternationalizationExtension(Extension):
+                 )
+ 
+             # expressions
+-            if parser.stream.current.type == "assign":
++            if token.value == "priority":
++                if priority_expr is not None:
++                    parser.fail(
++                        "duplicate priority expression",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                parser.stream.expect("assign")
++                priority_expr = parser.parse_expression()
++                continue
++            elif parser.stream.current.type == "assign":
+                 next(parser.stream)
+                 variables[token.value] = var = parser.parse_expression()
+-            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++            elif token.value in ("trimmed", "notrimmed"):
++                if trimmed is not None:
++                    parser.fail(
++                        f"duplicate trim mode {token.value!r}",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
+                 trimmed = token.value == "trimmed"
+                 continue
+             else:
+@@ -459,6 +543,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            priority_expr,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +599,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        priority_expr: t.Optional[nodes.Expr] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -528,19 +614,42 @@ class InternationalizationExtension(Extension):
+ 
+         # singular only:
+         if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            if priority_expr is not None:
++                node = nodes.Call(
++                    nodes.Name("_trans_priority_gettext", "load"),
++                    [nodes.Const(singular), priority_expr],
++                    [],
++                    None,
++                    None,
++                )
++            else:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+ 
+         # singular and plural
+         else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
++            if priority_expr is not None:
++                node = nodes.Call(
++                    nodes.Name("_trans_priority_ngettext", "load"),
++                    [
++                        nodes.Const(singular),
++                        nodes.Const(plural),
++                        plural_expr,
++                        priority_expr,
++                    ],
++                    [],
++                    None,
++                    None,
++                )
++            else:
++                ngettext = nodes.Name("ngettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
+ 
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..55d11fd 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -145,6 +145,53 @@ newstyle_i18n_env.install_gettext_callables(  # type: ignore
+ )
+ 
+ 
++
++# Priority gettext/ngettext callables for testing
++# priority_gettext(message, level): returns a translation if available at that level
++PRIORITY_TRANSLATIONS = {
++    "de": {
++        "Hello": {
++            0: "Hello",  # level 0 is a miss (returns source)
++            1: "Servus",
++            2: "Grüß Gott",
++        },
++        "World": {
++            0: "Welt",
++        },
++        "%(name)s user": {
++            0: "%(name)s Benutzer",
++        },
++        "%(name)s users": {
++            0: "%(name)s Benutzer",
++            1: "%(name)s Nutzer",
++        },
++    }
++}
++
++
++def priority_gettext(message, level):
++    language = "de"
++    trans_by_level = PRIORITY_TRANSLATIONS.get(language, {}).get(message, {})
++    if level in trans_by_level:
++        return trans_by_level[level]
++    return message
++
++
++def priority_ngettext(singular, plural, n, level):
++    language = "de"
++    msg = plural if n != 1 else singular
++    trans_by_level = PRIORITY_TRANSLATIONS.get(language, {}).get(msg, {})
++    if level in trans_by_level:
++        return trans_by_level[level]
++    return msg
++
++
++# Priority test helper that returns identity for levels >= 1
++# Used to test fallback when no priority resolver is installed
++NO_PRIORITY_GETTEXT = None
++NO_PRIORITY_NGETTEXT = None
++
++
+ class ExampleExtension(Extension):
+     tags = {"test"}
+     ext_attr = 42
+@@ -599,6 +646,321 @@ class TestNewstyleInternationalization:
+         assert tmpl.render(LANGUAGE="de", apples=5) == "5 Apples"
+ 
+ 
++
++
++class TestPriority:
++    """Tests for priority fallback in trans blocks."""
++
++    def test_priority_singular(self):
++        """Priority resolver returns a translated result at level 0."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: "Hallo" if l == 0 else m,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=0 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "Hallo"
++
++    def test_priority_singular_level1(self):
++        """Priority resolver tries level 0 (miss), then level 1 (hit)."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: m if l == 0 else "Servus",
++        )
++        tmpl = env.from_string(
++            "{% trans priority=1 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "Servus"
++
++    def test_priority_singular_max_level(self):
++        """Caps at level 9, goes through levels up to priority value."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        # priority_gettext that returns a match only at level 9
++        def custom_pgt(s, level):
++            if level == 9:
++                return "Matched at 9"
++            return s
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=custom_pgt,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=100 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "Matched at 9"
++
++    def test_priority_singular_level0_cap(self):
++        """Negative becomes 0; level 0 result different from source returns it."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: "Hallo" if l == 0 else m,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=-5 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "Hallo"
++
++    def test_priority_singular_invalid_value(self):
++        """Non-integer priority becomes 0; level 0 miss -> fallback to gettext."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s.upper(),
++            lambda s, p, n: s.upper() if n == 1 else p.upper(),
++            priority_gettext=lambda m, l: m,  # always a miss
++        )
++        tmpl = env.from_string(
++            "{% trans priority='abc' %}World{% endtrans %}"
++        )
++        assert tmpl.render() == "WORLD"
++
++    def test_priority_miss_fallback(self):
++        """No match at any level falls back to ordinary gettext."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s.upper(),
++            lambda s, p, n: s.upper() if n == 1 else p.upper(),
++            priority_gettext=lambda m, l: m,  # always miss
++        )
++        tmpl = env.from_string(
++            "{% trans priority=5 %}Unmatched{% endtrans %}"
++        )
++        assert tmpl.render() == "UNMATCHED"
++
++    def test_priority_no_resolver_fallback(self):
++        """No priority resolver installed falls back to ordinary gettext."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s.upper(),
++            lambda s, p, n: s.upper() if n == 1 else p.upper(),
++            priority_gettext=None,
++            priority_ngettext=None,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=5 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "HELLO"
++
++    def test_priority_plural(self):
++        """Priority works for plural translations (miss -> fallback to ngettext)."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: m,
++            priority_ngettext=lambda s, p, n, l: (
++                p if n != 1 else s
++            ),  # miss for all
++        )
++        tmpl = env.from_string(
++            "{% trans count=5, priority=0 %}{{ count }} user{% pluralize %}{{ count }} users{% endtrans %}"
++        )
++        # level 0 is a miss, fallback to ngettext -> identity -> "5 users"
++        assert tmpl.render() == "5 users"
++
++    def test_priority_plural_hit(self):
++        """Priority ngettext returns translated plural at level 0."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_ngettext=lambda s, p, n, l: "%(count)s Benutzer" if n != 1 else s,
++        )
++        tmpl = env.from_string(
++            "{% trans count=5, priority=0 %}{{ count }} user{% pluralize %}{{ count }} users{% endtrans %}"
++        )
++        assert tmpl.render() == "5 Benutzer"
++
++    def test_priority_plural_level1(self):
++        """Priority works for plural at higher level when lower is miss."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_ngettext=lambda s, p, n, l: (
++                s if l == 0 else ("%(count)s Nutzer" if n != 1 else s)
++            ),
++        )
++        tmpl = env.from_string(
++            "{% trans count=5, priority=1 %}{{ count }} user{% pluralize %}{{ count }} users{% endtrans %}"
++        )
++        assert tmpl.render() == "5 Nutzer"
++
++    def test_priority_plural_miss_fallback(self):
++        """No priority match for plural falls back to ordinary ngettext."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: "TRANS:" + (p if n != 1 else s),
++            priority_ngettext=lambda s, p, n, l: s if n != 1 else s,  # always a miss
++        )
++        tmpl = env.from_string(
++            "{% trans count=5, priority=5 %}{{ count }} user{% pluralize %}{{ count }} users{% endtrans %}"
++        )
++        assert tmpl.render() == "TRANS:5 users"
++
++    def test_priority_with_variable(self):
++        """Priority with an interpolated variable and old-style formatting."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=priority_gettext,
++        )
++        tmpl = env.from_string(
++            "{% trans name='Welt', priority=0 %}{{ name }} Hello{% endtrans %}"
++        )
++        # Using priority_gettext from module level (not @pass_context!)
++        # Actually this uses the shared PRIORITY_TRANSLATIONS
++        assert tmpl.render() == "Welt Hello"
++
++    def test_priority_duplicate_error(self):
++        """Duplicate priority raises TemplateAssertionError."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++        )
++        with pytest.raises(TemplateAssertionError):
++            env.from_string(
++                "{% trans priority=0 priority=1 %}Hello{% endtrans %}"
++            )
++
++    def test_priority_without_priority_unchanged(self):
++        """Blocks without priority keep existing behavior."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: "translated " + s,
++            lambda s, p, n: "translated " + (s if n == 1 else p),
++            priority_gettext=priority_gettext,
++            priority_ngettext=priority_ngettext,
++        )
++        tmpl = env.from_string(
++            "{% trans %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "translated Hello"
++
++    def test_priority_uninstall(self):
++        """Uninstalling removes priority callables."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=priority_gettext,
++            priority_ngettext=priority_ngettext,
++        )
++        env.uninstall_gettext_translations()
++        assert "priority_gettext" not in env.globals
++        assert "priority_ngettext" not in env.globals
++        assert "gettext" not in env.globals
++        assert "ngettext" not in env.globals
++
++    def test_priority_reinstall(self):
++        """Reinstalling replaces priority resolvers."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda s, l: "first",
++        )
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda s, l: "second",
++        )
++        tmpl = env.from_string(
++            "{% trans priority=0 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "second"
++
++    def test_priority_newstyle_singular(self):
++        """Priority works with newstyle gettext."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            newstyle=True,
++            priority_gettext=lambda m, l: "Hallo" if l == 0 else m,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=0 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "Hallo"
++
++    def test_priority_newstyle_vars(self):
++        """Priority works with newstyle variables."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            newstyle=True,
++            priority_gettext=lambda m, l: m,
++        )
++        tmpl = env.from_string(
++            "{% trans name='World', priority=1 %}Hello {{ name }}{% endtrans %}"
++        )
++        assert tmpl.render() == "Hello World"
++    def test_priority_trimmed(self):
++        """Priority with trimmed block."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: "Hallo" if l == 0 else m,
++        )
++        tmpl = env.from_string(
++            "{% trans trimmed priority=0 %}  Hello  {% endtrans %}"
++        )
++        assert tmpl.render() == "Hallo"
++
++    def test_priority_notrimmed(self):
++        """Priority with notrimmed block."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: m,
++        )
++        tmpl = env.from_string(
++            "{% trans notrimmed priority=0 %}  Hello  {% endtrans %}"
++        )
++        assert tmpl.render() == "  Hello  "
++
++    def test_priority_autoescape(self):
++        """Priority with autoescaping."""
++        env = Environment(extensions=["jinja2.ext.i18n"], autoescape=True)
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: "Hallo" if l == 0 else m,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=0 %}Hello{% endtrans %}"
++        )
++        assert tmpl.render() == "Hallo"
++
++    def test_priority_uses_int(self):
++        """priority value is converted with int()."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: s,
++            lambda s, p, n: s if n == 1 else p,
++            priority_gettext=lambda m, l: "matched" if l == 0 else m,
++        )
++        tmpl = env.from_string(
++            "{% trans priority=0.9 %}Hello{% endtrans %}"
++        )
++        # int(0.9) = 0, so level 0 -> "matched"
++        assert tmpl.render() == "matched"
++
+ class TestAutoEscape:
+     def test_scoped_setting(self):
+         env = Environment(autoescape=True)

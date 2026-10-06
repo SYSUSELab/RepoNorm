@@ -1,0 +1,427 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..5e0a1534 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,9 @@
++# This is the new implementation for tool.py with scalar coercion support
++
+ import asyncio
+ import inspect
++import re
++from decimal import Decimal, ROUND_DOWN
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -15,6 +19,134 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++# Duration suffixes (case-sensitive) - convert to seconds
++_DURATION_SUFFIXES = {
++    "ms": 0.001,   # milliseconds
++    "s": 1.0,      # seconds
++    "m": 60.0,     # minutes
++    "h": 3600.0,   # hours
++}
++
++# Size suffixes (case-sensitive) - convert to bytes
++_SIZE_SUFFIXES = {
++    "KB": 1000,    # kilobytes (decimal)
++    "MB": 1000000, # megabytes (decimal)
++    "GB": 1000000000, # gigabytes (decimal)
++}
++
++# Regex patterns for numeric strings
++_NUMERIC_PATTERN = re.compile(r'^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$')
++_DURATION_PATTERN = re.compile(r'^([+-]?\d+(?:\.\d+)?)\s*(ms|s|m|h)$', re.IGNORECASE)
++_SIZE_PATTERN = re.compile(r'^(\d+)\s*(KB|MB|GB)$', re.IGNORECASE)
++
++
++def _coerce_scalar(value: Any, schema: dict[str, Any]) -> Any:
++    """Coerce scalar string values according to JSON schema type.
++    
++    For boolean fields, accept case-insensitive "true" and "false".
++    For integer and number fields, accept finite decimal numeric strings,
++    with optional sign, decimal point and exponent.
++    Numeric fields also accept nonnegative decimal durations with suffix ms, s, m or h
++    and sizes with suffix KB, MB or GB. Units are case-sensitive; allow whitespace
++    between magnitude and suffix.
++    
++    Args:
++        value: The value to coerce
++        schema: The JSON schema for the field
++        
++    Returns:
++        The coerced value, or the original value if coercion fails
++    """
++    # Only coerce strings
++    if not isinstance(value, str):
++        return value
++    
++    # Trim surrounding whitespace
++    trimmed = value.strip()
++    
++    # Get the expected type from schema
++    type_str = schema.get("type")
++    
++    # If no type specified in schema, don't coerce
++    if type_str is None:
++        return value
++    
++    # Boolean coercion
++    if type_str == "boolean":
++        lower = trimmed.lower()
++        if lower == "true":
++            return True
++        elif lower == "false":
++            return False
++        # If it's not a valid boolean string, return original for error handling
++        return value
++    
++    # Integer/Number coercion
++    if type_str in ("integer", "number"):
++        # Try numeric string first
++        if _NUMERIC_PATTERN.match(trimmed):
++            try:
++                # Use Decimal for precise conversion
++                num = Decimal(trimmed)
++                
++                # Check for NaN/Inf
++                if not num.is_finite():
++                    return value
++                
++                if type_str == "integer":
++                    # For integers, check if the value is integral
++                    if num != int(num):
++                        # Non-integral value for integer schema - return original
++                        return value
++                    # Convert to int using Decimal for precision
++                    return int(num)
++                else:
++                    # Number type - convert to float
++                    return float(num)
++            except Exception:
++                return value
++        
++        # Try duration pattern (only for number type, not integer)
++        if type_str == "number":
++            match = re.match(r'^([+-]?\d+(?:\.\d+)?)\s*(ms|s|m|h)$', trimmed, re.IGNORECASE)
++            if match:
++                try:
++                    magnitude = Decimal(match.group(1))
++                    suffix = match.group(2).lower()
++                    
++                    if not magnitude.is_finite():
++                        return value
++                    
++                    # Convert to seconds
++                    seconds = float(magnitude) * _DURATION_SUFFIXES[suffix]
++                    return float(seconds)
++                except Exception:
++                    pass
++        
++        # Try size pattern (only for number type, not integer)
++        if type_str == "number":
++            match = re.match(r'^(\d+)\s*(KB|MB|GB)$', trimmed, re.IGNORECASE)
++            if match:
++                try:
++                    magnitude = int(match.group(1))
++                    suffix = match.group(2).upper()
++                    
++                    # Convert to bytes
++                    bytes_val = magnitude * _SIZE_SUFFIXES[suffix]
++                    return bytes_val
++                except Exception:
++                    pass
++        
++        # Return original value for unknown format
++        return value
++    
++    # String type - leave unchanged
++    if type_str == "string":
++        return value
++    
++    # Other types - leave unchanged
++    return value
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -116,8 +248,16 @@ class Tool(Type):
+         self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+ 
+     def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
++        # Coerce scalar string values according to JSON schema
++        coerced_kwargs = {}
+         for k, v in kwargs.items():
++            if k in self.args:
++                coerced_kwargs[k] = _coerce_scalar(v, self.args[k])
++            else:
++                coerced_kwargs[k] = v
++        
++        # Validate the args value comply to the json schema.
++        for k, v in coerced_kwargs.items():
+             if k not in self.args:
+                 if self.has_kwargs:
+                     continue
+@@ -133,7 +273,7 @@ class Tool(Type):
+ 
+         # Parse the args to the correct type.
+         parsed_kwargs = {}
+-        for k, v in kwargs.items():
++        for k, v in coerced_kwargs.items():
+             if k in self.arg_types and self.arg_types[k] != Any:
+                 # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+                 # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..f930ed3b 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,246 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# Scalar coercion test fixtures
++def dummy_float_function(x: float) -> str:
++    """A dummy function for testing float parameters."""
++    return f"{x}"
++
++
++def dummy_large_int_function(x: int) -> str:
++    """A dummy function for testing large integer parameters."""
++    return f"{x}"
++
++
++def dummy_with_kwargs(x: int, **kwargs) -> str:
++    """A dummy function for testing kwargs."""
++    return f"{x}"
++
++
++def dummy_bool_function(flag: bool) -> str:
++    """A dummy function for testing boolean parameters."""
++    return f"{flag}"
++
++
++# Scalar coercion tests
++def test_coerce_boolean_true():
++    """Test case-insensitive boolean true coercion."""
++    tool = Tool(dummy_bool_function)
++    
++    # Test various forms of true - _validate_and_parse_args returns dict
++    assert tool._validate_and_parse_args(flag="true") == {"flag": True}
++    assert tool._validate_and_parse_args(flag="True") == {"flag": True}
++    assert tool._validate_and_parse_args(flag="TRUE") == {"flag": True}
++    assert tool._validate_and_parse_args(flag=" true ") == {"flag": True}
++
++
++def test_coerce_boolean_false():
++    """Test case-insensitive boolean false coercion."""
++    tool = Tool(dummy_bool_function)
++    
++    assert tool._validate_and_parse_args(flag="false") == {"flag": False}
++    assert tool._validate_and_parse_args(flag="False") == {"flag": False}
++    assert tool._validate_and_parse_args(flag="FALSE") == {"flag": False}
++    assert tool._validate_and_parse_args(flag=" false ") == {"flag": False}
++
++
++def test_coerce_integer_basic():
++    """Test basic integer coercion from string."""
++    tool = Tool(dummy_large_int_function)
++    
++    result = tool._validate_and_parse_args(x="42")
++    assert result == {"x": 42}
++    result = tool._validate_and_parse_args(x="+42")
++    assert result == {"x": 42}
++    result = tool._validate_and_parse_args(x="-42")
++    assert result == {"x": -42}
++    result = tool._validate_and_parse_args(x=" 42 ")
++    assert result == {"x": 42}
++
++
++def test_coerce_integer_large():
++    """Test large integer coercion beyond float precision."""
++    tool = Tool(dummy_large_int_function)
++    
++    # Large integer that would lose precision in float
++    result = tool._validate_and_parse_args(x="123456789012345678901234567890")
++    expected = {"x": 123456789012345678901234567890}
++    assert result == expected
++    assert isinstance(result["x"], int)
++
++
++def test_coerce_integer_scientific_notation():
++    """Test integer coercion with scientific notation."""
++    tool = Tool(dummy_large_int_function)
++    
++    # Scientific notation that results in integer
++    assert tool._validate_and_parse_args(x="1e2") == {"x": 100}
++    assert tool._validate_and_parse_args(x="1E2") == {"x": 100}
++    assert tool._validate_and_parse_args(x="1.0e2") == {"x": 100}
++
++
++def test_coerce_integer_non_integral_rejected():
++    """Test that non-integral values are rejected for integer type."""
++    tool = Tool(dummy_large_int_function)
++    
++    # Non-integral decimal should remain as string (will fail validation)
++    with pytest.raises(ValueError, match="is not of type 'integer'"):
++        tool._validate_and_parse_args(x="42.5")
++    
++    # Negative non-integer
++    with pytest.raises(ValueError, match="is not of type 'integer'"):
++        tool._validate_and_parse_args(x="-3.14")
++
++
++def test_coerce_number_decimal():
++    """Test number coercion with decimal strings."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="3.14") == {"x": 3.14}
++    assert tool._validate_and_parse_args(x="+3.14") == {"x": 3.14}
++    assert tool._validate_and_parse_args(x="-3.14") == {"x": -3.14}
++    assert tool._validate_and_parse_args(x=".5") == {"x": 0.5}
++    assert tool._validate_and_parse_args(x="5.") == {"x": 5.0}
++
++
++def test_coerce_number_scientific_notation():
++    """Test number coercion with scientific notation."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1e2") == {"x": 100.0}
++    assert tool._validate_and_parse_args(x="1.5e3") == {"x": 1500.0}
++    assert tool._validate_and_parse_args(x="1E-2") == {"x": 0.01}
++
++
++def test_coerce_duration_ms():
++    """Test duration coercion with milliseconds suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="100ms") == {"x": 0.1}
++    assert tool._validate_and_parse_args(x="100 ms") == {"x": 0.1}
++    assert tool._validate_and_parse_args(x="100MS") == {"x": 0.1}  # Case insensitive
++
++
++def test_coerce_duration_s():
++    """Test duration coercion with seconds suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1s") == {"x": 1.0}
++    assert tool._validate_and_parse_args(x="1 s") == {"x": 1.0}
++    assert tool._validate_and_parse_args(x="1S") == {"x": 1.0}
++
++
++def test_coerce_duration_m():
++    """Test duration coercion with minutes suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1m") == {"x": 60.0}
++    assert tool._validate_and_parse_args(x="1 m") == {"x": 60.0}
++
++
++def test_coerce_duration_h():
++    """Test duration coercion with hours suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1h") == {"x": 3600.0}
++    assert tool._validate_and_parse_args(x="1 h") == {"x": 3600.0}
++
++
++def test_coerce_size_kb():
++    """Test size coercion with KB suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1KB") == {"x": 1000}
++    assert tool._validate_and_parse_args(x="1 KB") == {"x": 1000}
++    assert tool._validate_and_parse_args(x="1KB") == {"x": 1000}
++
++
++def test_coerce_size_mb():
++    """Test size coercion with MB suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1MB") == {"x": 1000000}
++    assert tool._validate_and_parse_args(x="1 MB") == {"x": 1000000}
++
++
++def test_coerce_size_gb():
++    """Test size coercion with GB suffix."""
++    tool = Tool(dummy_float_function)
++    
++    assert tool._validate_and_parse_args(x="1GB") == {"x": 1000000000}
++    assert tool._validate_and_parse_args(x="1 GB") == {"x": 1000000000}
++
++
++def test_coerce_nan_inf_rejected():
++    """Test that NaN and Inf are rejected."""
++    tool = Tool(dummy_float_function)
++    
++    # These should remain as strings since they're not finite
++    with pytest.raises(ValueError, match="is not of type 'number'"):
++        tool._validate_and_parse_args(x="nan")
++    with pytest.raises(ValueError, match="is not of type 'number'"):
++        tool._validate_and_parse_args(x="inf")
++    with pytest.raises(ValueError, match="is not of type 'number'"):
++        tool._validate_and_parse_args(x="-inf")
++
++
++def test_coerce_unknown_unit_retained():
++    """Test that unknown units are retained unchanged."""
++    tool = Tool(dummy_float_function)
++    
++    # Unknown unit should remain as string (will fail validation)
++    with pytest.raises(ValueError, match="is not of type 'number'"):
++        tool._validate_and_parse_args(x="100xyz")
++
++
++def test_coerce_non_string_unchanged():
++    """Test that non-string values are unchanged."""
++    tool = Tool(dummy_float_function)
++    
++    # Integer is valid for number type (Pydantic converts to float)
++    result = tool._validate_and_parse_args(x=42)
++    assert result == {"x": 42.0}
++    
++    # Float should remain float
++    assert tool._validate_and_parse_args(x=3.14) == {"x": 3.14}
++    
++    # Boolean is NOT valid for number type and will fail validation
++    with pytest.raises(ValueError, match="is not of type 'number'"):
++        tool._validate_and_parse_args(x=True)
++
++
++def test_coerce_string_field_unchanged():
++    """Test that string fields remain strings."""
++    def func_with_string(y: str) -> str:
++        return y
++    
++    tool = Tool(func_with_string)
++    
++    # String field should remain string even if it looks like a number
++    assert tool._validate_and_parse_args(y="42") == {"y": "42"}
++    assert tool._validate_and_parse_args(y="hello") == {"y": "hello"}
++
++
++def test_coerce_acall_integration():
++    """Test scalar coercion works with acall method."""
++    import asyncio
++    
++    async def test_async():
++        tool = Tool(dummy_float_function)
++        
++        # Test with string arguments that need coercion
++        result = await tool.acall(x="3.14")
++        assert result == "3.14"
++    
++    asyncio.run(test_async())
++
++
++def test_coerce_kwargs_unchanged():
++    """Test that unknown kwargs are unchanged."""
++    tool = Tool(dummy_with_kwargs)
++    
++    # Unknown kwarg should remain unchanged
++    result = tool._validate_and_parse_args(x="42", unknown_kwarg="value")
++    assert result == {"x": 42, "unknown_kwarg": "value"}

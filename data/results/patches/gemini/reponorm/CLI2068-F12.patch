@@ -1,0 +1,128 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..ec9a5f1 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        handle_exit_codes: cabc.Mapping[int, cabc.Callable[[int], t.Any]] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.handle_exit_codes = handle_exit_codes
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -518,6 +520,14 @@ class Editor:
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+             exit_code = c.wait()
++            if self.handle_exit_codes and exit_code in self.handle_exit_codes:
++                try:
++                    self.handle_exit_codes[exit_code](exit_code)
++                except Exception as e:
++                    raise ClickException(
++                        _("Editor handler failed: {e}").format(e=e)
++                    ) from e
++                return
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..6f9a289 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -649,6 +649,7 @@ def edit(
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+     extension: str = ".txt",
++    handle_exit_codes: cabc.Mapping[int, cabc.Callable[[int], t.Any]] | None = None,
+     filename: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+@@ -680,7 +681,7 @@ def edit(
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, handle_exit_codes=handle_exit_codes)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_editor_exit_codes.py b/tests/test_editor_exit_codes.py
+new file mode 100644
+index 0000000..082440b
+--- /dev/null
++++ b/tests/test_editor_exit_codes.py
+@@ -0,0 +1,68 @@
++import click
++import pytest
++import os
++from unittest.mock import MagicMock, patch
++
++def test_editor_exit_codes():
++    # Test that a handler is called for a specific exit code
++    handler_called = False
++    def handler(code):
++        nonlocal handler_called
++        handler_called = True
++        assert code == 10
++
++    # We need to mock subprocess.Popen to return exit code 10
++    with patch("subprocess.Popen") as mock_popen:
++        mock_popen.return_value.wait.return_value = 10
++        
++        # We need to mock os.system for get_editor check
++        with patch("os.system", return_value=0):
++            # We need to mock os.path.getmtime to avoid require_save check failure
++            with patch("os.path.getmtime", return_value=1.0),                  patch("os.path.getatime", return_value=1.0):
++                # We need to mock tempfile.mkstemp
++                with patch("tempfile.mkstemp", return_value=(1, "tempfile")):
++                    # We need to mock os.fdopen, os.unlink, os.utime, open
++                    with patch("os.fdopen"), patch("os.unlink"), patch("os.utime"), patch("builtins.open"):
++                        
++                        # This should not raise ClickException because we have a handler
++                        click.edit("test", handle_exit_codes={10: handler})
++                        assert handler_called
++
++def test_editor_unhandled_exit_code():
++    # Test that an unhandled exit code still raises ClickException
++    with patch("subprocess.Popen") as mock_popen:
++        mock_popen.return_value.wait.return_value = 1
++        
++        with patch("os.system", return_value=0):
++            with patch("os.path.getmtime", return_value=1.0),                  patch("os.path.getatime", return_value=1.0):
++                with patch("tempfile.mkstemp", return_value=(1, "tempfile")):
++                    with patch("os.fdopen"), patch("os.unlink"), patch("os.utime"), patch("builtins.open"):
++                        
++                        with pytest.raises(click.ClickException, match="Editing failed"):
++                            click.edit("test", handle_exit_codes={10: lambda x: None})
++
++
++def test_edit_file_exit_codes():
++    handler_called = False
++    def handler(code):
++        nonlocal handler_called
++        handler_called = True
++        assert code == 20
++
++    with patch("subprocess.Popen") as mock_popen:
++        mock_popen.return_value.wait.return_value = 20
++        with patch("os.system", return_value=0):
++            # edit_file doesn't use tempfile, so we don't need to mock it
++            # But it does use get_editor, which uses os.system
++            click.edit(filename="test.txt", handle_exit_codes={20: handler})
++            assert handler_called
++
++def test_editor_handler_raises():
++    def handler(code):
++        raise ValueError("Handler failed")
++
++    with patch("subprocess.Popen") as mock_popen:
++        mock_popen.return_value.wait.return_value = 30
++        with patch("os.system", return_value=0):
++            with pytest.raises(click.ClickException, match="Handler failed"):
++                click.edit("test", handle_exit_codes={30: handler})

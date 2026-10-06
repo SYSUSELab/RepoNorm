@@ -1,0 +1,219 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..8e72f4d 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        timeout: int | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.timeout = timeout
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -506,6 +508,7 @@ class Editor:
+         return "vi"
+ 
+     def edit_file(self, filename: str) -> None:
++        import signal
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -516,8 +519,57 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            # Use preexec_fn on Unix to set up a process group so we can
++            # kill all child processes when timing out.
++            if not WIN:
++                c = subprocess.Popen(
++                    f"{editor} \"{filename}\"",
++                    env=environ,
++                    shell=True,
++                    preexec_fn=os.setsid,
++                )
++            else:
++                c = subprocess.Popen(
++                    f"{editor} \"{filename}\"",
++                    env=environ,
++                    shell=True,
++                )
++
++            try:
++                if self.timeout is not None:
++                    exit_code = c.wait(timeout=self.timeout)
++                else:
++                    exit_code = c.wait()
++            except subprocess.TimeoutExpired:
++                # Request termination of the editor session.
++                if not WIN:
++                    try:
++                        os.killpg(os.getpgid(c.pid), signal.SIGTERM)
++                    except ProcessLookupError:
++                        pass
++                else:
++                    c.terminate()
++
++                # Wait briefly for graceful shutdown.
++                try:
++                    c.wait(timeout=1)
++                except subprocess.TimeoutExpired:
++                    # Forcefully stop it and reap the process.
++                    if not WIN:
++                        try:
++                            os.killpg(os.getpgid(c.pid), signal.SIGKILL)
++                        except ProcessLookupError:
++                            pass
++                    else:
++                        c.kill()
++                    c.wait()
++
++                raise ClickException(
++                    _("{editor}: Editing timed out after {timeout} seconds").format(
++                        editor=editor, timeout=self.timeout
++                    )
++                )
++
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..76e500c 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    timeout: int | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,27 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param timeout: If set to a positive integer, the editor session is
++                    limited to that many seconds. If the editor does not
++                    complete within the timeout, it is terminated and a
++                    :exc:`ClickException` is raised. Defaults to ``None``
++                    (no timeout).
+     """
++    if timeout is not None:
++        if isinstance(timeout, bool) or not isinstance(timeout, int):
++            raise ValueError(
++                "timeout must be a positive integer or None"
++            )
++        if timeout <= 0:
++            raise ValueError(
++                "timeout must be a positive integer or None"
++            )
++
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor, env=env, require_save=require_save, extension=extension, timeout=timeout
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..0003ba7 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,87 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++
++@pytest.mark.parametrize(
++    ("timeout", "expect_error"),
++    [
++        pytest.param(True, ValueError, id="bool True"),
++        pytest.param(False, ValueError, id="bool False"),
++        pytest.param(1.5, ValueError, id="float"),
++        pytest.param("10", ValueError, id="string"),
++        pytest.param([], ValueError, id="list"),
++        pytest.param({}, ValueError, id="dict"),
++        pytest.param(0, ValueError, id="zero"),
++        pytest.param(-1, ValueError, id="negative"),
++        pytest.param(None, None, id="None (no timeout)"),
++        pytest.param(1, None, id="positive int"),
++    ],
++)
++def test_edit_timeout_validation(runner, timeout, expect_error):
++    """Test that invalid timeout values raise ValueError."""
++    if expect_error is ValueError:
++        with pytest.raises(ValueError, match="timeout must be a positive integer or None"):
++            click.edit(text="test", editor="echo hello", timeout=timeout)
++    else:
++        # For valid timeouts, we expect an error from the editor not being found
++        # or the command failing, but not a ValueError
++        try:
++            click.edit(text="test", editor="echo hello", timeout=timeout)
++        except click.ClickException:
++            pass  # Expected - editor command may fail
++
++
++def test_edit_timeout_hanging_editor(runner):
++    """Test that a hanging editor is terminated after timeout."""
++    import time
++    
++    start = time.time()
++    with pytest.raises(click.ClickException, match=r"Editing timed out after 2 seconds"):
++        click.edit(
++            text="test",
++            editor="/usr/local/bin/python3 -c 'import time; time.sleep(10)'",
++            timeout=2,
++        )
++    elapsed = time.time() - start
++    assert 1.9 < elapsed < 4.0, f"Expected ~2s, got {elapsed:.2f}s"
++
++
++def test_edit_timeout_zero_exit_code(runner):
++    """Test that successful editor exit before timeout works normally."""
++    # Use sed to modify the file in place (like the existing test)
++    result = click.edit(
++        text="test",
++        editor="sed -i~ 's/$/Modified/'",
++        timeout=5,
++    )
++    assert result == "testModified\n"
++
++
++def test_edit_timeout_file_edit(runner):
++    """Test timeout works with filename parameter."""
++    import tempfile
++    import os
++    import time
++    
++    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
++        f.write("original")
++        temp_path = f.name
++    
++    try:
++        start = time.time()
++        with pytest.raises(click.ClickException, match=r"Editing timed out after 2 seconds"):
++            click.edit(
++                filename=temp_path,
++                editor="/usr/local/bin/python3 -c 'import time; time.sleep(10)'",
++                timeout=2,
++            )
++        elapsed = time.time() - start
++        assert 1.9 < elapsed < 4.0, f"Expected ~2s, got {elapsed:.2f}s"
++        
++        # File should still exist and be unchanged
++        with open(temp_path, "r") as f:
++            content = f.read()
++        assert content == "original"
++    finally:
++        os.unlink(temp_path)

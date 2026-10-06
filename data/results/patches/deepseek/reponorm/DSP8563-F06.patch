@@ -1,0 +1,340 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..f583560e 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -3,6 +3,10 @@ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
++import json
++import re
++
++import pydantic
+ from pydantic import BaseModel, TypeAdapter, create_model
+ 
+ from dspy.adapters.types.base_type import Type
+@@ -284,6 +288,113 @@ class ToolCalls(Type):
+         tool_calls = [cls.ToolCall(**item) for item in tool_calls_dicts]
+         return cls(tool_calls=tool_calls)
+ 
++    @classmethod
++    def validate_input(cls, data: Any) -> Any:
++        """Extract Python JSON structures from supported input formats.
++
++        Accepts plain JSON strings, markdown code-fenced JSON blocks (with or
++        without language labels), and already-parsed dicts or lists. On success
++        returns the parsed Python JSON structure; on failure returns the original
++        input unchanged.
++
++        Calling this method manually is not required under normal usage; the
++        Pydantic model API (model_validate, model_validate_json) invokes it
++        automatically through a model_validator.
++        """
++        if not isinstance(data, str):
++            return data
++        stripped = data.strip()
++        # First try plain JSON parsing
++        try:
++            return json.loads(stripped)
++        except json.JSONDecodeError:
++            pass
++        # Try extracting from the first markdown code fence
++        return cls._extract_from_fence(stripped)
++
++    @pydantic.model_validator(mode="before")
++    @classmethod
++    def _validate_and_normalize(cls, data: Any) -> Any:
++        """Model validator that normalizes data for ToolCalls validation."""
++        if isinstance(data, cls):
++            return {"tool_calls": [tc.model_dump() for tc in data.tool_calls]}
++
++        if isinstance(data, str):
++            extracted = cls.validate_input(data)
++            if extracted is not data:
++                # Extraction succeeded, normalize the result
++                return cls._normalize(extracted)
++            # Extraction did not succeed; return as-is so Pydantic produces
++            # its ordinary validation error.
++            return data
++
++        # For non-string data (lists, single name/args dicts), try normalization
++        return cls._normalize(data)
++
++    @classmethod
++    def model_validate_json(cls, data: Any, *args, **kwargs) -> "ToolCalls":
++        """Validate JSON data, including code-fenced JSON strings."""
++        if isinstance(data, bytes):
++            data = data.decode("utf-8")
++        if isinstance(data, str):
++            extracted = cls._try_extract_json_for_api(data)
++            if extracted is not data:
++                normalized = cls._normalize(extracted)
++                return cls.model_validate(normalized, *args, **kwargs)
++        return super().model_validate_json(data, *args, **kwargs)
++
++    @classmethod
++    def _try_extract_json_for_api(cls, data: str) -> Any:
++        """Try plain JSON parse first, then code fence extraction."""
++        stripped = data.strip()
++        try:
++            return json.loads(stripped)
++        except json.JSONDecodeError:
++            pass
++        return cls._extract_from_fence(stripped)
++
++    @classmethod
++    def _extract_from_fence(cls, data: str) -> Any:
++        """Extract JSON from the first triple-backtick code fence.
++
++        The opening fence may have any language label (or no label), followed
++        by a newline. The next triple-backtick delimiter closes the block.
++        Only the first block is considered.
++        """
++        fence_start = data.find("```")
++        if fence_start == -1:
++            return data
++
++        after_fence = data[fence_start + 3:]
++        newline_pos = after_fence.find("\n")
++        if newline_pos == -1:
++            return data  # Inline fence without opening newline: not supported
++
++        body_start = fence_start + 3 + newline_pos + 1
++        remaining = data[body_start:]
++
++        closing_match = re.search(r"\n```", remaining)
++        if closing_match is None:
++            return data  # No closing fence
++
++        body = remaining[:closing_match.start()].strip()
++        try:
++            return json.loads(body)
++        except json.JSONDecodeError:
++            return data
++
++    @classmethod
++    def _normalize(cls, data: Any) -> Any:
++        """Normalize parsed data into a canonical ToolCalls-compatible dict."""
++        if isinstance(data, dict):
++            if "tool_calls" in data:
++                return data
++            # Single name/args object
++            return {"tool_calls": [data]}
++        if isinstance(data, list):
++            return {"tool_calls": data}
++        return data
++
+     @classmethod
+     def description(cls) -> str:
+         return (
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..182a0694 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,206 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# ---- Code fence JSON validation tests ----
++
++
++def test_tool_calls_validate_input_plain_json():
++    """validate_input extracts valid plain JSON strings."""
++    result = ToolCalls.validate_input('{"tool_calls": [{"name": "test", "args": {}}]}')
++    assert isinstance(result, dict)
++    assert result["tool_calls"][0]["name"] == "test"
++
++
++def test_tool_calls_validate_input_code_fence_json():
++    """validate_input extracts JSON from a code fence with json label."""
++    result = ToolCalls.validate_input('```json\n[{"name": "test", "args": {}}]\n```')
++    assert isinstance(result, list)
++    assert result[0]["name"] == "test"
++
++
++def test_tool_calls_validate_input_code_fence_no_label():
++    """validate_input extracts JSON from a code fence without language label."""
++    result = ToolCalls.validate_input('```\n[{"name": "test", "args": {}}]\n```')
++    assert isinstance(result, list)
++    assert result[0]["name"] == "test"
++
++
++def test_tool_calls_validate_input_code_fence_uppercase_label():
++    """validate_input extracts JSON from a code fence with uppercase JSON label."""
++    result = ToolCalls.validate_input('```JSON\n[{"name": "test", "args": {}}]\n```')
++    assert isinstance(result, list)
++    assert result[0]["name"] == "test"
++
++
++def test_tool_calls_validate_input_code_fence_arbitrary_label():
++    """validate_input extracts JSON from a code fence with any language label."""
++    result = ToolCalls.validate_input('```python\n[{"name": "test", "args": {}}]\n```')
++    assert isinstance(result, list)
++    assert result[0]["name"] == "test"
++
++
++def test_tool_calls_validate_input_prose_before_fence():
++    """validate_input extracts JSON from a code fence preceded by prose."""
++    result = ToolCalls.validate_input(
++        "Here is the result:\n```json\n[{\"name\": \"test\", \"args\": {}}]\n```"
++    )
++    assert isinstance(result, list)
++    assert result[0]["name"] == "test"
++
++
++def test_tool_calls_validate_input_non_json_string_unchanged():
++    """validate_input returns the original string when extraction fails."""
++    result = ToolCalls.validate_input("not json")
++    assert result == "not json"
++
++
++def test_tool_calls_validate_input_inline_fence_unchanged():
++    """validate_input does not accept inline fences without opening newline."""
++    result = ToolCalls.validate_input('```json[{"name": "test"}]\n```')
++    assert result == '```json[{"name": "test"}]\n```'
++
++
++def test_tool_calls_validate_input_no_closing_fence_unchanged():
++    """validate_input does not accept missing closing fences."""
++    result = ToolCalls.validate_input('```json\n[{"name": "test"}]')
++    assert result == '```json\n[{"name": "test"}]'
++
++
++def test_tool_calls_validate_input_malformed_json_unchanged():
++    """validate_input does not accept malformed JSON in fence."""
++    result = ToolCalls.validate_input('```json\n{invalid}\n```')
++    assert result == '```json\n{invalid}\n```'
++
++
++def test_tool_calls_validate_input_first_block_only():
++    """validate_input only considers the first fence block; does not skip an invalid first block."""
++    data = '```\nnot json\n```\n```json\n[{"name": "test", "args": {}}]\n```'
++    result = ToolCalls.validate_input(data)
++    assert result == data  # unchanged because first block is invalid
++
++
++def test_tool_calls_validate_input_non_string_passthrough():
++    """validate_input returns non-string inputs unchanged."""
++    data = {"tool_calls": [{"name": "t", "args": {}}]}
++    assert ToolCalls.validate_input(data) is data
++    lst = [{"name": "t", "args": {}}]
++    assert ToolCalls.validate_input(lst) is lst
++    assert ToolCalls.validate_input(42) == 42
++
++
++def test_tool_calls_model_validate_canonical_json_string():
++    """model_validate accepts a plain JSON string with tool_calls container."""
++    tc = ToolCalls.model_validate('{"tool_calls": [{"name": "search", "args": {"q": 1}}]}')
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "search"
++
++
++def test_tool_calls_model_validate_code_fence():
++    """model_validate accepts JSON from a code fence."""
++    tc = ToolCalls.model_validate('```json\n[{"name": "search", "args": {"q": 1}}]\n```')
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "search"
++
++
++def test_tool_calls_model_validate_json_code_fence():
++    """model_validate_json accepts a code-fenced JSON string."""
++    tc = ToolCalls.model_validate_json('```json\n[{"name": "search", "args": {"q": 1}}]\n```')
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "search"
++
++
++def test_tool_calls_model_validate_json_plain():
++    """model_validate_json still works with plain JSON."""
++    tc = ToolCalls.model_validate_json('{"tool_calls": [{"name": "search", "args": {"q": 1}}]}')
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "search"
++
++
++def test_tool_calls_bare_list():
++    """model_validate accepts a bare list of tool call dicts."""
++    tc = ToolCalls.model_validate([{"name": "test", "args": {}}])
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "test"
++
++
++def test_tool_calls_single_name_args_dict():
++    """model_validate accepts a single name/args object."""
++    tc = ToolCalls.model_validate({"name": "test", "args": {}})
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "test"
++
++
++def test_tool_calls_empty_list():
++    """model_validate accepts an empty list."""
++    tc = ToolCalls.model_validate([])
++    assert len(tc.tool_calls) == 0
++
++
++def test_tool_calls_empty_list_via_code_fence():
++    """model_validate_json with an empty list in a code fence."""
++    tc = ToolCalls.model_validate_json('```\n[]\n```')
++    assert len(tc.tool_calls) == 0
++
++
++def test_tool_calls_invalid_string_rejected():
++    """model_validate rejects an arbitrary non-JSON string."""
++    with pytest.raises(Exception):
++        ToolCalls.model_validate("not json")
++
++
++def test_tool_calls_inline_fence_rejected():
++    """model_validate rejects an inline fence without opening newline."""
++    with pytest.raises(Exception):
++        ToolCalls.model_validate('```json[{"name": "test"}]\n```')
++
++
++def test_tool_calls_missing_closing_fence_rejected():
++    """model_validate rejects a code fence with no closing delimiter."""
++    with pytest.raises(Exception):
++        ToolCalls.model_validate('```json\n[{"name": "test", "args": {}}]')
++
++
++def test_tool_calls_malformed_json_in_fence_rejected():
++    """model_validate rejects a code fence with malformed JSON body."""
++    with pytest.raises(Exception):
++        ToolCalls.model_validate('```json\n{invalid}\n```')
++
++
++def test_tool_calls_backticks_in_json_value():
++    """Plain JSON containing backtick characters in a string value is not misinterpreted as a code fence."""
++    import json as _json
++    # Build valid JSON with backtick content including escaped newlines
++    data_obj = {"tool_calls": [{"name": "test", "args": {"code": "```python\nprint(1)\n```"}}]}
++    input_str = _json.dumps(data_obj)
++    tc = ToolCalls.model_validate(input_str)
++    assert tc.tool_calls[0].name == "test"
++    assert tc.tool_calls[0].args["code"] == "```python\nprint(1)\n```"
++
++
++def test_tool_calls_instance_passthrough():
++    """model_validate accepts an existing ToolCalls instance."""
++    tc1 = ToolCalls(tool_calls=[ToolCalls.ToolCall(name="test", args={})])
++    tc2 = ToolCalls.model_validate(tc1)
++    assert len(tc2.tool_calls) == 1
++    assert tc2.tool_calls[0].name == "test"
++
++
++def test_tool_calls_direct_constructor():
++    """Direct construction with keyword arguments still works."""
++    tc = ToolCalls(tool_calls=[ToolCalls.ToolCall(name="test", args={})])
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "test"
++
++
++def test_tool_calls_from_dict_list_unchanged():
++    """from_dict_list is unaffected by changes."""
++    tool_calls_dicts = [
++        {"name": "search", "args": {"query": "hello"}},
++        {"name": "translate", "args": {"text": "world", "lang": "fr"}},
++    ]
++    tc = ToolCalls.from_dict_list(tool_calls_dicts)
++    assert len(tc.tool_calls) == 2
++    assert tc.tool_calls[0].name == "search"
++    assert tc.tool_calls[1].name == "translate"

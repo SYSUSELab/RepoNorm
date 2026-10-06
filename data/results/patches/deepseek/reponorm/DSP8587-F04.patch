@@ -1,0 +1,446 @@
+diff --git a/dspy/streaming/streamify.py b/dspy/streaming/streamify.py
+index 5376d286..00f33466 100644
+--- a/dspy/streaming/streamify.py
++++ b/dspy/streaming/streamify.py
+@@ -177,7 +177,31 @@ def streamify(
+         async with create_task_group() as tg, send_stream, receive_stream:
+             tg.start_soon(generator, args, kwargs, send_stream)
+ 
+-            async for value in receive_stream:
++            # Collect listeners that have idle timeout configured
++            idle_listeners = [l for l in stream_listeners if l.idle_timeout_s is not None]
++            # Use a reasonable polling interval (min 50ms) derived from the smallest configured timeout
++            poll_interval = min((l.idle_timeout_s for l in idle_listeners), default=0.0)
++            if poll_interval > 0:
++                poll_interval = max(poll_interval / 10, 0.05)
++
++            while True:
++                if idle_listeners:
++                    try:
++                        value = await asyncio.wait_for(
++                            receive_stream.receive(), timeout=poll_interval
++                        )
++                    except asyncio.TimeoutError:
++                        # No chunk arrived in this interval; check idle timeouts.
++                        for listener in idle_listeners:
++                            timeout_response = listener.tick()
++                            if timeout_response is not None:
++                                yield timeout_response
++                                tg.cancel_scope.cancel()
++                                return
++                        continue
++                else:
++                    value = await receive_stream.receive()
++
+                 if isinstance(value, ModelResponseStream):
+                     if len(predict_id_to_listener) == 0:
+                         # No listeners are configured, yield the chunk directly for backwards compatibility.
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..3e4d1bef 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,9 @@
+ import re
++import math
++import time
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -18,7 +20,7 @@ ADAPTER_SUPPORT_STREAMING = [ChatAdapter, XMLAdapter, JSONAdapter]
+ 
+ 
+ class StreamListener:
+-    """Class that listens to the stream to capture the streeaming of a specific output field of a predictor."""
++    """Class that listens to the stream to capture the streaming of a specific output field of a predictor."""
+ 
+     def __init__(
+         self,
+@@ -26,6 +28,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        idle_timeout_s: float | None = None,
++        clock: Callable[[], float] | None = None,
+     ):
+         """
+         Args:
+@@ -36,10 +40,26 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            idle_timeout_s: If set to a positive finite number (int or float, not bool), the stream will be
++                automatically terminated after the specified number of seconds of inactivity (no non-empty chunks
++                received). None disables idle termination.
++            clock: A callable that returns the current monotonic time in seconds. Defaults to `time.monotonic`.
++                Used together with `tick()` and for measuring idle timeouts. A supplied clock and `tick(now_ts=...)`
++                use the same time domain.
+         """
++        if idle_timeout_s is not None:
++            if isinstance(idle_timeout_s, bool):
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++            if not isinstance(idle_timeout_s, (int, float)):
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++            if not math.isfinite(idle_timeout_s) or idle_timeout_s <= 0:
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+         self.predict_name = predict_name
++        self.idle_timeout_s = idle_timeout_s
++        self.clock = clock or time.monotonic
+ 
+         self.field_start_queue = []
+         self.field_end_queue = Queue()
+@@ -48,6 +68,9 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        self._last_activity_time: float | None = None
++        self._idle_emitted: bool = False
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -56,7 +79,7 @@ class StreamListener:
+             },
+             "JSONAdapter": {
+                 "start_identifier": f'"{self.signature_field_name}":',
+-                "end_identifier": re.compile(r"\w*\"(,|\s*})"),
++                "end_identifier": re.compile(r'\w*"(,|\s*})'),
+                 "start_indicator": '"',
+             },
+             "XMLAdapter": {
+@@ -152,6 +175,9 @@ class StreamListener:
+             # The stream is started, we keep returning the token until we see the start of the next field.
+             token = None
+             self.field_end_queue.put(chunk_message)
++            # Update last-activity time for non-empty received model chunks.
++            if chunk_message:
++                self._last_activity_time = self.clock()
+             if self.field_end_queue.qsize() > 10:
+                 # We keep the last 10 tokens in the buffer to check if they form a valid identifier for end_identifier,
+                 # i.e., "[[ ## {next_field_name} ## ]]" for ChatAdapter to identify the end of the current field.
+@@ -198,6 +224,36 @@ class StreamListener:
+                 f"{', '.join([a.__name__ for a in ADAPTER_SUPPORT_STREAMING])}"
+             )
+ 
++    def tick(self, now_ts: float | None = None) -> StreamResponse | None:
++        """Check the idle timeout state and return a timeout response if the timeout has been reached.
++
++        Before the timeout it returns ``None``. At or after the timeout it returns one
++        ``StreamResponse`` with an empty ``chunk`` field and clears the complete per-stream
++        boundary/cache state, so subsequent ticks do not emit duplicates.
++
++        Args:
++            now_ts: A timestamp in the clock's time domain. If None, uses ``self.clock()``.
++
++        Returns:
++            A ``StreamResponse`` with an empty chunk if the timeout has been reached, or ``None``.
++        """
++        if self.idle_timeout_s is None or self._idle_emitted:
++            return None
++
++        now = now_ts if now_ts is not None else self.clock()
++
++        if self._last_activity_time is not None and (now - self._last_activity_time) >= self.idle_timeout_s:
++            self._idle_emitted = True
++            # Clear per-stream state to prevent duplicates.
++            self.stream_start = False
++            self.stream_end = True
++            self.cache_hit = False
++            self.field_start_queue = []
++            self.field_end_queue = Queue()
++            return StreamResponse(self.predict_name, self.signature_field_name, "")
++
++        return None
++
+ 
+ def find_predictor_for_stream_listeners(program: "Module", stream_listeners: list[StreamListener]):
+     """Find the predictor for each stream listener.
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6d..50044ec0 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -837,3 +837,278 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+     assert all_chunks[1].predict_name == "predict2"
+     assert all_chunks[1].signature_field_name == "judgement"
+     assert all_chunks[1].chunk == "The answer is humorous."
++
++
++# ─── Idle timeout tests ────────────────────────────────────────────────────
++
++from dspy.streaming.streaming_listener import StreamListener
++
++
++class TestStreamListenerIdleTimeoutConstruction:
++    """Tests for StreamListener idle_timeout_s validation."""
++
++    def test_default_is_none(self):
++        """No idle_timeout_s means idle termination is disabled."""
++        l = StreamListener("field")
++        assert l.idle_timeout_s is None
++
++    def test_positive_float_accepted(self):
++        l = StreamListener("field", idle_timeout_s=3.5)
++        assert l.idle_timeout_s == 3.5
++
++    def test_positive_int_accepted(self):
++        l = StreamListener("field", idle_timeout_s=5)
++        assert l.idle_timeout_s == 5
++
++    def test_none_explicit(self):
++        l = StreamListener("field", idle_timeout_s=None)
++        assert l.idle_timeout_s is None
++
++    def test_bool_true_raises(self):
++        with pytest.raises(ValueError, match="positive finite"):
++            StreamListener("field", idle_timeout_s=True)
++
++    def test_bool_false_raises(self):
++        with pytest.raises(ValueError, match="positive finite"):
++            StreamListener("field", idle_timeout_s=False)
++
++    def test_zero_raises(self):
++        with pytest.raises(ValueError, match="positive finite"):
++            StreamListener("field", idle_timeout_s=0)
++
++    def test_negative_raises(self):
++        with pytest.raises(ValueError, match="positive finite"):
++            StreamListener("field", idle_timeout_s=-1)
++
++    def test_inf_raises(self):
++        with pytest.raises(ValueError, match="positive finite"):
++            StreamListener("field", idle_timeout_s=float("inf"))
++
++    def test_nan_raises(self):
++        with pytest.raises(ValueError, match="positive finite"):
++            StreamListener("field", idle_timeout_s=float("nan"))
++
++
++class TestStreamListenerIdleTimeoutTick:
++    """Tests for StreamListener.tick() method."""
++
++    def test_tick_before_stream_start_returns_none(self):
++        """When _last_activity_time is None (stream not started), tick returns None."""
++        clock = lambda: 100.0
++        l = StreamListener("field", idle_timeout_s=5.0, clock=clock)
++        assert l.tick() is None
++        assert l._idle_emitted is False
++
++    def test_tick_before_timeout_returns_none(self):
++        clock = lambda: 100.0
++        l = StreamListener("field", idle_timeout_s=5.0, clock=clock)
++        l._last_activity_time = 100.0  # activity at t=100
++        result = l.tick(now_ts=104.9)  # 4.9s later, still before timeout
++        assert result is None
++        assert l._idle_emitted is False
++
++    @pytest.mark.parametrize("delta", [0.0, 0.1, 5.0])
++    def test_tick_at_or_after_timeout_returns_timeout_response(self, delta):
++        clock = lambda: 100.0
++        l = StreamListener("field", predict_name="pred", idle_timeout_s=5.0, clock=clock)
++        l._last_activity_time = 100.0
++        result = l.tick(now_ts=105.0 + delta)
++        assert result is not None
++        assert isinstance(result, dspy.streaming.StreamResponse)
++        assert result.chunk == ""
++        assert result.predict_name == "pred"
++        assert result.signature_field_name == "field"
++        assert l._idle_emitted is True
++
++    def test_tick_no_duplicate_after_timeout_emitted(self):
++        clock = lambda: 100.0
++        l = StreamListener("field", idle_timeout_s=5.0, clock=clock)
++        l._last_activity_time = 100.0
++        first = l.tick(now_ts=200.0)
++        assert first is not None
++        second = l.tick(now_ts=300.0)
++        assert second is None  # No duplicate
++
++    def test_tick_disabled_when_timeout_is_none(self):
++        l = StreamListener("field")  # idle_timeout_s=None
++        l._last_activity_time = 0.0
++        result = l.tick(now_ts=1e9)
++        assert result is None
++
++
++class TestStreamListenerIdleTimeoutClockInjection:
++    """Tests for custom clock injection."""
++
++    def test_default_clock_is_time_monotonic(self):
++        import time
++        l = StreamListener("field", idle_timeout_s=5.0)
++        assert l.clock is time.monotonic
++
++    def test_custom_clock_is_used(self):
++        calls = []
++        def my_clock():
++            calls.append(1)
++            return 42.0
++        l = StreamListener("field", idle_timeout_s=5.0, clock=my_clock)
++        assert l.clock() == 42.0
++        assert len(calls) == 1
++
++    def test_tick_now_ts_overrides_clock(self):
++        """tick(now_ts=...) uses the provided timestamp regardless of clock."""
++        clock = lambda: 100.0
++        l = StreamListener("field", idle_timeout_s=5.0, clock=clock)
++        l._last_activity_time = 0.0
++        # If we used clock, now=100 would be >5s from activity=0 → timeout.
++        # But we pass now_ts=2.0, so no timeout.
++        result = l.tick(now_ts=2.0)
++        assert result is None
++
++
++class TestStreamListenerIdleTimeoutActivityRefresh:
++    """Tests that receive() refreshes last-activity time."""
++
++    def test_last_activity_time_starts_none(self):
++        l = StreamListener("field", idle_timeout_s=5.0)
++        assert l._last_activity_time is None
++
++    def test_last_activity_time_set_after_non_empty_chunk(self):
++        """receive() with a non-empty chunk sets _last_activity_time."""
++        import time
++        from litellm.types.utils import Delta, StreamingChoices
++        from dspy.dsp.utils.settings import settings
++        settings.adapter = None  # ChatAdapter default
++
++        clock = lambda: 42.0
++        l = StreamListener("field", predict_name="pred", idle_timeout_s=5.0, clock=clock)
++        # Force stream into started state so receive() processes chunks
++        l.field_start_queue = [f"[[ ## field ## ]]"]
++        l.stream_start = True
++
++        chunk = ModelResponseStream(
++            model="gpt",
++            choices=[StreamingChoices(delta=Delta(content="hello"))]
++        )
++        l._last_activity_time = None
++        l.receive(chunk)
++        assert l._last_activity_time == 42.0, f"Expected 42.0, got {l._last_activity_time}"
++
++    @pytest.mark.anyio
++    async def test_small_timeout_via_streamify(self):
++        """Integration test: idle timeout fires via streamify when upstream stalls."""
++        class StalledProgram(dspy.Module):
++            def __init__(self):
++                super().__init__()
++                self.predict = dspy.Predict("q->a")
++            def forward(self, question, **kwargs):
++                return self.predict(question=question)
++
++        # Create a stream that yields one chunk then stalls
++        async def stalled_stream(*args, **kwargs):
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content='[[ ## a ## ]]\n\n'))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content='hello'))]
++            )
++            # After this chunk, no more chunks arrive - idle timeout should fire
++            await asyncio.sleep(3600)
++
++        async def completion_side_effect(*args, **kwargs):
++            return stalled_stream()
++
++        listener = dspy.streaming.StreamListener(
++            signature_field_name="a",
++            idle_timeout_s=0.2,  # 200ms timeout
++            clock=time.monotonic,
++        )
++
++        program = dspy.streamify(
++            StalledProgram(),
++            stream_listeners=[listener],
++        )
++
++        with mock.patch("litellm.acompletion", side_effect=completion_side_effect):
++            with dspy.context(lm=dspy.LM("openai/gpt-4o-mini", cache=False)):
++                output = program(question="test")
++                timeout_responses = []
++                async for value in output:
++                    if isinstance(value, dspy.streaming.StreamResponse):
++                        if value.chunk == "":
++                            timeout_responses.append(value)
++
++        assert len(timeout_responses) == 1, (
++            f"Expected exactly one timeout response, got {len(timeout_responses)}"
++        )
++        assert timeout_responses[0].chunk == ""
++        assert timeout_responses[0].signature_field_name == "a"
++
++    @pytest.mark.anyio
++    async def test_no_timeout_when_stream_completes_normally(self):
++        """Idle timeout does not fire when the stream completes within the timeout."""
++        class FastProgram(dspy.Module):
++            def __init__(self):
++                super().__init__()
++                self.predict = dspy.Predict("q->a")
++            def forward(self, question, **kwargs):
++                return self.predict(question=question)
++
++        async def fast_stream(*args, **kwargs):
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content="[[ ## a ## ]]\n\n"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content="To"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content=" get"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content=" to"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content=" the"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content=" other"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content=" side"))]
++            )
++            yield ModelResponseStream(
++                model="gpt",
++                choices=[StreamingChoices(delta=Delta(content="! [[ ## completed ## ]]"))]
++            )
++
++        async def completion_side_effect(*args, **kwargs):
++            return fast_stream()
++
++        listener = dspy.streaming.StreamListener(
++            signature_field_name="a",
++            idle_timeout_s=30.0,  # Very long timeout
++        )
++
++        program = dspy.streamify(
++            FastProgram(),
++            stream_listeners=[listener],
++        )
++
++        with mock.patch("litellm.acompletion", side_effect=completion_side_effect):
++            with dspy.context(lm=dspy.LM("openai/gpt-4o-mini", cache=False)):
++                output = program(question="test")
++                responses = []
++                async for value in output:
++                    if isinstance(value, dspy.streaming.StreamResponse):
++                        responses.append(value)
++
++        assert len(responses) > 0
++        # All responses should have normal chunks (not empty)
++        assert all(r.chunk != "" for r in responses)

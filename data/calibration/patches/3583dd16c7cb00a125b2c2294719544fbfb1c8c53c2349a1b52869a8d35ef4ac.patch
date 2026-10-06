@@ -1,0 +1,187 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca7..2b31bd21b 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,8 @@
++import logging
+ import re
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -18,7 +19,7 @@ ADAPTER_SUPPORT_STREAMING = [ChatAdapter, XMLAdapter, JSONAdapter]
+ 
+ 
+ class StreamListener:
+-    """Class that listens to the stream to capture the streeaming of a specific output field of a predictor."""
++    """Listen to one output field, with optional lazy per-listener debug tracing."""
+ 
+     def __init__(
+         self,
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        debug: bool = False,
++        debug_logger: logging.Logger | None = None,
+     ):
+         """
+         Args:
+@@ -36,6 +39,8 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            debug: If True, enables debug logging for key state transitions.
++            debug_logger: Optional custom logger for debug messages. If None, uses default logger.
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+@@ -48,6 +53,10 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Debug mode setup
++        self.debug = debug
++        self._logger = debug_logger or logging.getLogger("dspy.streaming.listener")
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -66,6 +75,17 @@ class StreamListener:
+             },
+         }
+ 
++    def _safe_truncate(self, text: str, max_length: int = 80) -> str:
++        """Safely truncate text to avoid large string formatting in logs."""
++        if len(text) <= max_length:
++            return text
++        return f"{text[: max_length - 3]}..."
++
++    def _log_debug(self, message_factory: Callable[[], str]):
++        """Build and log a message only when debug output can be emitted."""
++        if self.debug and self._logger.isEnabledFor(logging.DEBUG):
++            self._logger.debug(message_factory())
++
+     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
+         for i in range(len(concat_message)):
+             if start_identifier.startswith(concat_message[len(concat_message) - i - 1 :]):
+@@ -91,6 +111,8 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                # Log state reset when allow_reuse=True
++                self._log_debug(lambda: f"State reset for field '{self.signature_field_name}' (allow_reuse=True)")
+             else:
+                 return
+ 
+@@ -112,6 +134,13 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
++                # Log start detection for cache hit case
++                self._log_debug(
++                    lambda: (
++                        f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', "
++                        f"stream_start=True, buffer_preview='{self._safe_truncate(message_after_start_identifier)}'"
++                    )
++                )
+                 return
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+@@ -139,6 +168,14 @@ class StreamListener:
+                     # because there could be a few splitters between ':' and '"', e.g., '"name": "value"'.
+                     chunk_message = chunk_message[1:]
+ 
++                # Log start detection
++                self._log_debug(
++                    lambda: (
++                        f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', "
++                        f"stream_start=True, buffer_preview='{self._safe_truncate(chunk_message)}'"
++                    )
++                )
++
+             elif self._buffered_message_end_with_start_identifier(concat_message.strip(), start_identifier):
+                 # If the buffered message ends with part of the start_identifier, we keep looking for the
+                 # start_identifier from the token stream.
+@@ -165,7 +202,22 @@ class StreamListener:
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
++                # Log rolling end check
++                self._log_debug(
++                    lambda: (
++                        f"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', "
++                        f"reason='regex_match', buffered_size={len(concat_message)}"
++                    )
++                )
++
+             if token:
++                # Log emit chunk
++                self._log_debug(
++                    lambda: (
++                        f"Emit chunk: len(token)={len(token)}, queue_size={self.field_end_queue.qsize()}, "
++                        f"is_last_chunk={self.stream_end}"
++                    )
++                )
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+@@ -177,6 +229,16 @@ class StreamListener:
+         """
+         last_tokens = "".join(self.field_end_queue.queue)
+         self.field_end_queue = Queue()
++
++        # Log flush
++        adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
++        self._log_debug(
++            lambda: (
++                f"Flush: adapter={adapter_name}, field='{self.signature_field_name}', "
++                f"truncated_buffer_length={len(last_tokens)}"
++            )
++        )
++
+         if isinstance(settings.adapter, JSONAdapter):
+             match = re.search(r'",|"\s*}', last_tokens)
+             if match:
+diff --git a/tests/streaming/test_listener_debug_contribution.py b/tests/streaming/test_listener_debug_contribution.py
+new file mode 100644
+index 000000000..7e02899ed
+--- /dev/null
++++ b/tests/streaming/test_listener_debug_contribution.py
+@@ -0,0 +1,33 @@
++import logging
++from unittest import mock
++
++from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
++
++import dspy
++
++
++def chunk(content):
++    return ModelResponseStream(model="test", choices=[StreamingChoices(delta=Delta(content=content))])
++
++
++def test_disabled_debug_does_not_build_or_emit_messages():
++    logger = mock.Mock()
++    logger.isEnabledFor.return_value = True
++    listener = dspy.streaming.StreamListener("answer", debug=False, debug_logger=logger)
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener.receive(chunk("[[ ## answer ## ]]\n"))
++    logger.debug.assert_not_called()
++
++
++def test_enabled_debug_reports_emission_without_changing_chunk(caplog):
++    logger = logging.getLogger("dspy.contribution.debug")
++    caplog.set_level(logging.DEBUG, logger=logger.name)
++    listener = dspy.streaming.StreamListener("answer", debug=True, debug_logger=logger)
++    response = None
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener.receive(chunk("[[ ## answer ## ]]\n"))
++        for value in "abcdefghijk":
++            response = listener.receive(chunk(value)) or response
++
++    assert response.chunk == "a"
++    assert any(record.getMessage().startswith("Emit chunk:") for record in caplog.records)

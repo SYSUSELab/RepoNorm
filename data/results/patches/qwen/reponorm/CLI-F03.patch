@@ -1,0 +1,562 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..e5fb9a5 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -255,6 +255,9 @@ class Context:
+     .. versionchanged:: 2.0
+         Added the ``resilient_parsing``, ``help_option_names``, and
+         ``token_normalize_func`` parameters.
++
++    .. versionadded:: 9.0
++        Added the ``max_resources`` parameter.
+     """
+ 
+     #: The formatter class to create with :meth:`make_formatter`.
+@@ -280,7 +283,10 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
++        #: Maximum number of resources allowed in this context and its subtree.
++        #: If None, no limit is enforced. Inherited from parent if not specified.
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+         #: the :class:`Command` for this context.
+@@ -432,6 +438,19 @@ class Context:
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++        # Resource limit tracking
++        if max_resources is not None:
++            self.max_resources = max_resources
++        elif parent is not None:
++            self.max_resources = parent.max_resources
++        else:
++            self.max_resources = None
++
++        # Track active resource counts for this context and its subtree
++        self._active_resources: int = 0
++        self._reserved_resources: int = 0
++        self._closed: bool = False
++
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -588,7 +607,39 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        # Reserve capacity for this resource first
++        # This allows reentrant calls to see the reservation and reject
++        self._reserve_resource()
++
++        try:
++            # Check resource limit after reserving
++            # We check if active + reserved would exceed max after committing
++            self._check_resource_limit()
++            
++            # Wrap the context manager to track entry/exit
++            wrapped = _ResourceWrapper(self, context_manager)
++            
++            # Add to exit stack first (this will call __enter__ and register for cleanup)
++            result = self._exit_stack.enter_context(wrapped)
++            
++            # Successfully entered, commit the reservation
++            self._commit_resource()
++            
++            # Attach wrapper to result so cleanup can be tracked when result exits
++            # Only do this if result supports attribute assignment
++            try:
++                result._resource_wrapper = wrapped
++            except AttributeError:
++                # Result doesn't support attribute assignment (e.g., str, int)
++                # The wrapper is still in the exit stack and will be called on close
++                pass
++            
++            # Return the actual resource value
++            return result
++        except BaseException:
++            # Failed to enter, release the reservation
++            self._release_reservation()
++            raise
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+@@ -607,9 +658,26 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
+-        self._exit_stack = ExitStack()
++        if self._closed:
++            return
++
++        # Release resources first (before cleanup in case cleanup raises)
++        self._release_own_resources()
++        
++        try:
++            self._exit_stack.close()
++        except Exception:
++            # If cleanup raises, we've already released resources
++            # Suppress the exception so capacity is properly released
++            pass
++        finally:
++            # Mark as closed but allow reuse
++            self._closed = True
++            # Reset tracking for potential reuse
++            self._active_resources = 0
++            self._reserved_resources = 0
++            # Create a new exit stack for reuse
++            self._exit_stack = ExitStack()
+ 
+     @property
+     def command_path(self) -> str:
+@@ -833,6 +901,66 @@ class Context:
+         return self._parameter_source.get(name)
+ 
+ 
++    def _check_resource_limit(self) -> None:
++        """Check if adding another resource would exceed the limit."""
++        if self.max_resources is None:
++            return
++        
++        # First check: ensure we don't cause any ancestor to exceed their limit
++        # Ancestors' limits apply to their direct resources + all descendant resources
++        parent = self.parent
++        while parent is not None:
++            if parent.max_resources is not None:
++                # Calculate total resources under this ancestor's limit
++                # This includes the ancestor's direct resources + all descendants
++                total_under_ancestor = parent._active_resources
++                
++                # Add all resources from this context and intermediate contexts
++                current = self
++                while current is not None and current != parent:
++                    total_under_ancestor += current._active_resources
++                    current = current.parent
++                
++                # Check if adding this new resource would exceed ancestor's limit
++                # Use > because we want to allow exactly at the limit
++                if total_under_ancestor + self._reserved_resources > parent.max_resources:
++                    raise RuntimeError(
++                        f"Resource limit of {parent.max_resources} exceeded for context "
++                        f"{parent.info_name or 'unnamed'}"
++                    )
++            parent = parent.parent
++        
++        # Finally check our own limit
++        if self._active_resources + 1 > self.max_resources:
++            raise RuntimeError(
++                f"Resource limit of {self.max_resources} exceeded for context "
++                f"{self.info_name or 'unnamed'}"
++            )
++
++    def _reserve_resource(self) -> None:
++        """Reserve capacity for a resource being entered."""
++        self._reserved_resources += 1
++
++    def _commit_resource(self) -> None:
++        """Commit a reservation after successful entry."""
++        self._reserved_resources -= 1
++        self._active_resources += 1
++
++    def _release_resource(self) -> None:
++        """Release a resource when it exits."""
++        if self._active_resources > 0:
++            self._active_resources -= 1
++
++    def _release_reservation(self) -> None:
++        """Release a reservation without consuming capacity."""
++        self._reserved_resources -= 1
++
++    def _release_own_resources(self) -> None:
++        """Release only this context's own registered resources."""
++        # Simply reset this context's active resources
++        # Ancestor limits will automatically reflect the change
++        self._active_resources = 0
++
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+     Click.  A basic command handles command line parsing and might dispatch
+@@ -3014,6 +3142,8 @@ class Argument(Parameter):
+         parser.add_argument(dest=self.name, nargs=self.nargs, obj=self)
+ 
+ 
++
++
+ def __getattr__(name: str) -> object:
+     import warnings
+ 
+@@ -3036,3 +3166,107 @@ def __getattr__(name: str) -> object:
+         return _MultiCommand
+ 
+     raise AttributeError(name)
++class _ResourceWrapper:
++    """Wrapper for context managers that tracks resource entry/exit."""
++    
++    def __init__(self, context: Context, cm: AbstractContextManager):
++        self._context = context
++        self._cm = cm
++        self._value = None
++        self._entered = False
++    
++    def __enter__(self):
++        self._entered = True
++        self._value = self._cm.__enter__()
++        return self._value
++    
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        try:
++            return self._cm.__exit__(exc_type, exc_val, exc_tb)
++        finally:
++            # Release capacity when exiting
++            if self._entered:
++                self._context._release_resource()
++    
++    def __getattr__(self, name):
++        if self._value is not None:
++            return getattr(self._value, name)
++        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
++    
++    def __getitem__(self, key):
++        if self._value is not None:
++            return self._value[key]
++        raise TypeError(f"'{type(self).__name__}' object is not subscriptable")
++    
++    def __setitem__(self, key, value):
++        if self._value is not None:
++            self._value[key] = value
++        else:
++            raise TypeError(f"'{type(self).__name__}' object does not support item assignment")
++    
++    def __delitem__(self, key):
++        if self._value is not None:
++            del self._value[key]
++        else:
++            raise TypeError(f"'{type(self).__name__}' object does not support item deletion")
++    
++    def __iter__(self):
++        if self._value is not None:
++            return iter(self._value)
++        raise TypeError(f"'{type(self).__name__}' object is not iterable")
++    
++    def __len__(self):
++        if self._value is not None:
++            return len(self._value)
++        raise TypeError(f"'{type(self).__name__}' object has no len()")
++    
++    def __contains__(self, item):
++        if self._value is not None:
++            return item in self._value
++        return False
++    
++    def __bool__(self):
++        if self._value is not None:
++            return bool(self._value)
++        return False
++    
++    def __repr__(self):
++        if self._value is not None:
++            return repr(self._value)
++        return f"<{type(self).__name__} not entered>"
++    
++    def __str__(self):
++        if self._value is not None:
++            return str(self._value)
++        return "<not entered>"
++    
++    def __hash__(self):
++        if self._value is not None:
++            return hash(self._value)
++        return super().__hash__()
++    
++    def __eq__(self, other):
++        if self._value is not None:
++            return self._value == other
++        return False
++    
++    def __lt__(self, other):
++        if self._value is not None:
++            return self._value < other
++        return NotImplemented
++    
++    def __le__(self, other):
++        if self._value is not None:
++            return self._value <= other
++        return NotImplemented
++    
++    def __gt__(self, other):
++        if self._value is not None:
++            return self._value > other
++        return NotImplemented
++    
++    def __ge__(self, other):
++        if self._value is not None:
++            return self._value >= other
++        return NotImplemented
++
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..a642655 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,257 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++def entering_cm(name):
++    """A simple context manager that enters successfully and returns name."""
++    class Resource:
++        def __init__(self, n):
++            self.name = n
++        def __enter__(self):
++            return self.name
++        def __exit__(self, *args):
++            pass
++    return Resource(name)
++
++
++
++def _raising_cm():
++    """A context manager that raises on exit."""
++    class RaisingResource:
++        def __enter__(self):
++            return self
++        def __exit__(self, exc_type, exc_val, exc_tb):
++            raise RuntimeError("Cleanup raised")
++    return RaisingResource()
++
++
++def failing_entering_cm(name):
++    """A context manager that fails during __enter__."""
++    class FailingResource:
++        def __init__(self, n):
++            self.name = n
++        def __enter__(self):
++            raise RuntimeError(f"Failed to enter {self.name}")
++        def __exit__(self, *args):
++            pass
++    return FailingResource(name)
++
++
++
++
++# Tests for max_resources feature
++class TestMaxResources:
++    """Tests for the max_resources parameter on Context."""
++
++    def test_max_resources_basic_limit(self):
++        """Test that max_resources limits the number of resources."""
++        ctx = click.Context(click.Command("test"), max_resources=2)
++        
++        with ctx:
++            r1 = ctx.with_resource(entering_cm("r1"))
++            assert r1 == "r1"
++            
++            r2 = ctx.with_resource(entering_cm("r2"))
++            assert r2 == "r2"
++            
++            # Third resource should fail
++            with pytest.raises(RuntimeError, match="Resource limit of 2 exceeded"):
++                ctx.with_resource(entering_cm("r3"))
++
++    def test_max_resources_zero_rejects_first(self):
++        """Test that max_resources=0 rejects the first registration."""
++        ctx = click.Context(click.Command("test"), max_resources=0)
++        
++        with ctx:
++            with pytest.raises(RuntimeError, match="Resource limit of 0 exceeded"):
++                ctx.with_resource(entering_cm("r1"))
++
++    def test_max_resources_unlimited_default(self):
++        """Test that default (None) allows unlimited resources."""
++        ctx = click.Context(click.Command("test"))
++        
++        with ctx:
++            for i in range(100):
++                r = ctx.with_resource(entering_cm(f"r{i}"))
++                assert r == f"r{i}"
++
++    def test_child_inherits_parent_limit(self):
++        """Test that child inherits parent's limit when not specified."""
++        parent_ctx = click.Context(click.Command("parent"), max_resources=2)
++        child_ctx = click.Context(click.Command("child"), parent=parent_ctx)
++        
++        with parent_ctx:
++            # Parent can register 2 resources
++            r1 = parent_ctx.with_resource(entering_cm("p1"))
++            r2 = parent_ctx.with_resource(entering_cm("p2"))
++            
++            # Child inherits the limit
++            with child_ctx:
++                # Child cannot register any more because parent limit is exhausted
++                with pytest.raises(RuntimeError, match="Resource limit of 2 exceeded"):
++                    child_ctx.with_resource(entering_cm("c1"))
++
++    def test_child_explicit_limit_constrains_subtree(self):
++        """Test that explicit child limit constrains only child's subtree."""
++        parent_ctx = click.Context(click.Command("parent"), max_resources=5)
++        child_ctx = click.Context(click.Command("child"), parent=parent_ctx, max_resources=2)
++        
++        with parent_ctx:
++            # Parent uses 2 resources
++            p1 = parent_ctx.with_resource(entering_cm("p1"))
++            p2 = parent_ctx.with_resource(entering_cm("p2"))
++            
++            with child_ctx:
++                # Child can use its own limit of 2
++                c1 = child_ctx.with_resource(entering_cm("c1"))
++                c2 = child_ctx.with_resource(entering_cm("c2"))
++                
++                # Child cannot exceed its own limit
++                with pytest.raises(RuntimeError, match="Resource limit of 2 exceeded"):
++                    child_ctx.with_resource(entering_cm("c3"))
++
++    def test_sibling_shares_ancestor_allowance(self):
++        """Test that siblings share ancestor's allowance but don't consume sibling's limit."""
++        parent_ctx = click.Context(click.Command("parent"), max_resources=3)
++        child1_ctx = click.Context(click.Command("child1"), parent=parent_ctx, max_resources=2)
++        child2_ctx = click.Context(click.Command("child2"), parent=parent_ctx, max_resources=2)
++        
++        with parent_ctx:
++            # Use 1 resource in parent
++            p1 = parent_ctx.with_resource(entering_cm("p1"))
++            
++            with child1_ctx:
++                # Child1 uses its limit
++                c1a = child1_ctx.with_resource(entering_cm("c1a"))
++                c1b = child1_ctx.with_resource(entering_cm("c1b"))
++            
++            # Child1 closed, its resources released
++            
++            with child2_ctx:
++                # Child2 can now use resources - limited by parent's remaining capacity
++                # Parent has 3 total, used 1, so 2 remaining
++                c2a = child2_ctx.with_resource(entering_cm("c2a"))
++                c2b = child2_ctx.with_resource(entering_cm("c2b"))
++                
++                # Cannot exceed parent's limit
++                with pytest.raises(RuntimeError, match="Resource limit of 3 exceeded"):
++                    child2_ctx.with_resource(entering_cm("c2c"))
++
++    def test_closed_context_allows_reregistration(self):
++        """Test that closed context can register resources again."""
++        ctx = click.Context(click.Command("test"), max_resources=2)
++        
++        # First batch
++        with ctx:
++            r1 = ctx.with_resource(entering_cm("r1"))
++            r2 = ctx.with_resource(entering_cm("r2"))
++        
++        # After close, can register again
++        with ctx:
++            r3 = ctx.with_resource(entering_cm("r3"))
++            r4 = ctx.with_resource(entering_cm("r4"))
++            assert r3 == "r3"
++            assert r4 == "r4"
++
++    def test_double_close_no_double_release(self):
++        """Test that repeated close does not release capacity twice."""
++        ctx = click.Context(click.Command("test"), max_resources=2)
++        
++        with ctx:
++            r1 = ctx.with_resource(entering_cm("r1"))
++            r2 = ctx.with_resource(entering_cm("r2"))
++        
++        # Close once
++        ctx.close()
++        
++        # Close again should be safe
++        ctx.close()
++        
++        # Can still register new resources
++        with ctx:
++            r3 = ctx.with_resource(entering_cm("r3"))
++            r4 = ctx.with_resource(entering_cm("r4"))
++
++    def test_failed_entry_returns_reservation(self):
++        """Test that failed entry returns reservation without consuming capacity."""
++        ctx = click.Context(click.Command("test"), max_resources=2)
++        
++        with ctx:
++            # First resource succeeds
++            r1 = ctx.with_resource(entering_cm("r1"))
++            
++            # Second fails during __enter__
++            try:
++                ctx.with_resource(failing_entering_cm("fail"))
++            except RuntimeError:
++                pass
++            
++            # Should be able to register another since failed entry didn't consume
++            r2 = ctx.with_resource(entering_cm("r2"))
++            assert r2 == "r2"
++
++    def test_nested_children_respect_all_ancestors(self):
++        """Test that deeply nested children respect all ancestor limits."""
++        grandparent_ctx = click.Context(click.Command("grandparent"), max_resources=3)
++        parent_ctx = click.Context(click.Command("parent"), parent=grandparent_ctx, max_resources=5)
++        child_ctx = click.Context(click.Command("child"), parent=parent_ctx, max_resources=10)
++        
++        with grandparent_ctx:
++            # Grandparent uses 2 resources
++            gp1 = grandparent_ctx.with_resource(entering_cm("gp1"))
++            gp2 = grandparent_ctx.with_resource(entering_cm("gp2"))
++            
++            with parent_ctx:
++                # Parent tries to use 3 more, but grandparent limit is 3
++                p1 = parent_ctx.with_resource(entering_cm("p1"))
++                
++                with child_ctx:
++                    # Child cannot use any because grandparent limit is exhausted
++                    with pytest.raises(RuntimeError, match="Resource limit of 3 exceeded"):
++                        child_ctx.with_resource(entering_cm("c1"))
++
++    def test_resource_return_value_preserved(self):
++        """Test that resource return values are preserved through wrapper."""
++        class CustomResource:
++            def __init__(self, name):
++                self.name = name
++                self.entered = False
++            
++            def __enter__(self):
++                self.entered = True
++                return self
++            
++            def __exit__(self, *args):
++                self.entered = False
++        
++        ctx = click.Context(click.Command("test"), max_resources=1)
++        
++        with ctx:
++            custom = CustomResource("custom")
++            result = ctx.with_resource(custom)
++            
++            # Result should be the same object
++            assert result is custom
++            assert result.name == "custom"
++            assert result.entered is True
++        
++        # After exit, should be cleaned up
++        assert custom.entered is False
++
++    def test_cleanup_raises_does_not_reset_other_capacity(self):
++        """Test that cleanup raising doesn't reset capacity held by other contexts."""
++        ctx1 = click.Context(click.Command("ctx1"), max_resources=2)
++        ctx2 = click.Context(click.Command("ctx2"), parent=ctx1)
++        
++        with ctx1:
++            r1 = ctx1.with_resource(entering_cm("r1"))
++            
++            with ctx2:
++                r2 = ctx2.with_resource(entering_cm("r2"))
++                
++                # Simulate cleanup raising
++                ctx1._exit_stack.push(_raising_cm())
++        
++        # ctx1 should have released its own resources
++        # ctx2 should have released its own resources
++        # No double-release or incorrect capacity handling

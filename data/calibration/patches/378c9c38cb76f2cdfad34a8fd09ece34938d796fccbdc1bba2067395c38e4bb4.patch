@@ -1,0 +1,193 @@
+diff --git a/docs/utils.rst b/docs/utils.rst
+index 995c171..0f3b63b 100644
+--- a/docs/utils.rst
++++ b/docs/utils.rst
+@@ -212,11 +212,18 @@ Example usage::
+ Alternatively, the function can also be used to launch editors for files by
+ a specific filename.  In this case, the return value is always `None`.
+ 
++One editor session can open multiple files by passing an iterable of
++filenames.  Each filename is passed as a distinct literal argument,
++including names containing whitespace or shell metacharacters.  An empty
++iterable or an item that is not a string is rejected before the editor starts.
++
+ Example usage::
+ 
+     import click
+     click.edit(filename='/etc/passwd')
+ 
++    click.edit(filename=['notes.txt', 'release notes.txt'])
++
+ 
+ Launching Applications
+ ----------------------
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..d9639f9 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -505,7 +505,8 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
++    def edit_files(self, filenames: cabc.Iterable[str]) -> None:
++        import shlex
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -515,8 +516,15 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        files = tuple(filenames)
++        if not files:
++            raise ValueError("filename iterable must not be empty")
++        if not all(isinstance(filename, str) for filename in files):
++            raise TypeError("every filename must be a string")
++        command = " ".join((editor, *(shlex.quote(filename) for filename in files)))
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            c = subprocess.Popen(command, env=environ, shell=True)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -559,7 +567,7 @@ class Editor:
+             # recorded, so get the new recorded value.
+             timestamp = os.path.getmtime(name)
+ 
+-            self.edit_file(name)
++            self.edit_files((name,))
+ 
+             if self.require_save and os.path.getmtime(name) == timestamp:
+                 return None
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..4a8a911 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -643,13 +643,34 @@ def secho(
+     return echo(message, file=file, nl=nl, err=err, color=color)
+ 
+ 
++@t.overload
++def edit(
++    text: t.AnyStr,
++    editor: str | None = None,
++    env: cabc.Mapping[str, str] | None = None,
++    require_save: bool = True,
++    extension: str = ".txt",
++) -> t.AnyStr: ...
++
++
++@t.overload
++def edit(
++    text: None = None,
++    editor: str | None = None,
++    env: cabc.Mapping[str, str] | None = None,
++    require_save: bool = True,
++    extension: str = ".txt",
++    filename: str | cabc.Iterable[str] | None = None,
++) -> None: ...
++
++
+ def edit(
+     text: t.AnyStr | None = None,
+     editor: str | None = None,
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+     extension: str = ".txt",
+-    filename: str | None = None,
++    filename: str | cabc.Iterable[str] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -676,7 +697,16 @@ def edit(
+                       highlighting.
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+-                     file as an indirection in that case.
++                     file as an indirection in that case. If the editor
++                     supports editing multiple files at once, a sequence of
++                     files may be passed as well. Invoke `click.file` once per
++                     file instead if multiple files cannot be managed at once
++                     or editing the files serially is desired.
++
++    .. versionchanged:: 8.2.0
++        ``filename`` now accepts any ``Iterable[str]`` in addition to a
++        ``str`` if the ``editor`` supports editing multiple files at once.
++
+     """
+     from ._termui_impl import Editor
+ 
+@@ -685,7 +715,10 @@ def edit(
+     if filename is None:
+         return ed.edit(text)
+ 
+-    ed.edit_file(filename)
++    if isinstance(filename, str):
++        filename = (filename,)
++
++    ed.edit_files(filenames=filename)
+     return None
+ 
+ 
+diff --git a/tests/test_n4c_author_edit_multiple.py b/tests/test_n4c_author_edit_multiple.py
+new file mode 100644
+index 0000000..3003742
+--- /dev/null
++++ b/tests/test_n4c_author_edit_multiple.py
+@@ -0,0 +1,54 @@
++import shlex
++
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code=0):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++def _argv(call):
++    command = call[0]
++    return shlex.split(command) if isinstance(command, str) else list(command)
++
++
++def test_multiple_filenames_are_one_safe_editor_invocation(monkeypatch):
++    filenames = ["plain.txt", "space name.txt", "$(touch marker).txt", "line\nbreak"]
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen",
++        lambda *args, **kwargs: calls.append((args[0], kwargs)) or _Process(),
++    )
++
++    click.edit(filename=(name for name in filenames), editor="editor --wait")
++
++    assert len(calls) == 1
++    assert _argv(calls[0]) == ["editor", "--wait", *filenames]
++
++
++@pytest.mark.parametrize("filename, error", [([], ValueError), (["ok", 3], TypeError)])
++def test_invalid_filename_iterables_do_not_launch(monkeypatch, filename, error):
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *args, **kwargs: pytest.fail("must not launch")
++    )
++    with pytest.raises(error):
++        click.edit(filename=filename, editor="editor")
++
++
++def test_multiple_filenames_preserve_environment_and_exit_error(monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        "subprocess.Popen",
++        lambda *args, **kwargs: calls.append((args[0], kwargs)) or _Process(3),
++    )
++
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(filename=["one", "two"], editor="editor", env={"EDIT_TEST": "1"})
++
++    assert calls[0][1]["env"]["EDIT_TEST"] == "1"

@@ -1,0 +1,464 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..1619ea7 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -4,6 +4,8 @@ sources.
+ import importlib.util
+ import os
+ import sys
++import threading
++import time
+ import typing as t
+ import weakref
+ import zipimport
+@@ -170,9 +172,14 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param auto_reload: Automatically poll for file changes and
++        invalidate environment caches.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionadded:: 3.x
++        Added the ``auto_reload`` parameter and proactive cache
++        invalidation.
+     """
+ 
+     def __init__(
+@@ -180,6 +187,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        auto_reload: bool = True,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,10 +195,176 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.auto_reload = auto_reload
++
++        # Monitoring state (only used when auto_reload is True)
++        self._environments: "weakref.WeakSet[Environment]" = weakref.WeakSet()
++        self._lock = threading.Lock()
++        self._monitor_stop = threading.Event()
++        self._monitor_thread: t.Optional[threading.Thread] = None
++        self._mtimes: t.Dict[str, float] = {}
++
++    def _get_template_name(self, filepath: str) -> t.Optional[str]:
++        """Convert an absolute file path to a canonical template name.
++
++        Returns ``None`` if the path is not under any search root.
++        """
++        for searchpath in self.searchpath:
++            if filepath.startswith(searchpath):
++                name = filepath[len(searchpath) :].strip(os.path.sep).replace(
++                    os.path.sep, "/"
++                )
++                if name[:2] == "./":
++                    name = name[2:]
++                return name or None
++        return None
++
++    def _get_current_mtimes(self) -> t.Dict[str, float]:
++        """Walk all search paths and return a dict of absolute file paths
++        to their modification times."""
++        mtimes: t.Dict[str, float] = {}
++        for searchpath in self.searchpath:
++            try:
++                for dirpath, _dirnames, filenames in os.walk(
++                    searchpath, followlinks=self.followlinks
++                ):
++                    for filename in filenames:
++                        filepath = os.path.join(dirpath, filename)
++                        try:
++                            mtimes[filepath] = os.path.getmtime(filepath)
++                        except OSError:
++                            pass
++            except OSError:
++                pass
++        return mtimes
++
++    def _invalidate_template(self, template_name: str) -> None:
++        """Remove a template from all tracked environment caches."""
++        for env in list(self._environments):
++            if env.cache is not None:
++                cache_key = (weakref.ref(self), template_name)
++                try:
++                    del env.cache[cache_key]
++                except KeyError:
++                    pass
++
++    def _monitor_loop(self) -> None:
++        """Background thread that periodically scans for file changes."""
++        while not self._monitor_stop.is_set():
++            if self._monitor_stop.wait(timeout=0.5):
++                break
++            try:
++                self.scan_once()
++            except Exception:
++                # Background filesystem errors must not terminate the monitor.
++                pass
++
++    def start_monitoring(self) -> None:
++        """Start the background polling monitor, if :attr:`auto_reload` is
++        ``True``.  Idempotent; does nothing if monitoring is already
++        active or if ``auto_reload`` is ``False``.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if (
++                self._monitor_thread is not None
++                and self._monitor_thread.is_alive()
++            ):
++                return
++            self._monitor_stop.clear()
++            self._mtimes = self._get_current_mtimes()
++            thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            thread.start()
++            self._monitor_thread = thread
++
++    def close(self) -> None:
++        """Stop the background polling monitor.  Idempotent.
++
++        A closed loader may be explicitly restarted by calling
++        :meth:`start_monitoring` again.
++        """
++        with self._lock:
++            if self._monitor_thread is None:
++                return
++            self._monitor_stop.set()
++            self._monitor_thread.join()
++            self._monitor_thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        return self
++
++    def __exit__(
++        self,
++        exc_type: t.Optional[t.Type[BaseException]],
++        exc_val: t.Optional[BaseException],
++        exc_tb: t.Optional[t.Any],
++    ) -> None:
++        self.close()
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous comparison of the current filesystem state
++        against the last known state.  Invalidates cache entries for any
++        modified, deleted, or added files.
++
++        :return: A list of canonical (``/``-separated) template names that
++            changed.
++        """
++        current_mtimes = self._get_current_mtimes()
++        changed: t.List[str] = []
++
++        # Check for modified or deleted files.
++        for filepath, old_mtime in list(self._mtimes.items()):
++            current_mtime = current_mtimes.get(filepath)
++            if current_mtime is None:
++                # File was deleted.
++                template_name = self._get_template_name(filepath)
++                if template_name is not None:
++                    changed.append(template_name)
++                    self._invalidate_template(template_name)
++            elif current_mtime != old_mtime:
++                # File was modified.
++                template_name = self._get_template_name(filepath)
++                if template_name is not None:
++                    changed.append(template_name)
++                    self._invalidate_template(template_name)
++
++        # Check for new files.
++        for filepath in current_mtimes:
++            if filepath not in self._mtimes:
++                template_name = self._get_template_name(filepath)
++                if template_name is not None:
++                    changed.append(template_name)
++                    self._invalidate_template(template_name)
++
++        self._mtimes = current_mtimes
++        return changed
++
++    def invalidate_changed(self, paths: t.Iterable[str]) -> t.List[str]:
++        """Synchronously invalidate cache entries for the supplied absolute
++        file paths.  Paths that are not under any search root are silently
++        ignored.
++
++        :return: A list of canonical (``/``-separated) template names that
++            were invalidated.
++        """
++        changed: t.List[str] = []
++        for filepath in paths:
++            template_name = self._get_template_name(filepath)
++            if template_name is not None:
++                changed.append(template_name)
++                self._invalidate_template(template_name)
++        return changed
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        # Start monitoring and track the environment when the loader is
++        # first used with auto_reload enabled.
++        if self.auto_reload:
++            self._environments.add(environment)
++            self.start_monitoring()
++
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..7e2d3a1 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,246 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++class TestFileSystemLoaderMonitor:
++    """Tests for FileSystemLoader proactive cache invalidation."""
++
++    searchpath = (Path(__file__).parent / "res" / "templates").resolve()
++
++    def test_auto_reload_default_true(self):
++        """auto_reload defaults to True."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        assert loader.auto_reload is True
++
++    def test_auto_reload_false(self):
++        """With auto_reload=False, monitoring is never started."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=False)
++        assert loader.auto_reload is False
++        # get_source should not track environments or start a thread
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        assert len(loader._environments) == 0
++        assert loader._monitor_thread is None
++
++    def test_auto_reload_false_start_monitoring_noop(self):
++        """start_monitoring is a no-op when auto_reload is False."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=False)
++        loader.start_monitoring()
++        assert loader._monitor_thread is None
++
++    def test_get_template_name_under_searchpath(self):
++        """_get_template_name returns canonical /-separated name."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        filepath = os.path.join(self.searchpath, "foo", "test.html")
++        name = loader._get_template_name(filepath)
++        assert name == "foo/test.html"
++
++    def test_get_template_name_root_file(self):
++        """_get_template_name returns just the filename for root-level files."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        filepath = os.path.join(self.searchpath, "test.html")
++        name = loader._get_template_name(filepath)
++        assert name == "test.html"
++
++    def test_get_template_name_outside_searchpath(self):
++        """_get_template_name returns None for paths outside search roots."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        name = loader._get_template_name("/tmp/somefile.html")
++        assert name is None
++
++    def test_get_template_name_nested_path(self):
++        """Nested paths are preserved."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        filepath = os.path.join(self.searchpath, "a", "b", "c", "template.html")
++        name = loader._get_template_name(filepath)
++        assert name == "a/b/c/template.html"
++
++    def test_get_template_name_leading_dot(self):
++        """Leading-dot names are preserved."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        filepath = os.path.join(self.searchpath, ".hidden", "file.html")
++        name = loader._get_template_name(filepath)
++        assert name == ".hidden/file.html"
++
++    def test_scan_once_returns_canonical_names(self):
++        """scan_once returns /-separated template names."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=False)
++        # Initialize mtimes with current state
++        loader._mtimes = loader._get_current_mtimes()
++        changed = loader.scan_once()
++        # No changes expected on a quiet filesystem
++        assert isinstance(changed, list)
++        assert all("/" not in n or n.count("/") >= 1 for n in changed)
++
++    @pytest.fixture
++    def temp_template_dir(self, tmp_path):
++        """Create a temporary directory with one template file."""
++        d = tmp_path / "templates"
++        d.mkdir()
++        (d / "hello.html").write_text("Hello {{ name }}!")
++        return d
++
++    def test_scan_once_detects_new_file(self, temp_template_dir):
++        """scan_once detects newly added files."""
++        loader = loaders.FileSystemLoader(temp_template_dir, auto_reload=False)
++        loader._mtimes = loader._get_current_mtimes()
++        # Add a new file
++        new_file = temp_template_dir / "new.html"
++        new_file.write_text("New!")
++        changed = loader.scan_once()
++        assert "new.html" in changed
++
++    def test_scan_once_detects_modified_file(self, temp_template_dir):
++        """scan_once detects modified files."""
++        loader = loaders.FileSystemLoader(temp_template_dir, auto_reload=False)
++        loader._mtimes = loader._get_current_mtimes()
++        time.sleep(0.01)  # Ensure mtime can differ
++        hello_file = temp_template_dir / "hello.html"
++        hello_file.write_text("Modified!")
++        changed = loader.scan_once()
++        assert "hello.html" in changed
++
++    def test_scan_once_detects_deleted_file(self, temp_template_dir):
++        """scan_once detects deleted files."""
++        loader = loaders.FileSystemLoader(temp_template_dir, auto_reload=False)
++        loader._mtimes = loader._get_current_mtimes()
++        (temp_template_dir / "hello.html").unlink()
++        changed = loader.scan_once()
++        assert "hello.html" in changed
++
++    def test_scan_once_invalidates_env_cache(self, temp_template_dir):
++        """scan_once removes cache entries from tracked environments."""
++        loader = loaders.FileSystemLoader(temp_template_dir, auto_reload=False)
++        env = Environment(loader=loader)
++        # Load template to populate cache
++        tmpl = env.get_template("hello.html")
++        cache_key = (weakref.ref(loader), "hello.html")
++        assert cache_key in env.cache
++        # Modify file and scan
++        time.sleep(0.01)
++        (temp_template_dir / "hello.html").write_text("Changed!")
++        loader._environments.add(env)
++        loader.scan_once()
++        # Cache entry should be gone
++        assert cache_key not in env.cache
++
++    def test_invalidate_changed_ignores_outside_paths(self):
++        """invalidate_changed ignores paths outside search roots."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=False)
++        result = loader.invalidate_changed(["/tmp/outside.html"])
++        assert result == []
++
++    def test_invalidate_changed_removes_cache(self, temp_template_dir):
++        """invalidate_changed removes specific cache entries."""
++        loader = loaders.FileSystemLoader(temp_template_dir, auto_reload=False)
++        env = Environment(loader=loader)
++        tmpl = env.get_template("hello.html")
++        cache_key = (weakref.ref(loader), "hello.html")
++        assert cache_key in env.cache
++        loader._environments.add(env)
++        filepath = str(temp_template_dir / "hello.html")
++        result = loader.invalidate_changed([filepath])
++        assert "hello.html" in result
++        assert cache_key not in env.cache
++
++    def test_close_stops_monitor(self):
++        """close() stops the background thread."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        thread = loader._monitor_thread
++        assert thread is not None
++        assert thread.is_alive()
++        loader.close()
++        assert not thread.is_alive()
++
++    def test_close_idempotent(self):
++        """close() is idempotent."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        loader.close()
++        loader.close()  # Second call should not raise
++        assert True
++
++    def test_start_monitoring_idempotent(self):
++        """start_monitoring() is idempotent."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        thread_id = id(loader._monitor_thread)
++        loader.start_monitoring()
++        assert id(loader._monitor_thread) == thread_id
++
++    def test_context_manager_calls_close(self):
++        """Context manager closes the monitor."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        with loader:
++            assert loader._monitor_thread is not None
++            thread = loader._monitor_thread
++        assert not thread.is_alive()
++
++    def test_weak_tracking_does_not_keep_env_alive(self):
++        """Environments are weakly tracked and can be garbage collected."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=False)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        # auto_reload=False means _environments is not populated in get_source
++        # So we manually add to _environments for this test
++        ref = weakref.ref(env)
++        loader._environments.add(env)
++        assert env in list(loader._environments)
++        del env
++        import gc
++        gc.collect()
++        assert ref() is None
++        assert len(list(loader._environments)) == 0
++
++    def test_auto_reload_tracks_environment(self):
++        """With auto_reload=True, get_source tracks the environment."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=True)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        assert env in list(loader._environments)
++
++    def test_background_errors_do_not_terminate_monitor(self):
++        """Background filesystem errors don't terminate the monitor thread."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        thread = loader._monitor_thread
++        assert thread is not None and thread.is_alive()
++        # The monitor will encounter any issues and just pass (caught in _monitor_loop)
++        # No way to force an error without breaking the filesystem, but verify
++        # the monitor loop catch clause is present by inspecting the source:
++        import inspect
++        source = inspect.getsource(loaders.FileSystemLoader._monitor_loop)
++        assert "except Exception" in source
++        assert "pass" in source
++
++    def test_restart_after_close(self):
++        """A closed loader can be restarted."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        thread1 = loader._monitor_thread
++        loader.close()
++        assert not thread1.is_alive()
++        loader.start_monitoring()
++        thread2 = loader._monitor_thread
++        assert thread2 is not None
++        assert thread2.is_alive()
++        assert thread2 is not thread1
++        loader.close()
++
++    def test_scan_no_monitor_no_crash(self):
++        """scan_once works even when monitoring was never started."""
++        loader = loaders.FileSystemLoader(self.searchpath, auto_reload=False)
++        # _mtimes is empty dict (never initialized)
++        assert loader._mtimes == {}
++        changed = loader.scan_once()
++        assert isinstance(changed, list)
++        # After scan, _mtimes should be populated
++        assert len(loader._mtimes) > 0

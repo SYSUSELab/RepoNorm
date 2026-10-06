@@ -1,0 +1,94 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..485fb11 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -355,6 +355,24 @@ class InternationalizationExtension(Extension):
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+         num_called_num = False
++        def validate_expression(node):
++            if isinstance(node, (nodes.Const, nodes.Name)):
++                return True
++            if isinstance(node, nodes.Getattr):
++                return validate_expression(node.node)
++            if isinstance(node, nodes.Filter):
++                return validate_expression(node.node) and all(validate_expression(arg) for arg in node.args)
++            if isinstance(node, nodes.Test):
++                return validate_expression(node.node) and all(validate_expression(arg) for arg in node.args)
++            if isinstance(node, nodes.Call):
++                if not isinstance(node.node, nodes.Name):
++                    return False
++                if node.dyn_args is not None or node.dyn_kwargs is not None:
++                    return False
++                return all(validate_expression(arg) for arg in node.args) and \
++                       all(validate_expression(kw.value) for kw in node.kwargs)
++            return False
++
+ 
+         # find all the variables referenced.  Additionally a variable can be
+         # defined in the body of the trans block too, but this is checked at
+@@ -378,11 +396,25 @@ class InternationalizationExtension(Extension):
+                     token.lineno,
+                     exc=TemplateAssertionError,
+                 )
++            if token.value in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++                parser.fail(
++                    f"translatable variable {token.value!r} conflicts with translation function names.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
+ 
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                if not validate_expression(var):
++                    parser.fail(
++                        f"translatable variable {token.value!r} has an invalid expression.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+diff --git a/tests/test_trans_validation.py b/tests/test_trans_validation.py
+new file mode 100644
+index 0000000..6714a19
+--- /dev/null
++++ b/tests/test_trans_validation.py
+@@ -0,0 +1,32 @@
++import pytest
++from jinja2 import Environment, DictLoader, exceptions
++from jinja2.ext import i18n
++
++@pytest.fixture
++def env():
++    env = Environment(loader=DictLoader({}), extensions=[i18n])
++    env.filters['filter'] = lambda x: x
++    env.tests['test'] = lambda x: True
++    return env
++
++def test_reserved_names(env):
++    for name in ["gettext", "ngettext", "pgettext", "npgettext", "_"]:
++        with pytest.raises(exceptions.TemplateSyntaxError, match=f"conflicts with translation function names"):
++            env.compile(f"{{% trans {name}='foo' %}}bar{{% endtrans %}}")
++
++def test_invalid_expressions(env):
++    invalid_exprs = [
++        "a+b", "a-b", "a*b", "a/b", "a if b else c", "obj[key]",
++        "func(*args)", "func(**kwargs)", "obj.method()"
++    ]
++    for expr in invalid_exprs:
++        with pytest.raises(exceptions.TemplateSyntaxError, match="has an invalid expression"):
++            env.compile(f"{{% trans x={expr} %}}bar{{% endtrans %}}")
++
++def test_valid_expressions(env):
++    valid_exprs = [
++        "1", "y", "obj.attr", "obj.attr.sub", "func(a, b=c)",
++        "val|filter", "val|filter(a)", "val is test"
++    ]
++    for expr in valid_exprs:
++        env.compile(f"{{% trans x={expr} %}}bar{{% endtrans %}}")

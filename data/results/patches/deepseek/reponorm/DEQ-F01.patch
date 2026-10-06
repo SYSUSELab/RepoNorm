@@ -1,0 +1,399 @@
+diff --git a/dirty_equals/__init__.py b/dirty_equals/__init__.py
+index ba8214e..e6fd2f5 100644
+--- a/dirty_equals/__init__.py
++++ b/dirty_equals/__init__.py
+@@ -18,6 +18,7 @@ from ._numeric import (
+     IsPositiveFloat,
+     IsPositiveInt,
+ )
++from ._ip import IsIP
+ from ._other import FunctionCheck, IsJson, IsUUID
+ from ._sequence import Contains, HasLen, IsList, IsListOrTuple, IsTuple
+ from ._strings import IsAnyStr, IsBytes, IsStr
+@@ -65,6 +66,8 @@ __all__ = (
+     'HasName',
+     'HasRepr',
+     'IsInstance',
++    # ip
++    'IsIP',
+     # other
+     'FunctionCheck',
+     'IsJson',
+diff --git a/dirty_equals/_ip.py b/dirty_equals/_ip.py
+new file mode 100644
+index 0000000..fd418f6
+--- /dev/null
++++ b/dirty_equals/_ip.py
+@@ -0,0 +1,172 @@
++import ipaddress
++from typing import Any, List, Optional, Sequence, Tuple, Union
++
++from ._base import DirtyEquals
++
++__all__ = ('IsIP',)
++
++
++def _parse_netmask(netmask: Any, version: int) -> int:
++    """Parse a netmask value into an integer for comparison."""
++    if isinstance(netmask, int):
++        return netmask
++    if version == 4:
++        return int(ipaddress.IPv4Address(netmask))
++    else:
++        return int(ipaddress.IPv6Address(netmask))
++
++
++def _parse_within_range(range_value: Any) -> List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
++    """Parse a within range spec into a list of IPv4Network/IPv6Network objects."""
++    if isinstance(range_value, str):
++        # Must be a strict CIDR
++        if '/' not in range_value:
++            raise ValueError(f'Not a valid CIDR network: {range_value!r}')
++        try:
++            net = ipaddress.ip_network(range_value, strict=True)
++        except ValueError as e:
++            raise ValueError(str(e))
++        return [net]
++    elif isinstance(range_value, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++        return [range_value]
++    elif isinstance(range_value, (list, tuple)):
++        if not range_value:
++            raise ValueError('within must be a non-empty list or tuple')
++        result = []
++        for item in range_value:
++            if isinstance(item, str):
++                if '/' not in item:
++                    raise ValueError(f'Not a valid CIDR network: {item!r}')
++                try:
++                    net = ipaddress.ip_network(item, strict=True)
++                except ValueError as e:
++                    raise ValueError(str(e))
++                result.append(net)
++            elif isinstance(item, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                result.append(item)
++            else:
++                raise ValueError(f'Invalid within range element: {item!r}')
++        return result
++    else:
++        raise ValueError(f'Invalid within range: {range_value!r}')
++
++
++def _check_within(obj: Any, within_ranges: List) -> bool:
++    """Check if obj (address or network) is within the given ranges."""
++    for net in within_ranges:
++        if isinstance(obj, ipaddress.IPv4Address) and isinstance(net, ipaddress.IPv4Network):
++            if obj in net:
++                return True
++        elif isinstance(obj, ipaddress.IPv6Address) and isinstance(net, ipaddress.IPv6Network):
++            if obj in net:
++                return True
++        elif isinstance(obj, ipaddress.IPv4Network) and isinstance(net, ipaddress.IPv4Network):
++            if obj.subnet_of(net):
++                return True
++        elif isinstance(obj, ipaddress.IPv6Network) and isinstance(net, ipaddress.IPv6Network):
++            if obj.subnet_of(net):
++                return True
++    return False
++
++
++class IsIP(DirtyEquals):
++    """
++    A class that checks if a value is a valid IP address or network.
++
++    Can check version, netmask, and containment within specific networks.
++    """
++
++    def __init__(self, version: Optional[int] = None, *, netmask: Any = None, within: Any = None):
++        """
++        Args:
++            version: The IP version to check (4 or 6), if omitted, all versions are accepted.
++            netmask: The network mask to check (only for network values).
++            within: A CIDR network string, network object, or list/tuple of these to check containment.
++        """
++        if version is not None and version not in (4, 6):
++            raise ValueError(f'version must be None, 4, or 6, got {version!r}')
++
++        if netmask is not None and version is None:
++            raise TypeError('To check the netmask you must specify the IP version')
++
++        self.version = version
++        self._netmask = None
++        if netmask is not None:
++            self._netmask = _parse_netmask(netmask, version)
++
++        self._within = None
++        if within is not None:
++            self._within = _parse_within_range(within)
++
++        # Build repr args
++        repr_args: Tuple[Any, ...] = ()
++        if version is not None:
++            repr_args = (version,)
++
++        repr_kwargs = {}
++        if netmask is not None:
++            repr_kwargs['netmask'] = netmask
++        if within is not None:
++            repr_kwargs['within'] = within
++
++        super().__init__(*repr_args, **repr_kwargs)
++
++    def equals(self, other: Any) -> bool:
++        parsed = self._parse(other)
++        if parsed is None:
++            return False
++
++        kind, obj = parsed
++
++        # Check version
++        if self.version is not None:
++            if self.version == 4 and not isinstance(obj, (ipaddress.IPv4Address, ipaddress.IPv4Network)):
++                return False
++            if self.version == 6 and not isinstance(obj, (ipaddress.IPv6Address, ipaddress.IPv6Network)):
++                return False
++
++        # Check netmask (only for networks)
++        if self._netmask is not None and kind == 'network':
++            candidate_netmask = int(obj.netmask)
++            if candidate_netmask != self._netmask:
++                return False
++
++        # Check within
++        if self._within is not None:
++            if not _check_within(obj, self._within):
++                return False
++
++        return True
++
++    @staticmethod
++    def _parse(value: Any) -> Optional[Tuple[str, Any]]:
++        """Parse a value into (kind, ipaddress_object) or None if invalid."""
++        if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
++            return ('address', value)
++        elif isinstance(value, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++            return ('network', value)
++        elif isinstance(value, str):
++            # Try address first
++            try:
++                return ('address', ipaddress.ip_address(value))
++            except ValueError:
++                pass
++            # Then try network (with strict=False to normalize host bits)
++            try:
++                return ('network', ipaddress.ip_network(value, strict=False))
++            except ValueError:
++                return None
++        elif isinstance(value, bytes):
++            try:
++                return ('address', ipaddress.ip_address(value))
++            except ValueError:
++                return None
++        elif isinstance(value, int):
++            if 0 <= value < 2**32:
++                return ('address', ipaddress.IPv4Address(value))
++            elif 2**32 <= value < 2**128:
++                return ('address', ipaddress.IPv6Address(value))
++            else:
++                return None
++        else:
++            return None
+diff --git a/tests/test_ip.py b/tests/test_ip.py
+new file mode 100644
+index 0000000..f20f32b
+--- /dev/null
++++ b/tests/test_ip.py
+@@ -0,0 +1,194 @@
++import ipaddress
++
++import pytest
++
++from dirty_equals import IsIP
++
++
++@pytest.mark.parametrize(
++    'other,dirty',
++    [
++        # Basic strings
++        ('192.168.0.1', IsIP()),
++        ('192.168.0.1', IsIP),
++        ('0.0.0.0', IsIP()),
++        ('255.255.255.255', IsIP()),
++        ('2001:db8::', IsIP()),
++        ('::1', IsIP()),
++        ('::', IsIP()),
++        # Integers
++        (0, IsIP()),
++        (3232235521, IsIP()),  # 192.168.0.1
++        (4294967295, IsIP()),  # 255.255.255.255
++        (2**32, IsIP()),       # first IPv6 address (::1:0:0)
++        (2**128 - 1, IsIP()),  # last IPv6 address
++        # Bytes
++        (b'\xc0\xa8\x00\x01', IsIP()),           # 192.168.0.1
++        (b'\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01', IsIP()),  # 2001:db8::1
++        # ipaddress objects
++        (ipaddress.IPv4Address('192.168.0.1'), IsIP()),
++        (ipaddress.IPv6Address('2001:db8::'), IsIP()),
++        (ipaddress.IPv4Network('192.168.0.0/24'), IsIP()),
++        (ipaddress.IPv6Network('2001:db8::/32'), IsIP()),
++        # Version-specific
++        ('192.168.0.1', IsIP(4)),
++        ('2001:db8::', IsIP(6)),
++        (3232235521, IsIP(4)),   # < 2**32 => IPv4
++        (2**32, IsIP(6)),        # >= 2**32 => IPv6
++        (ipaddress.IPv4Address('192.168.0.1'), IsIP(4)),
++        (ipaddress.IPv6Address('2001:db8::'), IsIP(6)),
++        (ipaddress.IPv4Network('192.168.0.0/24'), IsIP(4)),
++        (ipaddress.IPv6Network('2001:db8::/32'), IsIP(6)),
++        # String network with host bits set - should be accepted
++        ('192.168.0.1/24', IsIP(4)),
++        ('2001:db8::1/32', IsIP(6)),
++        # netmask
++        ('192.168.0.0/24', IsIP(4, netmask='255.255.255.0')),
++        ('2001:db8::/32', IsIP(6, netmask='ffff:ffff::')),
++        ('192.168.0.0/24', IsIP(4, netmask=0xffffff00)),
++        # within - address
++        ('192.168.0.1', IsIP(within='192.168.0.0/16')),
++        ('2001:db8::1', IsIP(within='2001:db8::/32')),
++        # within - network contained
++        ('192.168.0.0/24', IsIP(within='192.168.0.0/16')),
++        ('10.1.0.0/16', IsIP(within=['10.0.0.0/8', '192.168.0.0/16'])),
++        # Combined: version + within
++        ('192.168.0.1', IsIP(4, within='192.168.0.0/16')),
++        # within with ipaddress objects
++        ('192.168.0.1', IsIP(within=ipaddress.IPv4Network('192.168.0.0/16'))),
++        ('192.168.0.1', IsIP(within=[ipaddress.IPv4Network('192.168.0.0/16')])),
++        # within tuple
++        ('192.168.0.1', IsIP(within=('192.168.0.0/16',))),
++        # mixed list
++        ('192.168.0.1', IsIP(within=[ipaddress.IPv4Network('192.168.0.0/16'), '10.0.0.0/8'])),
++    ],
++)
++def test_is_ip_true(other, dirty):
++    assert other == dirty
++
++
++@pytest.mark.parametrize(
++    'other,dirty',
++    [
++        # Version mismatch
++        ('192.168.0.1', IsIP(6)),
++        ('2001:db8::', IsIP(4)),
++        (3232235521, IsIP(6)),   # < 2**32 => IPv4, version 6 rejection
++        (2**32, IsIP(4)),        # >= 2**32 => IPv6, version 4 rejection
++        (ipaddress.IPv4Address('192.168.0.1'), IsIP(6)),
++        (ipaddress.IPv6Address('2001:db8::'), IsIP(4)),
++        (ipaddress.IPv4Network('192.168.0.0/24'), IsIP(6)),
++        (ipaddress.IPv6Network('2001:db8::/32'), IsIP(4)),
++        # Invalid values (compare unequal, no exceptions)
++        ('not an ip', IsIP()),
++        (None, IsIP()),
++        (123.456, IsIP()),
++        (object(), IsIP()),
++        ([], IsIP()),
++        ({}, IsIP()),
++        # Version mismatch for string networks
++        ('192.168.0.0/24', IsIP(6)),
++        ('2001:db8::/32', IsIP(4)),
++        # netmask mismatch
++        ('192.168.0.0/24', IsIP(4, netmask='255.255.0.0')),
++        ('2001:db8::/32', IsIP(6, netmask='ffff:ffff:ffff::')),
++        ('192.168.0.0/24', IsIP(4, netmask=0xffff0000)),
++        # within - address not in network
++        ('10.0.0.1', IsIP(within='192.168.0.0/16')),
++        # within - network not contained (overlap only)
++        ('192.168.0.0/24', IsIP(within='192.168.0.128/25')),
++        # within - version mismatch
++        ('2001:db8::1', IsIP(within='192.168.0.0/16')),
++        # Integer outside IP range (>2**128)
++        (2**128, IsIP()),
++    ],
++)
++def test_is_ip_false(other, dirty):
++    assert other != dirty
++
++
++def test_repr():
++    assert repr(IsIP()) == 'IsIP()'
++    assert repr(IsIP(4)) == 'IsIP(4)'
++    assert repr(IsIP(6)) == 'IsIP(6)'
++    assert repr(IsIP(4, netmask='255.255.255.0')) == "IsIP(4, netmask='255.255.255.0')"
++    assert repr(IsIP(6, within='2001:db8::/32')) == "IsIP(6, within='2001:db8::/32')"
++
++
++def test_netmask_requires_version():
++    with pytest.raises(TypeError, match='To check the netmask you must specify the IP version'):
++        IsIP(netmask='255.255.255.0')
++
++
++def test_invalid_within_raises():
++    # Bare address without CIDR
++    with pytest.raises(ValueError):
++        IsIP(within='192.168.0.1')
++    # Invalid CIDR
++    with pytest.raises(ValueError):
++        IsIP(within='not a cidr')
++    # Empty list
++    with pytest.raises(ValueError):
++        IsIP(within=[])
++    # Non-string, non-network element
++    with pytest.raises(ValueError):
++        IsIP(within=[42])
++
++
++def test_dirty_not():
++    d = IsIP(4)
++    assert '192.168.0.1' == d
++    with pytest.raises(AssertionError):
++        assert '2001:db8::' == d
++    assert repr(d) == 'IsIP(4)'
++
++
++def test_network_non_containment():
++    """A network input must be wholly contained; overlap alone is insufficient."""
++    assert '192.168.0.0/24' != IsIP(within='192.168.0.128/25')
++
++
++def test_preserves_original_value():
++    d = IsIP()
++    assert d == '192.168.0.1'
++    assert d._other == '192.168.0.1'
++
++
++def test_bytes_v4():
++    assert b'\xc0\xa8\x00\x01' == IsIP(4)
++    assert b'\xc0\xa8\x00\x01' == IsIP()
++
++
++def test_bytes_v6():
++    val = b'\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
++    assert val == IsIP(6)
++    assert val == IsIP()
++
++
++def test_boolean_integers():
++    """True/False are valid IPv4 addresses as integers 1/0."""
++    import warnings
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", DeprecationWarning)
++        assert True == IsIP()
++        assert False == IsIP()
++        assert True == IsIP(4)
++        assert False == IsIP(4)
++        assert True != IsIP(6)
++        assert False != IsIP(6)
++
++
++def test_large_zero():
++    """An integer exactly 2**32 is the start of IPv6 range."""
++    assert 2**32 == IsIP(6)
++    assert 2**32 != IsIP(4)
++
++
++def test_version_validation():
++    """Version must be None, 4, or 6."""
++    with pytest.raises(ValueError):
++        IsIP(version=5)
++    with pytest.raises(ValueError):
++        IsIP(version='4')
++    with pytest.raises(ValueError):
++        IsIP(version=0)

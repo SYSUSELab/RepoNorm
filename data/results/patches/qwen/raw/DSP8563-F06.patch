@@ -1,0 +1,272 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..ac1f99d0 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import inspect
++import re
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -15,6 +16,43 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++def extract_json_from_markdown(text: str) -> str | None:
++    """Extract JSON from markdown fenced code blocks.
++    
++    Only considers the first triple-backtick block. The opening fence may have
++    any language label (including json, JSON, or no label), followed by a newline;
++    the next triple-backtick delimiter closes it. Parse the trimmed body as JSON,
++    ignoring surrounding prose.
++    
++    Args:
++        text: The input text that may contain markdown fenced code blocks.
++        
++    Returns:
++        The extracted JSON string if a valid markdown fence is found, otherwise None.
++        
++    Examples:
++        >>> extract_json_from_markdown('```json\n{"key": "value"}\n```')
++        '{"key": "value"}'
++        >>> extract_json_from_markdown('Some text\n```json\n{"key": "value"}\n```\nMore text')
++        '{"key": "value"}'
++        >>> extract_json_from_markdown('Plain JSON without fences')
++        None
++    """
++    # Pattern to match the first markdown code fence anywhere in text
++    # Opening fence: ``` followed by optional language label, then newline
++    # Content: anything until closing fence
++    # Closing fence: ``` at start of line
++    # Use search() without anchors to find first fence anywhere
++    # Non-greedy match for content, then closing fence
++    pattern = r'\`\`\`(?:[a-zA-Z]+)?\n(.*?)\n\`\`\`\s*'
++    match = re.search(pattern, text, re.DOTALL)
++    
++    if match:
++        return match.group(1).strip()
++    
++    # If no markdown fence found, return None
++    return None
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -309,6 +347,216 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    @classmethod
++    def validate_input(cls, data):
++        """Public extraction helper for parsing ToolCalls input.
++        
++        This method attempts to extract and parse ToolCalls from various input formats:
++        - Plain JSON strings
++        - JSON wrapped in markdown code fences
++        - Python lists of dicts
++        - Single dict objects (converted to list format)
++        
++        On success, returns the parsed Python structure. On failure, returns the original input unchanged.
++        
++        Args:
++            data: The input data to parse.
++            
++        Returns:
++            Parsed Python structure on success, original input on failure.
++            
++        Examples:
++            >>> ToolCalls.validate_input('[]')
++            []
++            >>> ToolCalls.validate_input('[{"name": "search", "args": {"query": "hello"}}]')
++            [{'name': 'search', 'args': {'query': 'hello'}}]
++            >>> ToolCalls.validate_input({'name': 'search', 'args': {'query': 'hello'}})
++            [{'name': 'search', 'args': {'query': 'hello'}}]
++        """
++        import json
++        
++        # If already a list or dict, try to process it directly
++        if isinstance(data, list):
++            return data
++        if isinstance(data, dict):
++            # Single object format - wrap in list
++            return [data]
++        
++        # If it's a string, try to extract from markdown or parse as JSON
++        if isinstance(data, str):
++            # First, try to extract from markdown fence
++            extracted = extract_json_from_markdown(data)
++            if extracted is not None:
++                try:
++                    parsed = json.loads(extracted)
++                    if isinstance(parsed, list):
++                        return parsed
++                    elif isinstance(parsed, dict):
++                        return [parsed]
++                    return parsed
++                except json.JSONDecodeError:
++                    pass
++            
++            # Try to parse the original string as JSON
++            try:
++                parsed = json.loads(data)
++                if isinstance(parsed, list):
++                    return parsed
++                elif isinstance(parsed, dict):
++                    return [parsed]
++                return parsed
++            except json.JSONDecodeError:
++                pass
++        
++        # Return original input if parsing failed
++        return data
++
++    @classmethod
++    def model_validate(cls, obj, **kwargs):
++        """Override model_validate to support markdown fences and flexible input formats.
++        
++        This method accepts:
++        - Plain JSON strings
++        - JSON wrapped in markdown code fences
++        - Python lists of dicts
++        - Single dict objects (converted to list format)
++        - Canonical tool_calls containers {"tool_calls": [...]}
++        
++        Args:
++            obj: The input object to validate.
++            **kwargs: Additional keyword arguments passed to the parent method.
++            
++        Returns:
++            A validated ToolCalls instance.
++            
++        Raises:
++            pydantic.ValidationError: If the input cannot be parsed into a valid ToolCalls.
++        """
++        import json
++        
++        # Handle string inputs (plain JSON or markdown-wrapped JSON)
++        if isinstance(obj, str):
++            # First, try to extract from markdown fence
++            extracted = extract_json_from_markdown(obj)
++            if extracted is not None:
++                try:
++                    parsed = json.loads(extracted)
++                    # Convert to proper format for ToolCalls
++                    if isinstance(parsed, dict):
++                        if "tool_calls" in parsed:
++                            # Canonical container format
++                            return super().model_validate(parsed, **kwargs)
++                        else:
++                            # Single object format - wrap in list
++                            parsed = [parsed]
++                    elif isinstance(parsed, list):
++                        # Bare list format
++                        pass
++                    else:
++                        return super().model_validate(obj, **kwargs)
++                    return super().model_validate({"tool_calls": parsed}, **kwargs)
++                except json.JSONDecodeError:
++                    pass
++            
++            # Try to parse the original string as JSON
++            try:
++                parsed = json.loads(obj)
++                # Convert to proper format for ToolCalls
++                if isinstance(parsed, dict):
++                    if "tool_calls" in parsed:
++                        # Canonical container format
++                        return super().model_validate(parsed, **kwargs)
++                    else:
++                        # Single object format - wrap in list
++                        parsed = [parsed]
++                elif isinstance(parsed, list):
++                    # Bare list format
++                    pass
++                else:
++                    return super().model_validate(obj, **kwargs)
++                return super().model_validate({"tool_calls": parsed}, **kwargs)
++            except json.JSONDecodeError:
++                pass
++        
++        # Handle list inputs (bare list format)
++        if isinstance(obj, list):
++            return super().model_validate({"tool_calls": obj}, **kwargs)
++        
++        # Handle dict inputs
++        if isinstance(obj, dict):
++            if "tool_calls" in obj:
++                # Canonical container format
++                return super().model_validate(obj, **kwargs)
++            else:
++                # Single object format - wrap in list
++                return super().model_validate({"tool_calls": [obj]}, **kwargs)
++        
++        # For other types, fall back to default behavior
++        return super().model_validate(obj, **kwargs)
++
++    @classmethod
++    def model_validate_json(cls, json_str, **kwargs):
++        """Override model_validate_json to support markdown fences.
++        
++        This method accepts JSON strings wrapped in markdown code fences.
++        
++        Args:
++            json_str: The JSON string to validate, optionally wrapped in markdown fences.
++            **kwargs: Additional keyword arguments passed to the parent method.
++            
++        Returns:
++            A validated ToolCalls instance.
++            
++        Raises:
++            pydantic.ValidationError: If the input cannot be parsed into a valid ToolCalls.
++        """
++        import json
++        
++        # Try to extract from markdown fence first
++        extracted = extract_json_from_markdown(json_str)
++        if extracted is not None:
++            try:
++                parsed = json.loads(extracted)
++                # Convert to proper format for ToolCalls
++                if isinstance(parsed, dict):
++                    if "tool_calls" in parsed:
++                        # Canonical container format
++                        return super().model_validate(parsed, **kwargs)
++                    else:
++                        # Single object format - wrap in list
++                        parsed = [parsed]
++                elif isinstance(parsed, list):
++                    # Bare list format
++                    pass
++                else:
++                    return super().model_validate_json(json_str, **kwargs)
++                return super().model_validate({"tool_calls": parsed}, **kwargs)
++            except json.JSONDecodeError:
++                pass
++        
++        # Try to parse the original JSON string directly
++        try:
++            parsed = json.loads(json_str)
++            # Convert to proper format for ToolCalls
++            if isinstance(parsed, dict):
++                if "tool_calls" in parsed:
++                    # Canonical container format
++                    return super().model_validate(parsed, **kwargs)
++                else:
++                    # Single object format - wrap in list
++                    parsed = [parsed]
++            elif isinstance(parsed, list):
++                # Bare list format
++                pass
++            else:
++                return super().model_validate_json(json_str, **kwargs)
++            return super().model_validate({"tool_calls": parsed}, **kwargs)
++        except json.JSONDecodeError:
++            pass
++        
++        # Fall back to default behavior
++        return super().model_validate_json(json_str, **kwargs)
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""

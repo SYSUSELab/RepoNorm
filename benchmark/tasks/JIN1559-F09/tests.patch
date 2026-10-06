@@ -1,0 +1,147 @@
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..b2f0d19 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -8,6 +8,7 @@ from jinja2 import Environment
+ from jinja2 import nodes
+ from jinja2 import pass_context
+ from jinja2.exceptions import TemplateAssertionError
++from jinja2.exceptions import TemplateSyntaxError
+ from jinja2.ext import Extension
+ from jinja2.lexer import count_newlines
+ from jinja2.lexer import Token
+@@ -712,3 +713,134 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++def test_extract_marker_public_records_and_render():
++    env = Environment(extensions=["jinja2.ext.i18n", "jinja2.ext.TranslationExtractorExtension"])
++    env.install_null_translations()
++    source = '{% extract comment="Button", priority=2 %}{{ _("Login") }}{% endextract %}'
++    assert env.from_string(source).render() == "Login"
++    records = list(env.extract_marked_translations(source, "page.html"))
++    assert records == [{
++        "source": "page.html", "lineno": 1,
++        "metadata": {"comment": "Button", "priority": 2},
++        "messages": [{"lineno": 1, "function": "_", "message": "Login"}],
++    }]
++    records[0]["metadata"]["comment"] = "changed"
++    assert list(env.extract_marked_translations(source))[0]["metadata"]["comment"] == "Button"
++
++
++def test_extract_marker_nested_messages_and_normal_extraction():
++    env = Environment(extensions=["jinja2.ext.i18n", "jinja2.ext.TranslationExtractorExtension"])
++    source = '{% extract context="outer" %}{{ _("A") }}{% if ok %}{{ gettext("B") }}{% endif %}{% endextract %}'
++    record = list(env.extract_marked_translations(source))[0]
++    assert [m["message"] for m in record["messages"]] == ["A", "B"]
++    assert [m[2] for m in env.extract_translations(source)] == ["A", "B"]
++
++
++def test_extract_marker_validation_and_stability():
++    env = Environment(extensions=["jinja2.ext.TranslationExtractorExtension"])
++    with pytest.raises(TemplateSyntaxError, match="note"):
++        env.from_string("{% extract note=value %}x{% endextract %}")
++    with pytest.raises(TemplateSyntaxError, match="note"):
++        env.from_string('{% extract note="a", note="b" %}x{% endextract %}')
++    source = '{% extract note="a" %}x{% endextract %}'
++    assert list(env.extract_marked_translations(source)) == list(env.extract_marked_translations(source))
++
++
++def test_marker_babel_entrypoint_preserves_message_lines_and_comments():
++    from jinja2.ext import babel_extract
++
++    source = (
++        '{% extract note="button" %}\n'
++        '{# trans Button caption #}\n'
++        '{{ gettext("Open") }}\n'
++        '{# trans Number of files #}\n'
++        '{{ ngettext("one file", "many files", n) }}\n'
++        '{% endextract %}\n'
++    )
++    options = {"extensions": "jinja2.ext.TranslationExtractorExtension", "silent": "false"}
++    assert list(babel_extract(BytesIO(source.encode()), ("gettext", "ngettext"), ["trans"], options)) == [
++        (3, "gettext", "Open", ["Button caption"]),
++        (5, "ngettext", ("one file", "many files", None), ["Number of files"]),
++    ]
++
++
++@pytest.mark.parametrize("silent", [False, True])
++def test_marker_babel_preserves_configured_syntax_error_policy(silent):
++    from jinja2.ext import babel_extract
++
++    options = {
++        "extensions": "jinja2.ext.TranslationExtractorExtension",
++        "silent": str(silent).lower(),
++    }
++    source = BytesIO(b'{% extract note=dynamic %}{{ gettext("Open") }}{% endextract %}')
++    if silent:
++        assert list(babel_extract(source, ("gettext",), [], options)) == []
++    else:
++        with pytest.raises(TemplateSyntaxError, match="note"):
++            list(babel_extract(source, ("gettext",), [], options))
++
++
++def test_marker_batch_logical_names_selection_and_independent_records():
++    from jinja2 import PrefixLoader
++
++    child = DictLoader({
++        "a.html": '{% extract note="A" %}{{ gettext("Alpha") }}{% endextract %}',
++        "b.html": '{% extract note="B" %}{{ gettext("Beta") }}{% endextract %}',
++    })
++    env = Environment(loader=PrefixLoader({"pkg": child}), extensions=["jinja2.ext.TranslationExtractorExtension"])
++    selected = list(env.extract_marked_translations_from_templates(iter(["pkg/b.html", "pkg/a.html"])))
++    assert [r["source"] for r in selected] == ["pkg/b.html", "pkg/a.html"]
++    assert [r["messages"][0]["message"] for r in selected] == ["Beta", "Alpha"]
++    selected[0]["metadata"]["note"] = "changed"
++    all_records = list(env.extract_marked_translations_from_templates())
++    assert [r["source"] for r in all_records] == ["pkg/a.html", "pkg/b.html"]
++    assert [r["metadata"]["note"] for r in all_records] == ["A", "B"]
++    assert list(env.extract_marked_translations_from_templates([])) == []
++
++
++@pytest.mark.parametrize("filename", [None, "/virtual/resource.html"])
++def test_marker_batch_custom_loader_source_contract(filename):
++    from jinja2 import BaseLoader
++    from jinja2 import TemplateNotFound
++
++    class ResourceLoader(BaseLoader):
++        def __init__(self):
++            self.message = "First"
++
++        def get_source(self, environment, name):
++            if name != "logical.html":
++                raise TemplateNotFound(name)
++            source = '{% extract note="resource" %}{{ gettext("' + self.message + '") }}{% endextract %}'
++            return source, filename, None
++
++    loader = ResourceLoader()
++    env = Environment(loader=loader, extensions=["jinja2.ext.TranslationExtractorExtension"])
++    record = list(env.extract_marked_translations_from_templates(["logical.html"]))[0]
++    assert record["source"] == "logical.html"
++    assert record["messages"] == [{"lineno": 1, "function": "gettext", "message": "First"}]
++    loader.message = "Second"
++    assert list(env.extract_marked_translations_from_templates(["logical.html"]))[0]["messages"][0]["message"] == "Second"
++    with pytest.raises(TemplateNotFound) as error:
++        list(env.extract_marked_translations_from_templates(["missing.html"]))
++    assert error.value.name == "missing.html"
++
++
++def test_marker_batch_function_loader_explicit_names_without_listing():
++    from jinja2 import FunctionLoader
++
++    source = '{% extract note="callable" %}{{ gettext("Hello") }}{% endextract %}'
++    env = Environment(loader=FunctionLoader(lambda name: source), extensions=["jinja2.ext.TranslationExtractorExtension"])
++    assert list(env.extract_marked_translations_from_templates(["page.html"]))[0]["source"] == "page.html"
++    with pytest.raises(TypeError):
++        list(env.extract_marked_translations_from_templates())
++
++
++def test_marker_batch_does_not_render_or_follow_dependencies():
++    source = '{% extends "absent-parent.html" %}{% include "absent-child.html" %}{% extract note="static" %}{{ explode() }}{{ gettext("Static") }}{% endextract %}'
++    env = Environment(loader=DictLoader({"page.html": source}), extensions=["jinja2.ext.TranslationExtractorExtension"])
++    env.globals["explode"] = lambda: 1 / 0
++    records = list(env.extract_marked_translations_from_templates())
++    assert len(records) == 1
++    assert records[0]["messages"] == [{"lineno": 1, "function": "gettext", "message": "Static"}]

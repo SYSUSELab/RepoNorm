@@ -1,0 +1,184 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..1b4b891 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,8 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Optional, List, Dict, Any
++import threading
++import os
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -22,12 +24,16 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: str, track_memory_usage: bool = False, memory_history_limit: Optional[int] = None):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        track_memory_usage: bool
++            Whether to track memory usage.
++        memory_history_limit: int | None
++            The maximum number of memory history entries to retain.
+ 
+         """
+         import xgrammar as xgr
+@@ -35,11 +41,49 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
++        self.track_memory_usage = track_memory_usage
++        
++        if not isinstance(memory_history_limit, (int, type(None))) or isinstance(memory_history_limit, bool):
++            raise ValueError("memory_history_limit must be an integer or None")
++        if memory_history_limit is not None and memory_history_limit < 0:
++            raise ValueError("memory_history_limit must be non-negative")
++            
++        self.memory_history_limit = memory_history_limit
++        
++        self.lock = threading.Lock()
++        self.total_calls = 0
++        self.peak_memory_mb = 0.0
++        self.sum_memory_mb = 0.0
++        self.memory_history = []
++        
++        if self.track_memory_usage:
++            try:
++                import psutil
++                self.psutil = psutil
++            except ImportError:
++                raise ImportError("psutil is required for memory tracking. Please install it with `pip install psutil`.")
++        
+         super().__init__("torch")
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+-        self.xgrammar_logits_processor = None
++        with self.lock:
++            self.xgrammar_logits_processor = None
++            self.total_calls = 0
++            self.peak_memory_mb = 0.0
++            self.sum_memory_mb = 0.0
++            self.memory_history = []
++
++    def get_memory_stats(self) -> Dict[str, Any]:
++        """Return memory statistics."""
++        with self.lock:
++            avg_memory = self.sum_memory_mb / self.total_calls if self.total_calls > 0 else 0.0
++            return {
++                "total_calls": self.total_calls,
++                "peak_memory_mb": self.peak_memory_mb,
++                "avg_memory_per_call_mb": avg_memory,
++                "memory_history": list(self.memory_history)
++            }
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
+@@ -47,7 +91,38 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++            
++        if not self.track_memory_usage:
++            return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++            
++        process = self.psutil.Process(os.getpid())
++        try:
++            before_rss = process.memory_info().rss
++        except Exception:
++            before_rss = None
++            
++        result = self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        
++        if before_rss is not None:
++            try:
++                after_rss = process.memory_info().rss
++                delta_mb = max(after_rss - before_rss, 0) / (1024 * 1024)
++            except Exception:
++                delta_mb = 0.0
++        else:
++            delta_mb = 0.0
++            
++        with self.lock:
++            self.total_calls += 1
++            self.peak_memory_mb = max(self.peak_memory_mb, delta_mb)
++            self.sum_memory_mb += delta_mb
++            
++            if self.memory_history_limit is not None:
++                self.memory_history.append(delta_mb)
++                if len(self.memory_history) > self.memory_history_limit:
++                    self.memory_history.pop(0)
++            
++        return result
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -79,7 +154,7 @@ class XGrammarBackend(BaseBackend):
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self, json_schema: str, track_memory_usage: bool = False, memory_history_limit: Optional[int] = None
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -97,9 +172,9 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, track_memory_usage=track_memory_usage, memory_history_limit=memory_history_limit)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(self, regex: str, track_memory_usage: bool = False, memory_history_limit: Optional[int] = None) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+@@ -114,9 +189,9 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, track_memory_usage=track_memory_usage, memory_history_limit=memory_history_limit)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(self, grammar: str, track_memory_usage: bool = False, memory_history_limit: Optional[int] = None) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+@@ -131,4 +206,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, track_memory_usage=track_memory_usage, memory_history_limit=memory_history_limit)
+diff --git a/pyproject.toml b/pyproject.toml
+index af55d59..15ccaeb 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -53,7 +53,7 @@ sglang = ["openai"]
+ tgi = ["huggingface_hub"]
+ transformers = ["accelerate", "datasets", "transformers"]
+ vllm = ["openai"]
+-xgrammar = ["xgrammar"]
++xgrammar = ["xgrammar", "psutil"]
+ llguidance = ["llguidance"]
+ test = [
+     "pre-commit",
+@@ -88,7 +88,7 @@ test = [
+     "sentencepiece",
+     "mkdocs_gen_files",
+     "llguidance",
+-    "xgrammar",
++    "xgrammar", "psutil",
+ ]
+ test-gpu=["outlines[test]", "vllm; sys_platform == 'linux'"]
+ 

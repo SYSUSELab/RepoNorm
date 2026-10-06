@@ -1,0 +1,145 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..9c587f75 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -29,6 +29,10 @@ class DescribeProgram(dspy.Signature):
+     (
+         """Below is some pseudo-code for a pipeline that solves tasks with calls to language models. Please describe what type of task this program appears to be designed to solve, and how it appears to work."""
+     )
++    cache_salt = dspy.InputField(
++        desc="Cache salt for distinguishing proposals (IGNORE).",
++        prefix="CACHE SALT (IGNORE):",
++    )
+     program_code = dspy.InputField(
+         format=str,
+         desc="Pseudocode for a language model program designed to solve a particular task.",
+@@ -49,6 +53,10 @@ class DescribeModule(dspy.Signature):
+     (
+         """Below is some pseudo-code for a pipeline that solves tasks with calls to language models. Please describe the purpose of one of the specified module in this pipeline."""
+     )
++    cache_salt = dspy.InputField(
++        desc="Cache salt for distinguishing proposals (IGNORE).",
++        prefix="CACHE SALT (IGNORE):",
++    )
+     program_code = dspy.InputField(
+         format=str,
+         desc="Pseudocode for a language model program designed to solve a particular task.",
+@@ -83,6 +91,10 @@ def generate_instruction_class(
+         (
+             """Use the information below to learn about a task that we are trying to solve using calls to an LM, then generate a new instruction that will be used to prompt a Language Model to better solve the task."""
+         )
++        cache_salt = dspy.InputField(
++            desc="Cache salt for distinguishing proposals (IGNORE).",
++            prefix="CACHE SALT (IGNORE):",
++        )
+         if use_dataset_summary:
+             dataset_description = dspy.InputField(
+                 desc="A description of the dataset that we are using.",
+@@ -173,6 +185,7 @@ class GenerateModuleInstruction(dspy.Module):
+         data_summary,
+         num_demos_in_context=3,
+         tip=None,
++        cache_salt=None,
+     ):
+         def gather_examples_from_sets(candidate_sets, max_examples):
+             """Helper function to gather up to augmented examples from given sets."""
+@@ -214,6 +227,7 @@ class GenerateModuleInstruction(dspy.Module):
+             try:
+                 program_description = strip_prefix(
+                     self.describe_program(
++                        cache_salt=cache_salt,
+                         program_code=self.program_code_string, program_example=task_demos,
+                     ).program_description,
+                 )
+@@ -235,6 +249,7 @@ class GenerateModuleInstruction(dspy.Module):
+                 module_code = f"{program.predictors()[pred_i].__class__.__name__}({', '.join(inputs)}) -> {', '.join(outputs)}"
+ 
+                 module_description = self.describe_module(
++                    cache_salt=cache_salt,
+                     program_code=self.program_code_string,
+                     program_description=program_description,
+                     program_example=task_demos,
+@@ -251,6 +266,7 @@ class GenerateModuleInstruction(dspy.Module):
+             print(f"task_demos {task_demos}")
+ 
+         instruct = self.generate_module_instruction(
++            cache_salt=cache_salt,
+             dataset_description=data_summary,
+             program_code=self.program_code_string,
+             module=module_code,
+@@ -323,6 +339,22 @@ class GroundedProposer(Proposer):
+                 self.use_dataset_summary = False
+                 print("")
+ 
++    def _generate_cache_salt(self, pred_i, demo_set_i):
++        """Generate a nonempty ASCII cache salt for distinguishing proposals.
++        
++        The salt is generated using the RNG to ensure reproducibility with the same seed.
++        Each proposal gets a distinct salt based on its position (pred_i, demo_set_i).
++        """
++        # Use the RNG to generate a reproducible salt string
++        # We'll use a simple approach: generate random hex-like characters
++        salt_length = 16
++        chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
++        salt_chars = []
++        for _ in range(salt_length):
++            idx = self.rng.randint(0, len(chars) - 1)
++            salt_chars.append(chars[idx])
++        return "".join(salt_chars)
++
+     def propose_instructions_for_program(
+         self,
+         trainset,
+@@ -357,6 +389,10 @@ class GroundedProposer(Proposer):
+             for demo_set_i in range(num_demos)[:min(N, num_demos)]:
+                 if pred_i not in proposed_instructions:
+                     proposed_instructions[pred_i] = []
++                
++                # Generate a unique cache salt for this proposal
++                cache_salt = self._generate_cache_salt(pred_i, demo_set_i)
++                
+                 selected_tip = None
+                 if self.set_tip_randomly:
+                     if self.verbose:
+@@ -380,6 +416,7 @@ class GroundedProposer(Proposer):
+                         demo_set_i=demo_set_i,
+                         trial_logs=trial_logs,
+                         tip=selected_tip,
++                        cache_salt=cache_salt,
+                     ),
+                 )
+ 
+@@ -395,6 +432,7 @@ class GroundedProposer(Proposer):
+         demo_set_i,
+         trial_logs,
+         tip=None,
++        cache_salt=None,
+     ) -> str:
+         """This method is responsible for returning a single instruction for a given predictor, using the specified criteria."""
+ 
+@@ -415,13 +453,9 @@ class GroundedProposer(Proposer):
+         )
+ 
+         # Generate a new instruction for our predictor, using the temperature specified for this round
+-        original_temp = self.prompt_model.kwargs["temperature"]
+-
+-        epsilon = self.rng.uniform(0.01, 0.05)
+-        modified_temp = T + epsilon
+-
++        # Note: We no longer perturb the temperature to distinguish proposals
++        
+         with dspy.settings.context(lm=self.prompt_model):
+-            self.prompt_model.kwargs["temperature"] = modified_temp
+             proposed_instruction = instruction_generator(
+                 demo_candidates=demo_candidates,
+                 pred_i=pred_i,
+@@ -431,8 +465,8 @@ class GroundedProposer(Proposer):
+                 previous_instructions=instruction_history,
+                 num_demos_in_context = self.num_demos_in_context,
+                 tip=tip,
++                cache_salt=cache_salt,
+             ).proposed_instruction
+-        self.prompt_model.kwargs["temperature"] = original_temp
+ 
+         # Log the trace used to generate the new instruction, along with the new instruction itself
+         if self.verbose:

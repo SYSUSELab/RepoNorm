@@ -1,0 +1,193 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 2db769f..dfb22e2 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -3,6 +3,8 @@
+ Version 8.2.0
+ -------------
+ 
++-   Add optional process-group isolation for editors launched by ``click.edit``.
++
+ Unreleased
+ 
+ -   Drop support for Python 3.7. :pr:`2588`
+diff --git a/docs/utils.rst b/docs/utils.rst
+index 995c171..158bbb5 100644
+--- a/docs/utils.rst
++++ b/docs/utils.rst
+@@ -217,6 +217,10 @@ Example usage::
+     import click
+     click.edit(filename='/etc/passwd')
+ 
++Set ``process_group=True`` to request that the editor run in a process group
++or session separate from the caller. Platforms without a supported process
++creation option continue with the normal launch behavior.
++
+ 
+ Launching Applications
+ ----------------------
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..4847edf 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        process_group: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.process_group = process_group
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,7 +507,7 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
++    def _launch_editor_filename(self, filename: str) -> None:
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -516,7 +518,17 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            process_kwargs: dict[str, t.Any] = {}
++            if self.process_group and not WIN:
++                process_kwargs["start_new_session"] = True
++            elif self.process_group:
++                creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", None)
++                if creation_flag is not None:
++                    process_kwargs["creationflags"] = creation_flag
++
++            c = subprocess.Popen(
++                f'{editor} "{filename}"', env=environ, shell=True, **process_kwargs
++            )
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -559,7 +571,7 @@ class Editor:
+             # recorded, so get the new recorded value.
+             timestamp = os.path.getmtime(name)
+ 
+-            self.edit_file(name)
++            self._launch_editor_filename(name)
+ 
+             if self.require_save and os.path.getmtime(name) == timestamp:
+                 return None
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..dcf65f1 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    process_group: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,15 +678,26 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param process_group: if true, request a process group or session separate
++                          from the caller when the platform supports it.
++
++    .. versionchanged:: 8.2.0
++        Added the ``process_group`` parameter.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        process_group=process_group,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+ 
+-    ed.edit_file(filename)
++    ed._launch_editor_filename(filename)
+     return None
+ 
+ 
+diff --git a/tests/test_n4c_author_edit_process_group.py b/tests/test_n4c_author_edit_process_group.py
+new file mode 100644
+index 0000000..da51ce3
+--- /dev/null
++++ b/tests/test_n4c_author_edit_process_group.py
+@@ -0,0 +1,63 @@
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code=0):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++def test_disabled_preserves_process_creation_exactly(monkeypatch):
++    calls = []
++    monkeypatch.setattr("click._termui_impl.WIN", False)
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: calls.append(k) or _Process()
++    )
++    click.edit(filename="one", editor="editor")
++    assert calls[0] == {"env": None, "shell": True}
++
++
++def test_posix_group_applies_to_direct_and_text_modes(monkeypatch):
++    calls = []
++    monkeypatch.setattr("click._termui_impl.WIN", False)
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: calls.append(k) or _Process()
++    )
++    click.edit(filename="one", editor="editor", process_group=True)
++    click.edit("text", editor="editor", process_group=True)
++    assert [call["start_new_session"] for call in calls] == [True, True]
++
++
++def test_unsupported_windows_group_degrades_to_normal(monkeypatch):
++    calls = []
++    monkeypatch.setattr("click._termui_impl.WIN", True)
++    monkeypatch.delattr("subprocess.CREATE_NEW_PROCESS_GROUP", raising=False)
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: calls.append(k) or _Process()
++    )
++    click.edit(filename="one", editor="editor", process_group=True)
++    assert calls[0] == {"env": None, "shell": True}
++
++
++def test_environment_and_nonzero_exit_are_preserved(monkeypatch):
++    calls = []
++    monkeypatch.setenv("PARENT", "kept")
++
++    def launch(*args, **kwargs):
++        calls.append(kwargs)
++        return _Process(7)
++
++    monkeypatch.setattr("subprocess.Popen", launch)
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(
++            filename="one",
++            editor="editor",
++            env={"EXPLICIT": "added"},
++            process_group=True,
++        )
++    assert calls[0]["env"]["PARENT"] == "kept"
++    assert calls[0]["env"]["EXPLICIT"] == "added"

@@ -1,0 +1,122 @@
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..84d7727 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,117 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++class _CountingType(click.ParamType):
++    name = "counting"
++    def __init__(self, prefix=""):
++        self.prefix = prefix
++        self.calls = []
++    def convert(self, value, param, ctx):
++        self.calls.append(value)
++        if value == "bad": self.fail("bad value", param, ctx)
++        return self.prefix + str(value)
++
++
++def _cached_command(param_type, *, cache=True, callback=None, **kwargs):
++    @click.command()
++    @click.option("--value", type=param_type, cache=cache, callback=callback, **kwargs)
++    def cli(value):
++        click.echo(value)
++    return cli
++
++
++def test_option_cache_keeps_file_lifetime_per_context(runner, tmp_path):
++    path = tmp_path / "input.txt"
++    path.write_text("first", encoding="utf-8")
++    streams = []
++
++    @click.command()
++    @click.option("--input", type=click.File("r", encoding="utf-8"), cache=True)
++    def cli(input):
++        assert not input.closed
++        streams.append(input)
++        click.echo(input.read())
++
++    first = runner.invoke(cli, ["--input", str(path)])
++    assert first.exit_code == 0, (first.output, first.exception)
++    assert first.output == "first\n"
++    assert streams[0].closed
++    path.write_text("second", encoding="utf-8")
++    second = runner.invoke(cli, ["--input", str(path)])
++    assert second.exit_code == 0, (second.output, second.exception)
++    assert second.output == "second\n"
++    assert all(stream.closed for stream in streams)
++
++
++def test_option_cache_reuses_success_for_same_instance(runner):
++    kind = _CountingType()
++    cli = _cached_command(kind)
++    assert runner.invoke(cli, ["--value", "a"]).output == "a\n"
++    assert runner.invoke(cli, ["--value", "b"]).output == "b\n"
++    assert runner.invoke(cli, ["--value", "a"]).output == "a\n"
++    assert kind.calls == ["a", "b"]
++
++
++def test_option_cache_disabled_converts_each_time(runner):
++    kind = _CountingType()
++    cli = _cached_command(kind, cache=False)
++    runner.invoke(cli, ["--value", "a"]); runner.invoke(cli, ["--value", "a"])
++    assert kind.calls == ["a", "a"]
++
++
++def test_option_cache_isolated_between_equal_named_options(runner):
++    left = _CountingType("left:"); right = _CountingType("right:")
++    left_cli = _cached_command(left); right_cli = _cached_command(right)
++    assert runner.invoke(left_cli, ["--value", "x"]).output == "left:x\n"
++    assert runner.invoke(right_cli, ["--value", "x"]).output == "right:x\n"
++    assert left.calls == ["x"] and right.calls == ["x"]
++
++
++def test_option_cache_does_not_store_failures(runner):
++    kind = _CountingType(); cli = _cached_command(kind)
++    assert runner.invoke(cli, ["--value", "bad"]).exit_code == 2
++    assert runner.invoke(cli, ["--value", "bad"]).exit_code == 2
++    assert kind.calls == ["bad", "bad"]
++
++
++def test_option_cache_clear_is_per_option(runner):
++    kind = _CountingType(); cli = _cached_command(kind); option = cli.params[0]
++    runner.invoke(cli, ["--value", "x"]); runner.invoke(cli, ["--value", "x"])
++    option.clear_value_cache()
++    runner.invoke(cli, ["--value", "x"])
++    assert kind.calls == ["x", "x"]
++
++
++def test_option_cache_callbacks_still_run_each_time(runner):
++    kind = _CountingType(); callbacks = []
++    cli = _cached_command(kind, callback=lambda c, p, v: callbacks.append(v) or v)
++    runner.invoke(cli, ["--value", "x"]); runner.invoke(cli, ["--value", "x"])
++    assert kind.calls == ["x"]
++    assert callbacks == ["x", "x"]
++
++
++@pytest.mark.parametrize("kwargs, expected_calls", [({"multiple": True}, 2), ({"nargs": 2}, 4)])
++def test_option_cache_excludes_composite_values(runner, kwargs, expected_calls):
++    kind = _CountingType(); cli = _cached_command(kind, **kwargs)
++    args = ["--value", "x"] if kwargs.get("multiple") else ["--value", "x", "y"]
++    runner.invoke(cli, args); runner.invoke(cli, args)
++    assert len(kind.calls) == expected_calls
++
++
++def test_option_cache_excludes_path_type(runner, tmp_path):
++    calls = []
++
++    class CountingPath(click.Path):
++        def convert(self, value, param, ctx):
++            calls.append(value)
++            return super().convert(value, param, ctx)
++
++    cli = _cached_command(CountingPath())
++    path = tmp_path / "item"
++    path.write_text("x", encoding="utf-8")
++    for _ in range(2):
++        result = runner.invoke(cli, ["--value", str(path)])
++        assert result.exit_code == 0, (result.output, result.exception)
++    assert calls == [str(path), str(path)]

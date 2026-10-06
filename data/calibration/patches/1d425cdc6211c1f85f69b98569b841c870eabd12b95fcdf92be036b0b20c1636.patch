@@ -1,0 +1,154 @@
+diff --git a/docs/utils.rst b/docs/utils.rst
+index 995c171..2d7a887 100644
+--- a/docs/utils.rst
++++ b/docs/utils.rst
+@@ -217,6 +217,10 @@ Example usage::
+     import click
+     click.edit(filename='/etc/passwd')
+ 
++Set ``auto_backup=True`` to preserve an existing directly edited file before
++the editor starts. Backups retain file metadata and use timestamped names;
++temporary text edits and new direct filenames do not create backups.
++
+ 
+ Launching Applications
+ ----------------------
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..eef3a22 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -505,8 +505,25 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
++    def edit_file(self, filename: str, auto_backup: bool = False) -> None:
++        import shutil
+         import subprocess
++        from datetime import datetime
++
++        # Create backup if requested and file exists
++        if auto_backup and os.path.exists(filename):
++            try:
++                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++                backup_filename = f"{filename}.backup.{timestamp}"
++                suffix = 1
++                while os.path.exists(backup_filename):
++                    backup_filename = f"{filename}.backup.{timestamp}.{suffix}"
++                    suffix += 1
++                shutil.copy2(filename, backup_filename)
++            except OSError as e:
++                raise ClickException(
++                    _("Failed to create backup file: {e}").format(e=e)
++                ) from e
+ 
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..ce88c26 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    auto_backup: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,6 +678,11 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param auto_backup: if true and an existing filename is provided, create
++                        a timestamped backup before starting the editor.
++
++    .. versionchanged:: 8.2.0
++        Added the ``auto_backup`` parameter.
+     """
+     from ._termui_impl import Editor
+ 
+@@ -685,7 +691,7 @@ def edit(
+     if filename is None:
+         return ed.edit(text)
+ 
+-    ed.edit_file(filename)
++    ed.edit_file(filename, auto_backup=auto_backup)
+     return None
+ 
+ 
+diff --git a/tests/test_n4c_author_edit_backup.py b/tests/test_n4c_author_edit_backup.py
+new file mode 100644
+index 0000000..4e35d48
+--- /dev/null
++++ b/tests/test_n4c_author_edit_backup.py
+@@ -0,0 +1,69 @@
++import os
++
++import pytest
++
++import click
++
++
++class _Process:
++    def wait(self):
++        return 0
++
++
++def test_backup_precedes_launch_and_preserves_metadata(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("before")
++    path.chmod(0o640)
++
++    def launch(*args, **kwargs):
++        (backup,) = tmp_path.glob("note.txt.backup.*")
++        assert backup.read_text() == "before"
++        assert backup.stat().st_mode & 0o777 == 0o640
++        return _Process()
++
++    monkeypatch.setattr("subprocess.Popen", launch)
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++
++
++def test_backups_do_not_overwrite_and_default_remains_off(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("first")
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process())
++
++    click.edit(filename=str(path), editor="editor")
++    assert not list(tmp_path.glob("note.txt.backup.*"))
++
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++    path.write_text("second")
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++    assert {item.read_text() for item in tmp_path.glob("note.txt.backup.*")} == {
++        "first",
++        "second",
++    }
++
++
++def test_missing_direct_file_and_text_mode_skip_backup(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process())
++
++    click.edit(filename="new.txt", editor="editor", auto_backup=True)
++    click.edit("text", editor="editor", auto_backup=True)
++    assert not list(tmp_path.glob("*.backup.*"))
++
++
++def test_backup_oserror_is_chained_and_prevents_launch(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("before")
++    monkeypatch.setattr(
++        "shutil.copy2", lambda *a, **k: (_ for _ in ()).throw(OSError("full"))
++    )
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: pytest.fail("editor must not launch")
++    )
++
++    with pytest.raises(
++        click.ClickException, match="^Failed to create backup file"
++    ) as e:
++        click.edit(filename=os.fspath(path), editor="editor", auto_backup=True)
++
++    assert isinstance(e.value.__cause__, OSError)

@@ -1,0 +1,487 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..ca7e595 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -6,12 +6,47 @@ import re
+ import textwrap
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Dict, Optional, Type, cast
++from typing import Any, Callable, Dict, Optional, Type, Union, cast
+ 
+ import jinja2
+ import pydantic
+ 
+ 
++def _get_active_condition(conditional_filters: Optional[Dict[str, Dict[str, Callable]]]) -> Optional[str]:
++    """Determine which condition is active based on environment variables.
++    
++    Returns the name of the active condition or None if no standard conditions match.
++    """
++    if not conditional_filters:
++        return None
++    
++    # Check for debug condition first (highest priority)
++    if os.environ.get("OUTLINES_DEBUG", "").lower() == "true":
++        if "debug" in conditional_filters:
++            return "debug"
++    
++    # Check for production condition
++    if os.environ.get("ENVIRONMENT", "").lower() == "production":
++        if "production" in conditional_filters:
++            return "production"
++    
++    # Check for testing condition
++    env_testing = os.environ.get("ENV", "").lower() == "testing"
++    outlines_testing = os.environ.get("OUTLINES_TESTING", "").lower() == "true"
++    testing_mode = os.environ.get("TESTING_MODE", "").lower() == "on"
++    
++    if env_testing or outlines_testing or testing_mode:
++        if "testing" in conditional_filters:
++            return "testing"
++    
++    # If no standard condition matched, select alphabetically first key
++    sorted_keys = sorted(conditional_filters.keys())
++    if sorted_keys:
++        return sorted_keys[0]
++    
++    return None
++
++
+ @dataclass
+ class Prompt:
+     """Represents a prompt function.
+@@ -40,7 +75,7 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(cls, content: str, conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -48,15 +83,19 @@ class Prompt:
+         ----------
+         content : str
+             The string content to be converted into a template.
++        conditional_filters : Optional[Dict[str, Dict[str, Callable]]]
++            A mapping where each outer key names a condition and maps to
++            Jinja filters installed when that condition is selected.
++            See `_get_active_condition` for how the active condition is determined.
+ 
+         Returns
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(cls._template_from_str(content, conditional_filters), None)
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(cls, path: Path, conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -67,6 +106,10 @@ class Prompt:
+         ----------
+         path : Path
+             The path to the file containing the Jinja template.
++        conditional_filters : Optional[Dict[str, Dict[str, Callable]]]
++            A mapping where each outer key names a condition and maps to
++            Jinja filters installed when that condition is selected.
++            See `_get_active_condition` for how the active condition is determined.
+ 
+         Returns
+         -------
+@@ -75,10 +118,10 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(cls._template_from_file(path, conditional_filters), None)
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(_, content: str, conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -106,10 +149,16 @@ class Prompt:
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
+ 
++        # Install conditional filters if specified
++        active_condition = _get_active_condition(conditional_filters)
++        if active_condition is not None and active_condition in conditional_filters:
++            for filter_name, filter_func in conditional_filters[active_condition].items():
++                env.filters[filter_name] = filter_func
++
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(_, path: Path, conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,10 +167,17 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        
++        # Install conditional filters if specified
++        active_condition = _get_active_condition(conditional_filters)
++        if active_condition is not None and active_condition in conditional_filters:
++            for filter_name, filter_func in conditional_filters[active_condition].items():
++                env.filters[filter_name] = filter_func
++        
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++def prompt(fn: Optional[Callable] = None, conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None) -> Union[Prompt, Callable[[Callable], Prompt]]:
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -131,8 +187,8 @@ def prompt(fn: Callable) -> Prompt:
+     >>> import outlines
+     >>>
+     >>> @outlines.prompt
+-    >>> def build_prompt(question):
+-    ...    "I have a ${question}"
++    ... def build_prompt(question):
++    ...     "I have a ${question}"
+     ...
+     >>> prompt = build_prompt("How are you?")
+ 
+@@ -149,15 +205,37 @@ def prompt(fn: Callable) -> Prompt:
+     ..      Your overall objective is to {{objective}}.
+     ...     Please solve the following task: {{task}}
+     ...     '''
+-    ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Parameters
++    ----------
++    fn : Optional[Callable]
++        The function to decorate. Its docstring should contain the prompt template.
++        Can be omitted if using the decorator with parameters: @prompt(conditional_filters=...).
++    conditional_filters : Optional[Dict[str, Dict[str, Callable]]]
++        A mapping where each outer key names a condition and maps to
++        Jinja filters installed when that condition is selected.
++        See `_get_active_condition` for how the active condition is determined.
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
++    
++    # Support both @prompt and @prompt(conditional_filters=...) usage
++    if fn is None:
++        # Called with parameters: @prompt(conditional_filters=...)
++        def decorator(fn: Callable) -> Prompt:
++            return _apply_prompt_decorator(fn, conditional_filters)
++        return decorator
++    else:
++        # Called directly: @prompt
++        return _apply_prompt_decorator(fn, conditional_filters)
++
+ 
++def _apply_prompt_decorator(fn: Callable, conditional_filters: Optional[Dict[str, Dict[str, Callable]]]) -> Prompt:
++    """Apply the prompt decorator to a function."""
+     signature = inspect.signature(fn)
+ 
+     # The docstring contains the template that will be rendered to be used
+@@ -166,7 +244,7 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(cast(str, docstring), conditional_filters)
+ 
+     return Prompt(template, signature)
+ 
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..0137957 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -1,12 +1,14 @@
+ import os
++import jinja2
+ import tempfile
++from pathlib import Path
+ from typing import Dict, List
+ 
+ import pytest
+ from pydantic import BaseModel, Field
+ 
+ import outlines
+-from outlines.prompts import Prompt
++from outlines.prompts import Prompt, prompt
+ 
+ 
+ def render(content: str, **kwargs):
+@@ -403,3 +405,262 @@ def test_template_from_str_with_extra_linebreaks():
+     """
+     template = Prompt._template_from_str(content)
+     assert template.render(name="World") == "Hello, World!\n"
++
++
++import os
++from unittest.mock import patch
++
++
++def test_conditional_filters_basic():
++    """Test basic conditional filters functionality."""
++    
++    def debug_filter(value):
++        return f"[DEBUG]{value}"
++    
++    def production_filter(value):
++        return f"[PROD]{value}"
++    
++    def testing_filter(value):
++        return f"[TEST]{value}"
++    
++    conditional_filters = {
++        "debug": {"custom": debug_filter},
++        "production": {"custom": production_filter},
++        "testing": {"custom": testing_filter},
++    }
++    
++    # Test with no condition active - should use alphabetically first key
++    content = "{{ value|custom }}"
++    prompt = Prompt.from_str(content, conditional_filters)
++    assert prompt(value="test") == "[DEBUG]test"  # debug is alphabetically first
++    
++    # Test with debug condition active
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "true"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[DEBUG]test"
++    
++    # Test with production condition active
++    with patch.dict(os.environ, {"ENVIRONMENT": "production"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[PROD]test"
++    
++    # Test with testing condition active
++    with patch.dict(os.environ, {"ENV": "testing"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[TEST]test"
++
++
++def test_conditional_filters_priority():
++    """Test that priority order is respected: debug > production > testing."""
++    
++    def debug_filter(value):
++        return f"[DEBUG]{value}"
++    
++    def production_filter(value):
++        return f"[PROD]{value}"
++    
++    def testing_filter(value):
++        return f"[TEST]{value}"
++    
++    conditional_filters = {
++        "debug": {"custom": debug_filter},
++        "production": {"custom": production_filter},
++        "testing": {"custom": testing_filter},
++    }
++    
++    content = "{{ value|custom }}"
++    
++    # Debug takes priority over production
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "true", "ENVIRONMENT": "production"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[DEBUG]test"
++    
++    # Debug takes priority over testing
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "true", "ENV": "testing"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[DEBUG]test"
++    
++    # Production takes priority over testing (when debug not active)
++    with patch.dict(os.environ, {"ENVIRONMENT": "production", "ENV": "testing"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[PROD]test"
++
++
++def test_conditional_filters_case_insensitive():
++    """Test that environment variable comparison is case-insensitive."""
++    
++    def debug_filter(value):
++        return f"[DEBUG]{value}"
++    
++    conditional_filters = {
++        "debug": {"custom": debug_filter},
++    }
++    
++    content = "{{ value|custom }}"
++    
++    # Test various case combinations
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "True"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[DEBUG]test"
++    
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "TRUE"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[DEBUG]test"
++    
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "TrUe"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[DEBUG]test"
++
++
++def test_conditional_filters_testing_variants():
++    """Test all variants that activate testing condition."""
++    
++    def testing_filter(value):
++        return f"[TEST]{value}"
++    
++    conditional_filters = {
++        "testing": {"custom": testing_filter},
++    }
++    
++    content = "{{ value|custom }}"
++    
++    # Test ENV=testing
++    with patch.dict(os.environ, {"ENV": "testing"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[TEST]test"
++    
++    # Test OUTLINES_TESTING=true
++    with patch.dict(os.environ, {"OUTLINES_TESTING": "true"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[TEST]test"
++    
++    # Test TESTING_MODE=on
++    with patch.dict(os.environ, {"TESTING_MODE": "on"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[TEST]test"
++
++
++def test_conditional_filters_active_not_in_mapping():
++    """Test that an active standard condition absent from mapping is skipped."""
++    
++    def debug_filter(value):
++        return f"[DEBUG]{value}"
++    
++    conditional_filters = {
++        "production": {"custom": lambda v: f"[PROD]{v}"},
++    }
++    
++    content = "{{ value|custom }}"
++    
++    # Debug is active but not in mapping, so should fall back to alphabetically first
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "true"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(value="test") == "[PROD]test"  # production is only key
++
++
++def test_conditional_filters_none_and_empty():
++    """Test that None and empty mapping install no conditional filters."""
++    
++    content = "{{ value }}"
++    
++    # None should work fine
++    prompt = Prompt.from_str(content, None)
++    assert prompt(value="test") == "test"
++    
++    # Empty dict should work fine
++    prompt = Prompt.from_str(content, {})
++    assert prompt(value="test") == "test"
++
++
++def test_conditional_filters_decorator():
++    """Test conditional filters with @outlines.prompt decorator."""
++    
++    def custom_filter(value):
++        return f"[CUSTOM]{value}"
++    
++    conditional_filters = {
++        "debug": {"custom": custom_filter},
++    }
++    
++    @prompt(conditional_filters=conditional_filters)
++    def test_prompt(value):
++        """{{ value|custom }}"""
++    
++    # Without debug active, should use alphabetically first (debug)
++    with patch.dict(os.environ, {}, clear=True):
++        result = test_prompt(value="test")
++        assert result == "[CUSTOM]test"
++    
++    # With debug active
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "true"}, clear=True):
++        result = test_prompt(value="test")
++        assert result == "[CUSTOM]test"
++
++
++def test_conditional_filters_from_file():
++    """Test conditional filters with Prompt.from_file."""
++    import tempfile
++    
++    def custom_filter(value):
++        return f"[CUSTOM]{value}"
++    
++    conditional_filters = {
++        "debug": {"custom": custom_filter},
++    }
++    
++    with tempfile.TemporaryDirectory() as tmpdir:
++        template_path = os.path.join(tmpdir, "template.txt")
++        with open(template_path, "w") as f:
++            f.write("{{ value|custom }}")
++        
++        prompt = Prompt.from_file(Path(template_path), conditional_filters)
++        assert prompt(value="test") == "[CUSTOM]test"
++
++
++def test_conditional_filters_unknown_filter_error():
++    """Test that referring to a filter from unselected condition produces unknown-filter error."""
++    
++    def debug_filter(value):
++        return f"[DEBUG]{value}"
++    
++    def production_filter(value):
++        return f"[PROD]{value}"
++    
++    conditional_filters = {
++        "debug": {"custom": debug_filter},
++        "production": {"custom": production_filter},
++    }
++    
++    content = "{{ value|custom }}"
++    
++    # With production active, debug filter should not be installed
++    with patch.dict(os.environ, {"ENVIRONMENT": "production"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        # Should use production's custom filter
++        assert prompt(value="test") == "[PROD]test"
++    
++    # If we try to use a filter that doesn't exist in any selected condition
++    content2 = "{{ value|nonexistent }}"
++    with patch.dict(os.environ, {}, clear=True):
++        with pytest.raises(jinja2.exceptions.TemplateAssertionError, match="No filter named 'nonexistent'."):
++            Prompt.from_str(content2, conditional_filters)
++
++
++def test_conditional_filters_overrides_builtin():
++    """Test that conditional filters take precedence over builtin filters."""
++    
++    def custom_name_filter(fn):
++        return "OVERRIDDEN_NAME"
++    
++    conditional_filters = {
++        "debug": {"name": custom_name_filter},
++    }
++    
++    def my_function():
++        pass
++    
++    content = "{{ fn|name }}"
++    
++    with patch.dict(os.environ, {"OUTLINES_DEBUG": "true"}, clear=True):
++        prompt = Prompt.from_str(content, conditional_filters)
++        assert prompt(fn=my_function) == "OVERRIDDEN_NAME"

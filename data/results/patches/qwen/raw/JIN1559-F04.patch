@@ -1,0 +1,194 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..620cfee 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -263,6 +263,7 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            extract_translations_with_metadata=self.extract_translations_with_metadata,
+             newstyle_gettext=False,
+         )
+ 
+@@ -351,6 +352,30 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++    def extract_translations_with_metadata(
++        self,
++        source: t.Union[str, nodes.Template],
++        source_name: t.Optional[str] = None,
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Extract translations with metadata from the given template.
++        
++        Returns an iterator of record mappings for metadata-bearing translation blocks.
++        Each record contains:
++        - ``source``: The original source code
++        - ``lineno``: The line number of the trans block
++        - ``metadata``: A copy of the metadata mapping (if any)
++        - ``messages``: List of message dicts with lineno, function, and message
++        
++        Repeated extraction is stable and has no retained Environment state.
++        """
++        if isinstance(source, str):
++            ast = self.environment.parse(source)
++        else:
++            ast = source
++            
++        for record in _extract_with_metadata(ast):
++            yield record
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+@@ -362,9 +387,10 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        metadata: t.Dict[str, t.Any] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if variables or metadata:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -379,6 +405,19 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            # Check for metadata keys first (they have = sign)
++            if token.value in ("note", "created", "modified"):
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if token.value in metadata:
++                    parser.fail(
++                        f"translatable variable {token.value!r} defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                metadata[token.value] = value
++                continue
++            
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+@@ -459,6 +498,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            metadata,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +554,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        metadata: t.Optional[t.Dict[str, t.Any]] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -568,7 +609,10 @@ class InternationalizationExtension(Extension):
+                         ]
+                     ),
+                 )
+-        return nodes.Output([node])
++        output = nodes.Output([node])
++        if metadata:
++            output.metadata = metadata  # type: ignore
++        return output
+ 
+ 
+ class ExprStmtExtension(Extension):
+@@ -636,6 +680,90 @@ class DebugExtension(Extension):
+         return pprint.pformat(result, depth=3, compact=True)
+ 
+ 
++def _convert_node_to_value(node: t.Any) -> t.Any:
++    """Convert an AST node to its actual Python value."""
++    if isinstance(node, nodes.Const):
++        return node.value
++    elif isinstance(node, nodes.Name):
++        # For variable references, return the name as a string
++        return node.name
++    elif isinstance(node, nodes.Call):
++        # For function calls, return a placeholder
++        return f"<call: {node.node}>"
++    elif isinstance(node, nodes.ExprStmt):
++        return None
++    else:
++        # For other node types, try to get the value attribute if available
++        return getattr(node, 'value', str(node))
++
++
++def _find_call_nodes(node: nodes.Node) -> t.List[nodes.Call]:
++    """Recursively find all Call nodes within a node tree."""
++    calls = []
++    if isinstance(node, nodes.Call):
++        calls.append(node)
++    for child in node.iter_child_nodes():
++        calls.extend(_find_call_nodes(child))
++    return calls
++
++
++def _extract_with_metadata(
++    ast: nodes.Template,
++    gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++) -> t.Iterator[t.Dict[str, t.Any]]:
++    """Extract translations with metadata from the given template node."""
++    for node in ast.find_all(nodes.Output):
++        # Check if this Output node has metadata (from trans tag)
++        metadata = getattr(node, 'metadata', None)
++        if metadata is None:
++            continue
++            
++        # Convert metadata values from AST nodes to actual values
++        converted_metadata = {}
++        for key, value in metadata.items():
++            converted_metadata[key] = _convert_node_to_value(value)
++            
++        # Extract messages from this node
++        messages = []
++        # Find all Call nodes recursively (handles MarkSafeIfAutoescape wrapper)
++        call_nodes = _find_call_nodes(node)
++        for call_node in call_nodes:
++            func_name = call_node.node.name if hasattr(call_node.node, 'name') else None
++            if func_name in gettext_functions:
++                # Get the message arguments
++                args = call_node.args
++                if args:
++                    first_arg = args[0]
++                    if isinstance(first_arg, nodes.Const):
++                        msg_value = first_arg.value
++                        if isinstance(msg_value, str):
++                            messages.append({
++                                'lineno': call_node.lineno,
++                                'function': func_name,
++                                'message': msg_value,
++                            })
++                    elif isinstance(first_arg, nodes.Concat):
++                        # Handle concatenated strings
++                        msg_parts = []
++                        for part in first_arg.nodes:
++                            if isinstance(part, nodes.Const) and isinstance(part.value, str):
++                                msg_parts.append(part.value)
++                        if msg_parts:
++                            messages.append({
++                                'lineno': call_node.lineno,
++                                'function': func_name,
++                                'message': ''.join(msg_parts),
++                            })
++        
++        if messages:
++            yield {
++                'source': None,  # Will be set by caller if needed
++                'lineno': node.lineno,
++                'metadata': converted_metadata,
++                'messages': messages,
++            }
++
++
+ def extract_from_ast(
+     ast: nodes.Template,
+     gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,

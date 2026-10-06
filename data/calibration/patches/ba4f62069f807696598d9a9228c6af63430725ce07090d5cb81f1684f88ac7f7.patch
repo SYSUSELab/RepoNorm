@@ -1,0 +1,303 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..b58ede86 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add an optional bounded resolution cache to ``FileSystemLoader``.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..be6bc3e4 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -442,6 +442,20 @@ own loader, subclass :class:`BaseLoader` and override `get_source`.
+ 
+ Here a list of the builtin loaders Jinja provides:
+ 
++``FileSystemLoader`` can cache successful path resolution.
++``path_cache_size`` defaults to zero, disabling caching.
++Positive integers bound least-recently-used eviction.
++Booleans and negative values are rejected. Misses are not
++cached. Missing files and earlier matching search paths
++cause resolution again. The cache stores filenames, not
++source, and does not replace the compiled-template cache.
++
++Use ``clear_path_cache()`` to remove entries, or
++``resize_path_cache(capacity)`` to change the bound immediately.
++Resizing to zero clears and disables caching. Subclasses may override
++``resolve_template_path(template)`` for uncached lookup. It returns a
++filename or ``None`` and is not called for valid cache hits.
++
+ .. autoclass:: jinja2.FileSystemLoader
+ 
+ .. autoclass:: jinja2.PackageLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..d624b01d 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -8,6 +8,7 @@ import typing as t
+ import weakref
+ import zipimport
+ from collections import abc
++from collections import OrderedDict
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -170,9 +171,17 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param path_cache_size: Maximum cached path resolutions.
++        Zero disables caching. Booleans, negative values, and
++        non-integers are rejected.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++
++    .. versionchanged:: 3.1.0
++        Add an optional bounded resolved-path cache. It stores
++        filenames, not source contents, and does not replace
++        the environment's template cache.
+     """
+ 
+     def __init__(
+@@ -180,6 +189,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_cache_size: int = 0,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,31 +197,110 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        if (
++            isinstance(path_cache_size, bool)
++            or not isinstance(path_cache_size, int)
++            or path_cache_size < 0
++        ):
++            raise ValueError("path_cache_size must be a non-negative integer")
++        self.path_cache_size = path_cache_size
++        self._resolved_paths: t.OrderedDict[str, str] = OrderedDict()
++
++    def clear_path_cache(self) -> None:
++        """Remove cached successful resolutions.
++
++        .. versionadded:: 3.1.0
++        """
++        self._resolved_paths.clear()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        """Apply a new bound and evict oldest entries.
++        Zero clears and disables caching. Booleans are rejected.
++
++        .. versionadded:: 3.1.0
++        """
++        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
++            raise ValueError("path cache capacity must be a non-negative integer")
++        self.path_cache_size = capacity
++        while len(self._resolved_paths) > capacity:
++            self._resolved_paths.popitem(last=False)
++        if capacity == 0:
++            self.clear_path_cache()
++
++    def _remember_path(self, template: str, filename: str) -> None:
++        if self.path_cache_size == 0:
++            return
++        self._resolved_paths[template] = filename
++        self._resolved_paths.move_to_end(template)
++        while len(self._resolved_paths) > self.path_cache_size:
++            self._resolved_paths.popitem(last=False)
++
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        """Resolve a logical name in path order, or return ``None``.
++        Override for uncached lookup. Valid cache hits skip
++        this hook. Existing name validation is retained.
++
++        .. versionadded:: 3.1.0
++        """
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            if os.path.isfile(filename):
++                return filename
++        return None
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+         pieces = split_template_path(template)
+-        for searchpath in self.searchpath:
+-            filename = os.path.join(searchpath, *pieces)
+-            f = open_if_exists(filename)
+-            if f is None:
+-                continue
+-            try:
+-                contents = f.read().decode(self.encoding)
+-            finally:
+-                f.close()
++        candidates = [
++            os.path.join(searchpath, *pieces) for searchpath in self.searchpath
++        ]
++        cached = self._resolved_paths.get(template) if self.path_cache_size else None
++        if cached is not None:
++            cached_index = next(
++                (
++                    index
++                    for index, path in enumerate(candidates)
++                    if os.path.abspath(path) == os.path.abspath(cached)
++                ),
++                len(candidates),
++            )
++            if not any(
++                os.path.isfile(path) for path in candidates[:cached_index]
++            ) and os.path.isfile(cached):
++                candidates = [cached]
++                self._resolved_paths.move_to_end(template)
++            else:
++                self._resolved_paths.pop(template, None)
++        if cached is not None and candidates == [cached]:
++            filename = cached
++        else:
++            resolved = self.resolve_template_path(template)
++            if resolved is None:
++                self._resolved_paths.pop(template, None)
++                raise TemplateNotFound(template)
++            filename = resolved
+ 
+-            mtime = os.path.getmtime(filename)
++        f = open_if_exists(filename)
++        if f is None:
++            self._resolved_paths.pop(template, None)
++            raise TemplateNotFound(template)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
+ 
+-            def uptodate() -> bool:
+-                try:
+-                    return os.path.getmtime(filename) == mtime
+-                except OSError:
+-                    return False
++        mtime = os.path.getmtime(filename)
+ 
+-            return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        self._remember_path(template, filename)
++        return contents, filename, uptodate
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+@@ -650,3 +739,8 @@ class ModuleLoader(BaseLoader):
+         return environment.template_class.from_module_dict(
+             environment, mod.__dict__, globals
+         )
++
++
++match None:
++    case None:
++        pass
+diff --git a/tests/test_n4c_author_resolved_path_cache.py b/tests/test_n4c_author_resolved_path_cache.py
+new file mode 100644
+index 00000000..92cec6d5
+--- /dev/null
++++ b/tests/test_n4c_author_resolved_path_cache.py
+@@ -0,0 +1,84 @@
++import os
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import FileSystemLoader
++from jinja2 import TemplateNotFound
++
++
++def test_cached_source_preserves_encoding_freshness_and_filename(tmp_path):
++    path = tmp_path / "page"
++    path.write_bytes("café".encode("latin-1"))
++    loader = FileSystemLoader(tmp_path, encoding="latin-1", path_cache_size=2)
++    text, filename, current = loader.get_source(Environment(), "page")
++    assert text == "café" and os.path.samefile(filename, path)
++    assert current() is True
++    stamp = path.stat()
++    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2000000000))
++    assert current() is False
++    assert loader.get_source(Environment(), "page")[0] == "café"
++    path.unlink()
++    assert current() is False
++
++
++def test_cache_does_not_bypass_parent_guard(tmp_path):
++    root = tmp_path / "root"
++    root.mkdir()
++    (root / "safe").write_text("safe")
++    (tmp_path / "secret").write_text("outside")
++    loader = FileSystemLoader(root, path_cache_size=2)
++    env = Environment()
++    loader.get_source(env, "safe")
++    loader.get_source(env, "safe")
++    with pytest.raises(TemplateNotFound) as caught:
++        loader.get_source(env, "../secret")
++    assert caught.value.name == "../secret"
++
++
++def test_default_disabled_cache_still_exposes_management(tmp_path):
++    loader = FileSystemLoader(tmp_path)
++    loader.clear_path_cache()
++    loader.resize_path_cache(0)
++    with pytest.raises(TemplateNotFound):
++        loader.get_source(Environment(), "new")
++
++
++def test_resolution_hook_uses_valid_hits_with_absolute_filename(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    (tmp_path / "page").write_text("ok")
++
++    class AbsoluteLoader(FileSystemLoader):
++        calls = 0
++
++        def resolve_template_path(self, template):
++            self.calls += 1
++            filename = super().resolve_template_path(template)
++            return os.path.abspath(filename) if filename is not None else None
++
++    loader = AbsoluteLoader(".", path_cache_size=2)
++    for _ in range(2):
++        assert loader.get_source(Environment(), "page")[0] == "ok"
++    assert loader.calls == 1
++    loader.clear_path_cache()
++    loader.get_source(Environment(), "page")
++    assert loader.calls == 2
++
++
++def test_misses_and_later_earlier_path_are_observed(tmp_path):
++    early, late = tmp_path / "early", tmp_path / "late"
++    early.mkdir()
++    late.mkdir()
++    loader = FileSystemLoader([early, late], path_cache_size=1)
++    with pytest.raises(TemplateNotFound):
++        loader.get_source(Environment(), "page")
++    (late / "page").write_text("late")
++    assert loader.get_source(Environment(), "page")[0] == "late"
++    (early / "page").write_text("early")
++    assert loader.get_source(Environment(), "page")[0] == "early"
++
++
++@pytest.mark.parametrize("size", [True, -1, "2"])
++def test_invalid_bounds_are_configuration_errors(tmp_path, size):
++    with pytest.raises(ValueError):
++        FileSystemLoader(tmp_path, path_cache_size=size)

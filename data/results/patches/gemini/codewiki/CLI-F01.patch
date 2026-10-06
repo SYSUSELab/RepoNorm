@@ -1,0 +1,602 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..c29cdb1
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,72 @@
++import click
++import os
++import sys
++import tempfile
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++@click.group()
++def cli():
++    pass
++
++@cli.command()
++@click.option('--input', type=click.File('r'))
++def cmd(input):
++    pass
++
++# Simulate shell completion
++# We want to trigger the completion for the --input option,
++# which should cause click to open the file.
++# The completion logic for File type should open the file.
++
++os.environ["_REPRODUCE_ISSUE_COMPLETE"] = "bash_complete"
++# We want to complete the value for --input
++os.environ["COMP_WORDS"] = "reproduce_issue.py cmd --input "
++os.environ["COMP_CWORD"] = "2"
++
++# Run completion
++from io import StringIO
++from contextlib import redirect_stdout
++
++try:
++    with redirect_stdout(StringIO()):
++        cli.main(prog_name="reproduce_issue.py")
++except SystemExit:
++    pass
++
++# Check if the file is still open.
++# We can check /proc/self/fd
++import os
++open_fds = os.listdir('/proc/self/fd')
++print(f"Open FDs: {open_fds}")
++
++# Check if our temp file is among the open files
++# We can check the file descriptor's target
++is_open = False
++for fd in open_fds:
++    try:
++        # We need to check if the file is open.
++        # The file we are looking for is the one that click might have opened.
++        # But wait, if we are completing the value for --input,
++        # click might open the file to check if it exists or to list its contents.
++        # Actually, click.File('r') will open the file.
++        
++        # Let's list all open files
++        target = os.readlink(f'/proc/self/fd/{fd}')
++        print(f"FD {fd} points to {target}")
++        if target == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 6fd9e54..054029a 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -271,8 +271,11 @@ class ShellComplete:
+         :param incomplete: Value being completed. May be empty.
+         """
+         ctx = _resolve_context(self.cli, self.ctx_args, self.prog_name, args)
+-        obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
+-        return obj.shell_complete(ctx, incomplete)
++        try:
++            obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++            return obj.shell_complete(ctx, incomplete)
++        finally:
++            ctx.close()
+ 
+     def format_completion(self, item: CompletionItem) -> str:
+         """Format a completion item into the form recognized by the
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000..b41705d
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,67 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import ShellComplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++@click.group()
++def cli():
++    pass
++
++@cli.command()
++@click.option('--input', type=click.File('r'))
++def cmd(input):
++    pass
++
++# We want to simulate the completion process and ensure that the context is closed.
++# The issue is that the context created in _resolve_context is not closed.
++
++# Let's try to reproduce the issue by manually calling _resolve_context
++# and checking if the file is closed.
++
++from click.shell_completion import _resolve_context
++ctx = _resolve_context(cli, {}, "reproduce_issue.py", ["cmd", "--input", temp_file_path])
++
++# Now check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Now close the context
++ctx.close()
++
++# Check again
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is still open after close()")
++else:
++    print("File is closed after close()")
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/test_fix_2.py b/test_fix_2.py
+new file mode 100644
+index 0000000..cdfd2d0
+--- /dev/null
++++ b/test_fix_2.py
+@@ -0,0 +1,55 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import _resolve_context, _resolve_incomplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++@click.group()
++def cli():
++    pass
++
++@cli.command()
++@click.option('--input', type=click.File('r'))
++def cmd(input):
++    pass
++
++# Simulate the completion process
++args = ["cmd", "--input"]
++incomplete = temp_file_path
++
++# 1. Resolve context
++ctx = _resolve_context(cli, {}, "reproduce_issue.py", args)
++
++# 2. Resolve incomplete
++obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++
++# 3. Get completions
++completions = obj.shell_complete(ctx, incomplete)
++
++# Check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Now, if we don't close the context, it should remain open.
++# The issue is that the context is not closed automatically.
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/test_fix_3.py b/test_fix_3.py
+new file mode 100644
+index 0000000..db3fd0b
+--- /dev/null
++++ b/test_fix_3.py
+@@ -0,0 +1,55 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import _resolve_context, _resolve_incomplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++@click.group()
++def cli():
++    pass
++
++@cli.command()
++@click.option('--input', type=click.File('r'))
++def cmd(input):
++    pass
++
++# Simulate the completion process
++# We want to complete the value for --input
++args = ["cmd", "--input"]
++incomplete = ""
++
++# 1. Resolve context
++ctx = _resolve_context(cli, {}, "reproduce_issue.py", args)
++
++# 2. Resolve incomplete
++obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++
++# 3. Get completions
++# The File type's shell_complete will be called.
++# Let's see if it opens the file.
++completions = obj.shell_complete(ctx, incomplete)
++
++# Check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/test_fix_4.py b/test_fix_4.py
+new file mode 100644
+index 0000000..abce347
+--- /dev/null
++++ b/test_fix_4.py
+@@ -0,0 +1,73 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import _resolve_context, _resolve_incomplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++@click.group()
++def cli():
++    pass
++
++@cli.command()
++@click.option('--input', type=click.File('r'))
++def cmd(input):
++    pass
++
++# Simulate the completion process
++# We want to complete the value for --input
++# The File type's shell_complete will be called.
++# Let's see if it opens the file.
++# Actually, click.File('r') will open the file when it's used as a parameter.
++# But in completion, we are not using it as a parameter, we are just completing it.
++
++# Let's try to use a custom type that opens a file in shell_complete
++class MyFileType(click.ParamType):
++    def shell_complete(self, ctx, param, incomplete):
++        self.f = open(temp_file_path, 'r')
++        return [click.shell_completion.CompletionItem("test")]
++
++@click.group()
++def cli2():
++    pass
++
++@cli2.command()
++@click.option('--input', type=MyFileType())
++def cmd2(input):
++    pass
++
++args = ["cmd2", "--input"]
++incomplete = ""
++
++# 1. Resolve context
++ctx = _resolve_context(cli2, {}, "reproduce_issue.py", args)
++
++# 2. Resolve incomplete
++obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++
++# 3. Get completions
++completions = obj.shell_complete(ctx, incomplete)
++
++# Check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/test_fix_5.py b/test_fix_5.py
+new file mode 100644
+index 0000000..1e45b98
+--- /dev/null
++++ b/test_fix_5.py
+@@ -0,0 +1,75 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import _resolve_context, _resolve_incomplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++class MyFileType(click.ParamType):
++    def shell_complete(self, ctx, param, incomplete):
++        self.f = open(temp_file_path, 'r')
++        return [click.shell_completion.CompletionItem("test")]
++
++@click.group()
++def cli2():
++    pass
++
++@cli2.command()
++@click.option('--input', type=MyFileType())
++def cmd2(input):
++    pass
++
++args = ["cmd2", "--input"]
++incomplete = ""
++
++# 1. Resolve context
++ctx = _resolve_context(cli2, {}, "reproduce_issue.py", args)
++
++# 2. Resolve incomplete
++obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++
++# 3. Get completions
++completions = obj.shell_complete(ctx, incomplete)
++
++# Check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Now close the context
++ctx.close()
++
++# Check again
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is still open after close()")
++else:
++    print("File is closed after close()")
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/test_fix_6.py b/test_fix_6.py
+new file mode 100644
+index 0000000..a693176
+--- /dev/null
++++ b/test_fix_6.py
+@@ -0,0 +1,77 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import _resolve_context, _resolve_incomplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++class MyFileType(click.ParamType):
++    def shell_complete(self, ctx, param, incomplete):
++        # Use with_resource to open the file
++        f = open(temp_file_path, 'r')
++        ctx.with_resource(f)
++        return [click.shell_completion.CompletionItem("test")]
++
++@click.group()
++def cli2():
++    pass
++
++@cli2.command()
++@click.option('--input', type=MyFileType())
++def cmd2(input):
++    pass
++
++args = ["cmd2", "--input"]
++incomplete = ""
++
++# 1. Resolve context
++ctx = _resolve_context(cli2, {}, "reproduce_issue.py", args)
++
++# 2. Resolve incomplete
++obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++
++# 3. Get completions
++completions = obj.shell_complete(ctx, incomplete)
++
++# Check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is not open")
++
++# Now close the context
++ctx.close()
++
++# Check again
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is still open after close()")
++else:
++    print("File is closed after close()")
++
++# Cleanup
++os.remove(temp_file_path)
+diff --git a/test_fix_7.py b/test_fix_7.py
+new file mode 100644
+index 0000000..a42b6b2
+--- /dev/null
++++ b/test_fix_7.py
+@@ -0,0 +1,62 @@
++import click
++import os
++import sys
++import tempfile
++from click.shell_completion import ShellComplete
++
++# Create a temporary file to test file completion
++with tempfile.NamedTemporaryFile(delete=False) as f:
++    f.write(b"test")
++    temp_file_path = f.name
++
++class MyFileType(click.ParamType):
++    def shell_complete(self, ctx, param, incomplete):
++        # Use with_resource to open the file
++        f = open(temp_file_path, 'r')
++        ctx.with_resource(f)
++        return [click.shell_completion.CompletionItem("test")]
++
++@click.group()
++def cli2():
++    pass
++
++@cli2.command()
++@click.option('--input', type=MyFileType())
++def cmd2(input):
++    pass
++
++# We need to use the ShellComplete class to trigger the completion
++# and check if the file is closed.
++from click.shell_completion import BashComplete
++
++# Simulate the completion process
++# We need to mock the environment variables that click uses for completion
++# Actually, we can just instantiate BashComplete and call complete()
++# But we need to mock get_completion_args()
++
++class MyBashComplete(BashComplete):
++    def get_completion_args(self):
++        return ["cmd2", "--input"], ""
++
++comp = MyBashComplete(cli2, {}, "reproduce_issue.py", "_REPRODUCE_ISSUE_COMPLETE")
++comp.complete()
++
++# Check if the file is open.
++import os
++open_fds = os.listdir('/proc/self/fd')
++is_open = False
++for fd in open_fds:
++    try:
++        if os.readlink(f'/proc/self/fd/{fd}') == temp_file_path:
++            is_open = True
++            break
++    except OSError:
++        pass
++
++if is_open:
++    print("File is open")
++else:
++    print("File is closed")
++
++# Cleanup
++os.remove(temp_file_path)

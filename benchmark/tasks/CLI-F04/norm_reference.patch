@@ -1,0 +1,247 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 540bbe2..8e04846 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   Add a ``cleanup_timeout`` context option to bound cleanup waiting while
++    preserving cleanup batches and reporting late background failures.
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..becc368 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,13 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param cleanup_timeout: Maximum time in seconds to wait for cleanup
++        operations during context teardown. If None, no timeout is applied.
++        When the timeout is exceeded, Click stops waiting while cleanup
++        continues in a daemon thread.
++
++    .. versionchanged:: 8.2
++        Added the ``cleanup_timeout`` parameter.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +287,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +435,16 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++
++        # Validate cleanup_timeout
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be greater than 0")
++
++        #: Maximum timeout for cleanup operations in seconds.
++        self.cleanup_timeout: float | None = cleanup_timeout
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -606,10 +624,60 @@ class Context:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        If cleanup_timeout is specified, Click waits up to that duration.
++        If the timeout is exceeded, cleanup continues in a daemon thread
++        while this method returns control to the caller.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
+-        self._exit_stack = ExitStack()
++        if self.cleanup_timeout is not None:
++            self._close_with_timeout()
++        else:
++            self._exit_stack.close()
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
++
++    def _close_with_timeout(self) -> None:
++        """Close with timeout using threading for timeout mechanism."""
++        import threading
++
++        cleanup_completed = threading.Event()
++        cleanup_error: BaseException | None = None
++        state_lock = threading.Lock()
++        timed_out = False
++        stack, self._exit_stack = self._exit_stack, ExitStack()
++
++        def _do_cleanup() -> None:
++            nonlocal cleanup_error
++            try:
++                stack.close()
++            except BaseException as e:
++                cleanup_error = e
++            finally:
++                with state_lock:
++                    if timed_out and cleanup_error is not None:
++                        echo(
++                            f"Warning: Background cleanup failed: {cleanup_error}",
++                            err=True,
++                        )
++                    cleanup_completed.set()
++
++        # Start cleanup in a separate thread
++        cleanup_thread = threading.Thread(target=_do_cleanup, daemon=True)
++        cleanup_thread.start()
++
++        # Wait for completion or timeout
++        cleanup_completed.wait(timeout=self.cleanup_timeout)
++        with state_lock:
++            if cleanup_completed.is_set():
++                if cleanup_error is not None:
++                    raise cleanup_error
++            else:
++                timed_out = True
++                echo(
++                    f"Warning: Cleanup operations timed out after "
++                    f"{self.cleanup_timeout} seconds and continue in the background.",
++                    err=True,
++                )
+ 
+     @property
+     def command_path(self) -> str:
+diff --git a/tests/test_cleanup_timeout_contribution.py b/tests/test_cleanup_timeout_contribution.py
+new file mode 100644
+index 0000000..8265c57
+--- /dev/null
++++ b/tests/test_cleanup_timeout_contribution.py
+@@ -0,0 +1,121 @@
++import threading
++import time
++from contextlib import contextmanager
++
++import pytest
++
++import click
++
++
++def test_cleanup_timeout_inherits_and_validates() -> None:
++    root = click.Context(click.Command("root"), cleanup_timeout=0.5)
++    assert click.Context(click.Command("child"), parent=root).cleanup_timeout == 0.5
++    assert (
++        click.Context(
++            click.Command("child"), parent=root, cleanup_timeout=1
++        ).cleanup_timeout
++        == 1
++    )
++
++    for value in (0, -1):
++        with pytest.raises(ValueError):
++            click.Context(click.Command("bad"), cleanup_timeout=value)
++
++
++def test_untimed_cleanup_remains_synchronous_and_lifo() -> None:
++    events = []
++    ctx = click.Context(click.Command("cmd"))
++    ctx.call_on_close(lambda: events.append("first"))
++    ctx.call_on_close(lambda: events.append("last"))
++    ctx.close()
++    assert events == ["last", "first"]
++
++
++def test_timed_cleanup_preserves_resource_and_callback_lifo() -> None:
++    events = []
++
++    @contextmanager
++    def resource():
++        events.append("enter")
++        try:
++            yield
++        finally:
++            events.append("exit")
++
++    ctx = click.Context(click.Command("cmd"), cleanup_timeout=1)
++    ctx.call_on_close(lambda: events.append("first"))
++    ctx.with_resource(resource())
++    ctx.call_on_close(lambda: events.append("last"))
++    ctx.close()
++    assert events == ["enter", "last", "exit", "first"]
++
++
++def test_timeout_returns_and_late_error_is_reported(monkeypatch) -> None:
++    started = threading.Event()
++    release = threading.Event()
++    reported = threading.Event()
++    diagnostics = []
++
++    def record_diagnostic(message, **kwargs) -> None:
++        diagnostics.append(str(message))
++        if "late-cleanup" in str(message):
++            reported.set()
++
++    monkeypatch.setattr(click.core, "echo", record_diagnostic)
++    ctx = click.Context(click.Command("cmd"), cleanup_timeout=0.02)
++
++    def cleanup() -> None:
++        started.set()
++        assert release.wait(2)
++        raise RuntimeError("late-cleanup")
++
++    ctx.call_on_close(cleanup)
++    before = time.monotonic()
++    ctx.close()
++    assert time.monotonic() - before < 1
++    assert started.wait(1)
++    assert any("timed out" in item.lower() for item in diagnostics)
++    release.set()
++    assert reported.wait(2)
++    assert any("late-cleanup" in item for item in diagnostics)
++
++
++def test_registrations_during_cleanup_form_the_next_batch() -> None:
++    events = []
++    ctx = click.Context(click.Command("cmd"), cleanup_timeout=1)
++
++    def first_batch() -> None:
++        events.append("first")
++        ctx.call_on_close(lambda: events.append("second"))
++
++    ctx.call_on_close(first_batch)
++    ctx.close()
++    assert events == ["first"]
++    ctx.close()
++    ctx.close()
++    assert events == ["first", "second"]
++
++
++def test_new_batch_closes_while_timed_out_batch_finishes() -> None:
++    events = []
++    started = threading.Event()
++    release = threading.Event()
++    ctx = click.Context(click.Command("cmd"), cleanup_timeout=0.02)
++
++    def old_batch() -> None:
++        events.append("old-start")
++        started.set()
++        assert release.wait(2)
++        events.append("old-end")
++
++    ctx.call_on_close(old_batch)
++    ctx.close()
++    assert started.wait(1)
++    ctx.call_on_close(lambda: events.append("new"))
++    ctx.close()
++    assert events == ["old-start", "new"]
++    release.set()
++    deadline = time.monotonic() + 2
++    while time.monotonic() < deadline and events[-1] != "old-end":
++        time.sleep(0.01)
++    assert events == ["old-start", "new", "old-end"]

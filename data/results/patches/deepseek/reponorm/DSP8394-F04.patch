@@ -1,0 +1,639 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..0675994d 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,6 +1,7 @@
+ import copy
+ import inspect
+ import logging
++import contextvars
+ import threading
+ from functools import wraps
+ from hashlib import sha256
+@@ -15,6 +16,11 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++# Per-call cache tracker context variable.
++# Each async task gets its own context, preventing concurrent callers from mixing counts.
++_cache_context_var: "contextvars.ContextVar" = contextvars.ContextVar("_dspy_cache_context", default=None)
++
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -58,6 +64,7 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._stats = {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -96,23 +103,50 @@ class Cache:
+         params = {k: transform_value(v) for k, v in request.items() if k not in ignored_args_for_cache_key}
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
++    def _record_context_event(self, hit_type=None):
++        """Record a cache event in the per-call context tracker, if active."""
++        ctx = _cache_context_var.get()
++        if ctx is not None:
++            with ctx["lock"]:
++                if hit_type == "mem":
++                    ctx["counts"]["hits"] += 1
++                    ctx["counts"]["mem_hits"] += 1
++                elif hit_type == "disk":
++                    ctx["counts"]["hits"] += 1
++                    ctx["counts"]["disk_hits"] += 1
++                else:
++                    ctx["counts"]["misses"] += 1
++
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+             logger.debug(f"Failed to generate cache key for request: {request}")
++            with self._lock:
++                self._stats["misses"] += 1
++            self._record_context_event(hit_type=None)
+             return None
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
++                self._stats["hits"] += 1
++                self._stats["mem_hits"] += 1
++            self._record_context_event(hit_type="mem")
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+             response = self.disk_cache[key]
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
++            with self._lock:
++                self._stats["hits"] += 1
++                self._stats["disk_hits"] += 1
++            self._record_context_event(hit_type="disk")
+         else:
++            with self._lock:
++                self._stats["misses"] += 1
++            self._record_context_event(hit_type=None)
+             return None
+ 
+         response = copy.deepcopy(response)
+@@ -168,6 +202,16 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    def stats(self) -> Dict[str, int]:
++        """Return a fresh dictionary with cache hit/miss statistics."""
++        with self._lock:
++            return dict(self._stats)
++
++    def reset_stats(self) -> None:
++        """Reset all cache statistics counters to zero without clearing entries."""
++        with self._lock:
++            self._stats = {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+diff --git a/dspy/primitives/prediction.py b/dspy/primitives/prediction.py
+index 670b816b..33399314 100644
+--- a/dspy/primitives/prediction.py
++++ b/dspy/primitives/prediction.py
+@@ -10,6 +10,7 @@ class Prediction(Example):
+ 
+         self._completions = None
+         self._lm_usage = None
++        self._cache_usage = None
+ 
+     def get_lm_usage(self):
+         return self._lm_usage
+@@ -17,6 +18,16 @@ class Prediction(Example):
+     def set_lm_usage(self, value):
+         self._lm_usage = value
+ 
++    def get_cache_usage(self):
++        """Return a copy of the cache usage snapshot for this prediction, or None if tracking is off."""
++        if self._cache_usage is None:
++            return None
++        return dict(self._cache_usage)
++
++    def set_cache_usage(self, value):
++        """Store a copy of the cache usage dictionary; stores None to clear."""
++        self._cache_usage = dict(value) if value is not None else None
++
+     @classmethod
+     def from_completions(cls, list_or_dict, signature=None):
+         obj = cls()
+diff --git a/dspy/primitives/program.py b/dspy/primitives/program.py
+index 39457c36..4c42f767 100644
+--- a/dspy/primitives/program.py
++++ b/dspy/primitives/program.py
+@@ -7,6 +7,7 @@ import magicattr
+ from dspy.dsp.utils.settings import settings, thread_local_overrides
+ from dspy.predict.parallel import Parallel
+ from dspy.primitives.module import BaseModule
++from dspy.primitives.prediction import Prediction
+ from dspy.utils.callback import with_callbacks
+ from dspy.utils.inspect_history import pretty_print_history
+ from dspy.utils.usage_tracker import track_usage
+@@ -50,33 +51,107 @@ class Module(BaseModule, metaclass=ProgramMeta):
+ 
+     @with_callbacks
+     def __call__(self, *args, **kwargs):
++        import dspy
++        import threading
++        from dspy.clients.cache import _cache_context_var
++
+         caller_modules = settings.caller_modules or []
+         caller_modules = list(caller_modules)
+         caller_modules.append(self)
+ 
+         with settings.context(caller_modules=caller_modules):
+-            if settings.track_usage and thread_local_overrides.get().get("usage_tracker") is None:
+-                with track_usage() as usage_tracker:
++            track_lm_usage = (
++                settings.track_usage
++                and thread_local_overrides.get().get("usage_tracker") is None
++            )
++            track_cache = settings.track_usage
++
++            if track_cache:
++                old_ctx = _cache_context_var.get()
++                my_ctx = {
++                    "lock": threading.Lock(),
++                    "counts": {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0},
++                }
++                token = _cache_context_var.set(my_ctx)
++            else:
++                my_ctx = None
++                token = None
++
++            output = None
++            try:
++                if track_lm_usage:
++                    with track_usage() as usage_tracker:
++                        output = self.forward(*args, **kwargs)
++                        output.set_lm_usage(usage_tracker.get_total_tokens())
++                else:
+                     output = self.forward(*args, **kwargs)
+-                output.set_lm_usage(usage_tracker.get_total_tokens())
+-                return output
+-
+-            return self.forward(*args, **kwargs)
++            except BaseException:
++                raise
++            else:
++                # On success, merge counts into parent context and attach to prediction
++                if track_cache and my_ctx is not None:
++                    if old_ctx is not None:
++                        with old_ctx["lock"]:
++                            for k in my_ctx["counts"]:
++                                old_ctx["counts"][k] += my_ctx["counts"][k]
++                    if isinstance(output, Prediction):
++                        output.set_cache_usage(dict(my_ctx["counts"]))
++            finally:
++                if track_cache and my_ctx is not None:
++                    _cache_context_var.reset(token)
++            return output
+ 
+     @with_callbacks
+     async def acall(self, *args, **kwargs):
++        import dspy
++        import threading
++        from dspy.clients.cache import _cache_context_var
++
+         caller_modules = settings.caller_modules or []
+         caller_modules = list(caller_modules)
+         caller_modules.append(self)
+ 
+         with settings.context(caller_modules=caller_modules):
+-            if settings.track_usage and thread_local_overrides.get().get("usage_tracker") is None:
+-                with track_usage() as usage_tracker:
++            track_lm_usage = (
++                settings.track_usage
++                and thread_local_overrides.get().get("usage_tracker") is None
++            )
++            track_cache = settings.track_usage
++
++            if track_cache:
++                old_ctx = _cache_context_var.get()
++                my_ctx = {
++                    "lock": threading.Lock(),
++                    "counts": {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0},
++                }
++                token = _cache_context_var.set(my_ctx)
++            else:
++                my_ctx = None
++                token = None
++
++            output = None
++            try:
++                if track_lm_usage:
++                    with track_usage() as usage_tracker:
++                        output = await self.aforward(*args, **kwargs)
++                        output.set_lm_usage(usage_tracker.get_total_tokens())
++                else:
+                     output = await self.aforward(*args, **kwargs)
+-                    output.set_lm_usage(usage_tracker.get_total_tokens())
+-                    return output
+-
+-            return await self.aforward(*args, **kwargs)
++            except BaseException:
++                raise
++            else:
++                # On success, merge counts into parent context and attach to prediction
++                if track_cache and my_ctx is not None:
++                    if old_ctx is not None:
++                        with old_ctx["lock"]:
++                            for k in my_ctx["counts"]:
++                                old_ctx["counts"][k] += my_ctx["counts"][k]
++                    if isinstance(output, Prediction):
++                        output.set_cache_usage(dict(my_ctx["counts"]))
++            finally:
++                if track_cache and my_ctx is not None:
++                    _cache_context_var.reset(token)
++            return output
+ 
+     def named_predictors(self):
+         from dspy.predict.predict import Predict
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff1485..2061a75c 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -280,3 +280,150 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++
++# ── Cache statistics ────────────────────────────────────────────────────────
++
++def test_stats_initial_state(cache):
++    """Stats start at zero."""
++    s = cache.stats()
++    assert s == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++
++
++def test_stats_miss_then_hit(cache):
++    """A miss increments misses; a subsequent hit increments hits and mem_hits."""
++    request = {"_fn_identifier": "test.fn", "prompt": "hello"}
++
++    # Miss
++    assert cache.get(request) is None
++    s = cache.stats()
++    assert s["misses"] == 1
++    assert s["hits"] == 0
++
++    # Put then get → hit
++    cache.put(request, "value")
++    assert cache.get(request) == "value"
++    s = cache.stats()
++    assert s["hits"] == 1
++    assert s["mem_hits"] == 1
++    assert s["misses"] == 1
++
++
++def test_stats_key_error_is_miss(cache):
++    """A cache-key generation failure counts as a miss."""
++    request = {"_fn_identifier": "test.fn", "bad": object()}  # not serialisable
++    assert cache.get(request) is None
++    s = cache.stats()
++    assert s["misses"] == 1
++    assert s["hits"] == 0
++
++
++def test_stats_reset(cache):
++    """reset_stats() clears counters without affecting entries."""
++    request = {"_fn_identifier": "test.fn", "prompt": "x"}
++    cache.get(request)  # miss
++    assert cache.stats()["misses"] == 1
++
++    cache.reset_stats()
++    s = cache.stats()
++    assert s == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++
++    # Cache entry still exists
++    cache.put(request, "val")
++    assert cache.get(request) == "val"
++    s = cache.stats()
++    assert s["hits"] == 1  # one new hit after reset
++
++
++def test_stats_return_is_copy(cache):
++    """Modifying a returned stats dict does not mutate internal counters."""
++    request = {"_fn_identifier": "test.fn", "prompt": "y"}
++    cache.get(request)  # miss
++    s = cache.stats()
++    s["misses"] = 999
++    assert cache.stats()["misses"] == 1
++
++
++def test_hits_equals_mem_hits_plus_disk_hits(cache):
++    """hits is always the sum of mem_hits and disk_hits."""
++    request = {"_fn_identifier": "test.fn", "prompt": "z"}
++    cache.get(request)  # miss
++    cache.put(request, "val")
++    cache.get(request)  # mem hit
++    s = cache.stats()
++    assert s["hits"] == s["mem_hits"] + s["disk_hits"]
++
++
++def test_stats_disk_hit(tmp_path):
++    """A disk hit increments disk_hits when memory cache misses."""
++    c = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=True,
++        disk_cache_dir=str(tmp_path),
++    )
++    request = {"_fn_identifier": "test.fn", "prompt": "disk_test"}
++    c.put(request, "disk_val")
++
++    # Pop memory cache but keep disk
++    c.reset_memory_cache()
++
++    val = c.get(request)
++    assert val == "disk_val"
++    s = c.stats()
++    assert s["disk_hits"] == 1
++    assert s["hits"] == 1
++    assert s["mem_hits"] == 0
++
++
++def test_stats_disk_hit_no_memory(tmp_path):
++    """Disk hits work correctly even when memory cache is disabled."""
++    c = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=False,
++        disk_cache_dir=str(tmp_path),
++    )
++    request = {"_fn_identifier": "test.fn", "prompt": "disk_only"}
++    c.put(request, "disk_val")
++
++    val = c.get(request)
++    assert val == "disk_val"
++    s = c.stats()
++    assert s["disk_hits"] == 1
++    assert s["hits"] == 1
++    assert s["mem_hits"] == 0
++
++
++def test_stats_concurrent_increment(cache):
++    """Concurrent gets safely increment counters."""
++    import concurrent.futures
++
++    request = {"_fn_identifier": "test.fn", "prompt": "concurrent"}
++    cache.put(request, "val")
++
++    def do_get():
++        cache.get(request)
++        return None
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++        list(pool.map(lambda _: do_get(), range(100)))
++
++    s = cache.stats()
++    assert s["hits"] == 100
++    assert s["mem_hits"] == 100
++    assert s["misses"] == 0
++
++
++def test_stats_concurrent_key_error(cache):
++    """Concurrent key-generation failures safely increment misses."""
++    import concurrent.futures
++
++    request = {"_fn_identifier": "test.fn", "bad": object()}
++
++    def do_get():
++        cache.get(request)
++        return None
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
++        list(pool.map(lambda _: do_get(), range(100)))
++
++    assert cache.stats()["misses"] == 100
+diff --git a/tests/primitives/test_module.py b/tests/primitives/test_module.py
+index 023f92c3..93620649 100644
+--- a/tests/primitives/test_module.py
++++ b/tests/primitives/test_module.py
+@@ -511,3 +511,218 @@ def test_forward_through_call_no_warning(capsys):
+     module(x="test")
+     captured = capsys.readouterr()
+     assert "Calling TestModule.forward() directly is discouraged" not in captured.err
++
++
++# ── Per-call cache usage tracking ─────────────────────────────────────────────
++
++import dspy
++
++
++def _clean_test_cache():
++    """Disable disk cache and clear memory cache for test isolation."""
++    import dspy
++    dspy.cache.enable_disk_cache = False
++    dspy.cache.memory_cache.clear()
++
++
++class _CacheTestModule(dspy.Module):
++    """A minimal module that exercises dspy.cache in forward()."""
++
++    def forward(self, key_suffix: str = ""):
++        import dspy
++        request = {"_fn_identifier": "test.fn", "prompt": f"input_{key_suffix}"}
++        result = dspy.cache.get(request)
++        if result is None:
++            dspy.cache.put(request, "computed")
++            result = dspy.cache.get(request)
++        return dspy.Prediction(result=result)
++
++
++def test_get_cache_usage_is_none_when_tracking_off():
++    """Without track_usage, Prediction.get_cache_usage() returns None."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=False)
++    module = _CacheTestModule()
++    prediction = module(key_suffix="off")
++    assert prediction.get_cache_usage() is None
++
++
++def test_get_cache_usage_basic():
++    """Per-call snapshot records miss then hit correctly."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    with dspy.settings.context(track_usage=True):
++        module = _CacheTestModule()
++
++        # First call: miss + subsequent hit
++        prediction = module(key_suffix="basic1")
++        usage = prediction.get_cache_usage()
++        assert usage is not None
++        assert usage["misses"] >= 1   # at least one miss
++        assert usage["hits"] >= 1     # at least one hit (from re-get after put)
++        assert usage["hits"] == usage["mem_hits"] + usage["disk_hits"]
++
++        # Second call with same key: only hits
++        prediction2 = module(key_suffix="basic1")
++        usage2 = prediction2.get_cache_usage()
++        assert usage2 is not None
++        assert usage2["misses"] == 0
++        assert usage2["hits"] >= 1
++        assert usage2["hits"] == usage2["mem_hits"] + usage2["disk_hits"]
++
++        # Verify snapshots are independent
++        assert usage is not prediction.get_cache_usage()
++        assert usage["misses"] == 1  # first call unchanged
++
++
++def test_get_cache_usage_independent_of_global_stats():
++    """Per-call snapshot is isolated from cache.stats() and later calls."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    dspy.cache.reset_stats()
++
++    module = _CacheTestModule()
++    pred1 = module(key_suffix="indep1")
++    usage1 = pred1.get_cache_usage()
++
++    pred2 = module(key_suffix="indep1")
++    usage2 = pred2.get_cache_usage()
++
++    global_stats = dspy.cache.stats()
++
++    # Global stats accounts for all operations
++    assert global_stats["hits"] > 0
++    assert global_stats["misses"] > 0
++
++    # First call had 1 miss, at least 1 hit
++    assert usage1["misses"] >= 1
++    assert usage1["hits"] >= 1
++
++    # Second call had only hits (key already cached)
++    assert usage2["misses"] == 0
++    assert usage2["hits"] >= 1
++
++    # Later resets don't affect already-captured snapshot
++    dspy.cache.reset_stats()
++    assert pred1.get_cache_usage()["misses"] == usage1["misses"]
++
++
++def test_get_cache_usage_mutating_return_does_not_affect_prediction():
++    """Changing the returned dict does not mutate the stored snapshot."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    dspy.cache.reset_stats()
++
++    module = _CacheTestModule()
++    prediction = module(key_suffix="mutate")
++    usage = prediction.get_cache_usage()
++    original_misses = usage["misses"]
++    usage["misses"] = 9999
++    assert prediction.get_cache_usage()["misses"] == original_misses
++
++
++def test_get_cache_usage_nested_calls():
++    """A module that calls another module merges inner usage into its snapshot."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    dspy.cache.reset_stats()
++
++    class OuterModule(dspy.Module):
++        def __init__(self):
++            super().__init__()
++            self.inner = _CacheTestModule()
++
++        def forward(self, key_suffix: str = ""):
++            # Inner call generates cache events
++            inner_pred = self.inner(key_suffix=f"inner_{key_suffix}")
++            # Direct cache events in outer
++            request = {"_fn_identifier": "outer.fn", "prompt": f"outer_{key_suffix}"}
++            dspy.cache.get(request)  # miss
++            dspy.cache.put(request, "outer_val")
++            dspy.cache.get(request)  # hit
++            return dspy.Prediction(result=inner_pred.result)
++
++    outer = OuterModule()
++    prediction = outer(key_suffix="nested")
++    usage = prediction.get_cache_usage()
++    assert usage is not None
++    # Should include both inner and outer events
++    assert usage["misses"] >= 2  # inner miss + outer miss (first call)
++    assert usage["hits"] >= 2   # inner hit + outer hit
++    assert usage["hits"] == usage["mem_hits"] + usage["disk_hits"]
++
++
++def test_get_cache_usage_exception_restores_context():
++    """Exception during forward must restore the caller's tracking context."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    dspy.cache.reset_stats()
++
++    from dspy.clients.cache import _cache_context_var
++
++    # Set up a parent context
++    parent_ctx = {
++        "lock": __import__("threading").Lock(),
++        "counts": {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 5},
++    }
++    token = _cache_context_var.set(parent_ctx)
++
++    class FailingModule(dspy.Module):
++        def forward(self):
++            # This will trigger cache events before failing
++            request = {"_fn_identifier": "fail.fn", "prompt": "fail"}
++            dspy.cache.get(request)  # miss
++            raise ValueError("simulated failure")
++
++    mod = FailingModule()
++    try:
++        mod()
++    except ValueError:
++        pass
++
++    # After the exception, the parent context should be restored
++    restored = _cache_context_var.get()
++    assert restored is parent_ctx
++    # And the parent context should NOT have the failing module's events
++    # (because the finally block resets the token without merging)
++    assert restored["counts"]["misses"] == 5
++
++    _cache_context_var.reset(token)
++
++
++def test_get_cache_usage_multiple_calls_independent():
++    """Each call to the same module produces an independent snapshot."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    dspy.cache.reset_stats()
++
++    module = _CacheTestModule()
++    preds = [module(key_suffix="multi") for _ in range(3)]
++    usages = [p.get_cache_usage() for p in preds]
++
++    # First call: miss + hit
++    assert usages[0]["misses"] >= 1
++    assert usages[0]["hits"] >= 1
++
++    # Second and third calls: only hits
++    assert usages[1]["misses"] == 0
++    assert usages[1]["hits"] >= 1
++    assert usages[2]["misses"] == 0
++    assert usages[2]["hits"] >= 1
++
++
++def test_get_cache_usage_zero_counts():
++    """A module that makes no cache calls gets zero counts."""
++    _clean_test_cache()
++    dspy.settings.configure(track_usage=True)
++    dspy.cache.reset_stats()
++
++    class NoOpModule(dspy.Module):
++        def forward(self):
++            return dspy.Prediction(result=42)
++
++    mod = NoOpModule()
++    prediction = mod()
++    usage = prediction.get_cache_usage()
++    assert usage is not None
++    assert usage == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}

@@ -1,0 +1,408 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..6f16d9cf 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,9 +2,10 @@ import copy
+ import inspect
+ import logging
+ import threading
++from contextvars import ContextVar
+ from functools import wraps
+ from hashlib import sha256
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, List, Optional
+ 
+ import cloudpickle
+ import pydantic
+@@ -58,6 +59,11 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        
++        # Thread-local storage for bypass state
++        self._bypass_state: ContextVar[Optional[List['Cache']]] = ContextVar(
++            f"_bypass_state_{id(self)}", default=None
++        )
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -103,6 +109,11 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
++        # Check if bypass is active for this cache instance
++        bypass_active = self._bypass_state.get()
++        if bypass_active is not None:
++            return None
++
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
+@@ -168,6 +179,59 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    class _BypassContext:
++        """Internal context manager for bypass mode."""
++        
++        def __init__(self, cache: 'Cache'):
++            self.cache = cache
++        
++        def __enter__(self):
++            # Push new bypass state onto the stack
++            current = self.cache._bypass_state.get()
++            if current is None:
++                current = []
++            current.append(self.cache)
++            self.cache._bypass_state.set(current)
++            return self
++        
++        def __exit__(self, exc_type, exc_val, exc_tb):
++            # Pop bypass state from the stack
++            current_list = self.cache._bypass_state.get()
++            if len(current_list) > 0:
++                current_list.pop()
++                if len(current_list) == 0:
++                    self.cache._bypass_state.set(None)
++                else:
++                    self.cache._bypass_state.set(current_list)
++            return False
++    
++    def bypass(self) -> '_BypassContext':
++        """Context manager to temporarily bypass cache reads while retaining writes.
++        
++        Within this context, cache reads behave as cache misses even when a value
++        is stored. Writes remain enabled according to the existing memory/disk
++        configuration. After the context ends, newly written values can be read
++        normally.
++        
++        This context manager works with both synchronous and asynchronous functions
++        decorated with @request_cache. A bypassed call recomputes its result, stores
++        it, and later ordinary calls reuse the fresh result.
++        
++        Nested contexts retain bypass until their outer context exits. Normal and
++        exceptional exits restore the previous state. Bypass is local to the current
++        thread/asynchronous execution context; an independently started thread or
++        sibling async task must retain its own state.
++        
++        Example:
++            >>> with dspy.cache.bypass():
++            ...     result = some_cached_function()  # Will recompute, not use cache
++            >>> result2 = some_cached_function()   # Will use cache now
++            
++        Returns:
++            _BypassContext: A context manager object.
++        """
++        return self._BypassContext(self)
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff1485..09b9f94c 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -1,4 +1,6 @@
+ from dataclasses import dataclass
++import asyncio
++import threading
+ from unittest.mock import patch
+ 
+ import pydantic
+@@ -6,7 +8,7 @@ import pytest
+ from cachetools import LRUCache
+ from diskcache import FanoutCache
+ 
+-from dspy.clients.cache import Cache
++from dspy.clients.cache import Cache, request_cache
+ 
+ 
+ @dataclass
+@@ -280,3 +282,287 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++
++def test_bypass_basic(cache):
++    """Test basic bypass functionality - reads are misses, writes still work."""
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    value = "test_response"
++    
++    # First, put a value in cache
++    cache.put(request, value)
++    
++    # Verify we can get it normally
++    result = cache.get(request)
++    assert result == value
++    
++    # Now use bypass - should not find cached value
++    with cache.bypass():
++        result = cache.get(request)
++        assert result is None
++    
++    # After bypass, should be able to get again
++    result = cache.get(request)
++    assert result == value
++
++
++def test_bypass_writes_still_work(cache):
++    """Test that writes still work during bypass."""
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    
++    with cache.bypass():
++        # Write a new value while bypassed
++        cache.put(request, "new_value")
++    
++    # Should be able to read the new value after bypass
++    result = cache.get(request)
++    assert result == "new_value"
++
++
++def test_bypass_nested_contexts(cache):
++    """Test nested bypass contexts - outer context controls exit."""
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    cache.put(request, "cached_value")
++    
++    # Outer bypass context
++    with cache.bypass():
++        assert cache.get(request) is None
++        
++        # Inner bypass context
++        with cache.bypass():
++            assert cache.get(request) is None
++        
++        # Still in outer context, should still be bypassed
++        assert cache.get(request) is None
++    
++    # After outer context exits, should be able to read
++    result = cache.get(request)
++    assert result == "cached_value"
++
++
++def test_bypass_exceptional_exit(cache):
++    """Test that bypass restores state after exception."""
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    cache.put(request, "cached_value")
++    
++    try:
++        with cache.bypass():
++            assert cache.get(request) is None
++            raise ValueError("Test exception")
++    except ValueError:
++        pass
++    
++    # State should be restored after exception
++    result = cache.get(request)
++    assert result == "cached_value"
++
++
++def test_bypass_with_request_cache_sync(cache):
++    """Test bypass works with @request_cache decorator on sync functions."""
++    call_count = [0]
++    
++    @request_cache()
++    def my_function(prompt):
++        call_count[0] += 1
++        return f"Response for {prompt}"
++    
++    # Mock dspy.cache
++    import dspy
++    original_cache = dspy.cache
++    dspy.cache = cache
++    
++    try:
++        # First call - should compute
++        result1 = my_function("Hello")
++        assert result1 == "Response for Hello"
++        assert call_count[0] == 1
++        
++        # Second call - should use cache
++        result2 = my_function("Hello")
++        assert result2 == "Response for Hello"
++        assert call_count[0] == 1
++        
++        # Third call in bypass - should recompute
++        with cache.bypass():
++            result3 = my_function("Hello")
++            assert result3 == "Response for Hello"
++            assert call_count[0] == 2
++        
++        # Fourth call - should use cache (fresh result from bypass)
++        result4 = my_function("Hello")
++        assert result4 == "Response for Hello"
++        assert call_count[0] == 2
++        
++    finally:
++        dspy.cache = original_cache
++
++
++def test_bypass_with_request_cache_async(cache):
++    """Test bypass works with @request_cache decorator on async functions."""
++    call_count = [0]
++    
++    @request_cache()
++    async def my_async_function(prompt):
++        call_count[0] += 1
++        return f"Async response for {prompt}"
++    
++    # Mock dspy.cache
++    import dspy
++    original_cache = dspy.cache
++    dspy.cache = cache
++    
++    try:
++        # First call - should compute
++        result1 = asyncio.run(my_async_function("Hello"))
++        assert result1 == "Async response for Hello"
++        assert call_count[0] == 1
++        
++        # Second call - should use cache
++        result2 = asyncio.run(my_async_function("Hello"))
++        assert result2 == "Async response for Hello"
++        assert call_count[0] == 1
++        
++        # Third call in bypass - should recompute
++        with cache.bypass():
++            result3 = asyncio.run(my_async_function("Hello"))
++            assert result3 == "Async response for Hello"
++            assert call_count[0] == 2
++        
++        # Fourth call - should use cache (fresh result from bypass)
++        result4 = asyncio.run(my_async_function("Hello"))
++        assert result4 == "Async response for Hello"
++        assert call_count[0] == 2
++        
++    finally:
++        dspy.cache = original_cache
++
++
++@pytest.mark.asyncio
++async def test_bypass_across_await(cache):
++    """Test bypass remains effective across await points."""
++    call_count = [0]
++    
++    @request_cache()
++    async def my_async_function(prompt):
++        call_count[0] += 1
++        return f"Async response for {prompt}"
++    
++    # Mock dspy.cache
++    import dspy
++    original_cache = dspy.cache
++    dspy.cache = cache
++    
++    try:
++        # First call - should compute
++        result1 = await my_async_function("Hello")
++        assert result1 == "Async response for Hello"
++        assert call_count[0] == 1
++        
++        # Second call - should use cache
++        result2 = await my_async_function("Hello")
++        assert result2 == "Async response for Hello"
++        assert call_count[0] == 1
++        
++        # Call in bypass with await - should recompute
++        with cache.bypass():
++            # Simulate some async work
++            await asyncio.sleep(0.001)
++            result3 = await my_async_function("Hello")
++            assert result3 == "Async response for Hello"
++            assert call_count[0] == 2
++        
++        # After bypass - should use cache
++        result4 = await my_async_function("Hello")
++        assert result4 == "Async response for Hello"
++        assert call_count[0] == 2
++        
++    finally:
++        dspy.cache = original_cache
++
++
++def test_bypass_thread_local(cache):
++    """Test bypass is local to thread."""
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    cache.put(request, "cached_value")
++    
++    results = {}
++    
++    def thread_func():
++        # In this thread, bypass should NOT affect the main thread's state
++        result = cache.get(request)
++        results['thread'] = result
++    
++    # Main thread enters bypass
++    with cache.bypass():
++        # Main thread sees bypass
++        assert cache.get(request) is None
++        
++        # Start a new thread
++        t = threading.Thread(target=thread_func)
++        t.start()
++        t.join()
++        
++        # Thread should see cached value (not affected by main thread's bypass)
++        assert results['thread'] == "cached_value"
++    
++    # Main thread can now read
++    result = cache.get(request)
++    assert result == "cached_value"
++
++
++def test_bypass_multiple_cache_instances(tmp_path):
++    """Test bypass is local to each Cache instance."""
++    cache1 = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=True,
++        disk_cache_dir=str(tmp_path / "cache1"),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=100,
++    )
++    
++    cache2 = Cache(
++        enable_disk_cache=True,
++        enable_memory_cache=True,
++        disk_cache_dir=str(tmp_path / "cache2"),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=100,
++    )
++    
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    cache1.put(request, "cache1_value")
++    cache2.put(request, "cache2_value")
++    
++    # Bypass only affects cache1
++    with cache1.bypass():
++        assert cache1.get(request) is None
++        assert cache2.get(request) == "cache2_value"
++    
++    # Both should work normally after
++    assert cache1.get(request) == "cache1_value"
++    assert cache2.get(request) == "cache2_value"
++
++
++def test_bypass_global_cache(tmp_path):
++    """Test bypass works with global dspy.cache."""
++    import dspy
++    
++    # Configure global cache
++    dspy.configure_cache(
++        enable_disk_cache=True,
++        enable_memory_cache=True,
++        disk_cache_dir=str(tmp_path),
++        disk_size_limit_bytes=1024 * 1024,
++        memory_max_entries=100,
++    )
++    
++    request = {"prompt": "Hello", "model": "gpt-4"}
++    dspy.cache.put(request, "global_cached_value")
++    
++    # Test bypass on global cache
++    with dspy.cache.bypass():
++        result = dspy.cache.get(request)
++        assert result is None
++    
++    # After bypass, should be able to read
++    result = dspy.cache.get(request)
++    assert result == "global_cached_value"

@@ -1,0 +1,205 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..487dcd9 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -477,6 +477,26 @@ def _nullpager(
+             text = strip_ansi(text)
+         stream.write(text)
+ 
++def _get_process_priority(priority: str | None) -> int | None:
++    """Map priority name to nice value or None.
++    
++    Returns None if priority is None or invalid.
++    Nice values range from -20 (highest priority) to 19 (lowest).
++    """
++    if priority is None:
++        return None
++    
++    mapping = {
++        "low": 10,
++        "below_normal": 5,
++        "normal": 0,
++        "above_normal": -5,
++        "high": -10,
++    }
++    
++    return mapping.get(priority)
++
++
+ 
+ class Editor:
+     def __init__(
+@@ -485,11 +505,24 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        process_priority: str | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        if process_priority is not None and process_priority not in (
++            "low",
++            "below_normal",
++            "normal",
++            "above_normal",
++            "high",
++        ):
++            raise ValueError(
++                f"process_priority must be one of low, below_normal, normal, "
++                f"above_normal, high, or None, got {process_priority!r}"
++            )
++        self.process_priority = process_priority
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -516,7 +549,14 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            c = subprocess.Popen(
++                f'{editor} "{filename}"',
++                env=environ,
++                shell=True,
++                creationflags=self._get_creation_flags(),
++            )
++            # Apply process priority after launch
++            self._apply_priority(c.pid)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -527,6 +567,41 @@ class Editor:
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+ 
++    def _get_creation_flags(self) -> int:
++        """Get Windows process creation flags for priority."""
++        if not WIN:
++            return 0
++        
++        flags = 0
++        priority_mapping = {
++            "low": subprocess.IDLE_PRIORITY_CLASS,
++            "below_normal": subprocess.BELOW_NORMAL_PRIORITY_CLASS,
++            "normal": subprocess.NORMAL_PRIORITY_CLASS,
++            "above_normal": subprocess.ABOVE_NORMAL_PRIORITY_CLASS,
++            "high": subprocess.HIGH_PRIORITY_CLASS,
++        }
++        
++        if self.process_priority:
++            flags = priority_mapping.get(self.process_priority, 0)
++        
++        return flags
++
++    def _apply_priority(self, pid: int) -> None:
++        """Apply nice value to a running process by PID."""
++        if self.process_priority is None:
++            return
++        
++        nice_value = _get_process_priority(self.process_priority)
++        if nice_value is None:
++            return
++        
++        try:
++            os.setpriority(os.PRIO_PROCESS, pid, nice_value)
++        except (OSError, ValueError):
++            # If we can't set priority (permission denied or not supported),
++            # continue with default
++            pass
++
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..e163c6e 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    process_priority: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,20 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param process_priority: scheduling priority for the editor process.
++                             One of ``low``, ``below_normal``, ``normal``,
++                             ``above_normal``, or ``high``.  ``None`` uses
++                             the platform default.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++            editor=editor,
++            env=env,
++            require_save=require_save,
++            extension=extension,
++            process_priority=process_priority,
++        )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..82d7563 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -1,4 +1,5 @@
+ import platform
++from unittest.mock import MagicMock
+ import time
+ 
+ import pytest
+@@ -470,3 +471,46 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++
++def test_edit_process_priority_invalid():
++    """Test that invalid process_priority raises ValueError."""
++    from click._termui_impl import Editor
++    
++    with pytest.raises(ValueError, match="process_priority must be one of"):
++        Editor(process_priority="invalid")
++
++
++def test_edit_process_priority_valid_values():
++    """Test that valid process_priority values are accepted by Editor."""
++    from click._termui_impl import Editor
++    
++    for priority in ["low", "below_normal", "normal", "above_normal", "high"]:
++        editor = Editor(process_priority=priority)
++        assert editor.process_priority == priority
++
++
++def test_edit_process_priority_none_default():
++    """Test that None process_priority is preserved."""
++    from click._termui_impl import Editor
++    
++    editor = Editor(process_priority=None)
++    assert editor.process_priority is None
++
++
++def test_edit_function_process_priority(runner):
++    """Test that edit function accepts process_priority parameter."""
++    # Just verify the parameter is accepted without error
++    # The actual editor execution is tested by test_fast_edit
++    try:
++        # This will fail because cat doesn't exist or vi isn't installed,
++        # but we're testing that process_priority is accepted
++        click.edit("test", editor="echo", process_priority="normal")
++    except Exception:
++        pass  # Expected to fail due to editor not being available
++
++
++def test_edit_function_invalid_process_priority():
++    """Test that edit function rejects invalid process_priority."""
++    with pytest.raises(ValueError, match="process_priority must be one of"):
++        click.edit("test", editor="echo", process_priority="invalid")

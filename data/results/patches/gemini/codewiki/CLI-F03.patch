@@ -1,0 +1,152 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..4a02c7a 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -426,11 +427,15 @@ class Context:
+ 
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
++        if max_resources is None and parent is not None:
++            max_resources = parent.max_resources
++        self.max_resources = max_resources
+ 
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._active_resources = 0
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -588,7 +593,21 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        if self.max_resources is not None:
++            ctx = self
++            while ctx is not None:
++                if ctx.max_resources is not None and ctx._active_resources >= ctx.max_resources:
++                    raise RuntimeError("Too many resources")
++                ctx = ctx.parent
++        
++        self._active_resources += 1
++        try:
++            res = self._exit_stack.enter_context(context_manager)
++            self._exit_stack.callback(lambda: setattr(self, "_active_resources", self._active_resources - 1))
++            return res
++        except Exception:
++            self._active_resources -= 1
++            raise
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+@@ -610,6 +629,7 @@ class Context:
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
++        self._active_resources = 0
+ 
+     @property
+     def command_path(self) -> str:
+diff --git a/tests/test_resource_limits.py b/tests/test_resource_limits.py
+new file mode 100644
+index 0000000..0faf12d
+--- /dev/null
++++ b/tests/test_resource_limits.py
+@@ -0,0 +1,87 @@
++import click
++import pytest
++from contextlib import contextmanager
++
++@contextmanager
++def resource(name):
++    yield name
++
++def test_max_resources():
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.with_resource(resource("res1"))
++        ctx.with_resource(resource("res2"))
++
++    # Limit 1 should fail
++    ctx = click.Context(cli, max_resources=1)
++    with pytest.raises(RuntimeError, match="Too many resources"):
++        cli.invoke(ctx)
++
++    # Limit 2 should pass
++    ctx = click.Context(cli, max_resources=2)
++    cli.invoke(ctx)
++
++def test_max_resources_parent_child():
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    @click.pass_context
++    def sub(ctx):
++        ctx.with_resource(resource("parent_res"))
++        ctx.with_resource(resource("child_res"))
++
++    # Parent limit 1, child limit 1.
++    # Total resources: 2.
++    # Should fail.
++    ctx = click.Context(cli, max_resources=1)
++    with pytest.raises(RuntimeError, match="Too many resources"):
++        cli.main(args=['sub'], obj=None, parent=ctx)
++
++def test_max_resources_zero():
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.with_resource(resource("res1"))
++
++    # Zero should reject the first registration.
++    ctx = click.Context(cli, max_resources=0)
++    with pytest.raises(RuntimeError, match="Too many resources"):
++        cli.invoke(ctx)
++
++def test_max_resources_failed_entry():
++    @contextmanager
++    def failing_resource():
++        raise Exception("Failed to enter")
++        yield
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        try:
++            ctx.with_resource(failing_resource())
++        except Exception:
++            pass
++        # Now try to add a resource.
++        # If the reservation was returned, this should work.
++        ctx.with_resource(resource("res1"))
++
++    # Limit 1.
++    ctx = click.Context(cli, max_resources=1)
++    cli.invoke(ctx)
++
++def test_max_resources_close():
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.with_resource(resource("res1"))
++        # Close the context
++        ctx.close()
++        # Now we should be able to add another resource
++        ctx.with_resource(resource("res2"))
++
++    # Limit 1.
++    ctx = click.Context(cli, max_resources=1)
++    cli.invoke(ctx)

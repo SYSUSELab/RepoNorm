@@ -1,0 +1,144 @@
+diff --git a/tests/clients/test_cache_namespace.py b/tests/clients/test_cache_namespace.py
+new file mode 100644
+index 0000000..7576341
+--- /dev/null
++++ b/tests/clients/test_cache_namespace.py
+@@ -0,0 +1,138 @@
++import asyncio
++import hashlib
++from concurrent.futures import ThreadPoolExecutor
++from threading import Barrier
++
++import pytest
++
++import dspy
++from dspy.clients.cache import Cache, request_cache
++from dspy.utils.parallelizer import ParallelExecutor
++
++
++@pytest.fixture
++def cache(tmp_path, monkeypatch):
++    cache = Cache(True, True, str(tmp_path))
++    monkeypatch.setattr(dspy, 'cache', cache)
++    with cache.namespace(None):
++        yield cache
++
++
++def test_keys_and_two_layers(cache):
++    request = {'prompt': 'identical'}
++    original = cache.cache_key(request)
++    cache.put(request, 'no namespace')
++    for name in ['a', 'b', '', '实验']:
++        with cache.namespace(name):
++            assert cache.cache_key(request) == hashlib.sha256(name.encode()).hexdigest()[:8] + ':' + original
++            assert cache.get(request) is None
++            cache.put(request, name)
++    cache.reset_memory_cache()
++    for name in ['b', 'a', '', '实验']:
++        with cache.namespace(name):
++            assert cache.get(request) == name
++    assert cache.cache_key(request) == original
++    assert cache.get(request) == 'no namespace'
++
++
++def test_nested_exception_and_property(cache):
++    cache.namespace = 'outer'
++    assert cache.namespace == 'outer'
++    assert cache.namespace.value == 'outer'
++    with cache.namespace('inner'):
++        with pytest.raises(RuntimeError):
++            with cache.namespace(None):
++                assert cache.namespace == None
++                raise RuntimeError('restore')
++        assert cache.namespace == 'inner'
++    assert cache.namespace == 'outer'
++    cache.set_namespace(None)
++    assert cache.namespace.value is None
++    with pytest.raises(ValueError):
++        cache.set_namespace(123)
++    assert cache.namespace.value is None
++
++
++def test_same_callable_reuse_and_override(cache):
++    calls = []
++    @request_cache()
++    def calculate(value):
++        calls.append(value)
++        return len(calls)
++    with cache.namespace('a'):
++        assert calculate(3) == calculate(3) == 1
++    with cache.namespace('b'):
++        assert calculate(3) == calculate(3) == 2
++    with cache.namespace('a'):
++        assert calculate(3) == 1
++    wrapped = request_cache(namespace='fixed')(calculate.__wrapped__)
++    with cache.namespace('a'):
++        assert wrapped(4) == 3
++        assert cache.namespace == 'a'
++    with cache.namespace('b'):
++        assert wrapped(4) == 3
++        assert cache.namespace == 'b'
++    assert calls == [3, 3, 4]
++
++
++def test_bare_threads_isolate_state_and_share_data(cache):
++    rendezvous = Barrier(2)
++    def worker(name):
++        assert cache.namespace.value is None
++        with cache.namespace(name):
++            cache.put({'key': 1}, name)
++            rendezvous.wait(timeout=15)
++            assert cache.get({'key': 1}) == name
++        return cache.namespace.value
++    with cache.namespace('parent'):
++        with ThreadPoolExecutor(2) as executor:
++            a = executor.submit(worker, 'a')
++            b = executor.submit(worker, 'b')
++            assert a.result(timeout=20) is b.result(timeout=20) is None
++        assert cache.namespace == 'parent'
++    with cache.namespace('a'):
++        assert cache.get({'key': 1}) == 'a'
++
++
++@pytest.mark.parametrize('workers', [1, 2])
++def test_dspy_parallel_inherits_and_restores(cache, workers):
++    def worker(item):
++        inherited = cache.namespace.value
++        cache.namespace = 'child-' + str(item)
++        return inherited, cache.namespace.value
++    with cache.namespace('parent'):
++        executor = ParallelExecutor(num_threads=workers, disable_progress_bar=True, max_errors=1)
++        assert executor.execute(worker, [1, 2]) == [('parent', 'child-1'), ('parent', 'child-2')]
++        assert cache.namespace == 'parent'
++
++
++@pytest.mark.asyncio
++async def test_async_task_overlap_and_decorator(cache):
++    entered = asyncio.Event()
++    inspected = asyncio.Event()
++    calls = []
++    @request_cache(namespace='decorated')
++    async def calculate(value):
++        calls.append(value)
++        assert cache.namespace == 'decorated'
++        return len(calls)
++    async def first():
++        with cache.namespace('first'):
++            entered.set()
++            await asyncio.wait_for(inspected.wait(), 15)
++            assert await calculate(1) == await calculate(1) == 1
++            assert cache.namespace == 'first'
++    async def second():
++        await asyncio.wait_for(entered.wait(), 15)
++        assert cache.namespace.value is None
++        inspected.set()
++    await asyncio.gather(first(), second())
++    assert cache.namespace.value is None
++    assert calls == [1]
++
++
++def test_configure_initial_namespace(cache, tmp_path):
++    dspy.configure_cache(enable_disk_cache=False, disk_cache_dir=str(tmp_path), namespace='run')
++    assert dspy.cache.namespace == 'run'
++    dspy.configure_cache(enable_disk_cache=False, disk_cache_dir=str(tmp_path), namespace=None)
++    assert dspy.cache.namespace.value is None

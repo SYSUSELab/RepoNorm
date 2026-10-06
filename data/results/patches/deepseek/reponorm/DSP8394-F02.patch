@@ -1,0 +1,674 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..a8647db2 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -12,6 +12,8 @@ from dspy.clients.embedding import Embedder
+ from dspy.clients.lm import LM
+ from dspy.clients.provider import Provider, TrainingJob
+ 
++_UNSET = object()  # sentinel for configure_cache namespace parameter
++
+ logger = logging.getLogger(__name__)
+ 
+ DISK_CACHE_DIR = os.environ.get("DSPY_CACHEDIR") or os.path.join(Path.home(), ".dspy_cache")
+@@ -33,6 +35,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    namespace=_UNSET,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +46,8 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        namespace: Optional namespace to set for the current execution context.
++            Pass None to clear the namespace; omit to leave unchanged.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -74,6 +79,11 @@ def configure_cache(
+         memory_max_entries,
+     )
+ 
++    import dspy.clients.cache as _cache_mod
++    if namespace is not _UNSET:
++        _cache_mod._validate_namespace(namespace)
++        dspy.cache.set_namespace(namespace)
++
+ 
+ litellm.telemetry = False
+ litellm.cache = None  # By default we disable litellm cache and use DSPy on-disk cache.
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..f59ce7c7 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,3 +1,4 @@
++import contextvars
+ import copy
+ import inspect
+ import logging
+@@ -14,6 +15,81 @@ from diskcache import FanoutCache
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Per-execution-context namespace variable.
++_namespace_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
++    "cache_namespace", default=None
++)
++
++
++class _NamespaceAccessor:
++    """Accessor returned by ``cache.namespace``.
++
++    Compares equal to the current namespace string or None, exposes the
++    current value through ``.value``, and supports ``with cache.namespace(v)``
++    for temporary changes.
++    """
++
++    __hash__ = None  # mutable-like; unhashable
++
++    def __init__(self) -> None:
++        pass
++
++    @property
++    def value(self) -> Optional[str]:
++        return _namespace_var.get()
++
++    def __eq__(self, other: object) -> bool:
++        return self.value == other
++
++    def __ne__(self, other: object) -> bool:
++        return self.value != other
++
++    def __repr__(self) -> str:
++        return f"Namespace(value={self.value!r})"
++
++    def __call__(self, value: Optional[str]):
++        """Return a context manager that temporarily sets *value* as namespace."""
++        _validate_namespace(value)
++        return _NamespaceContext(value)
++
++
++class _NamespaceContext:
++    """Context manager that temporarily sets a cache namespace."""
++
++    def __init__(self, value: Optional[str]) -> None:
++        self._value = value
++        self._token = None
++
++    def __enter__(self):
++        self._token = _namespace_var.set(self._value)
++        return self._value
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        _namespace_var.reset(self._token)
++        self._token = None
++
++
++def _validate_namespace(value: Any) -> None:
++    """Raise ``ValueError`` if *value* is not None or a string."""
++    if value is not None and not isinstance(value, str):
++        raise ValueError(
++            f"Namespace must be a string or None, got {type(value).__name__}"
++        )
++
++
++def _namespace_prefix() -> str:
++    """Return the namespace prefix string, or empty string if no namespace is active.
++
++    When a namespace (including empty string) is active the returned string is
++    ``<first 8 hex chars of SHA-256(namespace)>:``.  When the namespace is
++    ``None`` (the original behaviour) the returned string is empty.
++    """
++    ns = _namespace_var.get()
++    if ns is not None:
++        digest = sha256(ns.encode("utf-8")).hexdigest()[:8]
++        return f"{digest}:"
++    return ""
++
+ 
+ class Cache:
+     """DSPy Cache
+@@ -94,7 +170,9 @@ class Cache:
+                 return value
+ 
+         params = {k: transform_value(v) for k, v in request.items() if k not in ignored_args_for_cache_key}
+-        return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
++        raw_key = sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
++        # Prepend namespace prefix (empty string when no namespace is active).
++        return _namespace_prefix() + raw_key
+ 
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
+         try:
+@@ -168,12 +246,46 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    # ---- Namespace API ---------------------------------------------------
++
++    def set_namespace(self, value: Optional[str]) -> None:
++        """Set the cache namespace for the current execution context.
++
++        When *value* is ``None`` cache keys are computed with no prefix
++        (original behaviour).  When *value* is a string (including the empty
++        string) all cache keys are prefixed with ``<sha256_prefix>:``.
++
++        Raises ``ValueError`` if *value* is not a string or ``None``.
++        """
++        _validate_namespace(value)
++        _namespace_var.set(value)
++
++    @property
++    def namespace(self) -> _NamespaceAccessor:
++        """Return a namespace accessor.
++
++        The accessor can be used to read, compare, or temporarily set the
++        current namespace::
++
++            cache.namespace.value        # current namespace string or None
++            cache.namespace == "my_ns"   # comparison
++            cache.namespace = "my_ns"    # assignment
++            with cache.namespace("tmp"): # temporary change
++                ...
++        """
++        return _NamespaceAccessor()
++
++    @namespace.setter
++    def namespace(self, value: Optional[str]) -> None:
++        self.set_namespace(value)
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+     ignored_args_for_cache_key: Optional[list[str]] = None,
+     enable_memory_cache: bool = True,
+-    *,  # everything after this is keyword-only
++    *,
++    namespace: Optional[str] = None,
+     maxsize: Optional[int] = None,  # legacy / no-op
+ ):
+     """
+@@ -185,6 +297,10 @@ def request_cache(
+         ignored_args_for_cache_key: A list of arguments to ignore when computing the cache key from the request.
+         enable_memory_cache: Whether to enable in-memory cache at call time. If False, the memory cache will not be
+             written to on new data.
++        namespace: Optional decorator-level namespace.  When not None the namespace is
++            temporarily set for the duration of the call (including cache lookup and
++            writeback), then restored on return or exception.  When None the caller's
++            active namespace is used.
+     """
+     ignored_args_for_cache_key = ignored_args_for_cache_key or ["api_key", "api_base", "base_url"]
+     # Deprecation notice
+@@ -195,6 +311,9 @@ def request_cache(
+             "This parameter will be removed in a future release.",
+         )
+ 
++    if namespace is not None:
++        _validate_namespace(namespace)
++
+     def decorator(fn):
+         @wraps(fn)
+         def process_request(args, kwargs):
+@@ -221,38 +340,60 @@ def request_cache(
+             import dspy
+ 
+             cache = dspy.cache
+-            modified_request = process_request(args, kwargs)
+ 
+-            # Retrieve from cache if available
+-            cached_result = cache.get(modified_request, ignored_args_for_cache_key)
++            # Apply decorator-level namespace override, if any.
++            if namespace is not None:
++                token = _namespace_var.set(namespace)
++            else:
++                token = None
++
++            try:
++                modified_request = process_request(args, kwargs)
++
++                # Retrieve from cache if available
++                cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+ 
+-            if cached_result is not None:
+-                return cached_result
++                if cached_result is not None:
++                    return cached_result
+ 
+-            # Otherwise, compute and store the result
+-            result = fn(*args, **kwargs)
+-            # `enable_memory_cache` can be provided at call time to avoid indefinite growth.
+-            cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                # Otherwise, compute and store the result
++                result = fn(*args, **kwargs)
++                # `enable_memory_cache` can be provided at call time to avoid indefinite growth.
++                cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+ 
+-            return result
++                return result
++            finally:
++                if token is not None:
++                    _namespace_var.reset(token)
+ 
+         @wraps(fn)
+         async def async_wrapper(*args, **kwargs):
+             import dspy
+ 
+             cache = dspy.cache
+-            modified_request = process_request(args, kwargs)
+ 
+-            # Retrieve from cache if available
+-            cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+-            if cached_result is not None:
+-                return cached_result
++            # Apply decorator-level namespace override, if any.
++            if namespace is not None:
++                token = _namespace_var.set(namespace)
++            else:
++                token = None
++
++            try:
++                modified_request = process_request(args, kwargs)
++
++                # Retrieve from cache if available
++                cached_result = cache.get(modified_request, ignored_args_for_cache_key)
++                if cached_result is not None:
++                    return cached_result
+ 
+-            # Otherwise, compute and store the result
+-            result = await fn(*args, **kwargs)
+-            cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                # Otherwise, compute and store the result
++                result = await fn(*args, **kwargs)
++                cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+ 
+-            return result
++                return result
++            finally:
++                if token is not None:
++                    _namespace_var.reset(token)
+ 
+         if inspect.iscoroutinefunction(fn):
+             return async_wrapper
+diff --git a/dspy/utils/parallelizer.py b/dspy/utils/parallelizer.py
+index d45df534..2498b812 100644
+--- a/dspy/utils/parallelizer.py
++++ b/dspy/utils/parallelizer.py
+@@ -76,7 +76,7 @@ class ParallelExecutor:
+         resubmitted = set()
+ 
+         # This is the worker function each thread will run.
+-        def worker(parent_overrides, submission_id, index, item):
++        def worker(parent_overrides, parent_namespace, submission_id, index, item):
+             if self.cancel_jobs.is_set():
+                 return index, job_cancelled
+             # Record actual start time
+@@ -92,9 +92,16 @@ class ParallelExecutor:
+                 # Usage tracker needs to be deep copied across threads so that each thread tracks its own usage
+                 thread_local_overrides.overrides["usage_tracker"] = copy.deepcopy(parent_overrides["usage_tracker"])
+ 
++            # Propagate the cache namespace so that child threads see the parent's
++            # namespace.  Because ContextVars do not cross thread boundaries we
++            # capture the value in the parent thread and pass it explicitly.
++            from dspy.clients.cache import _namespace_var
++            ns_token = _namespace_var.set(parent_namespace)
++
+             try:
+                 return index, function(item)
+             finally:
++                _namespace_var.reset(ns_token)
+                 thread_local_overrides.reset(token)
+ 
+         # Handle Ctrl-C in the main thread
+@@ -127,8 +134,12 @@ class ParallelExecutor:
+                 futures_set = set()
+                 submission_counter = 0
+ 
++                # Capture the parent's cache namespace for propagation into child threads.
++                from dspy.clients.cache import _namespace_var
++                parent_namespace = _namespace_var.get()
++
+                 for idx, item in enumerate(data):
+-                    f = executor.submit(worker, parent_overrides, submission_counter, idx, item)
++                    f = executor.submit(worker, parent_overrides, parent_namespace, submission_counter, idx, item)
+                     futures_map[f] = (submission_counter, idx, item)
+                     futures_set.add(f)
+                     submission_counter += 1
+@@ -184,6 +195,7 @@ class ParallelExecutor:
+                                     nf = executor.submit(
+                                         worker,
+                                         parent_overrides,
++                                        parent_namespace,
+                                         submission_counter,
+                                         idx,
+                                         item,
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff1485..6e0d190f 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -280,3 +280,324 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++
++# ─── Namespace tests ─────────────────────────────────────────────────────────
++
++from hashlib import sha256
++import threading
++import asyncio
++
++from dspy.clients.cache import (
++    _namespace_var,
++    _namespace_prefix,
++    _NamespaceAccessor,
++    _validate_namespace,
++    request_cache,
++)
++
++
++class TestNamespaceValidation:
++    def test_none_valid(self):
++        _validate_namespace(None)
++
++    def test_empty_string_valid(self):
++        _validate_namespace("")
++
++    def test_string_valid(self):
++        _validate_namespace("my-namespace")
++
++    def test_non_string_raises(self):
++        for val in (123, True, 3.14, b"bytes", [], {}):
++            with pytest.raises(ValueError):
++                _validate_namespace(val)
++
++
++class TestNamespacePrefix:
++    def test_default_no_prefix(self):
++        assert _namespace_prefix() == ""
++
++    def test_non_none_prefix(self):
++        token = _namespace_var.set("test-ns")
++        try:
++            prefix = _namespace_prefix()
++            expected = sha256("test-ns".encode("utf-8")).hexdigest()[:8]
++            assert prefix == f"{expected}:"
++        finally:
++            _namespace_var.reset(token)
++
++    def test_empty_string_prefix(self):
++        token = _namespace_var.set("")
++        try:
++            prefix = _namespace_prefix()
++            expected = sha256("".encode("utf-8")).hexdigest()[:8]
++            assert prefix == f"{expected}:"
++        finally:
++            _namespace_var.reset(token)
++
++    def test_none_after_set_returns_no_prefix(self):
++        token = _namespace_var.set("temp")
++        _namespace_var.reset(token)
++        assert _namespace_prefix() == ""
++
++
++class TestNamespaceAccessor:
++    def test_value_property(self):
++        accessor = _NamespaceAccessor()
++        assert accessor.value is None
++        token = _namespace_var.set("hello")
++        try:
++            assert accessor.value == "hello"
++        finally:
++            _namespace_var.reset(token)
++
++    def test_equality(self):
++        accessor = _NamespaceAccessor()
++        token = _namespace_var.set("hello")
++        try:
++            assert accessor == "hello"
++            assert accessor != "world"
++        finally:
++            _namespace_var.reset(token)
++
++    def test_equality_none(self):
++        accessor = _NamespaceAccessor()
++        assert accessor == None
++        assert not (accessor is None)
++
++    def test_context_manager(self):
++        accessor = _NamespaceAccessor()
++        assert accessor.value is None
++        with accessor("inside"):
++            assert accessor.value == "inside"
++        assert accessor.value is None
++
++    def test_context_manager_nesting(self):
++        accessor = _NamespaceAccessor()
++        with accessor("outer"):
++            with accessor("inner"):
++                assert accessor.value == "inner"
++            assert accessor.value == "outer"
++
++    def test_context_manager_exception_restore(self):
++        accessor = _NamespaceAccessor()
++        token = _namespace_var.set("before")
++        try:
++            with pytest.raises(RuntimeError):
++                with accessor("temp"):
++                    raise RuntimeError("test")
++            assert accessor.value == "before"
++        finally:
++            _namespace_var.reset(token)
++
++    def test_context_manager_none_value(self):
++        accessor = _NamespaceAccessor()
++        _namespace_var.set("some")
++        with accessor(None):
++            assert accessor.value is None
++        assert accessor.value == "some"
++        _namespace_var.set(None)
++
++
++class TestCacheNamespace:
++    def test_initial_value(self, cache):
++        assert cache.namespace.value is None
++
++    def test_set_namespace(self, cache):
++        cache.set_namespace("my-ns")
++        assert cache.namespace.value == "my-ns"
++        assert cache.namespace == "my-ns"
++
++    def test_property_setter(self, cache):
++        cache.namespace = "other-ns"
++        assert cache.namespace.value == "other-ns"
++
++    def test_set_none_clears(self, cache):
++        cache.set_namespace("temp")
++        cache.set_namespace(None)
++        assert cache.namespace.value is None
++
++    def test_set_empty_string(self, cache):
++        cache.set_namespace("")
++        assert cache.namespace.value == ""
++
++    def test_invalid_value_raises(self, cache):
++        with pytest.raises(ValueError):
++            cache.set_namespace(123)
++        with pytest.raises(ValueError):
++            cache.namespace = 456
++
++    def test_cache_key_with_namespace(self, cache):
++        cache.set_namespace("ns-a")
++        key_a1 = cache.cache_key({"q": "hello"})
++        key_a2 = cache.cache_key({"q": "hello"})
++        assert key_a1 == key_a2
++        cache.set_namespace("ns-b")
++        key_b = cache.cache_key({"q": "hello"})
++        assert key_a1 != key_b
++
++    def test_cache_key_without_namespace(self, cache):
++        cache.set_namespace(None)
++        key = cache.cache_key({"q": "hello"})
++        assert ":" not in key
++
++    def test_cache_key_prefix_format(self, cache):
++        cache.set_namespace("some-ns")
++        key = cache.cache_key({"q": "hello"})
++        prefix_part, _, hash_part = key.partition(":")
++        assert len(prefix_part) == 8
++        assert len(hash_part) == 64
++        # Verify prefix is first 8 hex chars of SHA-256
++        expected = sha256("some-ns".encode("utf-8")).hexdigest()[:8]
++        assert prefix_part == expected
++
++    def test_context_manager_on_cache(self, cache):
++        cache.set_namespace("outer")
++        with cache.namespace("inner"):
++            assert cache.namespace.value == "inner"
++        assert cache.namespace.value == "outer"
++
++
++class TestRequestCacheDecoratorNamespace:
++    def test_decorator_no_namespace_uses_caller(self, cache):
++        with patch("dspy.cache", cache):
++            call_count = 0
++
++            @request_cache(cache_arg_name="prompt")
++            def my_func(prompt):
++                nonlocal call_count
++                call_count += 1
++                return {"response": f"result-{prompt['text']}"}
++
++            cache.set_namespace("caller-ns")
++            r1 = my_func(prompt={"text": "hello"})
++            assert r1["response"] == "result-hello"
++            assert call_count == 1
++
++            # Cache hit
++            r2 = my_func(prompt={"text": "hello"})
++            assert call_count == 1
++
++    def test_decorator_namespace_override(self, cache):
++        with patch("dspy.cache", cache):
++            call_count = 0
++
++            @request_cache(cache_arg_name="prompt", namespace="decorator-ns")
++            def my_func(prompt):
++                nonlocal call_count
++                call_count += 1
++                return {"response": f"result-{prompt['text']}"}
++
++            cache.set_namespace("caller-ns")
++            r1 = my_func(prompt={"text": "hello"})
++            assert r1["response"] == "result-hello"
++            assert call_count == 1
++
++            # Second call hits cache under decorator namespace
++            r2 = my_func(prompt={"text": "hello"})
++            assert call_count == 1
++
++            # Caller namespace is restored
++            assert cache.namespace.value == "caller-ns"
++
++    def test_decorator_namespace_exception_restore(self, cache):
++        with patch("dspy.cache", cache):
++            @request_cache(cache_arg_name="prompt", namespace="decorator-ns")
++            def failing_func(prompt):
++                raise RuntimeError("oops")
++
++            cache.set_namespace("caller-ns")
++            with pytest.raises(RuntimeError):
++                failing_func(prompt={"text": "hello"})
++            assert cache.namespace.value == "caller-ns"
++
++
++class TestConfigureCacheNamespace:
++    def test_no_argument_leaves_unchanged(self):
++        from dspy.clients import configure_cache
++        import dspy
++
++        dspy.cache.set_namespace("unchanged")
++        configure_cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/test_ns_cache",
++        )
++        assert dspy.cache.namespace.value == "unchanged"
++
++    def test_sets_namespace(self):
++        from dspy.clients import configure_cache
++        import dspy
++
++        configure_cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/test_ns_cache",
++            namespace="configured-ns",
++        )
++        assert dspy.cache.namespace.value == "configured-ns"
++
++    def test_explicit_none_clears(self):
++        from dspy.clients import configure_cache
++        import dspy
++
++        dspy.cache.set_namespace("to-clear")
++        configure_cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/test_ns_cache",
++            namespace=None,
++        )
++        assert dspy.cache.namespace.value is None
++
++    def test_invalid_value_raises(self):
++        from dspy.clients import configure_cache
++
++        with pytest.raises(ValueError):
++            configure_cache(
++                enable_disk_cache=False,
++                enable_memory_cache=True,
++                disk_cache_dir="/tmp/test_ns_cache",
++                namespace=123,
++            )
++
++
++class TestNamespaceThreading:
++    def test_bare_thread_isolation(self):
++        results = []
++
++        def thread_func():
++            from dspy.clients.cache import _namespace_var
++            start = _namespace_var.get()
++            _namespace_var.set("thread-ns")
++            results.append((start, _namespace_var.get()))
++
++        import dspy
++        dspy.cache.set_namespace(None)
++        t = threading.Thread(target=thread_func)
++        t.start()
++        t.join()
++        assert len(results) == 1
++        start, current = results[0]
++        assert start is None
++        assert current == "thread-ns"
++        assert _namespace_var.get() is None
++
++
++class TestNamespaceAsync:
++    @pytest.mark.asyncio
++    async def test_async_task_isolation(self):
++        results = {}
++
++        async def task(task_id):
++            initial = _namespace_var.get()
++            _namespace_var.set(f"async-{task_id}")
++            await asyncio.sleep(0.01)
++            results[task_id] = (initial, _namespace_var.get())
++
++        await asyncio.gather(task(1), task(2))
++        assert results[1][0] is None
++        assert results[1][1] == "async-1"
++        assert results[2][0] is None
++        assert results[2][1] == "async-2"
++        assert _namespace_var.get() is None

@@ -1,0 +1,307 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..a91c3c5 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -363,8 +363,45 @@ class Environment:
+         self.extensions = load_extensions(self, extensions)
+ 
+         self.is_async = enable_async
++        
++        # Translation cache state
++        self._translation_cache_size = 0
++        self._translation_cache_partition = None
++        self._translation_cache = None
++        
+         _environment_config_check(self)
+ 
++    def set_translation_cache_partition(self, value: t.Hashable) -> None:
++        """Set the translation cache partition and clear old entries.
++        
++        Applications whose translation result depends on locale or request state
++        must give each such state a distinct partition.
++        """
++        self._translation_cache_partition = value
++        if self._translation_cache is not None:
++            self._translation_cache.clear()
++
++    def clear_translation_cache(self) -> None:
++        """Clear all translation cache entries."""
++        if self._translation_cache is not None:
++            self._translation_cache.clear()
++
++    def resize_translation_cache(self, capacity: int) -> None:
++        """Resize the translation cache to a new capacity.
++        
++        A capacity of zero disables and clears the cache.
++        Invalid capacities raise ValueError.
++        """
++        if capacity < 0:
++            raise ValueError("cache capacity must be non-negative")
++        
++        self._translation_cache_size = capacity
++        if capacity == 0:
++            self._translation_cache = None
++        else:
++            from .utils import LRUCache
++            self._translation_cache = LRUCache(capacity)
++
+     def add_extension(self, extension: t.Union[str, t.Type["Extension"]]) -> None:
+         """Adds an extension after the environment was created.
+ 
+@@ -431,6 +468,16 @@ class Environment:
+         else:
+             rv.cache = copy_cache(self.cache)
+ 
++        # Create independent translation cache for overlay
++        if self._translation_cache is not None:
++            from .utils import LRUCache
++            rv._translation_cache = LRUCache(self._translation_cache.capacity)
++        else:
++            rv._translation_cache = None
++        
++        rv._translation_cache_partition = self._translation_cache_partition
++        rv._translation_cache_size = self._translation_cache_size
++
+         rv.extensions = {}
+         for key, value in self.extensions.items():
+             rv.extensions[key] = value.bind(rv)
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..dd85d39 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -48,6 +48,183 @@ GETTEXT_FUNCTIONS: t.Tuple[str, ...] = (
+     "pgettext",
+     "npgettext",
+ )
++
++def _make_cached_gettext(
++    gettext: t.Callable[[str], str],
++    func_name: str,
++    env: "Environment",
++) -> t.Callable[[str], str]:
++    """Wrap gettext to use the translation cache."""
++    
++    def cached_gettext(message: str) -> str:
++        # Look up cache and partition at call time, not wrap time
++        cache = getattr(env, "_translation_cache", None)
++        partition = getattr(env, "_translation_cache_partition", None)
++        
++        if cache is None:
++            return gettext(message)
++        
++        key = (func_name, partition, message)
++        
++        try:
++            return cache[key]
++        except KeyError:
++            result = gettext(message)
++            cache[key] = result
++            return result
++    
++    return cached_gettext
++
++
++def _make_cached_ngettext(
++    ngettext: t.Callable[[str, str, int], str],
++    func_name: str,
++    env: "Environment",
++) -> t.Callable[[str, str, int], str]:
++    """Wrap ngettext to use the translation cache."""
++    
++    def cached_ngettext(singular: str, plural: str, n: int) -> str:
++        # Look up cache and partition at call time, not wrap time
++        cache = getattr(env, "_translation_cache", None)
++        partition = getattr(env, "_translation_cache_partition", None)
++        
++        if cache is None:
++            return ngettext(singular, plural, n)
++        
++        key = (func_name, partition, singular, plural, n)
++        
++        try:
++            return cache[key]
++        except KeyError:
++            result = ngettext(singular, plural, n)
++            cache[key] = result
++            return result
++    
++    return cached_ngettext
++
++
++def _make_cached_pgettext(
++    pgettext: t.Callable[[str, str], str],
++    func_name: str,
++    env: "Environment",
++) -> t.Callable[[str, str], str]:
++    """Wrap pgettext to use the translation cache."""
++    
++    def cached_pgettext(context: str, message: str) -> str:
++        # Look up cache and partition at call time, not wrap time
++        cache = getattr(env, "_translation_cache", None)
++        partition = getattr(env, "_translation_cache_partition", None)
++        
++        if cache is None:
++            return pgettext(context, message)
++        
++        key = (func_name, partition, context, message)
++        
++        try:
++            return cache[key]
++        except KeyError:
++            result = pgettext(context, message)
++            cache[key] = result
++            return result
++    
++    return cached_pgettext
++
++
++def _make_cached_npgettext(
++    npgettext: t.Callable[[str, str, str, int], str],
++    func_name: str,
++    env: "Environment",
++) -> t.Callable[[str, str, str, int], str]:
++    """Wrap npgettext to use the translation cache."""
++    
++    def cached_npgettext(context: str, singular: str, plural: str, n: int) -> str:
++        # Look up cache and partition at call time, not wrap time
++        cache = getattr(env, "_translation_cache", None)
++        partition = getattr(env, "_translation_cache_partition", None)
++        
++        if cache is None:
++            return npgettext(context, singular, plural, n)
++        
++        key = (func_name, partition, context, singular, plural, n)
++        
++        try:
++            return cache[key]
++        except KeyError:
++            result = npgettext(context, singular, plural, n)
++            cache[key] = result
++            return result
++    
++    return cached_npgettext
++
++
++def get_current_environment() -> t.Optional["Environment"]:
++    """Get the current environment from thread-local storage."""
++    import threading
++    return getattr(threading.current_thread(), "_jinja2_env", None)
++
++
++def set_translation_cache_partition(value: t.Hashable) -> None:
++    """Set the translation cache partition and clear old entries.
++    
++    Applications whose translation result depends on locale or request state
++    must give each such state a distinct partition.
++    """
++    env = get_current_environment()
++    if env is not None:
++        env._translation_cache_partition = value
++        if hasattr(env, "_translation_cache"):
++            env._translation_cache.clear()
++
++
++def clear_translation_cache() -> None:
++    """Clear all translation cache entries."""
++    env = get_current_environment()
++    if env is not None and hasattr(env, "_translation_cache"):
++        env._translation_cache.clear()
++
++
++def resize_translation_cache(capacity: int) -> None:
++    """Resize the translation cache to a new capacity.
++    
++    A capacity of zero disables and clears the cache.
++    Invalid capacities raise ValueError.
++    """
++    if capacity < 0:
++        raise ValueError("cache capacity must be non-negative")
++    
++    env = get_current_environment()
++    if env is not None:
++        env._translation_cache_size = capacity
++        if capacity == 0:
++            if hasattr(env, "_translation_cache"):
++                delattr(env, "_translation_cache")
++        else:
++            from .utils import LRUCache
++            env._translation_cache = LRUCache(capacity)
++
++
++class _TranslationCacheManager:
++    """Context manager for setting translation cache partition temporarily."""
++    
++    def __init__(self, partition: t.Hashable):
++        self.partition = partition
++        self.old_partition = None
++    
++    def __enter__(self) -> "_TranslationCacheManager":
++        self.old_partition = getattr(
++            threading.current_thread(), "_jinja2_env", None
++        )
++        if self.old_partition is not None:
++            self.old_partition = getattr(self.old_partition, "_translation_cache_partition", None)
++        return self
++    
++    def __exit__(self, *args):
++        pass  # Partition changes are permanent via set_translation_cache_partition
++
++
++# Import threading at module level
++import threading
++
+ _ws_re = re.compile(r"\s*\n\s*")
+ 
+ 
+@@ -266,6 +443,14 @@ class InternationalizationExtension(Extension):
+             newstyle_gettext=False,
+         )
+ 
++    def _init_translation_cache(self, capacity: int) -> None:
++        """Initialize or reinitialize the translation cache."""
++        if capacity == 0:
++            self.environment._translation_cache = None
++        else:
++            from .utils import LRUCache
++            self.environment._translation_cache = LRUCache(capacity)
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -319,9 +504,18 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Optional[t.Hashable] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
++        
++        # Initialize or update translation cache
++        if cache_size != getattr(self.environment, "_translation_cache_size", 0):
++            self._init_translation_cache(cache_size)
++        
++        self.environment._translation_cache_partition = cache_partition
++        
+         if self.environment.newstyle_gettext:  # type: ignore
+             gettext = _make_new_gettext(gettext)
+             ngettext = _make_new_ngettext(ngettext)
+@@ -332,6 +526,17 @@ class InternationalizationExtension(Extension):
+             if npgettext is not None:
+                 npgettext = _make_new_npgettext(npgettext)
+ 
++        # Wrap callables with caching if cache is enabled
++        if cache_size > 0:
++            gettext = _make_cached_gettext(gettext, "gettext", self.environment)
++            ngettext = _make_cached_ngettext(ngettext, "ngettext", self.environment)
++            
++            if pgettext is not None:
++                pgettext = _make_cached_pgettext(pgettext, "pgettext", self.environment)
++
++            if npgettext is not None:
++                npgettext = _make_cached_npgettext(npgettext, "npgettext", self.environment)
++
+         self.environment.globals.update(
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )

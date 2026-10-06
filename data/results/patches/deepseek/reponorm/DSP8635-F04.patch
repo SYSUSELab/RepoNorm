@@ -1,0 +1,295 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..eda15822 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,4 +1,5 @@
+ import random
++import re
+ 
+ import dspy
+ from dspy.propose.dataset_summary_generator import create_dataset_summary
+@@ -23,6 +24,39 @@ TIPS = {
+         "persona": 'Include a persona that is relevant to the task in the instruction (ie. "You are a ...")',
+     }
+ 
++def truncate_description(description, max_chars):
++    """Truncate description to at most max_chars characters.
++    
++    Args:
++        description: String to truncate, or None.
++        max_chars: Maximum allowed length, or None to disable.
++    
++    Returns:
++        Truncated string, or original if unchanged.
++    """
++    if max_chars is None or description is None:
++        return description
++    if len(description) <= max_chars:
++        return description
++    if max_chars == 1:
++        return "\u2026"
++    
++    cap = max_chars
++    max_content_len = cap - 1  # reserve 1 char for ellipsis
++    text_prefix = description[:max_content_len]
++    
++    # Find last complete sentence ending (. ! ?) followed by whitespace or end of string
++    matches = list(re.finditer(r'[.!?](?:\s|$)', text_prefix))
++    if matches:
++        last_match = matches[-1]
++        end_pos = last_match.end()
++        truncated = description[:end_pos]
++    else:
++        truncated = description[:max_content_len]
++    
++    truncated = truncated.rstrip()
++    return truncated + "\u2026"
++
+ ### SIGNATURES USED TO HELP WITH INSTRUCTION GENERATION ###
+ 
+ class DescribeProgram(dspy.Signature):
+@@ -143,6 +177,7 @@ class GenerateModuleInstruction(dspy.Module):
+         use_instruct_history=True,
+         use_tip=True,
+         verbose=False,
++        max_description_chars=None,
+     ):
+         super().__init__()
+         self.use_dataset_summary = use_dataset_summary
+@@ -151,6 +186,7 @@ class GenerateModuleInstruction(dspy.Module):
+         self.use_instruct_history = use_instruct_history
+         self.use_tip = use_tip
+         self.verbose = verbose
++        self.max_description_chars = max_description_chars
+ 
+         self.program_code_string = program_code_string
+         self.describe_program = dspy.Predict(DescribeProgram)
+@@ -217,6 +253,7 @@ class GenerateModuleInstruction(dspy.Module):
+                         program_code=self.program_code_string, program_example=task_demos,
+                     ).program_description,
+                 )
++                program_description = truncate_description(program_description, self.max_description_chars)
+                 if self.verbose:
+                     print(f"PROGRAM DESCRIPTION: {program_description}")
+ 
+@@ -241,6 +278,7 @@ class GenerateModuleInstruction(dspy.Module):
+                     module=module_code,
+                     max_depth=10,
+                 ).module_description
++                module_description = truncate_description(module_description, self.max_description_chars)
+             except Exception as e:
+                 if self.verbose:
+                     print(f"Error getting program description. Running without program aware proposer. Error: {e}")
+@@ -284,9 +322,14 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        max_description_chars=2000,
+     ):
+         super().__init__()
++        if max_description_chars is not None:
++            if isinstance(max_description_chars, bool) or not isinstance(max_description_chars, int) or max_description_chars < 1:
++                raise ValueError(f"max_description_chars must be None or a positive integer, got {max_description_chars!r}")
++        self.max_description_chars = max_description_chars
+         self.program_aware = program_aware
+         self.use_dataset_summary = use_dataset_summary
+         self.use_task_demos = use_task_demos
+@@ -411,7 +454,8 @@ class GroundedProposer(Proposer):
+             use_task_demos=self.use_task_demos and demo_candidates,
+             use_instruct_history=self.use_instruct_history and instruction_history,
+             use_tip=self.use_tip,
+-            verbose=self.verbose
++            verbose=self.verbose,
++            max_description_chars=self.max_description_chars,
+         )
+ 
+         # Generate a new instruction for our predictor, using the temperature specified for this round
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..bf774867 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -52,3 +52,182 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         tip=None,
+     )
+     assert result == "instruction"
++
++from dspy.propose.grounded_proposer import truncate_description
++
++
++class TestTruncateDescription:
++    """Tests for the truncate_description helper function."""
++
++    def test_none_disables(self):
++        """None max_chars returns description unchanged."""
++        assert truncate_description("Hello world", None) == "Hello world"
++
++    def test_none_description(self):
++        """None description with a cap returns None."""
++        assert truncate_description(None, 100) is None
++
++    def test_already_within_cap(self):
++        """Description shorter than cap is unchanged."""
++        assert truncate_description("Hi", 2000) == "Hi"
++
++    def test_exactly_at_cap(self):
++        """Description exactly at cap is unchanged."""
++        assert truncate_description("Hello!", 6) == "Hello!"
++
++    def test_cap_one_produces_ellipsis(self):
++        """A cap of 1 produces only the ellipsis character."""
++        assert truncate_description("Hello world!", 1) == "\u2026"
++
++    def test_finds_last_sentence_ending(self):
++        """Overlong text is truncated at the last complete sentence that fits within cap-1."""
++        result = truncate_description("First sentence. Second sentence. More text.", 30)
++        # cap-1=29 characters for prefix: "First sentence. Second senten"
++        # Last sentence-ending match: ". " at position 14 → end_pos=16
++        # truncated = "First sentence. " → rstrip → "First sentence." → + "…"
++        assert result == "First sentence.\u2026"
++
++    def test_exclamation_sentence_ending(self):
++        """Exclamation mark is recognized as a sentence ending."""
++        result = truncate_description("Hello world! More text.", 14)
++        # cap-1=13: "Hello world! M"
++        # Match: "! " at 11-13 → end_pos=13
++        # truncated = "Hello world! " → rstrip → "Hello world!" → + "…"
++        assert result == "Hello world!\u2026"
++
++    def test_question_sentence_ending(self):
++        """Question mark is recognized as a sentence ending."""
++        result = truncate_description("Is this working? Yes it is.", 20)
++        # cap-1=19: "Is this working? Ye"
++        # Match: "? " at 15-17 → end_pos=17
++        # truncated = "Is this working? " → rstrip → "Is this working?" → + "…"
++        assert result == "Is this working?\u2026"
++
++    def test_no_sentence_ending_uses_hard_prefix(self):
++        """No sentence-ending punctuation in prefix results in a hard truncation."""
++        result = truncate_description("No punctuation here just text", 20)
++        # cap-1=19: "No punctuation here " - no matches
++        # hard prefix → rstrip → + "…"
++        assert result == "No punctuation here\u2026"
++        assert len(result) == 20
++
++    def test_trailing_whitespace_stripped(self):
++        """Trailing whitespace after the sentence ending is stripped before appending ellipsis."""
++        result = truncate_description("End.   Extra stuff after", 10)
++        # cap-1=9: "End.   Ex"
++        # Match ".   " → '.' at pos 3, first space at pos 4 → end_pos=5
++        # truncated = "End. " → rstrip → "End." → + "…"
++        assert result == "End.\u2026"
++
++    def test_sentence_ending_at_string_end_matches_dollar(self):
++        """Sentence ending at the end of the prefix (matched by \$)."""
++        result = truncate_description("End! More text.", 5)
++        # cap=5, max_content_len=4: "End!" which is exactly 4 chars
++        # prefix "End!" - match '!' followed by end-of-string ($) at positions 3-4 -> end_pos=4
++        # truncated = "End!" (no change, rstrip doesn't change) -> + "…" -> "End!…" (5 chars)
++
++class TestGroundedProposerValidation:
++    """Tests for GroundedProposer max_description_chars parameter validation."""
++
++    def test_default_is_2000(self):
++        """Default max_description_chars should be 2000."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, program=program, trainset=[], verbose=False
++        )
++        assert proposer.max_description_chars == 2000
++
++    def test_none_allowed(self):
++        """None should be accepted."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, program=program, trainset=[],
++            verbose=False, max_description_chars=None
++        )
++        assert proposer.max_description_chars is None
++
++    def test_bool_rejected(self):
++        """Boolean values should raise ValueError."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        with pytest.raises(ValueError, match="max_description_chars must be None or a positive integer"):
++            GroundedProposer(
++                prompt_model=prompt_model, program=program, trainset=[],
++                verbose=False, max_description_chars=True
++            )
++
++    def test_zero_rejected(self):
++        """Zero should raise ValueError."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        with pytest.raises(ValueError, match="max_description_chars must be None or a positive integer"):
++            GroundedProposer(
++                prompt_model=prompt_model, program=program, trainset=[],
++                verbose=False, max_description_chars=0
++            )
++
++    def test_negative_rejected(self):
++        """Negative integer should raise ValueError."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        with pytest.raises(ValueError, match="max_description_chars must be None or a positive integer"):
++            GroundedProposer(
++                prompt_model=prompt_model, program=program, trainset=[],
++                verbose=False, max_description_chars=-5
++            )
++
++    def test_float_rejected(self):
++        """Float should raise ValueError."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        with pytest.raises(ValueError, match="max_description_chars must be None or a positive integer"):
++            GroundedProposer(
++                prompt_model=prompt_model, program=program, trainset=[],
++                verbose=False, max_description_chars=3.5
++            )
++
++    def test_string_rejected(self):
++        """String should raise ValueError."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        with pytest.raises(ValueError, match="max_description_chars must be None or a positive integer"):
++            GroundedProposer(
++                prompt_model=prompt_model, program=program, trainset=[],
++                verbose=False, max_description_chars="200"
++            )
++
++    def test_program_aware_disabled_preserves_behavior(self):
++        """When program_aware=False, the proposer should not crash."""
++        import dspy
++        from dspy.utils.dummies import DummyLM
++
++        prompt_model = DummyLM([{"proposed_instruction": "test"}])
++        program = dspy.Predict("question -> answer")
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, program=program, trainset=[],
++            verbose=False, program_aware=False
++        )
++        assert proposer.max_description_chars == 2000

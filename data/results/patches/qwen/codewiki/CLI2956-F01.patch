@@ -1,0 +1,277 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..480b4a8 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2022,6 +2022,12 @@ class Parameter:
+         given. Takes ``ctx, param, incomplete`` and must return a list
+         of :class:`~click.shell_completion.CompletionItem` or a list of
+         strings.
++    :param auto_complete: Enable smart shell completion based on option name.
++        Can be a boolean or string specifying a strategy:
++        ``"user"``, ``"branch"``, ``"environment"``, ``"file"``, or
++        ``"directory"``. When True, automatically selects strategy from
++        underscore-delimited tokens in the option name. When False,
++        disables smart completion.
+     :param deprecated: If ``True`` or non-empty string, issues a message
+                         indicating that the argument is deprecated and highlights
+                         its deprecation in --help. The message can be customized
+@@ -2086,6 +2092,7 @@ class Parameter:
+         expose_value: bool = True,
+         is_eager: bool = False,
+         envvar: str | cabc.Sequence[str] | None = None,
++        auto_complete: bool | str = False,
+         shell_complete: t.Callable[
+             [Context, Parameter, str], list[CompletionItem] | list[str]
+         ]
+@@ -2118,6 +2125,20 @@ class Parameter:
+         self.metavar = metavar
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
++        self._auto_complete = auto_complete
++
++        # Validate auto_complete parameter
++        if not isinstance(auto_complete, (bool, str)):
++            raise TypeError(
++                f"auto_complete must be a boolean or string, got {type(auto_complete).__name__}"
++            )
++        if isinstance(auto_complete, str):
++            valid_strategies = {"user", "branch", "environment", "file", "directory"}
++            if auto_complete not in valid_strategies:
++                raise ValueError(
++                    f"Unknown auto_complete strategy '{auto_complete}'. "
++                    f"Valid strategies are: {', '.join(sorted(valid_strategies))}"
++                )
+         self.deprecated = deprecated
+ 
+         if __debug__:
+@@ -2441,7 +2462,9 @@ class Parameter:
+     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
+         """Return a list of completions for the incomplete value. If a
+         ``shell_complete`` function was given during init, it is used.
+-        Otherwise, the :attr:`type`
++        Otherwise, if :attr:`auto_complete` is enabled, a built-in strategy
++        is selected based on the option name or explicit strategy string.
++        If neither applies, the :attr:`type`
+         :meth:`~click.types.ParamType.shell_complete` function is used.
+ 
+         :param ctx: Invocation context for this command.
+@@ -2449,6 +2472,7 @@ class Parameter:
+ 
+         .. versionadded:: 8.0
+         """
++        # Explicit shell_complete callback always takes precedence
+         if self._custom_shell_complete is not None:
+             results = self._custom_shell_complete(ctx, self, incomplete)
+ 
+@@ -2459,6 +2483,30 @@ class Parameter:
+ 
+             return t.cast("list[CompletionItem]", results)
+ 
++        # Handle auto_complete
++        if self._auto_complete:
++            from click.shell_strategies import (
++                get_strategy,
++                get_strategy_from_name,
++            )
++
++            # Determine strategy: explicit string or name-based selection
++            if isinstance(self._auto_complete, str):
++                strategy_name = self._auto_complete
++            else:  # True means name-based selection
++                strategy_name = get_strategy_from_name(self.name or "")
++
++            if strategy_name:
++                try:
++                    strategy_func = get_strategy(strategy_name)
++                    results = strategy_func(ctx, self, incomplete)
++                    from click.shell_completion import CompletionItem
++
++                    return [CompletionItem(r) for r in results]
++                except ValueError:
++                    # Unknown strategy falls through to type completion
++                    pass
++
+         return self.type.shell_complete(ctx, self, incomplete)
+ 
+ 
+@@ -2549,6 +2597,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        auto_complete: bool | str = False,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2556,7 +2605,12 @@ class Option(Parameter):
+ 
+         default_is_missing = "default" not in attrs
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls,
++            type=type,
++            multiple=multiple,
++            deprecated=deprecated,
++            auto_complete=auto_complete,
++            **attrs,
+         )
+ 
+         if prompt is True:
+diff --git a/src/click/shell_strategies.py b/src/click/shell_strategies.py
+new file mode 100644
+index 0000000..a05e066
+--- /dev/null
++++ b/src/click/shell_strategies.py
+@@ -0,0 +1,153 @@
++"""Built-in shell completion strategies for click.Option."""
++import os
++import subprocess
++from typing import TYPE_CHECKING, Callable
++
++if TYPE_CHECKING:
++    from click import Context, Parameter
++
++
++def _filter_by_prefix(items: list[str], incomplete: str) -> list[str]:
++    """Filter items that start with the incomplete prefix."""
++    if not incomplete:
++        return items
++    return [item for item in items if item.startswith(incomplete)]
++
++
++def _sort_and_limit(items: list[str], max_count: int = 20) -> list[str]:
++    """Sort items and limit to max_count unique values."""
++    seen = set()
++    result = []
++    for item in sorted(items):
++        if item not in seen:
++            seen.add(item)
++            result.append(item)
++            if len(result) >= max_count:
++                break
++    return result
++
++
++def get_strategy_from_name(name: str) -> str | None:
++    """Detect completion strategy from underscore-delimited tokens in option name.
++    
++    Returns the strategy name if found, None otherwise.
++    """
++    # Normalize: lowercase and split by underscores
++    tokens = name.lower().split("_")
++    
++    # User-related tokens
++    user_tokens = {"user", "username", "owner", "author"}
++    if any(token in user_tokens for token in tokens):
++        return "user"
++    
++    # Branch/ref/revision tokens
++    branch_tokens = {"branch", "ref", "revision", "commit", "sha"}
++    if any(token in branch_tokens for token in tokens):
++        return "branch"
++    
++    # Environment/var tokens
++    env_tokens = {"env", "environment", "var", "variable"}
++    if any(token in env_tokens for token in tokens):
++        return "environment"
++    
++    # File/path tokens (but not directory)
++    file_tokens = {"file", "path", "input", "output", "filename", "filepath"}
++    if any(token in file_tokens for token in tokens):
++        return "file"
++    
++    # Directory tokens
++    dir_tokens = {"dir", "directory", "folder"}
++    if any(token in dir_tokens for token in tokens):
++        return "directory"
++    
++    return None
++
++
++def complete_user(ctx: "Context", param: "Parameter", incomplete: str) -> list[str]:
++    """Complete POSIX usernames, excluding those starting with underscore."""
++    try:
++        import pwd
++        
++        usernames = []
++        for entry in pwd.getpwall():
++            username = entry.pw_name
++            # Exclude system accounts starting with underscore
++            if not username.startswith("_"):
++                usernames.append(username)
++        
++        filtered = _filter_by_prefix(usernames, incomplete)
++        return _sort_and_limit(filtered, 20)
++    except (ImportError, OSError):
++        # Fall back to normal completion if pwd module unavailable
++        return []
++
++
++def complete_branch(ctx: "Context", param: "Parameter", incomplete: str) -> list[str]:
++    """Complete Git branch names."""
++    try:
++        result = subprocess.run(
++            ["git", "branch", "--format=%(refname:short)"],
++            capture_output=True,
++            text=True,
++            timeout=5,
++        )
++        if result.returncode == 0:
++            branches = [b.strip() for b in result.stdout.splitlines() if b.strip()]
++            filtered = _filter_by_prefix(branches, incomplete)
++            return _sort_and_limit(filtered, 20)
++    except (subprocess.SubprocessError, FileNotFoundError, OSError):
++        pass
++    
++    return []
++
++
++def complete_environment(ctx: "Context", param: "Parameter", incomplete: str) -> list[str]:
++    """Complete environment variable names (not values)."""
++    env_vars = list(os.environ.keys())
++    filtered = _filter_by_prefix(env_vars, incomplete)
++    return _sort_and_limit(filtered, 20)
++
++
++def complete_file(ctx: "Context", param: "Parameter", incomplete: str) -> list[str]:
++    """Complete file paths using standard path completion."""
++    from click.shell_completion import CompletionItem
++    
++    # Use Path type's completion which handles shell-based completion
++    from click.types import Path as ClickPath
++    path_type = ClickPath()
++    completions = path_type.shell_complete(ctx, param, incomplete)
++    
++    # Return just the values
++    return [c.value for c in completions]
++
++
++def complete_directory(ctx: "Context", param: "Parameter", incomplete: str) -> list[str]:
++    """Complete directory paths only."""
++    from click.shell_completion import CompletionItem
++    
++    # Use Path type with dir_okay=True, file_okay=False
++    from click.types import Path as ClickPath
++    path_type = ClickPath(dir_okay=True, file_okay=False)
++    completions = path_type.shell_complete(ctx, param, incomplete)
++    
++    # Return just the values
++    return [c.value for c in completions]
++
++
++STRATEGIES = {
++    "user": complete_user,
++    "branch": complete_branch,
++    "environment": complete_environment,
++    "file": complete_file,
++    "directory": complete_directory,
++}
++
++
++def get_strategy(strategy_name: str) -> Callable:
++    """Get a completion strategy function by name."""
++    if strategy_name not in STRATEGIES:
++        raise ValueError(
++            f"Unknown auto_complete strategy '{strategy_name}'. "
++            f"Valid strategies are: {', '.join(sorted(STRATEGIES.keys()))}"
++        )
++    return STRATEGIES[strategy_name]

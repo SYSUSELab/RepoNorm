@@ -1,0 +1,111 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..09e4773 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ import functools
++import threading
++from collections import OrderedDict
+ from concurrent.futures import ThreadPoolExecutor
+ from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
+ 
+@@ -53,6 +55,11 @@ class Encoding:
+ 
+         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
+ 
++        # Private LRU cache with capacity 128
++        self._cache: OrderedDict[tuple[str, frozenset], list[int]] = OrderedDict()
++        self._cache_lock = threading.Lock()
++        self._cache_capacity = 128
++
+     def __repr__(self) -> str:
+         return f"<Encoding {self.name!r}>"
+ 
+@@ -60,6 +67,20 @@ class Encoding:
+     # Encoding
+     # ====================
+ 
++    def _do_encode(self, text: str, allowed_special: Literal["all"] | AbstractSet[str]) -> list[int]:
++        """Internal method to perform actual encoding without validation or cache logic."""
++        try:
++            return self._core_bpe.encode(text, allowed_special)
++        except UnicodeEncodeError:
++            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++            # fixup for any surrogate pairs that may have sneaked their way into the text.
++            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++            # string, but given that this is input we want to support, maybe that's okay.
++            # Also we use errors="replace" to handle weird things like lone surrogates.
++            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            return self._core_bpe.encode(text, allowed_special)
++
+     def encode_ordinary(self, text: str) -> list[int]:
+         """Encodes a string into tokens, ignoring special tokens.
+ 
+@@ -80,6 +101,7 @@ class Encoding:
+         self,
+         text: str,
+         *,
++        use_cache: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+     ) -> list[int]:
+@@ -120,17 +142,28 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        try:
+-            return self._core_bpe.encode(text, allowed_special)
+-        except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+-            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++        if use_cache:
++            # Create cache key from text and normalized policy
++            # Convert to frozenset for hashability
++            allowed_key = frozenset(allowed_special) if isinstance(allowed_special, set) else allowed_special
++            disallowed_key = frozenset(disallowed_special) if isinstance(disallowed_special, set) else disallowed_special
++            cache_key = (text, allowed_key, disallowed_key)
++            
++            with self._cache_lock:
++                if cache_key in self._cache:
++                    # Move to end (most recently used)
++                    self._cache.move_to_end(cache_key)
++                    return list(self._cache[cache_key])  # Return copy
++                
++                # Cache miss - compute and store
++                result = self._do_encode(text, allowed_special)
++                self._cache[cache_key] = result
++                # Evict least recently used if over capacity
++                if len(self._cache) > self._cache_capacity:
++                    self._cache.popitem(last=False)
++                return list(result)  # Return copy
++        
++        return self._do_encode(text, allowed_special)
+ 
+     def encode_to_numpy(
+         self,
+@@ -176,6 +209,7 @@ class Encoding:
+         self,
+         text: list[str],
+         *,
++        use_cache: bool = False,
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+@@ -197,7 +231,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, use_cache=use_cache, allowed_special=allowed_special, disallowed_special=disallowed_special
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

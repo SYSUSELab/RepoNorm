@@ -1,0 +1,171 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..bb8fdab 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -48,6 +48,8 @@ GETTEXT_FUNCTIONS: t.Tuple[str, ...] = (
+     "pgettext",
+     "npgettext",
+ )
++
++GETTEXT_RESERVED_NAMES = frozenset(GETTEXT_FUNCTIONS)
+ _ws_re = re.compile(r"\s*\n\s*")
+ 
+ 
+@@ -379,10 +381,14 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            self._validate_variable_name(token.value, token.lineno)
++
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                self._validate_expr(token.value, var, token.lineno)
++                variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+@@ -420,6 +426,7 @@ class InternationalizationExtension(Extension):
+             next(parser.stream)
+             if parser.stream.current.type != "block_end":
+                 token = parser.stream.expect("name")
++                self._validate_variable_name(token.value, token.lineno)
+                 if token.value not in variables:
+                     parser.fail(
+                         f"unknown variable {token.value!r} for pluralization",
+@@ -438,6 +445,7 @@ class InternationalizationExtension(Extension):
+         # register free names as simple name expressions
+         for name in referenced:
+             if name not in variables:
++                self._validate_variable_name(name, lineno)
+                 variables[name] = nodes.Name(name, "load")
+ 
+         if not have_plural:
+@@ -466,6 +474,107 @@ class InternationalizationExtension(Extension):
+         else:
+             return node
+ 
++    @staticmethod
++    def _validate_expr(
++        var_name: str, expr: nodes.Expr, lineno: int
++    ) -> None:
++        """Validate that an expression assigned to a trans variable
++        consists only of allowed node types: constants, names,
++        attribute access, filters, tests, or calls whose callee is
++        a simple name. Arguments and keyword values must follow
++        the same rule; dynamic *args and **kwargs are rejected.
++        """
++        _valid_expr_nodes = (
++            nodes.Name,
++            nodes.Const,
++            nodes.Getattr,
++            nodes.Filter,
++            nodes.Test,
++        )
++
++        def _check(node: nodes.Expr, desc: str = "") -> None:
++            if isinstance(node, _valid_expr_nodes):
++                return
++            if isinstance(node, nodes.Call):
++                # callee must be a simple name
++                if not isinstance(node.node, nodes.Name):
++                    raise TemplateSyntaxError(
++                        'translation variable "'
++                        + var_name
++                        + '": '
++                        "only simple function names are allowed for "
++                        "function calls, got "
++                        + type(node.node).__name__
++                        + '. "'
++                        + var_name
++                        + '" includes template data and '
++                        "translation contexts.",
++                        lineno,
++                    )
++                # no dynamic args/kwargs
++                if node.dyn_args is not None:
++                    raise TemplateSyntaxError(
++                        'translation variable "'
++                        + var_name
++                        + '": '
++                        "*args is not allowed. "
++                        '"'
++                        + var_name
++                        + '" includes '
++                        "template data and translation contexts.",
++                        lineno,
++                    )
++                if node.dyn_kwargs is not None:
++                    raise TemplateSyntaxError(
++                        'translation variable "'
++                        + var_name
++                        + '": '
++                        "**kwargs is not allowed. "
++                        '"'
++                        + var_name
++                        + '" includes '
++                        "template data and translation contexts.",
++                        lineno,
++                    )
++                # validate args
++                for arg in node.args:
++                    _check(arg, 'argument of "' + var_name + '"')
++                # validate kwargs
++                for kwarg in node.kwargs:
++                    _check(kwarg.key, 'keyword name of "' + var_name + '"')
++                    _check(kwarg.value, 'keyword value of "' + var_name + '"')
++                return
++            raise TemplateSyntaxError(
++                'translation variable "'
++                + var_name
++                + '": '
++                "only simple expressions (constants, names, attribute "
++                "access, filters, tests, and function calls with simple "
++                "names) are allowed, got "
++                + type(node).__name__
++                + '. "'
++                + var_name
++                + '" includes template data and '
++                "translation contexts.",
++                lineno,
++            )
++
++        _check(expr)
++
++    @staticmethod
++    def _validate_variable_name(name: str, lineno: int) -> None:
++        """Validate that a trans variable name does not conflict
++        with translation function names.
++        """
++        if name in GETTEXT_RESERVED_NAMES:
++            raise TemplateSyntaxError(
++                'translatable variable "'
++                + name
++                + '" conflicts with '
++                "translation function names.",
++                lineno,
++            )
++
+     def _trim_whitespace(self, string: str, _ws_re: t.Pattern[str] = _ws_re) -> str:
+         return _ws_re.sub(" ", string.strip())
+ 
+@@ -482,7 +591,16 @@ class InternationalizationExtension(Extension):
+                 next(parser.stream)
+             elif parser.stream.current.type == "variable_begin":
+                 next(parser.stream)
+-                name = parser.stream.expect("name").value
++                name_token = parser.stream.expect("name")
++                name = name_token.value
++                # Validate the variable name against reserved names
++                if name in GETTEXT_RESERVED_NAMES:
++                    raise TemplateSyntaxError(
++                        "translatable variable \""
++                        + name
++                        + "\" conflicts with translation function names.",
++                        name_token.lineno,
++                    )
+                 referenced.append(name)
+                 buf.append(f"%({name})s")
+                 parser.stream.expect("variable_end")

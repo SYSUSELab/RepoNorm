@@ -1,0 +1,262 @@
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..f7ac769 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,124 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++@pytest.mark.parametrize("bad_exit", [False, True])
++def test_resource_quota_releases_only_closed_subtree(bad_exit):
++    from contextlib import contextmanager
++
++    @contextmanager
++    def resource(fail=False):
++        try:
++            yield object()
++        finally:
++            if fail:
++                raise ValueError("cleanup")
++
++    root = click.Context(click.Command("root"), max_resources=3)
++    left = click.Context(click.Command("left"), parent=root, max_resources=1)
++    right = click.Context(click.Command("right"), parent=root, max_resources=10)
++    root.with_resource(resource())
++    left.with_resource(resource(bad_exit))
++    right.with_resource(resource())
++    with pytest.raises(RuntimeError):
++        right.with_resource(resource())
++    if bad_exit:
++        with pytest.raises(ValueError, match="cleanup"):
++            left.close()
++    else:
++        left.close()
++    left.close()
++    right.with_resource(resource())
++    with pytest.raises(RuntimeError):
++        root.with_resource(resource())
++    right.close()
++    left.with_resource(resource())
++    with pytest.raises(RuntimeError):
++        left.with_resource(resource())
++    left.close()
++    root.close()
++
++
++def test_resource_quota_failed_enter_and_descendants():
++    from contextlib import contextmanager, nullcontext
++
++    @contextmanager
++    def failure():
++        raise ValueError("enter")
++        yield
++
++    root = click.Context(click.Command("root"), max_resources=2)
++    child = click.Context(click.Command("child"), parent=root, max_resources=1)
++    grandchild = click.Context(
++        click.Command("grandchild"), parent=child, max_resources=10
++    )
++    with pytest.raises(ValueError, match="enter"):
++        child.with_resource(failure())
++    grandchild.with_resource(nullcontext("ok"))
++    with pytest.raises(RuntimeError):
++        child.with_resource(nullcontext())
++    root.with_resource(nullcontext())
++    root.close()
++    # Closing root does not silently release a still-open descendant.
++    with pytest.raises(RuntimeError):
++        child.with_resource(nullcontext())
++    grandchild.close()
++    assert child.with_resource(nullcontext("reused")) == "reused"
++    child.close()
++
++
++def test_resource_quota_stays_active_until_exit_finishes():
++    from contextlib import contextmanager, nullcontext
++
++    ctx = click.Context(click.Command("ctx"), max_resources=1)
++
++    @contextmanager
++    def resource():
++        try:
++            yield
++        finally:
++            with pytest.raises(RuntimeError):
++                ctx.with_resource(nullcontext())
++
++    ctx.with_resource(resource())
++    ctx.close()
++    ctx.with_resource(nullcontext())
++    ctx.close()
++
++
++def test_resource_quota_completion_below_hierarchy_limit():
++    from contextlib import nullcontext
++    from click.shell_completion import ShellComplete
++
++    def resource_option(ctx, param, value):
++        return ctx.with_resource(nullcontext(value))
++
++    @click.group(context_settings={"max_resources": 2})
++    @click.option("--root-value", default="r", callback=resource_option)
++    def cli(root_value):
++        pass
++
++    @cli.command()
++    @click.option("--child-value", default="c", callback=resource_option)
++    def child(child_value):
++        pass
++
++    completion = ShellComplete(cli, {}, "cli", "_CLI_COMPLETE")
++    assert "--child-value" in [
++        item.value for item in completion.get_completions(["child"], "--child")
++    ]
++
++
++def test_resource_quota_reserves_reentrant_entry_and_rolls_back_failure():
++    from contextlib import contextmanager, nullcontext
++
++    ctx = click.Context(click.Command("ctx"), max_resources=1)
++
++    @contextmanager
++    def outer():
++        ctx.with_resource(nullcontext("inner"))
++        yield "outer"
++
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(outer())
++    assert ctx.with_resource(nullcontext("after failure")) == "after failure"
++    ctx.close()
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index 3e7a2bd..c155380 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -414,3 +414,128 @@ def test_add_completion_class_decorator():
+     # Using `add_completion_class` as a decorator adds the new shell immediately
+     assert "mysh" in click.shell_completion._available_shells
+     assert click.shell_completion._available_shells["mysh"] is MyshComplete
++
++
++def test_context_max_resources():
++    """Test max_resources parameter limits resource registration."""
++    from contextlib import contextmanager
++
++    import click
++
++    @contextmanager
++    def dummy_resource():
++        yield "resource"
++
++    # Test with no limit (default)
++    ctx = click.Context(click.Command("test"))
++    for _ in range(10):
++        ctx.with_resource(dummy_resource())
++
++    # Test with limit of 3
++    ctx = click.Context(click.Command("test"), max_resources=3)
++    for _ in range(3):
++        ctx.with_resource(dummy_resource())
++
++    # Should raise RuntimeError when exceeding limit
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(dummy_resource())
++
++
++def test_context_max_resources_inheritance():
++    """Test max_resources parameter is inherited from parent context."""
++    from contextlib import contextmanager
++
++    import click
++
++    @contextmanager
++    def dummy_resource():
++        yield "resource"
++
++    # Parent context with limit
++    parent_ctx = click.Context(click.Command("parent"), max_resources=2)
++    parent_ctx.with_resource(dummy_resource())
++
++    # Child context should inherit the limit
++    child_ctx = click.Context(click.Command("child"), parent=parent_ctx)
++    child_ctx.with_resource(dummy_resource())
++
++    # Should fail on next resource registration
++    with pytest.raises(RuntimeError):
++        child_ctx.with_resource(dummy_resource())
++
++
++def test_context_max_resources_reset_on_close():
++    """Test resource count is reset when context is closed."""
++    from contextlib import contextmanager
++
++    import click
++
++    @contextmanager
++    def dummy_resource():
++        yield "resource"
++
++    ctx = click.Context(click.Command("test"), max_resources=2)
++    ctx.with_resource(dummy_resource())
++    ctx.with_resource(dummy_resource())
++
++    # Should fail to add more resources
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(dummy_resource())
++
++    # After closing, resource count should reset
++    ctx.close()
++
++    # Should be able to add resources again
++    ctx.with_resource(dummy_resource())
++    ctx.with_resource(dummy_resource())
++
++
++def test_context_max_resources_edge_cases():
++    """Test edge cases for max_resources parameter."""
++    from contextlib import contextmanager
++
++    import click
++
++    @contextmanager
++    def dummy_resource():
++        yield "resource"
++
++    # Test with limit of 0
++    ctx = click.Context(click.Command("test"), max_resources=0)
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(dummy_resource())
++
++
++def test_context_max_resources_integration():
++    """Test max_resources with real context manager usage."""
++    from contextlib import contextmanager
++
++    import click
++
++    # Track resource lifecycle without printing to stdout
++    resource_log = []
++
++    @contextmanager
++    def file_resource(name):
++        resource_log.append(f"Opening {name}")
++        try:
++            yield name
++        finally:
++            resource_log.append(f"Closing {name}")
++
++    ctx = click.Context(click.Command("test"), max_resources=2)
++
++    # Successfully register 2 resources
++    file1 = ctx.with_resource(file_resource("file1.txt"))
++    file2 = ctx.with_resource(file_resource("file2.txt"))
++
++    assert file1 == "file1.txt"
++    assert file2 == "file2.txt"
++
++    # Verify resources were opened
++    assert "Opening file1.txt" in resource_log
++    assert "Opening file2.txt" in resource_log
++
++    # Third resource should fail
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(file_resource("file3.txt"))

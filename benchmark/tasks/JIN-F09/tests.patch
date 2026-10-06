@@ -1,0 +1,341 @@
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..511c65d 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -251,3 +251,115 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++
++def make_multilevel_users():
++    return [
++        {"name": "alice", "department": "eng", "role": "dev"},
++        {"name": "bob", "department": "eng", "role": "dev"},
++        {"name": "charlie", "department": "eng", "role": "manager"},
++        {"name": "diana", "department": "sales", "role": "rep"},
++        {"name": "eve", "department": "sales", "role": "manager"},
++    ]
++
++
++@mark_dualiter("users", make_multilevel_users)
++def test_groupby_multilevel_basic(env_async, users):
++    """Test basic multi-level grouping with 2 levels in async mode."""
++    tmpl = env_async.from_string(
++        "{% for dept_group in users()|groupby(['department', 'role'], levels=2) %}"
++        "{{ dept_group.grouper }}:\n"
++        "{% for role_group in dept_group.list %}"
++        "  {{ role_group.grouper }}: {{ role_group.list|map(attribute='name')|join(', ') }}\n"
++        "{% endfor %}"
++        "{% endfor %}"
++    )
++    out = tmpl.render(users=users)
++    expected = (
++        "eng:\n"
++        "  dev: alice, bob\n"
++        "  manager: charlie\n"
++        "sales:\n"
++        "  manager: eve\n"
++        "  rep: diana\n"
++    )
++    assert out == expected
++
++
++@mark_dualiter("users", make_multilevel_users)
++def test_groupby_multilevel_comma_separated_attributes(env_async, users):
++    list_template = env_async.from_string(
++        "{{ users()|groupby(['department', 'role'], levels=2) }}"
++    )
++    string_template = env_async.from_string(
++        "{{ users()|groupby('department, role', levels=2) }}"
++    )
++    assert string_template.render(users=users) == list_template.render(users=users)
++
++
++def make_three_level_data():
++    return [
++        {"a": "x", "b": "1", "c": "i", "value": "A"},
++        {"a": "x", "b": "1", "c": "ii", "value": "B"},
++        {"a": "x", "b": "2", "c": "i", "value": "C"},
++        {"a": "y", "b": "1", "c": "i", "value": "D"},
++    ]
++
++
++@mark_dualiter("data", make_three_level_data)
++def test_groupby_multilevel_three_levels(env_async, data):
++    """Test multi-level grouping with 3 levels in async mode."""
++    tmpl = env_async.from_string(
++        "{% for l1 in data()|groupby(['a', 'b', 'c'], levels=3) %}"
++        "{{ l1.grouper }}:\n"
++        "{% for l2 in l1.list %}"
++        "  {{ l2.grouper }}:\n"
++        "{% for l3 in l2.list %}"
++        "    {{ l3.grouper }}: {{ l3.list|map(attribute='value')|join(',') }}\n"
++        "{% endfor %}"
++        "{% endfor %}"
++        "{% endfor %}"
++    )
++    out = tmpl.render(data=data)
++    expected = (
++        "x:\n"
++        "  1:\n"
++        "    i: A\n"
++        "    ii: B\n"
++        "  2:\n"
++        "    i: C\n"
++        "y:\n"
++        "  1:\n"
++        "    i: D\n"
++    )
++    assert out == expected
++
++
++def test_groupby_multilevel_empty_data(env_async):
++    """Test multi-level grouping with empty data in async mode."""
++    tmpl = env_async.from_string(
++        "{% for group in []|groupby(['a', 'b'], levels=2) %}"
++        "{{ group.grouper }}\n"
++        "{% else %}"
++        "No data\n"
++        "{% endfor %}"
++    )
++    out = tmpl.render()
++    assert out == "No data\n"
++
++
++def test_groupby_multilevel_backward_compatibility(env_async):
++    """Test that single-level groupby still works in async mode."""
++    tmpl = env_async.from_string(
++        "{% for group in data|groupby('category') %}"
++        "{{ group.grouper }}: {{ group.list|map(attribute='name')|join(', ') }}\n"
++        "{% endfor %}"
++    )
++    data = [
++        {"name": "apple", "category": "fruit"},
++        {"name": "banana", "category": "fruit"},
++        {"name": "carrot", "category": "vegetable"},
++    ]
++    out = tmpl.render(data=data)
++    expected = "fruit: apple, banana\nvegetable: carrot\n"
++    assert out == expected
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..b138248 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -2,6 +2,36 @@ import random
+ from collections import namedtuple
+ 
+ import pytest
++
++
++@pytest.mark.parametrize("asynchronous", [False, True])
++def test_v5_hierarchy_complete_leaves(asynchronous):
++    import asyncio
++    from copy import deepcopy
++    from jinja2 import Environment
++    env = Environment(enable_async=asynchronous)
++    rows = [{"p": [{"a": a, "b": b}], "c": c, "id": i} for i, (a, b, c) in enumerate([(2, 1, 2), (1, 2, 1), (2, 1, 2), (2, 1, 1)])] + [{}]
++    before = deepcopy(rows)
++    attrs = ["p.0.a", "p.0.b", "c"]
++    async def stream():
++        for row in rows:
++            yield row
++    result = env.call_filter("groupby", stream() if asynchronous else iter(rows), [attrs], {"levels": 3, "default": 9})
++    if asynchronous:
++        result = asyncio.run(result)
++    leaves = [row for a in result for b in a.list for c in b.list for row in c.list]
++    assert sorted(id(row) for row in leaves) == sorted(id(row) for row in rows)
++    assert result[1].list[0].list[1].list == [rows[0], rows[2]]
++    assert attrs == ["p.0.a", "p.0.b", "c"] and rows == before
++
++
++@pytest.mark.parametrize("asynchronous", [False, True])
++@pytest.mark.parametrize("attrs, levels", [(["a", "b"], 1), (["a"], 2), (["a"], 0), (["a"], True), (["a"], 1.5)])
++def test_v5_hierarchy_levels_domain(asynchronous, attrs, levels):
++    from jinja2 import Environment
++    from jinja2.exceptions import FilterArgumentError
++    with pytest.raises(FilterArgumentError):
++        Environment(enable_async=asynchronous).from_string('{{rows|groupby(attrs, levels=levels)}}').render(rows=[], attrs=attrs, levels=levels)
+ from markupsafe import Markup
+ 
+ from jinja2 import Environment
+@@ -83,9 +113,7 @@ class TestFilter:
+         out = tmpl.render()
+         assert out == "&lt;&#34;&gt;&amp;"
+ 
+-    @pytest.mark.parametrize(
+-        ("chars", "expect"), [(None, "..stays.."), (".", "  ..stays"), (" .", "stays")]
+-    )
++    @pytest.mark.parametrize(("chars", "expect"), [(None, "..stays.."), (".", "  ..stays"), (" .", "stays")])
+     def test_trim(self, env, chars, expect):
+         tmpl = env.from_string("{{ foo|trim(chars) }}")
+         out = tmpl.render(foo="  ..stays..", chars=chars)
+@@ -140,9 +168,7 @@ class TestFilter:
+         out = tmpl.render(foo=list(range(10)))
+         assert out == "0"
+ 
+-    @pytest.mark.parametrize(
+-        ("value", "expect"), (("42", "42.0"), ("abc", "0.0"), ("32.32", "32.32"))
+-    )
++    @pytest.mark.parametrize(("value", "expect"), (("42", "42.0"), ("abc", "0.0"), ("32.32", "32.32")))
+     def test_float(self, env, value, expect):
+         t = env.from_string("{{ value|float }}")
+         assert t.render(value=value) == expect
+@@ -619,6 +645,157 @@ class TestFilter:
+         )
+         assert out == "NY: emma, john\nWA: smith\n"
+ 
++    def test_groupby_multilevel_basic(self, env):
++        """Test basic multi-level grouping with 2 levels."""
++        tmpl = env.from_string(
++            "{% for dept_group in users|groupby(['department', 'role'], levels=2) %}"
++            "{{ dept_group.grouper }}:\n"
++            "{% for role_group in dept_group.list %}"
++            "  {{ role_group.grouper }}: {{ role_group.list|map(attribute='name')|join(', ') }}\n"
++            "{% endfor %}"
++            "{% endfor %}"
++        )
++        users = [
++            {"name": "alice", "department": "eng", "role": "dev"},
++            {"name": "bob", "department": "eng", "role": "dev"},
++            {"name": "charlie", "department": "eng", "role": "manager"},
++            {"name": "diana", "department": "sales", "role": "rep"},
++            {"name": "eve", "department": "sales", "role": "manager"},
++        ]
++        out = tmpl.render(users=users)
++        expected = "eng:\n  dev: alice, bob\n  manager: charlie\nsales:\n  manager: eve\n  rep: diana\n"
++        assert out == expected
++
++    def test_groupby_multilevel_three_levels(self, env):
++        """Test multi-level grouping with 3 levels."""
++        tmpl = env.from_string(
++            "{% for l1 in data|groupby(['a', 'b', 'c'], levels=3) %}"
++            "{{ l1.grouper }}:\n"
++            "{% for l2 in l1.list %}"
++            "  {{ l2.grouper }}:\n"
++            "{% for l3 in l2.list %}"
++            "    {{ l3.grouper }}: {{ l3.list|map(attribute='value')|join(',') }}\n"
++            "{% endfor %}"
++            "{% endfor %}"
++            "{% endfor %}"
++        )
++        data = [
++            {"a": "x", "b": "1", "c": "i", "value": "A"},
++            {"a": "x", "b": "1", "c": "ii", "value": "B"},
++            {"a": "x", "b": "2", "c": "i", "value": "C"},
++            {"a": "y", "b": "1", "c": "i", "value": "D"},
++        ]
++        out = tmpl.render(data=data)
++        expected = "x:\n  1:\n    i: A\n    ii: B\n  2:\n    i: C\ny:\n  1:\n    i: D\n"
++        assert out == expected
++
++    def test_groupby_multilevel_with_default(self, env):
++        """Test multi-level grouping with default values."""
++        tmpl = env.from_string(
++            "{% for dept_group in users|groupby(['department', 'role'], levels=2, default='unknown') %}"
++            "{{ dept_group.grouper }}:\n"
++            "{% for role_group in dept_group.list %}"
++            "  {{ role_group.grouper }}: {{ role_group.list|map(attribute='name')|join(', ') }}\n"
++            "{% endfor %}"
++            "{% endfor %}"
++        )
++        users = [
++            {"name": "alice", "department": "eng", "role": "dev"},
++            {"name": "bob", "department": "eng"},  # missing role
++            {"name": "charlie", "role": "manager"},  # missing department
++            {"name": "diana"},  # missing both
++        ]
++        out = tmpl.render(users=users)
++        expected = "eng:\n  dev: alice\n  unknown: bob\nunknown:\n  manager: charlie\n  unknown: diana\n"
++        assert out == expected
++
++    def test_groupby_multilevel_empty_data(self, env):
++        """Test multi-level grouping with empty data."""
++        tmpl = env.from_string(
++            "{% for group in data|groupby(['a', 'b'], levels=2) %}{{ group.grouper }}\n{% else %}No data\n{% endfor %}"
++        )
++        out = tmpl.render(data=[])
++        assert out == "No data\n"
++
++    def test_groupby_multilevel_single_item(self, env):
++        """Test multi-level grouping with single item."""
++        tmpl = env.from_string(
++            "{% for l1 in data|groupby(['a', 'b'], levels=2) %}"
++            "{{ l1.grouper }}:\n"
++            "{% for l2 in l1.list %}"
++            "  {{ l2.grouper }}: {{ l2.list|map(attribute='value')|join(',') }}\n"
++            "{% endfor %}"
++            "{% endfor %}"
++        )
++        data = [{"a": "x", "b": "y", "value": "test"}]
++        out = tmpl.render(data=data)
++        expected = "x:\n  y: test\n"
++        assert out == expected
++
++    def test_groupby_multilevel_dot_notation(self, env):
++        """Test multi-level grouping with dot notation attributes."""
++        tmpl = env.from_string(
++            "{% for l1 in data|groupby(['obj.a', 'obj.b'], levels=2) %}"
++            "{{ l1.grouper }}:\n"
++            "{% for l2 in l1.list %}"
++            "  {{ l2.grouper }}: {{ l2.list|map(attribute='value')|join(',') }}\n"
++            "{% endfor %}"
++            "{% endfor %}"
++        )
++        data = [
++            {"obj": {"a": "x", "b": "1"}, "value": "A"},
++            {"obj": {"a": "x", "b": "2"}, "value": "B"},
++            {"obj": {"a": "y", "b": "1"}, "value": "C"},
++        ]
++        out = tmpl.render(data=data)
++        expected = "x:\n  1: A\n  2: B\ny:\n  1: C\n"
++        assert out == expected
++
++    def test_groupby_backward_compatibility(self, env):
++        """Test that single-level groupby still works as before."""
++        tmpl = env.from_string(
++            "{% for group in data|groupby('category') %}"
++            "{{ group.grouper }}: {{ group.list|map(attribute='name')|join(', ') }}\n"
++            "{% endfor %}"
++        )
++        data = [
++            {"name": "apple", "category": "fruit"},
++            {"name": "banana", "category": "fruit"},
++            {"name": "carrot", "category": "vegetable"},
++        ]
++        out = tmpl.render(data=data)
++        expected = "fruit: apple, banana\nvegetable: carrot\n"
++        assert out == expected
++
++    def test_groupby_single_attribute_list(self, env):
++        """Test that single attribute in list works without levels."""
++        tmpl = env.from_string(
++            "{% for group in data|groupby(['category']) %}"
++            "{{ group.grouper }}: {{ group.list|map(attribute='name')|join(', ') }}\n"
++            "{% endfor %}"
++        )
++        data = [
++            {"name": "apple", "category": "fruit"},
++            {"name": "banana", "category": "fruit"},
++        ]
++        out = tmpl.render(data=data)
++        expected = "fruit: apple, banana\n"
++        assert out == expected
++
++    def test_groupby_multilevel_comma_separated_attributes(self, env):
++        users = [
++            {"department": "eng", "role": "dev", "name": "alice"},
++            {"department": "eng", "role": "manager", "name": "bob"},
++            {"department": "sales", "role": "rep", "name": "carol"},
++        ]
++        list_template = env.from_string(
++            "{{ users|groupby(['department', 'role'], levels=2) }}"
++        )
++        string_template = env.from_string(
++            "{{ users|groupby('department, role', levels=2) }}"
++        )
++        assert string_template.render(users=users) == list_template.render(users=users)
++
+     def test_filtertag(self, env):
+         tmpl = env.from_string(
+             "{% filter upper|replace('FOO', 'foo') %}foobar{% endfilter %}"

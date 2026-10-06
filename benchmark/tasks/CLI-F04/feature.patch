@@ -1,0 +1,104 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..86e42b6 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,10 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param cleanup_timeout: Maximum time in seconds to wait for cleanup
++        operations during context teardown. If None, no timeout is applied.
++        When the timeout is exceeded, Click stops waiting while cleanup
++        continues in a daemon thread.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +284,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +432,16 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++
++        # Validate cleanup_timeout
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be greater than 0")
++
++        #: Maximum timeout for cleanup operations in seconds.
++        self.cleanup_timeout: float | None = cleanup_timeout
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -606,10 +621,60 @@ class Context:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        If cleanup_timeout is specified, Click waits up to that duration.
++        If the timeout is exceeded, cleanup continues in a daemon thread
++        while this method returns control to the caller.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
+-        self._exit_stack = ExitStack()
++        if self.cleanup_timeout is not None:
++            self._close_with_timeout()
++        else:
++            self._exit_stack.close()
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
++
++    def _close_with_timeout(self) -> None:
++        """Close with timeout using threading for timeout mechanism."""
++        import threading
++
++        cleanup_completed = threading.Event()
++        cleanup_error = None
++        state_lock = threading.Lock()
++        timed_out = False
++        stack, self._exit_stack = self._exit_stack, ExitStack()
++
++        def _do_cleanup():
++            nonlocal cleanup_error
++            try:
++                stack.close()
++            except BaseException as e:
++                cleanup_error = e
++            finally:
++                with state_lock:
++                    if timed_out and cleanup_error is not None:
++                        echo(
++                            f"Warning: Background cleanup failed: {cleanup_error}",
++                            err=True,
++                        )
++                    cleanup_completed.set()
++
++        # Start cleanup in a separate thread
++        cleanup_thread = threading.Thread(target=_do_cleanup, daemon=True)
++        cleanup_thread.start()
++
++        # Wait for completion or timeout
++        cleanup_completed.wait(timeout=self.cleanup_timeout)
++        with state_lock:
++            if cleanup_completed.is_set():
++                if cleanup_error is not None:
++                    raise cleanup_error
++            else:
++                timed_out = True
++                echo(
++                    f"Warning: Cleanup operations timed out after "
++                    f"{self.cleanup_timeout} seconds and continue in the background.",
++                    err=True,
++                )
+ 
+     @property
+     def command_path(self) -> str:

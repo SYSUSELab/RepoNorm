@@ -1,0 +1,320 @@
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..dae822a 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,246 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++
++def test_on_exit_callback_basic():
++    """Test that on_exit callback is called when context exits."""
++    results = []
++
++    def on_exit_callback(ctx):
++        results.append(f"exited:{ctx.command.name}")
++
++    @click.command("test_cmd")  # Explicitly name the command
++    def my_cmd():
++        pass
++
++    ctx = my_cmd.make_context("test", [], on_exit=on_exit_callback)
++    with ctx:
++        pass
++
++    assert results == ["exited:test_cmd"]
++
++
++def test_on_exit_callback_with_parameters():
++    """Test that on_exit callback receives correct context with parameters."""
++    callback_ctx = None
++
++    def on_exit_callback(ctx):
++        nonlocal callback_ctx
++        callback_ctx = ctx
++
++    @click.command("test_cmd")
++    @click.option("--value", default="default")
++    def my_cmd(value):
++        pass
++
++    ctx = my_cmd.make_context(
++        "test", ["--value", "test_value"], on_exit=on_exit_callback
++    )
++    with ctx:
++        pass
++
++    assert callback_ctx is not None
++    assert callback_ctx.params["value"] == "test_value"
++    assert callback_ctx.command.name == "test_cmd"
++
++
++def test_on_exit_callback_none():
++    """Test that no callback is called when on_exit is None."""
++
++    @click.command()
++    def test_cmd():
++        pass
++
++    # Should not raise any errors
++    ctx = test_cmd.make_context("test", [])
++    with ctx:
++        pass
++
++
++def test_on_exit_callback_exception_handling():
++    """Test that exceptions in on_exit callback don't break context cleanup."""
++
++    def failing_callback(ctx):
++        raise ValueError("Test exception")
++
++    @click.command()
++    def test_cmd():
++        pass
++
++    # Should not raise the ValueError from the callback
++    ctx = test_cmd.make_context("test", [], on_exit=failing_callback)
++    with ctx:
++        pass
++
++
++def test_on_exit_callback_multiple_contexts():
++    """Test on_exit callbacks work correctly with nested contexts."""
++    results = []
++
++    def parent_callback(ctx):
++        results.append(f"parent:{ctx.info_name}")
++
++    def child_callback(ctx):
++        results.append(f"child:{ctx.info_name}")
++
++    @click.group("parent_group")
++    def parent_group():
++        pass
++
++    @parent_group.command("child_cmd")
++    def child_cmd():
++        pass
++
++    # Test with parent context - enable resilient parsing to avoid help error
++    parent_ctx = parent_group.make_context(
++        "parent", [], on_exit=parent_callback, resilient_parsing=True
++    )
++    with parent_ctx:
++        # Test with child context
++        child_ctx = child_cmd.make_context(
++            "child", [], parent=parent_ctx, on_exit=child_callback
++        )
++        with child_ctx:
++            pass
++
++    assert "child:child" in results
++    assert "parent:parent" in results
++
++
++def test_on_exit_callback_context_manager_reuse():
++    """Test that on_exit callback works correctly when context is reused."""
++    call_count = 0
++
++    def counting_callback(ctx):
++        nonlocal call_count
++        call_count += 1
++
++    @click.command()
++    def test_cmd():
++        pass
++
++    ctx = test_cmd.make_context("test", [], on_exit=counting_callback)
++
++    # Use context multiple times
++    with ctx:
++        pass
++
++    with ctx:
++        pass
++
++    # Should be called twice
++    assert call_count == 2
++
++
++def test_on_exit_callback_with_command_chain():
++    """Test on_exit callback with chained commands."""
++    results = []
++
++    def chain_callback(ctx):
++        results.append(f"chain:{ctx.info_name}:{len(ctx.params)}")
++
++    @click.group("chain_group", chain=True)
++    def chain_group():
++        pass
++
++    @chain_group.command("cmd1")
++    @click.option("--opt1")
++    def cmd1(opt1):
++        pass
++
++    @chain_group.command("cmd2")
++    @click.option("--opt2")
++    def cmd2(opt2):
++        pass
++
++    ctx = chain_group.make_context(
++        "chain_test", [], on_exit=chain_callback, resilient_parsing=True
++    )
++    with ctx:
++        pass
++
++    assert len(results) == 1
++    assert "chain:chain_test:0" == results[0]
++
++
++def test_on_exit_real_teardown_and_exit_once():
++    events = []
++    ctx = click.Context(click.Command("cmd"), on_exit=lambda ctx: events.append("exit"))
++    with ctx:
++        with ctx:
++            pass
++        assert events == []
++    assert events == ["exit"]
++    with ctx.scope(cleanup=False):
++        pass
++    assert events == ["exit"]
++    with pytest.raises(click.exceptions.Exit):
++        with ctx:
++            ctx.exit()
++    assert events == ["exit", "exit"]
++    assert click.get_current_context(silent=True) is None
++
++
++@pytest.mark.parametrize("failure", [ValueError, KeyboardInterrupt, SystemExit])
++def test_on_exit_failure_preserves_cleanup_and_stack(failure):
++    events = []
++
++    def callback(ctx):
++        events.append("exit")
++        raise failure("callback")
++
++    ctx = click.Context(click.Command("cmd"), on_exit=callback)
++    ctx.call_on_close(lambda: events.append("cleanup"))
++    if failure is ValueError:
++        with ctx:
++            pass
++    else:
++        with pytest.raises(failure):
++            with ctx:
++                pass
++    assert sorted(events) == ["cleanup", "exit"]
++    assert click.get_current_context(silent=True) is None
++
++
++def test_on_exit_real_chain(runner):
++    events = []
++
++    def exited(ctx):
++        events.append(ctx.info_name)
++
++    @click.group(chain=True, context_settings={"on_exit": exited})
++    def cli():
++        pass
++
++    @cli.command(context_settings={"on_exit": exited})
++    def first():
++        pass
++
++    @cli.command(context_settings={"on_exit": exited})
++    def second():
++        pass
++
++    result = runner.invoke(cli, ["first", "second"])
++    assert result.exit_code == 0, result.output
++    assert sorted(events) == ["cli", "first", "second"]
++
++
++def test_on_exit_command_failure_observes_final_state(runner):
++    events = []
++
++    def exited(ctx):
++        events.append((ctx.info_name, ctx.params["value"]))
++
++    @click.command(context_settings={"on_exit": exited})
++    @click.option("--value", type=int)
++    @click.pass_context
++    def cli(ctx, value):
++        ctx.call_on_close(lambda: events.append("cleanup"))
++        raise RuntimeError("command failed")
++
++    result = runner.invoke(cli, ["--value", "7"])
++    assert isinstance(result.exception, RuntimeError)
++    assert len(events) == 2
++    assert ("cli", 7) in events and "cleanup" in events
++    assert click.get_current_context(silent=True) is None
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index 3e7a2bd..b6dd343 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -414,3 +414,64 @@ def test_add_completion_class_decorator():
+     # Using `add_completion_class` as a decorator adds the new shell immediately
+     assert "mysh" in click.shell_completion._available_shells
+     assert click.shell_completion._available_shells["mysh"] is MyshComplete
++
++
++def test_shell_completion_with_on_exit_callback():
++    """Test that shell completion works correctly with on_exit callbacks."""
++    results = []
++
++    def completion_callback(ctx):
++        results.append(f"completion:{ctx.info_name}")
++
++    @click.command()
++    def test_cmd():
++        pass
++
++    # Shell completion should work normally with on_exit callback
++    comp = ShellComplete(
++        test_cmd, {"on_exit": completion_callback}, "test", "_COMPLETE"
++    )
++    completions = comp.get_completions([], "--")
++
++    # Should get standard completions
++    completion_values = [c.value for c in completions]
++    assert "--help" in completion_values
++
++    # The callback should not interfere with completion functionality
++    assert len(completions) > 0
++
++
++def test_shell_completion_resolve_context_with_on_exit():
++    """Test that _resolve_context works with on_exit parameter without breaking."""
++    from click.shell_completion import _resolve_context
++
++    callback_called = []
++
++    def test_callback(ctx):
++        callback_called.append(True)
++
++    @click.command()
++    def test_cmd():
++        pass
++
++    # Test that context resolution works with on_exit in ctx_args
++    ctx_args = {"on_exit": test_callback, "resilient_parsing": True}
++    ctx = _resolve_context(test_cmd, ctx_args, "test", [])
++
++    assert ctx is not None
++    assert ctx.command is test_cmd
++
++    # Test that the callback is not called during shell completion resolution
++    # This is the key behavior: shell completion should not trigger callbacks
++    assert len(callback_called) == 0  # Not called during resolution
++
++    # Test that shell completion continues to work normally even with on_exit callback
++    # The main requirement is that the presence of on_exit doesn't break completion
++    comp = ShellComplete(test_cmd, {"on_exit": test_callback}, "test", "_COMPLETE")
++    completions = comp.get_completions([], "--")
++    completion_values = [c.value for c in completions]
++    assert "--help" in completion_values
++    assert len(completions) > 0
++
++    # Still no callback should have been triggered during completion
++    assert len(callback_called) == 0

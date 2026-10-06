@@ -1,0 +1,113 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..2199429 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        timeout: int | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.timeout = timeout
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -507,6 +509,7 @@ class Editor:
+ 
+     def edit_file(self, filename: str) -> None:
+         import subprocess
++        import signal
+ 
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+@@ -516,12 +519,47 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            kwargs: dict = {}
++            if not WIN:
++                kwargs["start_new_session"] = True
++            c = subprocess.Popen(
++                f'{editor} "{filename}"',
++                env=environ,
++                shell=True,
++                **kwargs,
++            )
++            exit_code = c.wait(timeout=self.timeout)
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+                 )
++        except subprocess.TimeoutExpired:
++            # Graceful termination
++            if WIN:
++                c.terminate()
++            else:
++                try:
++                    os.killpg(os.getpgid(c.pid), signal.SIGTERM)
++                except ProcessLookupError:
++                    pass
++            # Wait briefly for graceful shutdown
++            try:
++                c.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                # Forceful stop
++                if WIN:
++                    c.kill()
++                else:
++                    try:
++                        os.killpg(os.getpgid(c.pid), signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++                c.wait()
++            raise ClickException(
++                _("{editor}: Editing timed out after {timeout} seconds").format(
++                    editor=editor, timeout=self.timeout
++                )
++            )
+         except OSError as e:
+             raise ClickException(
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..e93861f 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    timeout: int | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,23 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param timeout: the maximum number of seconds to wait for the editor
++                    to finish. If the editor does not exit within this
++                    time, it is terminated and a :exc:`ClickException`
++                    is raised. ``None`` means no timeout.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    if timeout is not None:
++        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
++            raise ValueError(
++                f"timeout must be a positive integer or None, not {timeout!r}"
++            )
++
++    ed = Editor(
++        editor=editor, env=env, require_save=require_save, extension=extension,
++        timeout=timeout,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)

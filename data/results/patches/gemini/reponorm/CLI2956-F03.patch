@@ -1,0 +1,146 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..8aa419b 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2499,6 +2499,9 @@ class Option(Parameter):
+                      multiple times and recorded.  This is similar to ``nargs``
+                      in how it works but supports arbitrary number of
+                      arguments.
++    :param batch_size: if this is set to a positive integer, then the
++                       argument is grouped into batches of this size.
++                       This is only valid with ``multiple=True``.
+     :param count: this flag makes an option increment an integer.
+     :param allow_from_autoenv: if this is enabled then the value of this
+                                parameter will be pulled from an environment
+@@ -2541,6 +2544,7 @@ class Option(Parameter):
+         is_flag: bool | None = None,
+         flag_value: t.Any | None = None,
+         multiple: bool = False,
++        batch_size: int | None = None,
+         count: bool = False,
+         allow_from_autoenv: bool = True,
+         type: types.ParamType | t.Any | None = None,
+@@ -2555,6 +2559,15 @@ class Option(Parameter):
+             help = inspect.cleandoc(help)
+ 
+         default_is_missing = "default" not in attrs
++
++        if batch_size is not None:
++            if not isinstance(batch_size, int) or isinstance(batch_size, bool):
++                raise TypeError('batch_size must be an integer.')
++            if batch_size <= 0:
++                raise ValueError('batch_size must be a positive integer.')
++            if not multiple:
++                raise TypeError('batch_size is only valid with multiple=True.')
++        self.batch_size = batch_size
+         super().__init__(
+             param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
+         )
+@@ -2662,6 +2675,18 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++
++    def process_value(self, ctx: 'Context', value: t.Any) -> t.Any:
++        value = super().process_value(ctx, value)
++
++        if self.batch_size is not None and value is not None:
++            # Group into batches
++            batches = []
++            for i in range(0, len(value), self.batch_size):
++                batches.append(tuple(value[i : i + self.batch_size]))
++            value = tuple(batches)
++
++        return value
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+diff --git a/src/click/decorators.py b/src/click/decorators.py
+index 21f4c34..4d6bc78 100644
+--- a/src/click/decorators.py
++++ b/src/click/decorators.py
+@@ -337,6 +337,9 @@ def argument(
+                 :class:`Argument`.
+     :param param_decls: Passed as positional arguments to the constructor of
+         ``cls``.
++    :param batch_size: if this is set to a positive integer, then the
++                       argument is grouped into batches of this size.
++                       This is only valid with ``multiple=True``.
+     :param attrs: Passed as keyword arguments to the constructor of ``cls``.
+     """
+     if cls is None:
+@@ -350,7 +353,10 @@ def argument(
+ 
+ 
+ def option(
+-    *param_decls: str, cls: type[Option] | None = None, **attrs: t.Any
++    *param_decls: str,
++    cls: type[Option] | None = None,
++    batch_size: int | None = None,
++    **attrs: t.Any,
+ ) -> t.Callable[[FC], FC]:
+     """Attaches an option to the command.  All positional arguments are
+     passed as parameter declarations to :class:`Option`; all keyword
+@@ -365,12 +371,17 @@ def option(
+                 :class:`Option`.
+     :param param_decls: Passed as positional arguments to the constructor of
+         ``cls``.
++    :param batch_size: if this is set to a positive integer, then the
++                       argument is grouped into batches of this size.
++                       This is only valid with ``multiple=True``.
+     :param attrs: Passed as keyword arguments to the constructor of ``cls``.
+     """
+     if cls is None:
+         cls = Option
+ 
+     def decorator(f: FC) -> FC:
++        if batch_size is not None:
++            attrs['batch_size'] = batch_size
+         _param_memo(f, cls(param_decls, **attrs))
+         return f
+ 
+diff --git a/tests/test_batch_option.py b/tests/test_batch_option.py
+new file mode 100644
+index 0000000..e53d2bd
+--- /dev/null
++++ b/tests/test_batch_option.py
+@@ -0,0 +1,39 @@
++import click
++from click.testing import CliRunner
++import pytest
++
++def test_batch_size_basic():
++    @click.command()
++    @click.option("--foo", multiple=True, batch_size=2)
++    def cli(foo):
++        click.echo(repr(foo))
++
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--foo", "a", "--foo", "b", "--foo", "c", "--foo", "d"])
++    assert result.exit_code == 0
++    assert result.output.strip() == "(('a', 'b'), ('c', 'd'))"
++
++    result = runner.invoke(cli, ["--foo", "a", "--foo", "b", "--foo", "c"])
++    assert result.exit_code == 0
++    assert result.output.strip() == "(('a', 'b'), ('c',))"
++
++def test_batch_size_invalid_type():
++    with pytest.raises(TypeError, match='batch_size must be an integer.'):
++        @click.command()
++        @click.option("--foo", multiple=True, batch_size="2")
++        def cli(foo):
++            pass
++
++def test_batch_size_invalid_value():
++    with pytest.raises(ValueError, match='batch_size must be a positive integer.'):
++        @click.command()
++        @click.option("--foo", multiple=True, batch_size=0)
++        def cli(foo):
++            pass
++
++def test_batch_size_without_multiple():
++    with pytest.raises(TypeError, match='batch_size is only valid with multiple=True.'):
++        @click.command()
++        @click.option("--foo", batch_size=2)
++        def cli(foo):
++            pass

@@ -1,0 +1,160 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..6cab3a6 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1195,6 +1195,7 @@ class Command:
+ 
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
++        resolve_dynamic_defaults(ctx)
+ 
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+@@ -2412,13 +2413,20 @@ class Parameter:
+ 
+             ctx.set_parameter_source(self.name, source)  # type: ignore
+ 
+-            try:
+-                value = self.process_value(ctx, value)
+-            except Exception:
+-                if not ctx.resilient_parsing:
+-                    raise
+-
+-                value = None
++            # Check if it is a dynamic default
++            is_dynamic = False
++            if source == ParameterSource.DEFAULT:
++                default = self.default
++                if isinstance(default, dict) and default and all(k.startswith("--") for k in default.keys()):
++                    is_dynamic = True
++
++            if not is_dynamic:
++                try:
++                    value = self.process_value(ctx, value)
++                except Exception:
++                    if not ctx.resilient_parsing:
++                        raise
++                    value = None
+ 
+         if self.expose_value:
+             ctx.params[self.name] = value  # type: ignore
+@@ -2866,7 +2874,11 @@ class Option(Parameter):
+                 default_string = f"({self.show_default})"
+             elif isinstance(default_value, (list, tuple)):
+                 default_string = ", ".join(str(d) for d in default_value)
+-            elif inspect.isfunction(default_value):
++            elif inspect.isfunction(default_value) or (
++                isinstance(default_value, dict)
++                and default_value
++                and all(k.startswith("--") for k in default_value.keys())
++            ):
+                 default_string = _("(dynamic)")
+             elif self.is_bool_flag and self.secondary_opts:
+                 # For boolean flags that have distinct True/False opts,
+@@ -3133,3 +3145,78 @@ def __getattr__(name: str) -> object:
+         return _MultiCommand
+ 
+     raise AttributeError(name)
++
++def resolve_dynamic_defaults(ctx: Context) -> None:
++    params = ctx.command.get_params(ctx)
++    dynamic_params = []
++    for param in params:
++        if isinstance(param, Option):
++            default = param.default
++            if isinstance(default, dict) and default and all(k.startswith("--") for k in default.keys()):
++                dynamic_params.append(param)
++    
++    resolved = set()
++    
++    while True:
++        changed = False
++        for param in dynamic_params:
++            if param.name in resolved:
++                continue
++            
++            if ctx.get_parameter_source(param.name) != ParameterSource.DEFAULT:
++                resolved.add(param.name)
++                continue
++            
++            default_map = param.default
++            
++            all_deps_resolved = True
++            for opt_name in default_map.keys():
++                dep_param = None
++                for p in params:
++                    if isinstance(p, Option) and opt_name in p.opts:
++                        dep_param = p
++                        break
++                
++                if dep_param is None:
++                    raise UsageError(f"Unknown option {opt_name} in dynamic default.")
++                
++                if ctx.get_parameter_source(dep_param.name) == ParameterSource.DEFAULT:
++                    if dep_param in dynamic_params:
++                        if dep_param.name not in resolved:
++                            all_deps_resolved = False
++                            break
++                    else:
++                        # Static default, already resolved
++                        pass
++            
++            if all_deps_resolved:
++                new_default = None
++                for opt_name, mapping in default_map.items():
++                    if not isinstance(mapping, dict):
++                        raise TypeError(f"Dynamic default for {opt_name} must be a dictionary.")
++                    
++                    dep_param = None
++                    for p in params:
++                        if isinstance(p, Option) and opt_name in p.opts:
++                            dep_param = p
++                            break
++                    
++                    dep_value = ctx.params.get(dep_param.name)
++                    dep_value_str = str(dep_value)
++                    
++                    if dep_value_str in mapping:
++                        new_default = mapping[dep_value_str]
++                
++                # Process the new default
++                value = param.process_value(ctx, new_default)
++                ctx.params[param.name] = value
++                resolved.add(param.name)
++                changed = True
++        
++        if not changed:
++            break
++            
++    # Check for cycles
++    for param in dynamic_params:
++        if param.name not in resolved:
++            raise UsageError(f"Dependency cycle or unresolved dynamic default for {param.name}.")
+diff --git a/tests/test_dynamic_defaults.py b/tests/test_dynamic_defaults.py
+new file mode 100644
+index 0000000..37d6050
+--- /dev/null
++++ b/tests/test_dynamic_defaults.py
+@@ -0,0 +1,22 @@
++import click
++import pytest
++
++def test_dynamic_defaults():
++    @click.command()
++    @click.option("--foo", default="a")
++    @click.option("--bar", default={"--foo": {"a": "b", "c": "d"}})
++    def cmd(foo, bar):
++        click.echo(f"foo={foo}, bar={bar}")
++
++    runner = click.testing.CliRunner()
++    
++    # Test default
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    # The current implementation doesn't resolve dynamic defaults, so it should print the dict
++    assert "foo=a, bar=b" in result.output
++
++    # Test with foo=c
++    result = runner.invoke(cmd, ["--foo", "c"])
++    assert result.exit_code == 0
++    assert "foo=c, bar=d" in result.output

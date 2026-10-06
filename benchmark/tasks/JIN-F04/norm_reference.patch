@@ -1,0 +1,139 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..2711a6f3 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add a ``max_groups`` option to ``groupby`` to retain only the first
++    requested number of complete groups.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..64c2a79e 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1163,7 +1163,8 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    max_groups: t.Optional[int] = None,
++) -> "t.List[_GroupTuple]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+     nested access, like ``"address.city"``. Unlike Python's ``groupby``,
+@@ -1203,6 +1204,18 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    You can limit the number of groups returned by specifying ``max_groups``.
++    This is useful for displaying "top N" groups.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", max_groups=3) %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.1
++        Added the ``max_groups`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+@@ -1210,11 +1223,18 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
++    if max_groups is not None and (type(max_groups) is not int or max_groups < 0):
++        raise FilterArgumentError("max_groups must be a nonnegative integer or None")
++    groups = [
+         _GroupTuple(key, list(values))
+         for key, values in groupby(sorted(value, key=expr), expr)
+     ]
+ 
++    if max_groups is not None:
++        return groups[:max_groups]
++
++    return groups
++
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+ async def do_groupby(
+@@ -1222,13 +1242,21 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    max_groups: t.Optional[int] = None,
++) -> "t.List[_GroupTuple]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
++    if max_groups is not None and (type(max_groups) is not int or max_groups < 0):
++        raise FilterArgumentError("max_groups must be a nonnegative integer or None")
++    groups = [
+         _GroupTuple(key, await auto_to_list(values))
+         for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+     ]
+ 
++    if max_groups is not None:
++        return groups[:max_groups]
++
++    return groups
++
+ 
+ @pass_environment
+ def sync_do_sum(
+diff --git a/tests/test_groupby_limit_contribution.py b/tests/test_groupby_limit_contribution.py
+new file mode 100644
+index 00000000..1c10a988
+--- /dev/null
++++ b/tests/test_groupby_limit_contribution.py
+@@ -0,0 +1,42 @@
++import asyncio
++
++import pytest
++
++from jinja2 import Environment
++from jinja2.exceptions import FilterArgumentError
++
++
++def test_groupby_limit_keeps_complete_first_group():
++    env = Environment()
++    rows = [{"key": 2}, {"key": 1, "id": "a"}, {"key": 1, "id": "b"}]
++    groups = env.call_filter("groupby", iter(rows), ["key"], {"max_groups": 1})
++    assert [group.grouper for group in groups] == [1]
++    assert groups[0].list == rows[1:]
++
++
++def test_groupby_limit_zero_and_default():
++    env = Environment()
++    assert (
++        env.call_filter(
++            "groupby", [{}, {"key": 1}], ["key"], {"default": 0, "max_groups": 0}
++        )
++        == []
++    )
++
++
++@pytest.mark.parametrize("limit", [-1, 1.5, "1", True])
++def test_groupby_limit_rejects_invalid_values(limit):
++    env = Environment()
++    with pytest.raises(FilterArgumentError):
++        env.call_filter("groupby", [], ["key"], {"max_groups": limit})
++
++
++def test_async_groupby_limit_accepts_async_iterable():
++    env = Environment(enable_async=True)
++
++    async def rows():
++        for key in [2, 1, 3]:
++            yield {"key": key}
++
++    groups = asyncio.run(env.call_filter("groupby", rows(), ["key"], {"max_groups": 2}))
++    assert [group.grouper for group in groups] == [1, 2]

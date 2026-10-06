@@ -1,0 +1,164 @@
+diff --git a/dspy/adapters/types/__init__.py b/dspy/adapters/types/__init__.py
+index 11b9faee..ac9feace 100644
+--- a/dspy/adapters/types/__init__.py
++++ b/dspy/adapters/types/__init__.py
+@@ -1,3 +1,4 @@
++from dspy.adapters.types.tool_parser import parse_python_calls
+ from dspy.adapters.types.audio import Audio
+ from dspy.adapters.types.base_type import Type
+ from dspy.adapters.types.code import Code
+@@ -5,4 +6,4 @@ from dspy.adapters.types.history import History
+ from dspy.adapters.types.image import Image
+ from dspy.adapters.types.tool import Tool, ToolCalls
+ 
+-__all__ = ["History", "Image", "Audio", "Type", "Tool", "ToolCalls", "Code"]
++__all__ = ["parse_python_calls", "History", "Image", "Audio", "Type", "Tool", "ToolCalls", "Code"]
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..7da7e3f8 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,3 +1,4 @@
++from dspy.adapters.types.tool_parser import parse_python_calls
+ import asyncio
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+@@ -255,6 +256,18 @@ class Tool(Type):
+ 
+ 
+ class ToolCalls(Type):
++    @classmethod
++    def validate_input(cls, value: Any) -> Any:
++        if isinstance(value, str):
++            return parse_python_calls(value)
++        return value
++
++    @classmethod
++    def model_validate(cls, value: Any, **kwargs) -> "ToolCalls":
++        if isinstance(value, str):
++            value = parse_python_calls(value)
++        return super().model_validate(value, **kwargs)
++
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
+diff --git a/dspy/adapters/types/tool_parser.py b/dspy/adapters/types/tool_parser.py
+new file mode 100644
+index 00000000..eaf9f60d
+--- /dev/null
++++ b/dspy/adapters/types/tool_parser.py
+@@ -0,0 +1,90 @@
++import ast
++import tokenize
++import io
++from typing import Any
++
++def parse_python_calls(text: str) -> dict:
++    if not text.strip():
++        raise ValueError("Empty input")
++    
++    # Check for comments
++    tokens = tokenize.generate_tokens(io.StringIO(text).readline)
++    for tok in tokens:
++        if tok.type == tokenize.COMMENT:
++            raise ValueError("Comments not allowed")
++    
++    try:
++        tree = ast.parse(text)
++    except SyntaxError as e:
++        raise ValueError(f"Malformed syntax: {e}")
++        
++    tool_calls = []
++    
++    for node in tree.body:
++        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
++            raise ValueError("Only calls are allowed")
++        
++        call = node.value
++        
++        # Callee: identifier or dot-separated sequence
++        def get_name(node):
++            if isinstance(node, ast.Name):
++                return node.id
++            elif isinstance(node, ast.Attribute):
++                return f"{get_name(node.value)}.{node.attr}"
++            else:
++                raise ValueError("Invalid callee")
++        
++        name = get_name(call.func).split('.')[-1]
++        
++        # Arguments: only keyword arguments
++        if call.args:
++            raise ValueError("Positional arguments not allowed")
++        if call.keywords is None:
++            args = {}
++        else:
++            args = {}
++            for kw in call.keywords:
++                if kw.arg in args:
++                    raise ValueError(f"Duplicate keyword argument: {kw.arg}")
++                args[kw.arg] = parse_value(kw.value)
++        
++        tool_calls.append({"name": name, "args": args})
++        
++    return {"tool_calls": tool_calls}
++
++def parse_value(node):
++    if isinstance(node, ast.Constant):
++        if isinstance(node.value, (str, int, float, bool)) or node.value is None:
++            # Check for non-finite numbers
++            if isinstance(node.value, float) and not (float('-inf') < node.value < float('inf')):
++                raise ValueError("Non-finite numbers not allowed")
++            return node.value
++        else:
++            raise ValueError(f"Unsupported constant type: {type(node.value)}")
++    elif isinstance(node, ast.List):
++        return [parse_value(elt) for elt in node.elts]
++    elif isinstance(node, ast.Tuple):
++        return [parse_value(elt) for elt in node.elts]
++    elif isinstance(node, ast.Dict):
++        keys = []
++        for k, v in zip(node.keys, node.values):
++            if k is None: # Handle **kwargs
++                raise ValueError("Dictionary unpacking not allowed")
++            if not isinstance(k, ast.Constant) or not isinstance(k.value, str):
++                raise ValueError("Dictionary keys must be strings")
++            if k.value in keys:
++                raise ValueError(f"Duplicate dictionary key: {k.value}")
++            keys.append(k.value)
++        return {k.value: parse_value(v) for k, v in zip(node.keys, node.values)}
++    elif isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, (ast.UAdd, ast.USub)):
++            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)):
++                val = node.operand.value
++                return +val if isinstance(node.op, ast.UAdd) else -val
++            else:
++                raise ValueError("Unary operators only permitted on numbers")
++        else:
++            raise ValueError("Unsupported unary operator")
++    else:
++        raise ValueError(f"Unsupported value type: {type(node)}")
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..ccffbceb 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,20 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++def test_tool_calls_parser():
++    # Test valid input
++    text = "foo(a=1); bar(b='baz')"
++    tool_calls = ToolCalls.model_validate(text)
++    assert len(tool_calls.tool_calls) == 2
++    assert tool_calls.tool_calls[0].name == "foo"
++    assert tool_calls.tool_calls[0].args == {"a": 1}
++    assert tool_calls.tool_calls[1].name == "bar"
++    assert tool_calls.tool_calls[1].args == {"b": "baz"}
++
++    # Test invalid input
++    with pytest.raises(ValueError):
++        ToolCalls.model_validate("foo(1)") # Positional argument
++    
++    with pytest.raises(ValueError):
++        ToolCalls.model_validate("foo(a=1) # comment") # Comment

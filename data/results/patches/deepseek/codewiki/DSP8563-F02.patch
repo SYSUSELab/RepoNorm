@@ -1,0 +1,452 @@
+diff --git a/dspy/__init__.py b/dspy/__init__.py
+index ea4c75a8..bfafdb35 100644
+--- a/dspy/__init__.py
++++ b/dspy/__init__.py
+@@ -6,7 +6,7 @@ from dspy.teleprompt import *
+ 
+ from dspy.evaluate import Evaluate  # isort: skip
+ from dspy.clients import *  # isort: skip
+-from dspy.adapters import Adapter, ChatAdapter, JSONAdapter, XMLAdapter, TwoStepAdapter, Image, Audio, History, Type, Tool, ToolCalls, Code  # isort: skip
++from dspy.adapters import Adapter, ChatAdapter, JSONAdapter, XMLAdapter, TwoStepAdapter, Image, Audio, History, Type, Tool, ToolCalls, Code, parse_python_calls  # isort: skip
+ from dspy.utils.logging_utils import configure_dspy_loggers, disable_logging, enable_logging
+ from dspy.utils.asyncify import asyncify
+ from dspy.utils.syncify import syncify
+diff --git a/dspy/adapters/__init__.py b/dspy/adapters/__init__.py
+index 1dea6da4..103e4de6 100644
+--- a/dspy/adapters/__init__.py
++++ b/dspy/adapters/__init__.py
+@@ -2,7 +2,7 @@ from dspy.adapters.base import Adapter
+ from dspy.adapters.chat_adapter import ChatAdapter
+ from dspy.adapters.json_adapter import JSONAdapter
+ from dspy.adapters.two_step_adapter import TwoStepAdapter
+-from dspy.adapters.types import Audio, Code, History, Image, Tool, ToolCalls, Type
++from dspy.adapters.types import Audio, Code, History, Image, Tool, ToolCalls, Type, parse_python_calls
+ from dspy.adapters.xml_adapter import XMLAdapter
+ 
+ __all__ = [
+@@ -18,4 +18,5 @@ __all__ = [
+     "TwoStepAdapter",
+     "Tool",
+     "ToolCalls",
++    "parse_python_calls",
+ ]
+diff --git a/dspy/adapters/types/__init__.py b/dspy/adapters/types/__init__.py
+index 11b9faee..60695f7f 100644
+--- a/dspy/adapters/types/__init__.py
++++ b/dspy/adapters/types/__init__.py
+@@ -3,6 +3,6 @@ from dspy.adapters.types.base_type import Type
+ from dspy.adapters.types.code import Code
+ from dspy.adapters.types.history import History
+ from dspy.adapters.types.image import Image
+-from dspy.adapters.types.tool import Tool, ToolCalls
++from dspy.adapters.types.tool import Tool, ToolCalls, parse_python_calls
+ 
+-__all__ = ["History", "Image", "Audio", "Type", "Tool", "ToolCalls", "Code"]
++__all__ = ["History", "Image", "Audio", "Type", "Tool", "ToolCalls", "Code", "parse_python_calls"]
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..a9faa852 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -2,8 +2,11 @@ import asyncio
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
++import ast
++import io
++import tokenize
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, model_validator
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -309,6 +312,26 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def validate_input(cls, data: Any):
++        if isinstance(data, cls):
++            return data
++
++        if isinstance(data, str):
++            return parse_python_calls(data)
++
++        if isinstance(data, dict):
++            if "tool_calls" in data:
++                return data
++            # Allow a single dict with name/args
++            if "name" in data:
++                return {"tool_calls": [data]}
++            raise ValueError(f"Received invalid dict for `dspy.ToolCalls`: {data}")
++
++        raise ValueError(f"Received invalid value for `dspy.ToolCalls`: {data}")
++
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+@@ -366,3 +389,227 @@ def convert_input_schema_to_tool_args(
+             arg_desc[name] += " (Required)"
+ 
+     return args, arg_types, arg_desc
++
++
++
++def _has_comments(text: str) -> bool:
++    """Check if text contains Python comments outside string literals."""
++    try:
++        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
++        for tok in tokens:
++            if tok.type == tokenize.COMMENT:
++                return True
++        return False
++    except tokenize.TokenError:
++        return False
++
++
++def _parse_literal(node: ast.AST):
++    """Parse a literal value from an AST node.
++
++    Only allows: strings, finite ints/floats, booleans, None,
++    lists, tuples (converted to lists), dicts with string keys.
++    """
++    if isinstance(node, ast.Constant):
++        value = node.value
++        if isinstance(value, bool):
++            return value
++        elif isinstance(value, int):
++            return value
++        elif isinstance(value, float):
++            if value != value:  # NaN check
++                raise ValueError("NaN is not allowed")
++            if value == float('inf') or value == float('-inf'):
++                raise ValueError("Infinity and -Infinity are not allowed")
++            return value
++        elif isinstance(value, str):
++            return value
++        elif value is None:
++            return None
++        elif isinstance(value, bytes):
++            raise ValueError("Bytes literals are not allowed")
++        elif isinstance(value, complex):
++            raise ValueError("Complex numbers are not allowed")
++        elif isinstance(value, type(Ellipsis)):
++            raise ValueError("Ellipsis (...) is not allowed")
++        else:
++            raise ValueError(f"Unsupported constant type: {type(value).__name__}")
++
++    elif isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, ast.UAdd):
++            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)) and not isinstance(node.operand.value, bool):
++                val = node.operand.value
++                if isinstance(val, float) and (val != val or val == float('inf') or val == float('-inf')):
++                    raise ValueError("Infinity, -Infinity, and NaN are not allowed")
++                return +val
++            else:
++                raise ValueError("Unary + is only permitted on numeric literals")
++        elif isinstance(node.op, ast.USub):
++            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)) and not isinstance(node.operand.value, bool):
++                val = node.operand.value
++                if isinstance(val, float) and (val != val or val == float('inf') or val == float('-inf')):
++                    raise ValueError("Infinity, -Infinity, and NaN are not allowed")
++                return -val
++            else:
++                raise ValueError("Unary - is only permitted on numeric literals")
++        else:
++            raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
++
++    elif isinstance(node, ast.List):
++        return [_parse_literal(el) for el in node.elts]
++
++    elif isinstance(node, ast.Tuple):
++        return [_parse_literal(el) for el in node.elts]
++
++    elif isinstance(node, ast.Dict):
++        keys = []
++        for key_node in node.keys:
++            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
++                raise ValueError("Dictionary keys must be strings")
++            keys.append(key_node.value)
++
++        if len(keys) != len(set(keys)):
++            raise ValueError("Duplicate dictionary keys are not allowed")
++
++        return {
++            key_node.value: _parse_literal(val_node)
++            for key_node, val_node in zip(node.keys, node.values)
++        }
++
++    elif isinstance(node, ast.Name):
++        if node.id == "True":
++            return True
++        elif node.id == "False":
++            return False
++        elif node.id == "None":
++            return None
++        else:
++            raise ValueError(f"Variables are not allowed, got '{node.id}'")
++
++    elif isinstance(node, ast.Call):
++        raise ValueError("Nested function calls are not allowed")
++
++    elif isinstance(node, ast.JoinedStr):
++        raise ValueError("F-strings are not allowed")
++
++    elif isinstance(node, ast.Lambda):
++        raise ValueError("Lambda expressions are not allowed")
++
++    elif isinstance(node, ast.ListComp):
++        raise ValueError("List comprehensions are not allowed")
++
++    elif isinstance(node, ast.SetComp):
++        raise ValueError("Set comprehensions are not allowed")
++
++    elif isinstance(node, ast.DictComp):
++        raise ValueError("Dict comprehensions are not allowed")
++
++    elif isinstance(node, ast.GeneratorExp):
++        raise ValueError("Generator expressions are not allowed")
++
++    elif isinstance(node, ast.BinOp):
++        raise ValueError("Binary operations are not allowed")
++
++    elif isinstance(node, ast.Compare):
++        raise ValueError("Comparison operations are not allowed")
++
++    elif isinstance(node, ast.IfExp):
++        raise ValueError("Conditional expressions are not allowed")
++
++    elif isinstance(node, ast.Subscript):
++        raise ValueError("Subscript operations are not allowed")
++
++    elif isinstance(node, ast.Attribute):
++        raise ValueError("Attribute access is not allowed in argument values")
++
++    elif isinstance(node, ast.Starred):
++        raise ValueError("Argument unpacking is not allowed")
++
++    else:
++        raise ValueError(f"Unsupported expression type: {type(node).__name__}")
++
++
++def _extract_tool_name(func_node: ast.AST) -> str:
++    """Extract the tool name from a function call node.
++
++    A callee is an identifier or a dot-separated sequence of identifiers.
++    The final (rightmost) identifier is used as the tool name.
++    """
++    if isinstance(func_node, ast.Name):
++        return func_node.id
++    elif isinstance(func_node, ast.Attribute):
++        parts = []
++        current = func_node
++        while isinstance(current, ast.Attribute):
++            parts.append(current.attr)
++            current = current.value
++        if isinstance(current, ast.Name):
++            # parts[0] is the final (rightmost/innermost) attribute
++            return parts[0]
++        else:
++            raise ValueError("Dotted names must consist only of simple identifiers")
++    else:
++        raise ValueError(f"Invalid function name expression: {type(func_node).__name__}")
++
++
++def parse_python_calls(text: str) -> dict:
++    """Parse a safe subset of Python-style tool calls.
++
++    Accepts one or more top-level calls separated by newlines or semicolons.
++    A callee is an identifier or a dot-separated sequence of identifiers;
++    the final identifier is used as the tool name.
++
++    Args:
++        text: A string containing one or more Python-style function calls
++
++    Returns:
++        A dict with ``tool_calls`` key containing a list of
++        ``{"name": ..., "args": {...}}`` dicts.
++
++    Raises:
++        ValueError: If the input is empty, contains malformed syntax, or
++            contains disallowed constructs.
++    """
++    if not text or not text.strip():
++        raise ValueError("Empty input")
++
++    if _has_comments(text):
++        raise ValueError("Python comments are not allowed")
++
++    try:
++        tree = ast.parse(text)
++    except SyntaxError as e:
++        raise ValueError(f"Malformed syntax: {e}")
++
++    if not isinstance(tree, ast.Module):
++        raise ValueError("Input must be a module-level expression")
++
++    if not tree.body:
++        raise ValueError("Empty input")
++
++    tool_calls = []
++
++    for node in tree.body:
++        if not isinstance(node, ast.Expr):
++            raise ValueError(f"Only function calls are allowed, got a {type(node).__name__}")
++
++        call = node.value
++        if not isinstance(call, ast.Call):
++            raise ValueError(f"Expected a function call, got {type(call).__name__}")
++
++        tool_name = _extract_tool_name(call.func)
++
++        if call.args:
++            raise ValueError(f"Positional arguments are not allowed in call to '{tool_name}'")
++
++        args = {}
++        for keyword in call.keywords:
++            if keyword.arg is None:
++                raise ValueError(f"Argument unpacking (**) is not allowed in call to '{tool_name}'")
++            if keyword.arg in args:
++                raise ValueError(f"Duplicate keyword argument '{keyword.arg}' in call to '{tool_name}'")
++            args[keyword.arg] = _parse_literal(keyword.value)
++
++        tool_calls.append({"name": tool_name, "args": args})
++
++    return {"tool_calls": tool_calls}
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..c13f32ae 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,130 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# --- Tests for parse_python_calls and ToolCalls string input ---
++
++PARSE_PYTHON_CALLS_SUCCESS_CASES = [
++    # (input, expected)
++    (
++        'search(query="hello")',
++        {"tool_calls": [{"name": "search", "args": {"query": "hello"}}]},
++    ),
++    (
++        'search(query="hello")\ntranslate(text="world")',
++        {"tool_calls": [{"name": "search", "args": {"query": "hello"}}, {"name": "translate", "args": {"text": "world"}}]},
++    ),
++    (
++        'a(x=1); b(y=2)',
++        {"tool_calls": [{"name": "a", "args": {"x": 1}}, {"name": "b", "args": {"y": 2}}]},
++    ),
++    (
++        'module.search(query="hello")',
++        {"tool_calls": [{"name": "search", "args": {"query": "hello"}}]},
++    ),
++    (
++        'a.b.c(x=1)',
++        {"tool_calls": [{"name": "c", "args": {"x": 1}}]},
++    ),
++    (
++        'no_args()',
++        {"tool_calls": [{"name": "no_args", "args": {}}]},
++    ),
++    (
++        'test(s="hello", i=42, f=3.14, b=True, n=None, lst=[1,2,3], tup=(4,5,6), d={"key": "val"})',
++        {"tool_calls": [{"name": "test", "args": {"s": "hello", "i": 42, "f": 3.14, "b": True, "n": None, "lst": [1, 2, 3], "tup": [4, 5, 6], "d": {"key": "val"}}}]},
++    ),
++    (
++        'test(x=-1, y=+5)',
++        {"tool_calls": [{"name": "test", "args": {"x": -1, "y": 5}}]},
++    ),
++    (
++        'greet(name="世界")',
++        {"tool_calls": [{"name": "greet", "args": {"name": "世界"}}]},
++    ),
++    (
++        'test(s="hello # world")',
++        {"tool_calls": [{"name": "test", "args": {"s": "hello # world"}}]},
++    ),
++]
++
++
++PARSE_PYTHON_CALLS_ERROR_CASES = [
++    # (input, error_substring)
++    ("", "Empty"),
++    ("   ", "Empty"),
++    ("x = 1", "function call"),
++    ('test("hello")', "Positional"),
++    ('test(x=1) # comment', "comment"),
++    ('test(x=1, x=2)', "Duplicate"),
++    ('test(x=other())', "Nested"),
++    ('test(x=f"hello")', "F-string"),
++    ('test(x=1e999)', "Infinity"),
++    ('test(x=-1e999)', "Infinity"),
++    ('test(x=+True)', "Unary"),
++    ('test(x=-False)', "Unary"),
++    ('test(x=unknown_var)', "Variable"),
++    ('test(**{"x": 1})', "unpack"),
++    ('test(d={"x": 1, "x": 2})', "Duplicate"),
++    ('test(d={1: "one"})', "string"),
++]
++
++
++@pytest.mark.parametrize("input_str,expected", PARSE_PYTHON_CALLS_SUCCESS_CASES)
++def test_parse_python_calls_success(input_str, expected):
++    """Test that parse_python_calls correctly parses valid inputs."""
++    from dspy.adapters.types.tool import parse_python_calls
++    result = parse_python_calls(input_str)
++    assert result == expected, f"Expected {expected}, got {result}"
++
++
++@pytest.mark.parametrize("input_str,error_substring", PARSE_PYTHON_CALLS_ERROR_CASES)
++def test_parse_python_calls_errors(input_str, error_substring):
++    """Test that parse_python_calls raises ValueError for invalid inputs."""
++    from dspy.adapters.types.tool import parse_python_calls
++    with pytest.raises(ValueError, match=error_substring):
++        parse_python_calls(input_str)
++
++
++def test_tool_calls_model_validate_string():
++    """Test that ToolCalls.model_validate accepts string input."""
++    tc = ToolCalls.model_validate('search(query="hello")')
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "search"
++    assert tc.tool_calls[0].args == {"query": "hello"}
++
++
++def test_tool_calls_model_validate_string_multiple():
++    """Test that ToolCalls.model_validate accepts string with multiple calls."""
++    tc = ToolCalls.model_validate('search(query="hello")\ntranslate(text="world")')
++    assert len(tc.tool_calls) == 2
++    assert tc.tool_calls[0].name == "search"
++    assert tc.tool_calls[1].name == "translate"
++
++
++def test_tool_calls_model_validate_dict():
++    """Test that ToolCalls.model_validate still accepts dict input."""
++    tc = ToolCalls.model_validate({"tool_calls": [{"name": "search", "args": {"query": "hello"}}]})
++    assert len(tc.tool_calls) == 1
++    assert tc.tool_calls[0].name == "search"
++
++
++def test_tool_calls_model_validate_existing_instance():
++    """Test that ToolCalls.model_validate accepts an existing ToolCalls instance."""
++    tc1 = ToolCalls(tool_calls=[ToolCalls.ToolCall(name="search", args={"query": "hello"})])
++    tc2 = ToolCalls.model_validate(tc1)
++    assert len(tc2.tool_calls) == 1
++    assert tc2.tool_calls[0].name == "search"
++
++
++def test_tool_calls_validate_input():
++    """Test that ToolCalls.validate_input works with string input."""
++    result = ToolCalls.validate_input('search(query="hello")')
++    assert result == {"tool_calls": [{"name": "search", "args": {"query": "hello"}}]}
++
++
++def test_tool_calls_validate_input_dict():
++    """Test that ToolCalls.validate_input works with dict input."""
++    result = ToolCalls.validate_input({"tool_calls": [{"name": "search", "args": {"query": "hello"}}]})
++    assert result == {"tool_calls": [{"name": "search", "args": {"query": "hello"}}]}

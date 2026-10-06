@@ -1,0 +1,233 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..95e110cb 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,4 +1,5 @@
+ import re
++import time
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
+@@ -48,6 +49,9 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Metrics
++        self._reset_metrics()
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -66,6 +70,35 @@ class StreamListener:
+             },
+         }
+ 
++    def _reset_metrics(self):
++        self.chunk_count = 0
++        self.char_count = 0
++        self.first_ts = None
++        self.last_ts = None
++
++    def stats(self):
++        if self.stream_end:
++            self._reset_metrics()
++            
++        duration_s = None
++        if self.first_ts is not None and self.last_ts is not None:
++            duration_s = self.last_ts - self.first_ts
++            
++        avg_chunk_chars = 0
++        if self.chunk_count > 0:
++            avg_chunk_chars = self.char_count / self.chunk_count
++            
++        return {
++            "predict_name": self.predict_name,
++            "field": self.signature_field_name,
++            "chunk_count": self.chunk_count,
++            "char_count": self.char_count,
++            "first_ts": self.first_ts,
++            "last_ts": self.last_ts,
++            "duration_s": duration_s,
++            "avg_chunk_chars": avg_chunk_chars,
++        }
++
+     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
+         for i in range(len(concat_message)):
+             if start_identifier.startswith(concat_message[len(concat_message) - i - 1 :]):
+@@ -91,6 +124,7 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                self._reset_metrics()
+             else:
+                 return
+ 
+@@ -101,6 +135,14 @@ class StreamListener:
+         except Exception:
+             return
+ 
++        # Update metrics
++        self.chunk_count += 1
++        self.char_count += len(chunk_message)
++        now = time.time()
++        if self.first_ts is None:
++            self.first_ts = now
++        self.last_ts = now
++
+         if chunk_message and start_identifier in chunk_message:
+             # If the cache is hit, the chunk_message could be the full response. When it happens we can
+             # directly end the stream listening. In some models like gemini, each stream chunk can be multiple
+@@ -114,59 +156,41 @@ class StreamListener:
+                 self.stream_end = True
+                 return
+ 
+-        if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+-            # We look for the pattern of start_identifier, i.e., "[[ ## {self.signature_field_name} ## ]]" for
+-            # ChatAdapter to identify the start of the stream of our target field. Once the start_indicator, i.e., "[["
+-            # for ChatAdapter, is found, we start checking the next tokens
+-            self.field_start_queue.append(chunk_message)
++        if len(self.field_start_queue) == 0:
++            if start_indicator in chunk_message:
++                if self._buffered_message_end_with_start_identifier(chunk_message, start_identifier):
++                    self.field_start_queue.append(chunk_message)
++                elif start_identifier in chunk_message:
++                    self.field_start_queue.append(chunk_message)
++                    self.stream_start = True
+             return
+ 
+-        if len(self.field_start_queue) > 0 and not self.stream_start:
+-            # We keep appending the tokens to the queue until we have a full identifier or the concanated
+-            # tokens no longer match our expected identifier.
++        if not self.stream_start:
+             self.field_start_queue.append(chunk_message)
+             concat_message = "".join(self.field_start_queue)
+-
+             if start_identifier in concat_message:
+-                # We have a full identifier, we can start the stream.
+                 self.stream_start = True
+-                self.field_start_queue = []
+-                # Keep the part after the start_identifier from the concat_message, we need to write it to the buffer.
+-                value_start_index = concat_message.find(start_identifier) + len(start_identifier)
+-                chunk_message = concat_message[value_start_index:].lstrip()
+-                if isinstance(settings.adapter, JSONAdapter) and chunk_message.startswith('"'):
+-                    # For JSONAdapter, we need to remove the leading ". We cannot do this with the start_identifier
+-                    # because there could be a few splitters between ':' and '"', e.g., '"name": "value"'.
+-                    chunk_message = chunk_message[1:]
+-
+-            elif self._buffered_message_end_with_start_identifier(concat_message.strip(), start_identifier):
+-                # If the buffered message ends with part of the start_identifier, we keep looking for the
+-                # start_identifier from the token stream.
+-                return
+-            else:
+-                # Doesn't match the expected identifier, reset the queue.
+-                self.field_start_queue = []
+-                return
++            return
+ 
+-        if self.stream_start:
+-            # The stream is started, we keep returning the token until we see the start of the next field.
++        self.field_end_queue.put(chunk_message)
++        if self.field_end_queue.qsize() > 10:
++            # We keep the last 10 tokens in the buffer to check if they form a valid identifier for end_identifier,
++            # i.e., "[[ ## {next_field_name} ## ]]" for ChatAdapter to identify the end of the current field.
++            # In most cases 10 tokens are enough to cover the end_identifier for all adapters.
++            token = self.field_end_queue.get()
++        else:
+             token = None
+-            self.field_end_queue.put(chunk_message)
+-            if self.field_end_queue.qsize() > 10:
+-                # We keep the last 10 tokens in the buffer to check if they form a valid identifier for end_identifier,
+-                # i.e., "[[ ## {next_field_name} ## ]]" for ChatAdapter to identify the end of the current field.
+-                # In most cases 10 tokens are enough to cover the end_identifier for all adapters.
+-                token = self.field_end_queue.get()
+-            concat_message = "".join(self.field_end_queue.queue).strip()
+-            if re.search(end_identifier, concat_message):
+-                # The next field is identified, we can end the stream and flush out all tokens in the buffer.
+-                self.stream_end = True
+-                last_token = self.flush()
+-                token = token + last_token if token else last_token
+-                token = token.rstrip()  # Remove the trailing \n\n
++        
++        concat_message = "".join(self.field_end_queue.queue).strip()
++        if re.search(end_identifier, concat_message):
++            # The next field is identified, we can end the stream and flush out all tokens in the buffer.
++            self.stream_end = True
++            last_token = self.flush()
++            token = token + last_token if token else last_token
++            token = token.rstrip()  # Remove the trailing \n\n
+ 
+-            if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++        if token:
++            return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+diff --git a/tests/streaming/test_streaming_metrics.py b/tests/streaming/test_streaming_metrics.py
+new file mode 100644
+index 00000000..84812dd5
+--- /dev/null
++++ b/tests/streaming/test_streaming_metrics.py
+@@ -0,0 +1,62 @@
++import time
++import pytest
++from unittest.mock import MagicMock
++from dspy.streaming.streaming_listener import StreamListener
++from dspy.streaming.messages import StreamResponse
++
++def test_stream_listener_stats():
++    listener = StreamListener(signature_field_name="answer", predict_name="my_predictor")
++    
++    # Initial state
++    stats = listener.stats()
++    assert stats["predict_name"] == "my_predictor"
++    assert stats["field"] == "answer"
++    assert stats["chunk_count"] == 0
++    assert stats["char_count"] == 0
++    assert stats["first_ts"] is None
++    assert stats["last_ts"] is None
++    assert stats["duration_s"] is None
++    assert stats["avg_chunk_chars"] == 0
++
++    # Simulate receiving chunks
++    chunk1 = MagicMock()
++    chunk1.choices = [MagicMock()]
++    chunk1.choices[0].delta.content = "Hello"
++    
++    listener.receive(chunk1)
++    
++    # After first chunk
++    stats = listener.stats()
++    assert stats["chunk_count"] == 1
++    assert stats["char_count"] == 5
++    assert stats["first_ts"] is not None
++    assert stats["last_ts"] is not None
++    assert stats["duration_s"] >= 0
++    assert stats["avg_chunk_chars"] == 5.0
++
++    # Simulate second chunk
++    chunk2 = MagicMock()
++    chunk2.choices = [MagicMock()]
++    chunk2.choices[0].delta.content = " world"
++    
++    time.sleep(0.1)
++    listener.receive(chunk2)
++    
++    stats = listener.stats()
++    assert stats["chunk_count"] == 2
++    assert stats["char_count"] == 11
++    assert stats["duration_s"] >= 0.1
++    assert stats["avg_chunk_chars"] == 5.5
++
++    # Simulate end of stream
++    # The listener logic for end is complex, let's just set stream_end manually to test reset
++    listener.stream_end = True
++    
++    # After stream_end, stats should be reset
++    stats = listener.stats()
++    assert stats["chunk_count"] == 0
++    assert stats["char_count"] == 0
++    assert stats["first_ts"] is None
++    assert stats["last_ts"] is None
++    assert stats["duration_s"] is None
++    assert stats["avg_chunk_chars"] == 0

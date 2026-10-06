@@ -1,0 +1,135 @@
+diff --git a/tests/test_pattern_tracking.py b/tests/test_pattern_tracking.py
+new file mode 100644
+index 0000000..7f3004c
+--- /dev/null
++++ b/tests/test_pattern_tracking.py
+@@ -0,0 +1,50 @@
++import tiktoken
++import pytest
++
++def test_pattern_tracking():
++    enc = tiktoken.get_encoding("cl100k_base")
++    text = "hello hello hello world"
++    
++    # Test default behavior
++    tokens = enc.encode(text)
++    assert isinstance(tokens, list)
++    
++    # Test new behavior
++    tokens, patterns = enc.encode(text, return_repeated_pattern=True)
++    assert isinstance(tokens, list)
++    assert isinstance(patterns, dict)
++    
++    # Verify patterns
++    # "hello hello hello world" -> [15339, 24748, 24748, 1917]
++    # Pairs: (15339, 24748), (24748, 24748), (24748, 1917)
++    assert len(patterns) == 3
++    assert patterns[(15339, 24748)] == 1
++    assert patterns[(24748, 24748)] == 1
++    assert patterns[(24748, 1917)] == 1
++
++def test_pattern_tracking_empty():
++    enc = tiktoken.get_encoding("cl100k_base")
++    tokens, patterns = enc.encode("", return_repeated_pattern=True)
++    assert tokens == []
++    assert patterns == {}
++
++def test_pattern_tracking_single():
++    enc = tiktoken.get_encoding("cl100k_base")
++    tokens, patterns = enc.encode("hello", return_repeated_pattern=True)
++    assert len(tokens) == 1
++    assert patterns == {}
++
++def test_pattern_tracking_overlap():
++    # "hello hello hello" -> [15339, 24748, 24748]
++    # Pairs: (15339, 24748), (24748, 24748)
++    # Wait, (15339, 24748) is 1, (24748, 24748) is 1.
++    # Let's try to get (A, A) with count 2.
++    # We need [A, A, A]
++    # Maybe "hello hello hello hello" -> [15339, 24748, 24748, 24748]
++    # Pairs: (15339, 24748), (24748, 24748), (24748, 24748)
++    # (24748, 24748) count is 2.
++    enc = tiktoken.get_encoding("cl100k_base")
++    text = "hello hello hello hello"
++    tokens, patterns = enc.encode(text, return_repeated_pattern=True)
++    assert len(tokens) == 4
++    assert patterns[(24748, 24748)] == 2
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..f4ce15a 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+ 
+ import functools
++from collections import Counter
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
++from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence, overload, overload
+ 
+ import regex
+ 
+@@ -76,13 +77,35 @@ class Encoding:
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+             return self._core_bpe.encode_ordinary(text)
+ 
++    @overload
++    @overload
+     def encode(
+         self,
+         text: str,
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        return_repeated_pattern: Literal[False] = False,
++    ) -> list[int]: ...
++
++    @overload
++    def encode(
++        self,
++        text: str,
++        *,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        return_repeated_pattern: Literal[True],
++    ) -> tuple[list[int], dict[tuple[int, int], int]]: ...
++
++    def encode(
++        self,
++        text: str,
++        *,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        return_repeated_pattern: bool = False,
++    ) -> list[int] | tuple[list[int], dict[tuple[int, int], int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -121,7 +144,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +153,16 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if return_repeated_pattern:
++            if len(tokens) < 2:
++                return tokens, {}
++            pairs = [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
++            counts = Counter(pairs)
++            return tokens, dict(counts.most_common(3))
++        return tokens
++
+ 
+     def encode_to_numpy(
+         self,

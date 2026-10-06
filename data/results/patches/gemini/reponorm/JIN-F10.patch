@@ -1,0 +1,309 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..b2b7b88 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -21,6 +21,7 @@ from .runtime import Undefined
+ from .utils import htmlsafe_json_dumps
+ from .utils import pass_context
+ from .utils import pass_environment
++from .utils import _PassArg
+ from .utils import pass_eval_context
+ from .utils import pformat
+ from .utils import url_quote
+@@ -1163,6 +1164,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    filter_groups: t.Optional[t.Callable[[t.List[V]], bool]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,10 +1212,19 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    groups = []
++    for key, values in groupby(sorted(value, key=expr), expr):
++        items = list(values)
++        if filter_groups is None:
++            groups.append(_GroupTuple(key, items))
++        else:
++            if getattr(filter_groups, "jinja_pass_arg", None) == _PassArg.environment:
++                res = filter_groups(environment, items)
++            else:
++                res = filter_groups(items)
++            if res:
++                groups.append(_GroupTuple(key, items))
++    return groups
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1233,22 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    filter_groups: t.Optional[t.Callable[[t.List[V]], t.Union[bool, t.Awaitable[bool]]]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    groups = []
++    for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr):
++        items = await auto_to_list(values)
++        if filter_groups is None:
++            groups.append(_GroupTuple(key, items))
++        else:
++            if getattr(filter_groups, "jinja_pass_arg", None) == _PassArg.environment:
++                res = filter_groups(environment, items)
++            else:
++                res = filter_groups(items)
++            if await auto_await(res):
++                groups.append(_GroupTuple(key, items))
++    return groups
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_filter.py b/tests/test_groupby_filter.py
+new file mode 100644
+index 0000000..fad3a31
+--- /dev/null
++++ b/tests/test_groupby_filter.py
+@@ -0,0 +1,100 @@
++import pytest
++import asyncio
++from jinja2 import Environment, pass_environment
++
++def test_groupby_filter_predicate():
++    env = Environment()
++    data = [
++        {"name": "a", "group": 1},
++        {"name": "b", "group": 1},
++        {"name": "c", "group": 2},
++        {"name": "d", "group": 2},
++    ]
++    
++    # Test with predicate
++    def predicate(items):
++        return len(items) > 2
++    
++    # This should filter out both groups because both have 2 items
++    result = env.from_string("{% for g in data|groupby('group', filter_groups=predicate) %}{{ g.grouper }}{% endfor %}").render(data=data, predicate=predicate)
++    assert result == ""
++
++    def predicate2(items):
++        return len(items) == 2
++    
++    # This should keep both groups
++    result = env.from_string("{% for g in data|groupby('group', filter_groups=predicate2) %}{{ g.grouper }}{% endfor %}").render(data=data, predicate2=predicate2)
++    assert result == "12"
++
++def test_groupby_filter_async_predicate():
++    env = Environment(enable_async=True)
++    data = [
++        {"name": "a", "group": 1},
++        {"name": "b", "group": 1},
++        {"name": "c", "group": 2},
++        {"name": "d", "group": 2},
++    ]
++    
++    async def predicate(items):
++        await asyncio.sleep(0.01)
++        return len(items) > 2
++    
++    # This should filter out both groups because both have 2 items
++    result = asyncio.run(env.from_string("{% for g in data|groupby('group', filter_groups=predicate) %}{{ g.grouper }}{% endfor %}").render_async(data=data, predicate=predicate))
++    assert result == ""
++
++    async def predicate2(items):
++        await asyncio.sleep(0.01)
++        return len(items) == 2
++    
++    # This should keep both groups
++    result = asyncio.run(env.from_string("{% for g in data|groupby('group', filter_groups=predicate2) %}{{ g.grouper }}{% endfor %}").render_async(data=data, predicate2=predicate2))
++    assert result == "12"
++
++def test_groupby_filter_pass_environment():
++    env = Environment(enable_async=True)
++    data = [
++        {"name": "a", "group": 1},
++        {"name": "b", "group": 1},
++    ]
++    
++    @pass_environment
++    def predicate(env, items):
++        return env is not None and len(items) > 0
++    
++    result = asyncio.run(env.from_string("{% for g in data|groupby('group', filter_groups=predicate) %}{{ g.grouper }}{% endfor %}").render_async(data=data, predicate=predicate))
++    assert result == "1"
++
++def test_groupby_filter_sync_pass_environment():
++    env = Environment()
++    data = [
++        {"name": "a", "group": 1},
++        {"name": "b", "group": 1},
++    ]
++    
++    @pass_environment
++    def predicate(env, items):
++        return env is not None and len(items) > 0
++    
++    result = env.from_string("{% for g in data|groupby('group', filter_groups=predicate) %}{{ g.grouper }}{% endfor %}").render(data=data, predicate=predicate)
++    assert result == "1"
++
++def test_groupby_filter_empty_input():
++    env = Environment()
++    data = []
++    
++    def predicate(items):
++        return False
++    
++    result = env.from_string("{% for g in data|groupby('group', filter_groups=predicate) %}{{ g.grouper }}{% endfor %}").render(data=data, predicate=predicate)
++    assert result == ""
++
++def test_groupby_filter_async_empty_input():
++    env = Environment(enable_async=True)
++    data = []
++    
++    async def predicate(items):
++        return False
++    
++    result = asyncio.run(env.from_string("{% for g in data|groupby('group', filter_groups=predicate) %}{{ g.grouper }}{% endfor %}").render_async(data=data, predicate=predicate))
++    assert result == ""
+diff --git a/update_groupby.py b/update_groupby.py
+new file mode 100644
+index 0000000..0ab3511
+--- /dev/null
++++ b/update_groupby.py
+@@ -0,0 +1,85 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find sync_do_groupby
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def sync_do_groupby(' in line:
++        start_line = i
++        break
++
++# Update sync_do_groupby signature
++lines[start_line+4] = '    default: t.Optional[t.Any] = None,\n'
++lines.insert(start_line+5, '    filter_groups: t.Optional[t.Callable[[t.List[V]], bool]] = None,\n')
++
++# Update sync_do_groupby body
++# Find the end of the function
++end_line = 0
++for i in range(start_line, len(lines)):
++    if lines[i].strip() == 'return [':
++        # Find the closing bracket
++        for j in range(i, len(lines)):
++            if lines[j].strip() == ']':
++                end_line = j
++                break
++        break
++
++# Replace the list comprehension
++lines[i:end_line+1] = [
++    '    groups = []\n',
++    '    for key, values in groupby(sorted(value, key=expr), expr):\n',
++    '        items = list(values)\n',
++    '        if filter_groups is None or filter_groups(items):\n',
++    '            groups.append(_GroupTuple(key, items))\n',
++    '    return groups\n'
++]
++
++# Find do_groupby
++start_line = 0
++for i, line in enumerate(lines):
++    if 'async def do_groupby(' in line:
++        start_line = i
++        break
++
++# Update do_groupby signature
++lines[start_line+4] = '    default: t.Optional[t.Any] = None,\n'
++lines.insert(start_line+5, '    filter_groups: t.Optional[t.Callable[[t.List[V]], t.Union[bool, t.Awaitable[bool]]]] = None,\n')
++
++# Update do_groupby body
++# Find the end of the function
++for i in range(start_line, len(lines)):
++    if lines[i].strip() == 'return [':
++        # Find the closing bracket
++        for j in range(i, len(lines)):
++            if lines[j].strip() == ']':
++                end_line = j
++                break
++        break
++
++# Replace the list comprehension
++lines[i:end_line+1] = [
++    '    groups = []\n',
++    '    for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr):\n',
++    '        items = await auto_to_list(values)\n',
++    '        if filter_groups is None:\n',
++    '            groups.append(_GroupTuple(key, items))\n',
++    '        else:\n',
++    '            if getattr(filter_groups, "jinja_pass_arg", None) == _PassArg.environment:\n',
++    '                res = filter_groups(environment, items)\n',
++    '            else:\n',
++    '                res = filter_groups(items)\n',
++    '            if await auto_await(res):\n',
++    '                groups.append(_GroupTuple(key, items))\n',
++    '    return groups\n'
++]
++
++# Add _PassArg import
++for i, line in enumerate(lines):
++    if 'from .utils import pass_environment' in line:
++        lines.insert(i+1, 'from .utils import _PassArg\n')
++        break
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/update_groupby_sync.py b/update_groupby_sync.py
+new file mode 100644
+index 0000000..e680026
+--- /dev/null
++++ b/update_groupby_sync.py
+@@ -0,0 +1,35 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find sync_do_groupby
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def sync_do_groupby(' in line:
++        start_line = i
++        break
++
++# Find the end of the function
++for i in range(start_line, len(lines)):
++    if lines[i].strip() == 'return groups':
++        # Replace the loop
++        lines[i-5:i+1] = [
++            '    groups = []\n',
++            '    for key, values in groupby(sorted(value, key=expr), expr):\n',
++            '        items = list(values)\n',
++            '        if filter_groups is None:\n',
++            '            groups.append(_GroupTuple(key, items))\n',
++            '        else:\n',
++            '            if getattr(filter_groups, "jinja_pass_arg", None) == _PassArg.environment:\n',
++            '                res = filter_groups(environment, items)\n',
++            '            else:\n',
++            '                res = filter_groups(items)\n',
++            '            if res:\n',
++            '                groups.append(_GroupTuple(key, items))\n',
++            '    return groups\n'
++        ]
++        break
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(lines)

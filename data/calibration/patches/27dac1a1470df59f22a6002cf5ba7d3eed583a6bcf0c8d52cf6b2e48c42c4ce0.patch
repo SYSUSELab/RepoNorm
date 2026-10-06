@@ -1,0 +1,276 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 2db769f..6a56404 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -3,6 +3,8 @@
+ Version 8.2.0
+ -------------
+ 
++-   Add opt-in concurrent-edit locks for direct files passed to ``click.edit``.
++
+ Unreleased
+ 
+ -   Drop support for Python 3.7. :pr:`2588`
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..8eae94f 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        lock_files: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.lock_files = lock_files
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,28 +507,88 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
+-        import subprocess
++    def _get_lock_filename(self, filename: str) -> str:
++        """Generate lock filename for the given file."""
++        dir_name, base_name = os.path.split(filename)
++        lock_name = f".{base_name}.lock"
++        return os.path.join(dir_name, lock_name)
+ 
+-        editor = self.get_editor()
+-        environ: dict[str, str] | None = None
++    def _create_lock_file(self, filename: str) -> str:
++        lock_filename = self._get_lock_filename(filename)
++        try:
++            with open(lock_filename, "x", encoding="utf-8") as f:
++                import datetime
+ 
+-        if self.env:
+-            environ = os.environ.copy()
+-            environ.update(self.env)
++                f.write(
++                    f"PID: {os.getpid()}\n"
++                    f"Time: {datetime.datetime.now().isoformat()}\n"
++                )
++        except FileExistsError:
++            try:
++                with open(lock_filename, encoding="utf-8") as f:
++                    info = f.read().strip()
++            except OSError:
++                info = "unavailable"
++            raise ClickException(
++                _(
++                    "File is already being edited. Lock file exists: {lock_file}. "
++                    "Lock info: {info}"
++                ).format(lock_file=lock_filename, info=info)
++            ) from None
++        except OSError as e:
++            raise ClickException(
++                _("Failed to create lock file {lock_file}: {e}").format(
++                    lock_file=lock_filename, e=e
++                )
++            ) from e
++        return lock_filename
+ 
++    def _remove_lock_file(self, lock_filename: str) -> None:
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
+-            if exit_code != 0:
+-                raise ClickException(
+-                    _("{editor}: Editing failed").format(editor=editor)
+-                )
++            os.unlink(lock_filename)
+         except OSError as e:
+             raise ClickException(
+-                _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
++                _("Failed to remove lock file {lock_file}: {e}").format(
++                    lock_file=lock_filename, e=e
++                )
+             ) from e
+ 
++    @contextlib.contextmanager
++    def _lock_context(self, filename: str) -> t.Iterator[None]:
++        """Context manager for lock file handling."""
++        if not self.lock_files:
++            yield
++            return
++
++        lock_filename = self._create_lock_file(filename)
++        try:
++            yield
++        finally:
++            self._remove_lock_file(lock_filename)
++
++    def edit_file(self, filename: str) -> None:
++        import subprocess
++
++        with self._lock_context(filename):
++            editor = self.get_editor()
++            environ: dict[str, str] | None = None
++
++            if self.env:
++                environ = os.environ.copy()
++                environ.update(self.env)
++
++            try:
++                c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++                exit_code = c.wait()
++                if exit_code != 0:
++                    raise ClickException(
++                        _("{editor}: Editing failed").format(editor=editor)
++                    )
++            except OSError as e:
++                raise ClickException(
++                    _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
++                ) from e
++
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..0988794 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,37 +650,17 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    lock_files: bool = False,
+ ) -> t.AnyStr | None:
+-    r"""Edits the given text in the defined editor.  If an editor is given
+-    (should be the full path to the executable but the regular operating
+-    system search path is used for finding the executable) it overrides
+-    the detected editor.  Optionally, some environment variables can be
+-    used.  If the editor is closed without changes, `None` is returned.  In
+-    case a file is edited directly the return value is always `None` and
+-    `require_save` and `extension` are ignored.
+-
+-    If the editor cannot be opened a :exc:`UsageError` is raised.
+-
+-    Note for Windows: to simplify cross-platform usage, the newlines are
+-    automatically converted from POSIX to Windows and vice versa.  As such,
+-    the message here will have ``\n`` as newline markers.
+-
+-    :param text: the text to edit.
+-    :param editor: optionally the editor to use.  Defaults to automatic
+-                   detection.
+-    :param env: environment variables to forward to the editor.
+-    :param require_save: if this is true, then not saving in the editor
+-                         will make the return value become `None`.
+-    :param extension: the extension to tell the editor about.  This defaults
+-                      to `.txt` but changing this might change syntax
+-                      highlighting.
+-    :param filename: if provided it will edit this file instead of the
+-                     provided text contents.  It will not use a temporary
+-                     file as an indirection in that case.
+-    """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        lock_files=lock_files and filename is not None,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_n4c_author_edit_lock.py b/tests/test_n4c_author_edit_lock.py
+new file mode 100644
+index 0000000..8e9f4c1
+--- /dev/null
++++ b/tests/test_n4c_author_edit_lock.py
+@@ -0,0 +1,86 @@
++from pathlib import Path
++
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code=0):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++def _lock(path):
++    return path.with_name(f".{path.name}.lock")
++
++
++def test_lock_is_atomic_visible_during_launch_and_removed(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++
++    def launch(*args, **kwargs):
++        lines = _lock(path).read_text().splitlines()
++        assert lines[0].startswith("PID: ") and lines[0][5:].isdigit()
++        assert lines[1].startswith("Time: ")
++        return _Process()
++
++    monkeypatch.setattr("subprocess.Popen", launch)
++    click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert not _lock(path).exists()
++
++
++def test_existing_lock_reports_owner_without_launch(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    lock = _lock(path)
++    lock.write_text("PID: 42\nTime: earlier\n")
++    monkeypatch.setattr(
++        "subprocess.Popen", lambda *a, **k: pytest.fail("must not launch")
++    )
++    with pytest.raises(click.ClickException) as error:
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert str(lock) in str(error.value)
++    assert "PID: 42" in str(error.value)
++    assert lock.read_text().startswith("PID: 42")
++
++
++@pytest.mark.parametrize("failure", [OSError("launch"), 7])
++def test_lock_is_removed_after_editor_failure(tmp_path, monkeypatch, failure):
++    path = tmp_path / "note.txt"
++
++    def launch(*args, **kwargs):
++        if isinstance(failure, OSError):
++            raise failure
++        return _Process(failure)
++
++    monkeypatch.setattr("subprocess.Popen", launch)
++    with pytest.raises(click.ClickException):
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert not _lock(path).exists()
++
++
++def test_cleanup_error_is_chained(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process())
++    monkeypatch.setattr(
++        "click._termui_impl.os.unlink",
++        lambda name: (_ for _ in ()).throw(OSError("busy")),
++    )
++    with pytest.raises(click.ClickException, match="Failed to remove") as error:
++        click.edit(filename=str(path), editor="editor", lock_files=True)
++    assert isinstance(error.value.__cause__, OSError)
++
++
++def test_text_mode_and_default_do_not_create_locks(tmp_path, monkeypatch):
++    paths = []
++
++    def launch(command, **kwargs):
++        paths.append(Path(command.rsplit('"', 2)[1]))
++        return _Process()
++
++    monkeypatch.setattr("subprocess.Popen", launch)
++    direct = tmp_path / "note.txt"
++    click.edit(filename=str(direct), editor="editor")
++    click.edit("text", editor="editor", lock_files=True)
++    assert all(not _lock(path).exists() for path in [direct, *paths])

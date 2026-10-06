@@ -1,0 +1,258 @@
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..51ad0e7 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -254,3 +254,82 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++
++def test_compress():
++    """Test that compress=True collapses adjacent repeated token IDs."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    # Test basic compression
++    text = "The dog dog dog ran ran quickly"
++    tokens = enc.encode(text)
++    compressed = enc.encode(text, compress=True)
++    
++    # Verify compression reduced length
++    assert len(compressed) < len(tokens), "Compression should reduce length when there are repetitions"
++    
++    # Verify no consecutive duplicates in compressed output
++    for i in range(len(compressed) - 1):
++        assert compressed[i] != compressed[i + 1], f"Found consecutive duplicates {compressed[i]} at position {i}"
++    
++    # Verify non-compressed has consecutive duplicates
++    has_duplicates = any(tokens[i] == tokens[i + 1] for i in range(len(tokens) - 1))
++    assert has_duplicates, "Original encoding should have consecutive duplicates"
++
++
++def test_compress_empty():
++    """Test compress with empty string."""
++    enc = tiktoken.get_encoding("gpt2")
++    assert enc.encode("", compress=True) == []
++
++
++def test_compress_no_repetitions():
++    """Test compress with text that has no repeated adjacent tokens."""
++    enc = tiktoken.get_encoding("gpt2")
++    text = "hello world"
++    normal = enc.encode(text)
++    compressed = enc.encode(text, compress=True)
++    assert normal == compressed
++
++
++def test_compress_encode_ordinary():
++    """Test compress parameter with encode_ordinary."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    text = "dog dog dog"
++    normal = enc.encode_ordinary(text)
++    compressed = enc.encode_ordinary(text, compress=True)
++    
++    # Verify compression reduced length
++    if len(normal) > 1:
++        assert len(compressed) <= len(normal), "Compression should not increase length"
++    
++    # Verify no consecutive duplicates in compressed output
++    for i in range(len(compressed) - 1):
++        assert compressed[i] != compressed[i + 1], f"Found consecutive duplicates {compressed[i]}"
++
++
++def test_compress_batch():
++    """Test compress parameter with batch encoding."""
++    enc = tiktoken.get_encoding("gpt2")
++    
++    texts = ["dog dog", "cat cat", "bird bird bird"]
++    results = enc.encode_batch(texts, compress=True)
++    
++    # Verify each result has no consecutive duplicates
++    for result in results:
++        for i in range(len(result) - 1):
++            assert result[i] != result[i + 1], f"Found consecutive duplicates in {result}"
++
++
++def test_compress_encode_to_numpy():
++    """Test compress parameter with encode_to_numpy."""
++    import numpy as np
++    enc = tiktoken.get_encoding("gpt2")
++    
++    text = "dog dog dog"
++    compressed = enc.encode_to_numpy(text, compress=True)
++    
++    # Verify no consecutive duplicates
++    for i in range(len(compressed) - 1):
++        assert compressed[i] != compressed[i + 1], f"Found consecutive duplicates {compressed[i]}"
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..d17bcd8 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -12,6 +12,27 @@ if TYPE_CHECKING:
+     import numpy as np
+     import numpy.typing as npt
+ 
++def _compress_tokens(tokens: list[int]) -> list[int]:
++    """Compresses a list of tokens by collapsing adjacent repeated token IDs.
++    
++    This is a lossy transformation that does not preserve the original text.
++    Each consecutive run of the same token ID is represented by one token ID.
++    Repeated IDs separated by another token remain distinct.
++    
++    Example:
++        >>> _compress_tokens([1, 2, 2, 2, 3, 3, 4])
++        [1, 2, 3, 4]
++    """
++    if not tokens:
++        return []
++    compressed = [tokens[0]]
++    for token in tokens[1:]:
++        if token != compressed[-1]:
++            compressed.append(token)
++    return compressed
++
++
++
+ 
+ class Encoding:
+     def __init__(
+@@ -60,21 +81,34 @@ class Encoding:
+     # Encoding
+     # ====================
+ 
+-    def encode_ordinary(self, text: str) -> list[int]:
++    def encode_ordinary(
++        self, text: str, *, compress: bool = False
++    ) -> list[int]:
+         """Encodes a string into tokens, ignoring special tokens.
+ 
+         This is equivalent to `encode(text, disallowed_special=())` (but slightly faster).
+ 
++        Args:
++            text: The input text to encode.
++            compress: If True, collapse adjacent repeated token IDs in the output.
++                This is a lossy transformation that does not preserve the original text.
++
+         ```
+         >>> enc.encode_ordinary("hello world")
+         [31373, 995]
++        >>> enc.encode_ordinary("dog dog dog", compress=True)
++        [464]
++        ```
+         """
+         try:
+-            return self._core_bpe.encode_ordinary(text)
++            result = self._core_bpe.encode_ordinary(text)
+         except UnicodeEncodeError:
+             # See comment in encode
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode_ordinary(text)
++            result = self._core_bpe.encode_ordinary(text)
++        if compress:
++            result = _compress_tokens(result)
++        return result
+ 
+     def encode(
+         self,
+@@ -82,6 +116,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -121,7 +156,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +165,10 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
++        if compress:
++            result = _compress_tokens(result)
++        return result
+ 
+     def encode_to_numpy(
+         self,
+@@ -138,6 +176,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> npt.NDArray[np.uint32]:
+         """Encodes a string into tokens, returning a numpy array.
+ 
+@@ -155,10 +194,14 @@ class Encoding:
+ 
+         import numpy as np
+ 
+-        buffer = self._core_bpe.encode_to_tiktoken_buffer(text, self.special_tokens_set)
+-        return np.frombuffer(buffer, dtype=np.uint32)
++        result = self._core_bpe.encode_to_tiktoken_buffer(text, self.special_tokens_set)
++        if compress:
++            result = _compress_tokens(list(np.frombuffer(result, dtype=np.uint32)))
++        return np.array(result, dtype=np.uint32)
+ 
+-    def encode_ordinary_batch(self, text: list[str], *, num_threads: int = 8) -> list[list[int]]:
++    def encode_ordinary_batch(
++        self, texts: Sequence[str], *, num_threads: int = 8, compress: bool = False
++    ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel, ignoring special tokens.
+ 
+         This is equivalent to `encode_batch(text, disallowed_special=())` (but slightly faster).
+@@ -168,17 +211,21 @@ class Encoding:
+         [[31373, 995], [11274, 16390, 995]]
+         ```
+         """
+-        encoder = functools.partial(self.encode_ordinary)
++        if compress:
++            encoder = functools.partial(self.encode_ordinary, compress=True)
++        else:
++            encoder = self.encode_ordinary
+         with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++            return list(e.map(encoder, texts))
+ 
+     def encode_batch(
+         self,
+-        text: list[str],
++        texts: Sequence[str],
+         *,
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -196,11 +243,16 @@ class Encoding:
+         if not isinstance(disallowed_special, frozenset):
+             disallowed_special = frozenset(disallowed_special)
+ 
+-        encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
+-        )
++        if compress:
++            encoder = functools.partial(
++                self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, compress=True
++            )
++        else:
++            encoder = functools.partial(
++                self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            )
+         with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++            return list(e.map(encoder, texts))
+ 
+     def encode_with_unstable(
+         self,

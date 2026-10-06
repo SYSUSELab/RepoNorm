@@ -1,0 +1,319 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..9ef5b8a 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool = False,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,10 +428,20 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        if parent is not None:
++            validate_nesting = parent.validate_nesting
++
++        #: If true, nested context lifetimes are validated. A child context
++        #: must be closed before its parent. This is inherited from the parent.
++        #:
++        #: .. versionadded:: 9.0
++        self.validate_nesting: bool = validate_nesting
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._children: set[Context] = set()
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -467,6 +478,8 @@ class Context:
+ 
+     def __enter__(self) -> Context:
+         self._depth += 1
++        if self.parent is not None and self.parent.validate_nesting:
++            self.parent._children.add(self)
+         push_context(self)
+         return self
+ 
+@@ -607,6 +620,16 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self.parent is not None:
++            self.parent._children.discard(self)
++        elif self.validate_nesting:
++            # Validate that no children are still open
++            if self._children:
++                child_names = [c.info_name for c in self._children]
++                raise RuntimeError(
++                    f"Cannot close {self.info_name!r} while child commands "
++                    f"{child_names!r} are still open."
++                )
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+@@ -728,7 +751,10 @@ class Context:
+ 
+         :meta private:
+         """
+-        return type(self)(command, info_name=command.name, parent=self)
++        ctx = type(self)(command, info_name=command.name, parent=self)
++        if self.validate_nesting:
++            self._children.add(ctx)
++        return ctx
+ 
+     @t.overload
+     def invoke(
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..bdd63a7 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,243 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++
++def test_validate_nesting_default_false():
++    """By default, validate_nesting is False and no validation occurs."""
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    # Should work without errors
++    result = cli.main(["sub"], standalone_mode=False)
++    assert result is None  # Returns None when standalone_mode=False
++
++
++def test_validate_nesting_parent_refuses_close_with_child():
++    """A validated parent must refuse to close while any child remains open."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    ctx = cli.make_context("cli", [], resilient_parsing=True)
++    ctx.__enter__()
++    try:
++        # Create child context manually
++        sub_ctx = ctx._make_sub_context(click.Command("sub"))
++        sub_ctx.__enter__()
++        # Don't close the child - leave it open
++
++        # Try to close parent manually - should fail
++        with pytest.raises(RuntimeError, match="Cannot close"):
++            ctx.close()
++    finally:
++        # Clean up by closing child first
++        sub_ctx.__exit__(None, None, None)
++
++
++def test_validate_nesting_child_closes_first_works():
++    """Closing child first then parent should work."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    ctx = cli.make_context("cli", [], resilient_parsing=True)
++    ctx.__enter__()
++    try:
++        # Create child context manually
++        sub_ctx = ctx._make_sub_context(click.Command("sub"))
++        with sub_ctx:
++            pass  # Child closes properly
++
++        # Parent can now close
++        ctx.close()  # Should not raise
++    finally:
++        pass
++
++
++def test_validate_nesting_inherited_by_descendants():
++    """Validation flag is inherited by descendants."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.group()
++    def group():
++        pass
++
++    @group.command()
++    def sub():
++        click.echo("sub")
++
++    # Build the full context hierarchy like shell completion does
++    from click.shell_completion import _resolve_context
++    ctx_args = {}
++    ctx = _resolve_context(cli, ctx_args, "cli", ["group", "sub"])
++
++    with ctx:
++        # All contexts in hierarchy should have validate_nesting=True
++        assert ctx.validate_nesting is True
++        assert ctx.parent.validate_nesting is True
++        assert ctx.parent.parent.validate_nesting is True
++
++
++def test_validate_nesting_multiple_children():
++    """Parent with multiple children should track all of them."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    def sub1():
++        click.echo("sub1")
++
++    @cli.command()
++    def sub2():
++        click.echo("sub2")
++
++    ctx = cli.make_context("cli", [], resilient_parsing=True)
++    ctx.__enter__()
++    try:
++        # Create two child contexts
++        sub1_ctx = ctx._make_sub_context(click.Command("sub1"))
++        sub2_ctx = ctx._make_sub_context(click.Command("sub2"))
++
++        with sub1_ctx:
++            pass
++
++        # Parent still has one child open
++        with pytest.raises(RuntimeError, match="Cannot close"):
++            ctx.close()
++    finally:
++        sub2_ctx.__exit__(None, None, None)
++
++
++def test_validate_nesting_nested_levels():
++    """Nested levels should all validate correctly."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.group()
++    def group():
++        pass
++
++    @group.command()
++    def sub():
++        click.echo("sub")
++
++    # Build the full context hierarchy
++    from click.shell_completion import _resolve_context
++    ctx_args = {}
++    ctx = _resolve_context(cli, ctx_args, "cli", ["group", "sub"])
++
++    # Close in correct order: sub -> group -> cli
++    # Using nested with statements ensures proper order
++    with ctx:  # sub
++        pass  # sub exits first
++    with ctx.parent:  # group
++        pass  # group exits second
++    with ctx.parent.parent:  # cli
++        pass  # cli exits last
++
++
++def test_validate_nesting_failed_parsing_no_phantom():
++    """Failed parsing should not leave phantom open child."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    ctx = cli.make_context("cli", [], resilient_parsing=True)
++    ctx.__enter__()
++    try:
++        # Create child context
++        sub_ctx = ctx._make_sub_context(click.Command("sub"))
++        sub_ctx.__enter__()
++
++        # Simulate failed parsing by exiting without proper cleanup
++        sub_ctx.__exit__(ValueError("parse error"), None, None)
++
++        # Parent should be able to close (child was removed on exit)
++        ctx.close()  # Should not raise
++    finally:
++        pass
++
++
++def test_validate_nesting_closed_child_reopens():
++    """Entering a previously closed child opens and tracks it again."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    ctx = cli.make_context("cli", [], resilient_parsing=True)
++    ctx.__enter__()
++    try:
++        # Create and close child
++        sub_ctx = ctx._make_sub_context(click.Command("sub"))
++        with sub_ctx:
++            pass
++
++        # Re-enter the same child context
++        sub_ctx.__enter__()
++
++        # Parent should have child again
++        with pytest.raises(RuntimeError, match="Cannot close"):
++            ctx.close()
++    finally:
++        sub_ctx.__exit__(None, None, None)
++
++
++def test_validate_nesting_normal_cli_execution():
++    """Normal CLI execution should work without validation errors."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        click.echo("cli")
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    # Normal execution should work
++    result = cli.main(["sub"], standalone_mode=False)
++    assert result is None
++
++
++def test_validate_nesting_shell_completion():
++    """Shell completion should work without validation errors."""
++    @click.group(context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        click.echo("sub")
++
++    # Shell completion uses _resolve_context which builds hierarchy
++    from click.shell_completion import _resolve_context
++    ctx_args = {}
++    ctx = _resolve_context(cli, ctx_args, "cli", [])
++
++    # Completion should complete without errors
++    completions = cli.shell_complete(ctx, "")
++    assert isinstance(completions, list)

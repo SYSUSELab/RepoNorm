@@ -1,0 +1,346 @@
+diff --git a/outlines/__init__.py b/outlines/__init__.py
+index eeba78d..a0523e9 100644
+--- a/outlines/__init__.py
++++ b/outlines/__init__.py
+@@ -8,7 +8,7 @@ import outlines.types
+ from outlines.base import vectorize
+ from outlines.caching import clear_cache, disable_cache, get_cache
+ from outlines.function import Function
+-from outlines.prompts import Prompt, prompt
++from outlines.prompts import Prompt, prompt, register_filter, unregister_filter
+ 
+ __all__ = [
+     "clear_cache",
+@@ -17,6 +17,8 @@ __all__ = [
+     "Function",
+     "prompt",
+     "Prompt",
++    "register_filter",
++    "unregister_filter",
+     "vectorize",
+     "grammars",
+ ]
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..b0f79a7 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -12,6 +12,15 @@ import jinja2
+ import pydantic
+ 
+ 
++# Global filter registry - stores user-registered filters
++_global_filters: Dict[str, Callable] = {}
++
++# Protected filters that cannot be overridden by global filters
++_PROTECTED_FILTERS = frozenset([
++    "name", "description", "source", "signature", "schema", "args"
++])
++
++
+ @dataclass
+ class Prompt:
+     """Represents a prompt function.
+@@ -99,12 +108,19 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        
++        # Add default Outlines filters first
+         env.filters["name"] = get_fn_name
+         env.filters["description"] = get_fn_description
+         env.filters["source"] = get_fn_source
+         env.filters["signature"] = get_fn_signature
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
++        
++        # Then add global filters (they can override defaults except protected ones)
++        for name, func in _global_filters.items():
++            if name not in _PROTECTED_FILTERS:
++                env.filters[name] = func
+ 
+         return env.from_string(cleaned_template)
+ 
+@@ -118,9 +134,68 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        
++        # Add default Outlines filters first
++        env.filters["name"] = get_fn_name
++        env.filters["description"] = get_fn_description
++        env.filters["source"] = get_fn_source
++        env.filters["signature"] = get_fn_signature
++        env.filters["schema"] = get_schema
++        env.filters["args"] = get_fn_args
++        
++        # Then add global filters (they can override defaults except protected ones)
++        for name, func in _global_filters.items():
++            if name not in _PROTECTED_FILTERS:
++                env.filters[name] = func
++        
+         return env.get_template(os.path.basename(path))
+ 
+ 
++def register_filter(name: str, func: Callable):
++    """Register a custom filter for use in prompts.
++
++    Registered filters are available to all prompts constructed after registration,
++    including those created via bare ``@outlines.prompt``, ``Prompt.from_str``,
++    and ``Prompt.from_file``, including included and inherited file templates.
++
++    Parameters
++    ----------
++    name : str
++        The name of the filter to register.
++    func : Callable
++        The filter function to register.
++
++    Notes
++    -----
++    - Registering an existing name replaces its registered callable.
++    - Unregistering an unknown name is a no-op.
++    - Registry changes affect only templates constructed after the change;
++      existing ``Prompt`` instances retain the filter callable captured by
++      their Jinja environment.
++    - The Outlines-specific filters ``name``, ``description``, ``source``,
++      ``signature``, ``schema``, and ``args`` remain protected and cannot
++      be overridden by global filters.
++    """
++    _global_filters[name] = func
++
++
++def unregister_filter(name: str):
++    """Unregister a previously registered filter.
++
++    Parameters
++    ----------
++    name : str
++        The name of the filter to unregister.
++
++    Notes
++    -----
++    - Unregistering an unknown name is a no-op.
++    - Changes affect only templates constructed after the unregistration;
++      existing ``Prompt`` instances retain their original filter callables.
++    """
++    _global_filters.pop(name, None)
++
++
+ def prompt(fn: Callable) -> Prompt:
+     """Decorate a function that contains a prompt template.
+ 
+@@ -131,8 +206,8 @@ def prompt(fn: Callable) -> Prompt:
+     >>> import outlines
+     >>>
+     >>> @outlines.prompt
+-    >>> def build_prompt(question):
+-    ...    "I have a ${question}"
++    ... def build_prompt(question):
++    ...     "I have a ${question}"
+     ...
+     >>> prompt = build_prompt("How are you?")
+ 
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..b44e2d2 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -1,12 +1,13 @@
+ import os
+ import tempfile
+ from typing import Dict, List
++from pathlib import Path
+ 
+ import pytest
+ from pydantic import BaseModel, Field
+ 
+ import outlines
+-from outlines.prompts import Prompt
++from outlines.prompts import Prompt, register_filter, unregister_filter
+ 
+ 
+ def render(content: str, **kwargs):
+@@ -403,3 +404,184 @@ def test_template_from_str_with_extra_linebreaks():
+     """
+     template = Prompt._template_from_str(content)
+     assert template.render(name="World") == "Hello, World!\n"
++
++
++class TestRegisterFilter:
++    """Tests for register_filter and unregister_filter functions."""
++
++    def test_register_filter(self):
++        """Test that a filter can be registered and used in prompts."""
++        from outlines.prompts import _global_filters, Prompt
++        
++        # Register a custom filter
++        def my_upper(value):
++            return value.upper() if isinstance(value, str) else value
++        
++        register_filter("my_upper", my_upper)
++        
++        try:
++            # Verify it's in the global registry
++            assert "my_upper" in _global_filters
++            assert _global_filters["my_upper"] is my_upper
++            
++            # Use it in a prompt
++            template = Prompt._template_from_str("Hello {{ name|my_upper }}!")
++            result = template.render({"name": "world"})
++            assert result == "Hello WORLD!"
++        finally:
++            # Clean up
++            unregister_filter("my_upper")
++    
++    def test_unregister_filter(self):
++        """Test that a filter can be unregistered."""
++        from outlines.prompts import _global_filters, Prompt
++        
++        def my_filter(value):
++            return value
++        
++        register_filter("my_filter", my_filter)
++        assert "my_filter" in _global_filters
++        
++        unregister_filter("my_filter")
++        assert "my_filter" not in _global_filters
++    
++    def test_unregister_unknown_filter_is_noop(self):
++        """Test that unregistering an unknown filter is a no-op."""
++        from outlines.prompts import _global_filters
++        
++        initial_len = len(_global_filters)
++        unregister_filter("nonexistent_filter_xyz")
++        assert len(_global_filters) == initial_len
++    
++    def test_replace_registered_filter(self):
++        """Test that registering an existing name replaces its callable."""
++        from outlines.prompts import _global_filters, Prompt
++        
++        def filter_v1(value):
++            return "v1"
++        
++        def filter_v2(value):
++            return "v2"
++        
++        register_filter("replace_me", filter_v1)
++        assert _global_filters["replace_me"] is filter_v1
++        
++        register_filter("replace_me", filter_v2)
++        assert _global_filters["replace_me"] is filter_v2
++        
++        template = Prompt._template_from_str("{{ value|replace_me }}")
++        result = template.render({"value": "test"})
++        assert result == "v2"
++        
++        unregister_filter("replace_me")
++    
++    def test_protected_filters_cannot_be_overridden(self):
++        """Test that protected filters cannot be overridden by global filters."""
++        from outlines.prompts import _PROTECTED_FILTERS, Prompt
++        
++        def fake_name(value):
++            return "FAKE_NAME"
++        
++        # Try to override a protected filter
++        register_filter("name", fake_name)
++        
++        # The protected filter should still work correctly
++        def sample_fn():
++            pass
++        
++        template = Prompt._template_from_str("{{ sample_fn|name }}")
++        result = template.render(sample_fn=sample_fn)
++        assert result == "sample_fn"  # Should be original function name
++        
++        unregister_filter("name")
++    
++    def test_existing_prompt_retains_original_filter(self):
++        """Test that existing Prompt instances retain their original filters."""
++        from outlines.prompts import _global_filters, Prompt
++        
++        def filter_v1(value):
++            return "v1"
++        
++        def filter_v2(value):
++            return "v2"
++        
++        # Create a prompt with v1
++        register_filter("persist_test", filter_v1)
++        template1 = Prompt._template_from_str("{{ value|persist_test }}")
++        result1 = template1.render({"value": "test"})
++        assert result1 == "v1"
++        
++        # Replace the filter
++        register_filter("persist_test", filter_v2)
++        
++        # Old prompt should still use v1
++        result1_after = template1.render({"value": "test"})
++        assert result1_after == "v1"
++        
++        # New prompt should use v2
++        template2 = Prompt._template_from_str("{{ value|persist_test }}")
++        result2 = template2.render({"value": "test"})
++        assert result2 == "v2"
++        
++        unregister_filter("persist_test")
++    
++    def test_filter_with_include_template(self):
++        """Test that registered filters work with included templates."""
++        from outlines.prompts import _global_filters, Prompt
++        import tempfile
++        
++        def format_value(value):
++            return f"[{value}]"
++        
++        register_filter("format_value", format_value)
++        
++        try:
++            with tempfile.TemporaryDirectory() as tmpdir:
++                # Create an included template file
++                include_path = os.path.join(tmpdir, "include.jinja")
++                with open(include_path, "w") as f:
++                    f.write("{{ value|format_value }}")
++                
++                # Create main template that includes the other
++                main_path = os.path.join(tmpdir, "main.jinja")
++                with open(main_path, "w") as f:
++                    f.write("{% include 'include.jinja' %}")
++                
++                template = Prompt._template_from_file(Path(main_path))
++                result = template.render({"value": "hello"})
++                assert result == "[hello]"
++        finally:
++            unregister_filter("format_value")
++    
++    def test_filter_with_include_template_nested(self):
++        """Test that registered filters work with nested included templates."""
++        from outlines.prompts import _global_filters, Prompt
++        import tempfile
++        
++        def format_value(value):
++            return f"<{value}>"
++        
++        register_filter("format_value", format_value)
++        
++        try:
++            with tempfile.TemporaryDirectory() as tmpdir:
++                # Create an inner template
++                inner_path = os.path.join(tmpdir, "inner.jinja")
++                with open(inner_path, "w") as f:
++                    f.write("{{ value|format_value }}")
++                
++                # Create a middle template that includes the inner one
++                middle_path = os.path.join(tmpdir, "middle.jinja")
++                with open(middle_path, "w") as f:
++                    f.write("Middle: {% include 'inner.jinja' %}")
++                
++                # Create main template that includes the middle one
++                main_path = os.path.join(tmpdir, "main.jinja")
++                with open(main_path, "w") as f:
++                    f.write("Main: {% include 'middle.jinja' %}")
++                
++                template = Prompt._template_from_file(Path(main_path))
++                result = template.render({"value": "test"})
++                assert result == "Main: Middle: <test>"
++        finally:
++            unregister_filter("format_value")

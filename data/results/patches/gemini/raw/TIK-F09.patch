@@ -1,0 +1,284 @@
+diff --git a/apply_compression_logic.py b/apply_compression_logic.py
+new file mode 100644
+index 0000000..aded1e9
+--- /dev/null
++++ b/apply_compression_logic.py
+@@ -0,0 +1,45 @@
++import sys
++
++with open('tiktoken/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Define the compression function
++compression_func = """
++        if compress:
++            if not tokens:
++                return []
++            compressed = [tokens[0]]
++            for token in tokens[1:]:
++                if token != compressed[-1]:
++                    compressed.append(token)
++            return compressed
++        return tokens
++"""
++
++# We need to replace the return statements.
++# The first return is at line 123: return self._core_bpe.encode(text, allowed_special)
++# The second return is at line 133: return self._core_bpe.encode(text, allowed_special)
++
++# Let's find the lines again to be sure.
++# Actually, I can just replace the return statements with a call to a helper or just inline the logic.
++# Let's inline the logic for simplicity.
++
++new_lines = []
++for line in lines:
++    if 'return self._core_bpe.encode(text, allowed_special)' in line:
++        indent = line[:line.find('return')]
++        new_lines.append(f'{indent}tokens = self._core_bpe.encode(text, allowed_special)\n')
++        new_lines.append(f'{indent}if compress:\n')
++        new_lines.append(f'{indent}    if not tokens:\n')
++        new_lines.append(f'{indent}        return []\n')
++        new_lines.append(f'{indent}    compressed = [tokens[0]]\n')
++        new_lines.append(f'{indent}    for token in tokens[1:]:\n')
++        new_lines.append(f'{indent}        if token != compressed[-1]:\n')
++        new_lines.append(f'{indent}            compressed.append(token)\n')
++        new_lines.append(f'{indent}    return compressed\n')
++        new_lines.append(f'{indent}return tokens\n')
++    else:
++        new_lines.append(line)
++
++with open('tiktoken/core.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/apply_fix.py b/apply_fix.py
+new file mode 100644
+index 0000000..88f9239
+--- /dev/null
++++ b/apply_fix.py
+@@ -0,0 +1,34 @@
++import sys
++
++with open('tiktoken/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the encode method
++start_line = -1
++for i, line in enumerate(lines):
++    if 'def encode(' in line:
++        start_line = i
++        break
++
++# Insert compress parameter
++# The current lines are:
++# 79:    def encode(
++# 80:        self,
++# 81:        text: str,
++# 82:        *,
++# 83:        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++# 84:        disallowed_special: Literal["all"] | Collection[str] = "all",
++# 85:    ) -> list[int]:
++
++# We want:
++# 79:    def encode(
++# 80:        self,
++# 81:        text: str,
++# 82:        *,
++# 83:        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++# 84:        disallowed_special: Literal["all"] | Collection[str] = "all",
++# 85:        compress: bool = False,
++# 86:    ) -> list[int]:
++
++# Actually, I already inserted it at line 83 in the previous step.
++# Let's check the file content again.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..c0bfffd
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,22 @@
++import tiktoken
++
++enc = tiktoken.get_encoding("gpt2")
++text = "The dog dog dog ran ran quickly"
++encoded = enc.encode(text)
++print(f"Original: {encoded}")
++
++# This is what we want to implement
++def compress_tokens(tokens):
++    if not tokens:
++        return []
++    compressed = [tokens[0]]
++    for token in tokens[1:]:
++        if token != compressed[-1]:
++            compressed.append(token)
++    return compressed
++
++# We expect the user to be able to do:
++# encoded_compressed = enc.encode(text, compress=True)
++# For now, let's just simulate it
++compressed = compress_tokens(encoded)
++print(f"Compressed: {compressed}")
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..4f24cae 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -28,6 +28,7 @@ class Encoding:
+         See openai_public.py for examples of how to construct an Encoding object.
+ 
+         Args:
++        compress: Whether to collapse adjacent repeated token IDs.
+             name: The name of the encoding. It should be clear from the name of the encoding
+                 what behaviour to expect, in particular, encodings with different special tokens
+                 should have different names.
+@@ -82,6 +83,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -109,6 +111,11 @@ class Encoding:
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
++        Args:
++            text: The text to encode.
++            allowed_special: A set of special tokens to allow.
++            disallowed_special: A set of special tokens to disallow.
++            compress: Whether to collapse adjacent repeated token IDs.
+         """
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+@@ -121,7 +128,16 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++            if compress:
++                if not tokens:
++                    return []
++                compressed = [tokens[0]]
++                for token in tokens[1:]:
++                    if token != compressed[-1]:
++                        compressed.append(token)
++                return compressed
++            return tokens
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +146,16 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++            if compress:
++                if not tokens:
++                    return []
++                compressed = [tokens[0]]
++                for token in tokens[1:]:
++                    if token != compressed[-1]:
++                        compressed.append(token)
++                return compressed
++            return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -138,6 +163,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> npt.NDArray[np.uint32]:
+         """Encodes a string into tokens, returning a numpy array.
+ 
+@@ -179,6 +205,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -208,6 +235,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> tuple[list[int], list[list[int]]]:
+         """Encodes a string into stable tokens and possible completion sequences.
+ 
+diff --git a/update_docstring.py b/update_docstring.py
+new file mode 100644
+index 0000000..2e616f7
+--- /dev/null
++++ b/update_docstring.py
+@@ -0,0 +1,12 @@
++with open('tiktoken/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the docstring
++for i, line in enumerate(lines):
++    if 'Args:' in line:
++        # Insert the compress parameter description
++        lines.insert(i + 1, '        compress: Whether to collapse adjacent repeated token IDs.\n')
++        break
++
++with open('tiktoken/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/update_docstring_v2.py b/update_docstring_v2.py
+new file mode 100644
+index 0000000..6fcb0cf
+--- /dev/null
++++ b/update_docstring_v2.py
+@@ -0,0 +1,16 @@
++with open('tiktoken/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the end of the docstring
++for i, line in enumerate(lines):
++    if '"""' in line and i > 88:
++        # Insert the Args section
++        lines.insert(i, '        Args:\n')
++        lines.insert(i + 1, '            text: The text to encode.\n')
++        lines.insert(i + 2, '            allowed_special: A set of special tokens to allow.\n')
++        lines.insert(i + 3, '            disallowed_special: A set of special tokens to disallow.\n')
++        lines.insert(i + 4, '            compress: Whether to collapse adjacent repeated token IDs.\n')
++        break
++
++with open('tiktoken/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/verify_fix.py b/verify_fix.py
+new file mode 100644
+index 0000000..912203e
+--- /dev/null
++++ b/verify_fix.py
+@@ -0,0 +1,27 @@
++import tiktoken
++
++enc = tiktoken.get_encoding("gpt2")
++text = "The dog dog dog ran ran quickly"
++
++# Test without compression
++encoded = enc.encode(text)
++print(f"Original: {encoded}")
++
++# Test with compression
++encoded_compressed = enc.encode(text, compress=True)
++print(f"Compressed: {encoded_compressed}")
++
++# Verify compression
++expected = [464, 3290, 4966, 2952]
++assert encoded_compressed == expected, f"Expected {expected}, but got {encoded_compressed}"
++
++# Test empty string
++assert enc.encode("", compress=True) == []
++
++# Test no repetition
++text2 = "The dog ran"
++encoded2 = enc.encode(text2)
++encoded2_compressed = enc.encode(text2, compress=True)
++assert encoded2 == encoded2_compressed
++
++print("All tests passed!")

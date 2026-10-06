@@ -1,0 +1,84 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..745f986 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool = False,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -431,6 +432,12 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self.validate_nesting = validate_nesting or (
++            parent is not None and parent.validate_nesting
++        )
++        self._open_children: set[Context] = set()
++        if parent is not None:
++            parent._open_children.add(self)
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -466,6 +473,8 @@ class Context:
+         }
+ 
+     def __enter__(self) -> Context:
++        if self.parent is not None:
++            self.parent._open_children.add(self)
+         self._depth += 1
+         push_context(self)
+         return self
+@@ -477,9 +486,11 @@ class Context:
+         tb: TracebackType | None,
+     ) -> None:
+         self._depth -= 1
+-        if self._depth == 0:
+-            self.close()
+-        pop_context()
++        try:
++            if self._depth == 0:
++                self.close()
++        finally:
++            pop_context()
+ 
+     @contextmanager
+     def scope(self, cleanup: bool = True) -> cabc.Iterator[Context]:
+@@ -607,9 +618,19 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self._open_children:
++            names = [
++                child.info_name or child.command.name or "unknown"
++                for child in self._open_children
++            ]
++            raise RuntimeError(
++                f"Cannot close context with open children: {', '.join(names)}"
++            )
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
++        if self.parent is not None:
++            self.parent._open_children.discard(self)
+ 
+     @property
+     def command_path(self) -> str:
+@@ -1151,8 +1172,12 @@ class Command:
+ 
+         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
+ 
+-        with ctx.scope(cleanup=False):
+-            self.parse_args(ctx, args)
++        try:
++            with ctx.scope(cleanup=False):
++                self.parse_args(ctx, args)
++        except BaseException:
++            ctx.close()
++            raise
+         return ctx
+ 
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:

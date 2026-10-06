@@ -1,0 +1,225 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..fb72fb43 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Normalize logical template paths for filesystem and package loaders
++    while preserving root safety and original request names.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..02413df4 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -446,6 +446,16 @@ Here a list of the builtin loaders Jinja provides:
+ 
+ .. autoclass:: jinja2.PackageLoader
+ 
++    Filesystem and package loaders normalize logical template names.
++    Both slash styles separate segments; empty and dot segments vanish,
++    and internal parent steps may return to the template root. Root
++    escapes, leading separators, and ASCII drive prefixes are rejected.
++    Missing or rejected requests report their original spelling.
++    Package directories and archives use the same logical name rules.
++    Configured encoding, physical filenames, and freshness semantics
++    remain unchanged. Environment caches retain the original request
++    name, so equivalent spellings may use separate compiled entries.
++
+ .. autoclass:: jinja2.DictLoader
+ 
+ .. autoclass:: jinja2.FunctionLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..2e39d309 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -21,6 +21,32 @@ if t.TYPE_CHECKING:
+     from .environment import Template
+ 
+ 
++def _normalize_template_path(template: str) -> str:
++    if (
++        template.startswith(("/", "\\"))
++        or len(template) >= 2
++        and template[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++        and template[1] == ":"
++    ):
++        raise TemplateNotFound(template)
++
++    pieces: t.List[str] = []
++
++    for piece in template.translate({92: 47}).split("/"):
++        if not piece or piece == ".":
++            continue
++
++        if piece == "..":
++            if not pieces:
++                raise TemplateNotFound(template)
++
++            pieces.pop()
++        else:
++            pieces.append(piece)
++
++    return "/".join(pieces)
++
++
+ def split_template_path(template: str) -> t.List[str]:
+     """Split a path into segments and perform a sanity check.  If it detects
+     '..' in the path it will raise a `TemplateNotFound` error.
+@@ -171,6 +197,12 @@ class FileSystemLoader(BaseLoader):
+         files.
+     :param followlinks: Follow symbolic links in the path.
+ 
++    Logical names accept both slash styles and safe internal parent
++    steps. Parent steps may not escape the template root.
++
++    .. versionchanged:: 3.1.0
++        Normalize logical template paths before filesystem lookup.
++
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
+     """
+@@ -191,7 +223,8 @@ class FileSystemLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+-        pieces = split_template_path(template)
++        original_name = template
++        pieces = split_template_path(_normalize_template_path(template))
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+@@ -211,7 +244,7 @@ class FileSystemLoader(BaseLoader):
+                     return False
+ 
+             return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        raise TemplateNotFound(original_name)
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+@@ -257,6 +290,12 @@ class PackageLoader(BaseLoader):
+     contributor. Zip files contributing to a namespace are not
+     supported.
+ 
++    Logical names use both slash styles and safe internal parent steps,
++    without allowing parent steps to escape the template root.
++
++    .. versionchanged:: 3.1.0
++        Normalize logical template paths in directory and zip packages.
++
+     .. versionchanged:: 3.0
+         No longer uses ``setuptools`` as a dependency.
+ 
+@@ -326,13 +365,15 @@ class PackageLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Optional[t.Callable[[], bool]]]:
++        original_name = template
++        template = _normalize_template_path(template)
+         p = os.path.join(self._template_root, *split_template_path(template))
+         up_to_date: t.Optional[t.Callable[[], bool]]
+ 
+         if self._archive is None:
+             # Package is a directory.
+             if not os.path.isfile(p):
+-                raise TemplateNotFound(template)
++                raise TemplateNotFound(original_name)
+ 
+             with open(p, "rb") as f:
+                 source = f.read()
+@@ -347,7 +388,7 @@ class PackageLoader(BaseLoader):
+             try:
+                 source = self._loader.get_data(p)  # type: ignore
+             except OSError as e:
+-                raise TemplateNotFound(template) from e
++                raise TemplateNotFound(original_name) from e
+ 
+             # Could use the zip's mtime for all template mtimes, but
+             # would need to safely reload the module if it's out of
+diff --git a/tests/test_n4c_author_logical_paths.py b/tests/test_n4c_author_logical_paths.py
+new file mode 100644
+index 00000000..533ddce9
+--- /dev/null
++++ b/tests/test_n4c_author_logical_paths.py
+@@ -0,0 +1,77 @@
++import sys
++import zipfile
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import FileSystemLoader
++from jinja2 import PackageLoader
++from jinja2 import TemplateNotFound
++
++
++@pytest.mark.parametrize("name", ["child/../page", "child\\..\\page"])
++def test_safe_internal_parent_and_original_environment_keys(tmp_path, name):
++    (tmp_path / "page").write_text("hello")
++    env = Environment(loader=FileSystemLoader(tmp_path))
++    original = env.get_template("page")
++    other = env.get_template(name)
++    assert other.render() == "hello"
++    assert other is not original
++    assert env.get_template(name) is other
++
++
++@pytest.mark.parametrize("name", ["../secret", "child/../../secret"])
++def test_parent_escape_is_rejected_before_reading(tmp_path, name):
++    root = tmp_path / "root"
++    root.mkdir()
++    (tmp_path / "secret").write_text("outside")
++    with pytest.raises(TemplateNotFound) as caught:
++        FileSystemLoader(root).get_source(Environment(), name)
++    assert caught.value.name == name
++
++
++def test_safe_missing_retains_original_spelling(tmp_path):
++    name = "child\\..\\missing"
++    with pytest.raises(TemplateNotFound) as caught:
++        FileSystemLoader(tmp_path).get_source(Environment(), name)
++    assert caught.value.name == name
++
++
++@pytest.mark.parametrize("archive", [False, True])
++def test_package_parent_paths_keep_filename_and_freshness(
++    tmp_path, monkeypatch, archive
++):
++    name = "n4c_author_paths_pkg"
++    if archive:
++        path = tmp_path / "package.zip"
++        with zipfile.ZipFile(path, "w") as z:
++            z.writestr(name + "/__init__.py", "")
++            z.writestr(name + "/templates/page", "café".encode("latin-1"))
++    else:
++        path = tmp_path
++        directory = path / name / "templates"
++        directory.mkdir(parents=True)
++        (directory.parent / "__init__.py").write_text("")
++        (directory / "page").write_bytes("café".encode("latin-1"))
++    monkeypatch.syspath_prepend(str(path))
++    try:
++        loader = PackageLoader(name, encoding="latin-1")
++        text, filename, current = loader.get_source(Environment(), "child/../page")
++        assert text == "café"
++        assert filename.endswith("templates/page")
++        if archive:
++            assert current is None
++        else:
++            assert current() is True
++            (directory / "page").unlink()
++            assert current() is False
++    finally:
++        sys.modules.pop(name, None)
++
++
++def test_ascii_drive_prefix_does_not_reject_non_ascii_filename(tmp_path):
++    (tmp_path / "é:page").write_text("ordinary")
++    env = Environment(loader=FileSystemLoader(tmp_path))
++    assert env.get_template("é:page").render() == "ordinary"
++    with pytest.raises(TemplateNotFound):
++        env.get_template("C:page")

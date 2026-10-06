@@ -1,0 +1,90 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..a73399ad 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,3 +1,4 @@
++import contextvars
+ import copy
+ import inspect
+ import logging
+@@ -15,6 +16,34 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++class _CacheBypass:
++    """Context manager that temporarily bypasses cache reads on a specific Cache instance.
++
++    Within the context, ``cache.get()`` behaves as a cache miss even when a value
++    is stored.  Writes via ``cache.put()`` remain enabled.  After the context ends,
++    newly written values can be read normally.
++
++    Nested contexts are supported via a counter: the outermost exit restores the
++    previous state.  Normal and exceptional exits both restore the state.
++    """
++
++    def __init__(self, cache: "Cache") -> None:
++        self._cache = cache
++        self._previous_count: Optional[int] = None
++
++    def __enter__(self) -> "_CacheBypass":
++        state = dict(Cache._bypass_state.get())
++        self._previous_count = state.get(self._cache._cache_id, 0)
++        state[self._cache._cache_id] = self._previous_count + 1
++        Cache._bypass_state.set(state)
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        state = dict(Cache._bypass_state.get())
++        state[self._cache._cache_id] = self._previous_count
++        Cache._bypass_state.set(state)
++
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -23,6 +52,12 @@ class Cache:
+         2. On-disk cache - implemented with diskcache.FanoutCache
+     """
+ 
++    # Per-thread / per-async-context bypass state.
++    # Maps ``id(cache_instance) -> int`` (bypass nesting depth).
++    _bypass_state: contextvars.ContextVar[Dict[int, int]] = contextvars.ContextVar(
++        "cache_bypass_state", default={}
++    )
++
+     def __init__(
+         self,
+         enable_disk_cache: bool,
+@@ -58,6 +93,22 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._cache_id = id(self)
++
++    def _is_bypass_active(self) -> bool:
++        """Return True if a bypass context is active on *this* cache instance."""
++        return self._bypass_state.get().get(self._cache_id, 0) > 0
++
++    def bypass(self) -> _CacheBypass:
++        """Return a context manager that bypasses cache reads on this instance.
++
++        Usage::
++
++            with cache.bypass():
++                # reads behave as misses, writes still happen
++                ...
++        """
++        return _CacheBypass(self)
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -97,6 +148,9 @@ class Cache:
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
++        if self._is_bypass_active():
++            return None
++
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:

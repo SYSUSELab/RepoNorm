@@ -1,0 +1,198 @@
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..d17ce8e 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -254,3 +254,123 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++
++# Tests for max_tokens and max_total_tokens budget limits
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_max_tokens_validation(make_enc):
++    """Test that invalid max_tokens values raise ValueError."""
++    enc = make_enc()
++    
++    # Test bool values are rejected
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode("hello", max_tokens=True)
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode("hello", max_tokens=False)
++    
++    # Test non-positive integers are rejected
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode("hello", max_tokens=0)
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode("hello", max_tokens=-1)
++    
++    # Test None is allowed (no limit)
++    result = enc.encode("hello", max_tokens=None)
++    assert len(result) > 0
++    
++    # Test valid positive integer works
++    result = enc.encode("hello", max_tokens=100)
++    assert len(result) > 0
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_max_tokens_per_document_limit(make_enc):
++    """Test that max_tokens limits each document individually."""
++    enc = make_enc()
++    
++    # Test exact equality is accepted
++    text = "hello world"
++    encoded = enc.encode(text)
++    result = enc.encode(text, max_tokens=len(encoded))
++    assert result == encoded
++    
++    # Test over-budget raises error
++    with pytest.raises(ValueError, match="exceeds max_tokens"):
++        enc.encode("hello world", max_tokens=1)
++    
++    # Test empty input with valid limits remains allowed
++    result = enc.encode("", max_tokens=10)
++    assert result == []
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_max_total_tokens_batch_limit(make_enc):
++    """Test that max_total_tokens limits the sum across the batch."""
++    enc = make_enc()
++    
++    # Test exact equality is accepted
++    texts = ["hello", "world"]
++    total_tokens = sum(len(enc.encode(t)) for t in texts)
++    result = enc.encode_batch(texts, max_total_tokens=total_tokens)
++    assert len(result) == 2
++    
++    # Test over-budget raises error
++    with pytest.raises(ValueError, match="exceeds max_total_tokens"):
++        enc.encode_batch(["hello", "world"], max_total_tokens=1)
++    
++    # Test empty batch with valid limits remains allowed
++    result = enc.encode_batch([], max_total_tokens=10)
++    assert result == []
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_encode_batch_max_tokens_validation(make_enc):
++    """Test that invalid max_tokens/max_total_tokens values raise ValueError in encode_batch."""
++    enc = make_enc()
++    
++    # Test bool values are rejected
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode_batch(["hello"], max_tokens=True)
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode_batch(["hello"], max_total_tokens=False)
++    
++    # Test non-positive integers are rejected
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode_batch(["hello"], max_tokens=0)
++    with pytest.raises(ValueError, match="must be a positive integer"):
++        enc.encode_batch(["hello"], max_total_tokens=-1)
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_encode_batch_per_document_violation_first(make_enc):
++    """Test that per-document violations are reported before total violations."""
++    enc = make_enc()
++    
++    # First document exceeds per-document limit
++    with pytest.raises(ValueError, match="Document at index 0.*exceeding max_tokens"):
++        enc.encode_batch(["this is a very long text that exceeds budget", "short"], max_tokens=5)
++    
++    # Second document exceeds per-document limit
++    with pytest.raises(ValueError, match="Document at index 1.*exceeding max_tokens"):
++        enc.encode_batch(["short", "this is a very long text that exceeds budget"], max_tokens=5)
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_encode_batch_combined_limits(make_enc):
++    """Test that both max_tokens and max_total_tokens apply together."""
++    enc = make_enc()
++    
++    # Both limits satisfied
++    texts = ["hello", "world"]
++    result = enc.encode_batch(texts, max_tokens=10, max_total_tokens=100)
++    assert len(result) == 2
++    
++    # Per-document limit violated
++    with pytest.raises(ValueError, match="Document at index 0.*exceeding max_tokens"):
++        enc.encode_batch(["this is a very long text that exceeds budget", "short"], 
++                         max_tokens=5, max_total_tokens=100)
++    
++    # Total limit violated but per-document OK
++    with pytest.raises(ValueError, match="Total tokens.*exceeds max_total_tokens"):
++        enc.encode_batch(["hello", "world"], max_tokens=10, max_total_tokens=1)
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..6b2214d 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        max_tokens: int | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -120,8 +121,15 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if max_tokens is not None:
++            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
++                raise ValueError("max_tokens must be a positive integer")
++
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
++            if max_tokens is not None and len(result) > max_tokens:
++                raise ValueError(f"Encoded {len(result)} tokens exceeds max_tokens={max_tokens}")
++            return result
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -179,6 +187,8 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        max_tokens: int | None = None,
++        max_total_tokens: int | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -196,9 +206,30 @@ class Encoding:
+         if not isinstance(disallowed_special, frozenset):
+             disallowed_special = frozenset(disallowed_special)
+ 
++        if max_tokens is not None:
++            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
++                raise ValueError("max_tokens must be a positive integer")
++        if max_total_tokens is not None:
++            if isinstance(max_total_tokens, bool) or not isinstance(max_total_tokens, int) or max_total_tokens <= 0:
++                raise ValueError("max_total_tokens must be a positive integer")
++
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, max_tokens=max_tokens
+         )
++        
++        # First validate all documents against per-document budget
++        if max_tokens is not None:
++            for i, t in enumerate(text):
++                encoded = self._core_bpe.encode(t, allowed_special)
++                if len(encoded) > max_tokens:
++                    raise ValueError(f"Document at index {i} has {len(encoded)} tokens, exceeding max_tokens={max_tokens}")
++        
++        # Then validate total budget
++        if max_total_tokens is not None:
++            total = sum(len(self._core_bpe.encode(t, allowed_special)) for t in text)
++            if total > max_total_tokens:
++                raise ValueError(f"Total tokens {total} exceeds max_total_tokens={max_total_tokens}")
++        
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+ 

@@ -1,0 +1,92 @@
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 1857145..7e924b6 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,87 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++@pytest.mark.parametrize('tag', ['json', 'JSON', '', 'text', 'yaml'])
++@pytest.mark.parametrize('shape', ['single', 'list', 'canonical'])
++def test_toolcalls_fenced_normal_validation(tag, shape):
++    import json
++    from dspy import ToolCalls
++    call = {'name': 'search', 'args': {'q': 'snow'}}
++    value = {'single': call, 'list': [call], 'canonical': {'tool_calls': [call]}}[shape]
++    text = 'explanation\n```' + tag + '\n' + json.dumps(value) + '\n```\nafterward'
++    expected = {'tool_calls': [call]}
++    assert [item.model_dump() for item in ToolCalls.model_validate(text).tool_calls] == expected['tool_calls']
++    assert [item.model_dump() for item in ToolCalls.model_validate_json(json.dumps(text)).tool_calls] == expected['tool_calls']
++    assert ToolCalls.validate_input(text) == value
++
++
++def test_toolcalls_raw_json_and_first_block_rules():
++    import json
++    from dspy import ToolCalls
++    call = {'name': 'search', 'args': {'literal': '``` is text'}}
++    assert [item.model_dump() for item in ToolCalls.model_validate(json.dumps(call)).tool_calls] == [call]
++    valid = '```json\n[]\n```'
++    assert ToolCalls.model_validate(valid).tool_calls == []
++    assert ToolCalls.model_validate(valid + '\n```json\n{}\n```').tool_calls == []
++    for text in ['```json\nnot-json\n```\n' + valid, '```json\n[]',
++                 '```[]```', 'explanation only', '```yaml\nname: search\n```']:
++        assert ToolCalls.validate_input(text) == text
++        with pytest.raises(ValueError):
++            ToolCalls.model_validate(text)
++
++
++def test_toolcalls_fenced_chat_adapter_public_path():
++    import dspy
++    class Calls(dspy.Signature):
++        question: str = dspy.InputField()
++        calls: dspy.ToolCalls = dspy.OutputField()
++    completion = '[[ ## calls ## ]]\n```JSON\n[{"name":"search","args":{"q":"hello"}}]\n```\n[[ ## completed ## ]]'
++    parsed = dspy.ChatAdapter().parse(Calls, completion)
++    assert [item.model_dump() for item in parsed['calls'].tool_calls] == [{'name': 'search', 'args': {'q': 'hello'}}]
++
++
++def test_fences_do_not_bypass_toolcall_validation():
++    from dspy import ToolCalls
++    for body in ['[{"name":"missing-args"}]', '{"name":"x","args":[]}', '123']:
++        with pytest.raises(ValueError):
++            ToolCalls.model_validate('```json\n' + body + '\n```')
++
++
++@pytest.mark.parametrize("adapter_name", ["ChatAdapter", "JSONAdapter", "XMLAdapter"])
++def test_fenced_toolcalls_nested_signature_adapters(adapter_name):
++    import json
++    import dspy
++    from pydantic import BaseModel
++    from dspy.utils.exceptions import AdapterParseError
++
++    class Batch(BaseModel):
++        calls: dspy.ToolCalls
++        note: str
++
++    class Result(dspy.Signature):
++        question: str = dspy.InputField()
++        batch: Batch = dspy.OutputField()
++
++    adapter = getattr(dspy, adapter_name)()
++
++    def completion(body):
++        payload = json.dumps({"calls": body, "note": "keep this sibling"})
++        if adapter_name == "JSONAdapter":
++            return '{"batch":' + payload + '}'
++        if adapter_name == "XMLAdapter":
++            return "<batch>" + payload + "</batch><completed/>"
++        return "[[ ## batch ## ]]\n" + payload + "\n[[ ## completed ## ]]"
++
++    call = {"name": "search", "args": {"query": "snow"}}
++    text = "before\n```json\n" + json.dumps([call]) + "\n```\nafter"
++    result = adapter.parse(Result, completion(text))["batch"]
++    assert isinstance(result, Batch)
++    assert isinstance(result.calls, dspy.ToolCalls)
++    assert [item.model_dump() for item in result.calls.tool_calls] == [call]
++    assert result.note == "keep this sibling"
++    for invalid in ('```json\n[{"name":"missing-args"}]\n```',
++                    '```json\ninvalid\n```\n' + text):
++        with pytest.raises((ValueError, AdapterParseError)):
++            adapter.parse(Result, completion(invalid))

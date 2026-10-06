@@ -1,0 +1,171 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..2218ee31 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,3 +1,4 @@
++from dspy.propose.instruction_utils import process_instruction
+ import random
+ 
+ import dspy
+@@ -283,6 +284,9 @@ class GroundedProposer(Proposer):
+         use_tip=True,
+         set_tip_randomly=True,
+         set_history_randomly=True,
++        min_instr_chars=30,
++        max_instr_chars=600,
++        rephrase_when_too_long=False,
+         verbose=False,
+         rng=None
+     ):
+@@ -297,6 +301,18 @@ class GroundedProposer(Proposer):
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        self.min_instr_chars = min_instr_chars
++        self.max_instr_chars = max_instr_chars
++        self.rephrase_when_too_long = rephrase_when_too_long
++        if self.min_instr_chars > self.max_instr_chars:
++            raise ValueError("min_instr_chars must be <= max_instr_chars")
++        if self.min_instr_chars < 0 or self.max_instr_chars < 0:
++            raise ValueError("min_instr_chars and max_instr_chars must be non-negative")
++        self.min_instr_chars = min_instr_chars
++        self.max_instr_chars = max_instr_chars
++        self.rephrase_when_too_long = rephrase_when_too_long
++        if self.min_instr_chars > self.max_instr_chars:
++            raise ValueError("min_instr_chars must be <= max_instr_chars")
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -396,6 +412,7 @@ class GroundedProposer(Proposer):
+         trial_logs,
+         tip=None,
+     ) -> str:
++        basic_instruction = get_signature(predictor).instructions
+         """This method is responsible for returning a single instruction for a given predictor, using the specified criteria."""
+ 
+         # Create an instruction history string for our predictor
+@@ -439,4 +456,13 @@ class GroundedProposer(Proposer):
+             self.prompt_model.inspect_history(n=1)
+             print(f"PROPOSED INSTRUCTION: {proposed_instruction}")
+ 
+-        return strip_prefix(proposed_instruction)
++        proposed_instruction = process_instruction(
++            instruction=strip_prefix(proposed_instruction),
++            min_instr_chars=self.min_instr_chars,
++            max_instr_chars=self.max_instr_chars,
++            rephrase_when_too_long=self.rephrase_when_too_long,
++            basic_instruction=basic_instruction,
++            verbose=self.verbose,
++            prompt_model=self.prompt_model
++        )
++        return proposed_instruction
+diff --git a/dspy/propose/instruction_utils.py b/dspy/propose/instruction_utils.py
+new file mode 100644
+index 00000000..468f5e80
+--- /dev/null
++++ b/dspy/propose/instruction_utils.py
+@@ -0,0 +1,80 @@
++import re
++import dspy
++from dspy.propose.shorten_instruction import ShortenInstruction
++
++def process_instruction(
++    instruction,
++    min_instr_chars,
++    max_instr_chars,
++    rephrase_when_too_long,
++    basic_instruction,
++    verbose=False,
++    prompt_model=None
++):
++    # Measure length
++    length = len(instruction)
++    
++    # If shorter than min, use canonical signature instructions
++    if length < min_instr_chars:
++        if verbose:
++            print(f"Instruction too short ({length} < {min_instr_chars}). Using basic instruction.")
++        return basic_instruction
++    
++    # If longer than max
++    if length > max_instr_chars:
++        if not rephrase_when_too_long:
++            # Retain last sentence boundary
++            # Look for . ! or ? followed by whitespace or end
++            matches = list(re.finditer(r'[.!?](\s+|$)', instruction))
++            
++            # We need to fit in max_instr_chars - 1 (for ...)
++            limit = max_instr_chars - 1
++            
++            # Find the last match that fits
++            best_match = None
++            for match in reversed(matches):
++                if match.end() <= limit:
++                    best_match = match
++                    break
++            
++            if best_match:
++                trimmed = instruction[:best_match.end()] + "…"
++                if verbose:
++                    print(f"Instruction too long ({length} > {max_instr_chars}). Trimmed at sentence boundary to {len(trimmed)}.")
++                return trimmed
++            else:
++                # Hard truncate
++                trimmed = instruction[:max_instr_chars - 1] + "…"
++                if verbose:
++                    print(f"Instruction too long ({length} > {max_instr_chars}). Hard truncated to {len(trimmed)}.")
++                return trimmed
++        else:
++            # Rephrase
++            if verbose:
++                print(f"Instruction too long ({length} > {max_instr_chars}). Rephrasing.")
++            
++            shortener = dspy.Predict(ShortenInstruction)
++            try:
++                with dspy.settings.context(lm=prompt_model):
++                    result = shortener(long_instruction=instruction, max_chars=max_instr_chars)
++                    proposed = result.proposed_instruction
++                    # Strip prefix "PROPOSED INSTRUCTION:"
++                    if proposed.startswith("PROPOSED INSTRUCTION:"):
++                        proposed = proposed[len("PROPOSED INSTRUCTION:"):].strip()
++                    
++                    if not proposed or len(proposed) < min_instr_chars:
++                        if verbose:
++                            print("Rephrasing failed or too short. Falling back to basic instruction.")
++                        return basic_instruction
++                    
++                    # Hard truncate if still too long
++                    if len(proposed) > max_instr_chars:
++                        proposed = proposed[:max_instr_chars]
++                    
++                    return proposed
++            except Exception as e:
++                if verbose:
++                    print(f"Rephrasing error: {e}. Falling back to basic instruction.")
++                return basic_instruction
++                
++    return instruction
+diff --git a/dspy/propose/shorten_instruction.py b/dspy/propose/shorten_instruction.py
+new file mode 100644
+index 00000000..01eeba16
+--- /dev/null
++++ b/dspy/propose/shorten_instruction.py
+@@ -0,0 +1,18 @@
++import dspy
++
++class ShortenInstruction(dspy.Signature):
++    """Shorten the given instruction to be within the specified character limit."""
++    long_instruction = dspy.InputField(
++        format=str,
++        desc="The instruction to be shortened.",
++        prefix="LONG INSTRUCTION:",
++    )
++    max_chars = dspy.InputField(
++        format=int,
++        desc="The maximum number of characters allowed.",
++        prefix="MAX CHARS:",
++    )
++    proposed_instruction = dspy.OutputField(
++        desc="The shortened instruction.",
++        prefix="PROPOSED INSTRUCTION:",
++    )

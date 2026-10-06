@@ -1,0 +1,466 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..c90ba7d 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -7,7 +7,7 @@ import sys
+ import typing as t
+ import weakref
+ import zipimport
+-from collections import abc
++from collections import abc, OrderedDict
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -170,9 +170,15 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param path_cache_size: If set to a positive integer, caches resolved
++        template paths up to that many entries with LRU eviction. Zero
++        (the default) disables caching. Booleans and negative values are
++        rejected.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionadded:: NEXT_VERSION
++        Added the ``path_cache_size`` parameter.
+     """
+ 
+     def __init__(
+@@ -180,6 +186,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_cache_size: int = 0,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -188,30 +195,162 @@ class FileSystemLoader(BaseLoader):
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
++        if not isinstance(path_cache_size, int) or isinstance(path_cache_size, bool):
++            raise TypeError(
++                f"path_cache_size must be a non-negative integer, "
++                f"got {type(path_cache_size).__name__}"
++            )
++        if path_cache_size < 0:
++            raise ValueError(
++                f"path_cache_size must be a non-negative integer, "
++                f"got {path_cache_size}"
++            )
++
++        self._path_cache_size = path_cache_size
++        self._path_cache: t.Optional[OrderedDict] = (
++            OrderedDict() if path_cache_size > 0 else None
++        )
++
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        """Resolve a template name to a filename by searching the
++        search paths in priority order, without using the path cache.
++
++        Returns the resolved filename or ``None`` if the template
++        could not be found. Subclasses can override this to customize
++        or observe resolution.
++        """
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            if os.path.isfile(filename):
++                return filename
++        return None
++
++    def _get_searchpath_index(self, filename: str) -> int:
++        """Return the index of the search path that contains the
++        given filename. Assumes the filename was resolved from one
++        of the search paths.
++        """
++        for i, sp in enumerate(self.searchpath):
++            if filename.startswith(sp + os.sep) or filename == sp:
++                return i
++            # Handle case where searchpath does not have trailing sep
++            # but filename could be longer.
++            common = os.path.commonpath([os.path.normpath(sp), os.path.normpath(filename)])
++            if common == os.path.normpath(sp):
++                return i
++        return 0
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+         pieces = split_template_path(template)
+-        for searchpath in self.searchpath:
+-            filename = os.path.join(searchpath, *pieces)
+-            f = open_if_exists(filename)
+-            if f is None:
+-                continue
++
++        # Check the path cache for a previously resolved filename.
++        filename = self._get_path_cache(template)
++        if filename is None:
++            filename = self.resolve_template_path(template)
++            if filename is None:
++                raise TemplateNotFound(template)
++            self._put_path_cache(template, filename)
++
++        f = open_if_exists(filename)
++        if f is None:
++            # File was removed between cache lookup and open.
++            raise TemplateNotFound(template)
++
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
++
++        mtime = os.path.getmtime(filename)
++
++        def uptodate() -> bool:
+             try:
+-                contents = f.read().decode(self.encoding)
+-            finally:
+-                f.close()
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
+ 
+-            mtime = os.path.getmtime(filename)
++        return contents, filename, uptodate
+ 
+-            def uptodate() -> bool:
+-                try:
+-                    return os.path.getmtime(filename) == mtime
+-                except OSError:
+-                    return False
++    def _get_path_cache(self, template: str) -> t.Optional[str]:
++        """Return a cached filename for *template*, or None.
+ 
+-            return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        Performs freshness checks: if the cached file no longer exists,
++        or if an earlier search path now takes precedence, the entry is
++        removed and None is returned.
++        """
++        if self._path_cache is None:
++            return None
++
++        entry = self._path_cache.get(template)
++        if entry is None:
++            return None
++
++        filename, index = entry
++
++        # File removed -> stale.
++        if not os.path.isfile(filename):
++            del self._path_cache[template]
++            return None
++
++        # An earlier search path now has this template -> stale.
++        pieces = split_template_path(template)
++        for i in range(index):
++            earlier = os.path.join(self.searchpath[i], *pieces)
++            if os.path.isfile(earlier):
++                del self._path_cache[template]
++                return None
++
++        # Move to end for LRU ordering.
++        self._path_cache.move_to_end(template)
++        return filename
++
++    def _put_path_cache(self, template: str, filename: str) -> None:
++        """Store *filename* for *template* in the path cache."""
++        if self._path_cache is None:
++            return
++
++        index = self._get_searchpath_index(filename)
++        self._path_cache[template] = (filename, index)
++        self._path_cache.move_to_end(template)
++
++        if len(self._path_cache) > self._path_cache_size:
++            self._path_cache.popitem(last=False)
++
++    def clear_path_cache(self) -> None:
++        """Remove all entries from the path cache."""
++        if self._path_cache is not None:
++            self._path_cache.clear()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        """Change the path cache capacity.
++
++        A capacity of zero disables and clears the cache.  A positive
++        integer enables or resizes the cache, evicting least-recently-used
++        entries as needed.
++        """
++        if not isinstance(capacity, int) or isinstance(capacity, bool):
++            raise TypeError(
++                f"capacity must be a non-negative integer, "
++                f"got {type(capacity).__name__}"
++            )
++        if capacity < 0:
++            raise ValueError(
++                f"capacity must be a non-negative integer, got {capacity}"
++            )
++
++        self._path_cache_size = capacity
++
++        if capacity == 0:
++            self._path_cache = None
++        elif self._path_cache is None:
++            self._path_cache = OrderedDict()
++        else:
++            # Evict LRU entries until within capacity.
++            while len(self._path_cache) > capacity:
++                self._path_cache.popitem(last=False)
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+@@ -229,8 +368,6 @@ class FileSystemLoader(BaseLoader):
+                     if template not in found:
+                         found.add(template)
+         return sorted(found)
+-
+-
+ class PackageLoader(BaseLoader):
+     """Load templates from a directory in a Python package.
+ 
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..9399b9d 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -172,6 +172,236 @@ class TestFileSystemLoader:
+         assert t.render() == expect
+ 
+ 
++# --- Insert tests for path cache ---
++
++    def test_path_cache_disabled_by_default(self):
++        """Default path_cache_size=0 means no caching."""
++        loader = loaders.FileSystemLoader(str(self.searchpath))
++        assert loader._path_cache is None
++
++    def test_path_cache_rejects_bool(self):
++        """Booleans raise TypeError."""
++        with pytest.raises(TypeError):
++            loaders.FileSystemLoader(str(self.searchpath), path_cache_size=True)
++        with pytest.raises(TypeError):
++            loaders.FileSystemLoader(str(self.searchpath), path_cache_size=False)
++
++    def test_path_cache_rejects_negative(self):
++        """Negative integers raise ValueError."""
++        with pytest.raises(ValueError):
++            loaders.FileSystemLoader(str(self.searchpath), path_cache_size=-1)
++
++    def test_path_cache_zero_disables(self):
++        """Explicit zero disables cache."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=0)
++        assert loader._path_cache is None
++
++    def test_path_cache_hit_and_miss(self):
++        """Positive size caches hits; misses are not cached."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=10)
++        env = Environment(loader=loader)
++        # A hit
++        tmpl = env.get_template("test.html")
++        assert tmpl.render().strip() == "BAR"
++        assert "test.html" in loader._path_cache
++        # A miss is not cached
++        with pytest.raises(TemplateNotFound):
++            env.get_template("nonexistent.html")
++        assert "nonexistent.html" not in loader._path_cache
++
++    def test_path_cache_clear(self):
++        """clear_path_cache() removes all entries."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=10)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        env.get_template("foo/test.html")
++        assert len(loader._path_cache) == 2
++        loader.clear_path_cache()
++        assert len(loader._path_cache) == 0
++
++    def test_resize_path_cache_increase(self):
++        """resize_path_cache can increase capacity."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=1)
++
++        def _load(name):
++            # Fresh Environment to bypass compiled template cache.
++            return Environment(loader=loader).get_template(name)
++
++        _load("test.html")
++        _load("foo/test.html")
++        # Only one entry kept due to LRU
++        assert len(loader._path_cache) == 1
++        loader.resize_path_cache(10)
++        _load("test.html")
++        _load("foo/test.html")
++        assert len(loader._path_cache) == 2
++
++
++    def test_resize_path_cache_zero_disables(self):
++        """resize_path_cache(0) disables and clears."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=10)
++        env = Environment(loader=loader)
++        env.get_template("test.html")
++        assert loader._path_cache is not None
++        loader.resize_path_cache(0)
++        assert loader._path_cache is None
++
++    def test_resize_path_cache_negative_rejected(self):
++        """resize_path_cache with negative raises ValueError."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=10)
++        with pytest.raises(ValueError):
++            loader.resize_path_cache(-5)
++
++    def test_resize_path_cache_bool_rejected(self):
++        """resize_path_cache with bool raises TypeError."""
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=10)
++        with pytest.raises(TypeError):
++            loader.resize_path_cache(True)
++
++    def test_path_cache_freshness_removed_file(self):
++        """Cached file removed is resolved again (miss)."""
++        import tempfile
++        tmpdir = tempfile.mkdtemp()
++        try:
++            tmpl_path = Path(tmpdir) / "hello.html"
++            tmpl_path.write_text("Hello")
++            loader = loaders.FileSystemLoader(tmpdir, path_cache_size=10)
++            env = Environment(loader=loader)
++            # Cache it
++            tmpl = env.get_template("hello.html")
++            assert tmpl.render().strip() == "Hello"
++            assert "hello.html" in loader._path_cache
++            # Remove the file
++            tmpl_path.unlink()
++            # Next load should re-resolve (miss) and raise
++            with pytest.raises(TemplateNotFound):
++                env.get_template("hello.html")
++            # Cache entry should be gone
++            assert "hello.html" not in loader._path_cache
++        finally:
++            import shutil
++            shutil.rmtree(tmpdir)
++
++    def test_path_cache_freshness_earlier_path(self):
++        """Earlier searchpath takes precedence on next load."""
++        import tempfile
++        tmpdir1 = tempfile.mkdtemp()
++        tmpdir2 = tempfile.mkdtemp()
++        try:
++            (Path(tmpdir1) / "name.html").write_text("FIRST")
++            (Path(tmpdir2) / "name.html").write_text("SECOND")
++            loader = loaders.FileSystemLoader(
++                [tmpdir1, tmpdir2], path_cache_size=10
++            )
++            env = Environment(loader=loader)
++            # tmpdir1 is first, so "name.html" resolves to FIRST
++            tmpl = env.get_template("name.html")
++            assert tmpl.render().strip() == "FIRST"
++            # Remove from first path
++            (Path(tmpdir1) / "name.html").unlink()
++            # Should now resolve from second path
++            tmpl2 = env.get_template("name.html")
++            assert tmpl2.render().strip() == "SECOND"
++        finally:
++            import shutil
++            shutil.rmtree(tmpdir1)
++            shutil.rmtree(tmpdir2)
++
++    def test_path_cache_resolve_template_hook_called(self):
++        """Cache misses call resolve_template_path."""
++        import tempfile
++        tmpdir = tempfile.mkdtemp()
++        try:
++            (Path(tmpdir) / "hook.html").write_text("Hook")
++            loader = loaders.FileSystemLoader(tmpdir, path_cache_size=10)
++            # Monkey-patch to track calls
++            calls = []
++            original = loader.resolve_template_path
++            def tracking_resolve(template):
++                calls.append(template)
++                return original(template)
++            loader.resolve_template_path = tracking_resolve
++            env = Environment(loader=loader)
++            # First access: miss, calls resolve_template_path
++            env.get_template("hook.html")
++            assert "hook.html" in calls
++            calls.clear()
++            # Second access: cache hit, does NOT call resolve_template_path
++            env.get_template("hook.html")
++            assert "hook.html" not in calls
++            # Miss should call it
++            with pytest.raises(TemplateNotFound):
++                env.get_template("nope.html")
++            assert "nope.html" in calls
++        finally:
++            import shutil
++            shutil.rmtree(tmpdir)
++
++    def test_path_cache_lru_eviction(self):
++        """LRU eviction removes least recently used entries."""
++        import tempfile
++        tmpdir = tempfile.mkdtemp()
++        try:
++            # Create templates
++            for i in range(5):
++                (Path(tmpdir) / f"t{i}.html").write_text(f"Template {i}")
++            loader = loaders.FileSystemLoader(tmpdir, path_cache_size=3)
++            env = Environment(loader=loader)
++            # Load t0, t1, t2 (all cached)
++            for i in range(5):
++                env.get_template(f"t{i}.html")
++            # Cache size is 3, so only t2, t3, t4 should be cached (t2 most recently used at this point due to order)
++            # Actually, let's be more precise:
++            # Load order: t0, t1, t2, t3, t4
++            # After t0: cache = [t0]
++            # After t1: cache = [t0, t1]
++            # After t2: cache = [t0, t1, t2]
++            # After t3: cache = [t1, t2, t3]  (t0 evicted)
++            # After t4: cache = [t2, t3, t4]  (t1 evicted)
++            assert "t0.html" not in loader._path_cache
++            assert "t1.html" not in loader._path_cache
++            assert "t2.html" in loader._path_cache
++            assert "t3.html" in loader._path_cache
++            assert "t4.html" in loader._path_cache
++        finally:
++            import shutil
++            shutil.rmtree(tmpdir)
++
++    def test_path_cache_clear_cache_independent_of_env_cache(self):
++        """clear_path_cache doesn't affect Environment's compiled template cache."""
++        # Load a template twice without clearing; verify env cache still works
++        loader = loaders.FileSystemLoader(str(self.searchpath), path_cache_size=10)
++        env = Environment(loader=loader)
++        tmpl1 = env.get_template("test.html")
++        loader.clear_path_cache()
++        # The compiled template should still be cached in Environment
++        tmpl2 = env.get_template("test.html")
++        assert tmpl1 is tmpl2
++
++    def test_path_cache_resize_evicts_lru(self):
++        """Shrinking cache evicts least recently used entries."""
++        import tempfile
++        tmpdir = tempfile.mkdtemp()
++        try:
++            for i in range(5):
++                (Path(tmpdir) / f"t{i}.html").write_text(f"Template {i}")
++            loader = loaders.FileSystemLoader(tmpdir, path_cache_size=10)
++            env = Environment(loader=loader)
++            for i in range(5):
++                env.get_template(f"t{i}.html")
++            assert len(loader._path_cache) == 5
++            # Shrink to 3
++            loader.resize_path_cache(3)
++            assert len(loader._path_cache) == 3
++            # The 2 oldest (t0, t1) should be evicted
++            assert "t0.html" not in loader._path_cache
++            assert "t1.html" not in loader._path_cache
++            assert "t2.html" in loader._path_cache
++            assert "t3.html" in loader._path_cache
++            assert "t4.html" in loader._path_cache
++        finally:
++            import shutil
++            shutil.rmtree(tmpdir)
+ class TestModuleLoader:
+     archive = None
+ 

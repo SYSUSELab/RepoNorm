@@ -1,0 +1,1024 @@
+diff --git a/apply_changes.py b/apply_changes.py
+new file mode 100644
+index 0000000..8067fc7
+--- /dev/null
++++ b/apply_changes.py
+@@ -0,0 +1,71 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# Update __init__
++init_pattern = r'(def __init__\(\n\s+self,\n\s+searchpath: t\.Union\[str, os\.PathLike, t\.Sequence\[t\.Union\[str, os\.PathLike\]\]\],\n\s+encoding: str = "utf-8",\n\s+followlinks: bool = False,\n\s+\) -> None:)'
++init_replacement = r'\1\n        path_cache_size: int = 0,\n    ) -> None:\n        if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):\n            searchpath = [searchpath]\n\n        self.searchpath = [os.fspath(p) for p in searchpath]\n        self.encoding = encoding\n        self.followlinks = followlinks\n        self.path_cache_size = path_cache_size\n        self._path_cache = collections.OrderedDict() if path_cache_size > 0 else None'
++
++# Remove the old body of __init__
++content = re.sub(r'def __init__\(\n\s+self,\n\s+searchpath: t\.Union\[str, os\.PathLike, t\.Sequence\[t\.Union\[str, os\.PathLike\]\]\],\n\s+encoding: str = "utf-8",\n\s+followlinks: bool = False,\n\s+\) -> None:\n\s+if not isinstance\(searchpath, abc\.Iterable\) or isinstance\(searchpath, str\):\n\s+searchpath = \[searchpath\]\n\n\s+self\.searchpath = \[os\.fspath\(p\) for p in searchpath\]\n\s+self\.encoding = encoding\n\s+self\.followlinks = followlinks', init_replacement, content)
++
++# Add new methods
++methods = """
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            if os.path.exists(filename):
++                return filename
++        return None
++
++    def clear_path_cache(self) -> None:
++        if self._path_cache is not None:
++            self._path_cache.clear()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
++            raise ValueError("capacity must be a non-negative integer")
++        self.path_cache_size = capacity
++        if capacity == 0:
++            self._path_cache = None
++        else:
++            if self._path_cache is None:
++                self._path_cache = collections.OrderedDict()
++            while len(self._path_cache) > capacity:
++                self._path_cache.popitem(last=False)
++"""
++
++# Insert methods after __init__
++content = re.sub(r'(self\._path_cache = collections\.OrderedDict\(\) if path_cache_size > 0 else None)', r'\1' + methods, content)
++
++# Update get_source
++get_source_pattern = r'def get_source\(\n\s+self, environment: "Environment", template: str\n\s+\) -> t\.Tuple\[str, str, t\.Callable\[\[\], bool\]\]:\n\s+pieces = split_template_path\(template\)\n\s+for searchpath in self\.searchpath:\n\s+filename = os\.path\.join\(searchpath, \*pieces\)\n\s+f = open_if_exists\(filename\)\n\s+if f is None:\n\s+continue'
++get_source_replacement = """def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        if self._path_cache is not None:
++            filename = self._path_cache.get(template)
++            if filename is not None and os.path.exists(filename):
++                self._path_cache.move_to_end(template)
++            else:
++                filename = self.resolve_template_path(template)
++                if filename is not None:
++                    self._path_cache[template] = filename
++                    if len(self._path_cache) > self.path_cache_size:
++                        self._path_cache.popitem(last=False)
++        else:
++            filename = self.resolve_template_path(template)
++
++        if filename is None:
++            raise TemplateNotFound(template)
++
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(template)"""
++
++content = re.sub(get_source_pattern, get_source_replacement, content)
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.write(content)
+diff --git a/apply_changes_v2.py b/apply_changes_v2.py
+new file mode 100644
+index 0000000..c2d7690
+--- /dev/null
++++ b/apply_changes_v2.py
+@@ -0,0 +1,130 @@
++import os
++
++# Read the original file
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++# Add collections import
++lines.insert(3, 'import collections\n')
++
++# Find the FileSystemLoader class
++start_line = 0
++for i, line in enumerate(lines):
++    if 'class FileSystemLoader(BaseLoader):' in line:
++        start_line = i
++        break
++
++# Find the end of __init__
++init_end_line = 0
++for i in range(start_line, len(lines)):
++    if 'self.followlinks = followlinks' in lines[i]:
++        init_end_line = i + 1
++        break
++
++# Add path_cache_size to __init__
++lines[init_end_line-1] = '        self.followlinks = followlinks\n        self.path_cache_size = path_cache_size\n        self._path_cache = collections.OrderedDict() if path_cache_size > 0 else None\n'
++# Wait, I need to change the __init__ signature too.
++# Let's find the __init__ signature.
++for i in range(start_line, init_end_line):
++    if 'def __init__(' in lines[i]:
++        lines[i+3] = '        followlinks: bool = False,\n        path_cache_size: int = 0,\n'
++        break
++
++# Add new methods after __init__
++new_methods = [
++    '\n',
++    '    def resolve_template_path(self, template: str) -> t.Optional[str]:\n',
++    '        pieces = split_template_path(template)\n',
++    '        for searchpath in self.searchpath:\n',
++    '            filename = os.path.join(searchpath, *pieces)\n',
++    '            if os.path.exists(filename):\n',
++    '                return filename\n',
++    '        return None\n',
++    '\n',
++    '    def clear_path_cache(self) -> None:\n',
++    '        if self._path_cache is not None:\n',
++    '            self._path_cache.clear()\n',
++    '\n',
++    '    def resize_path_cache(self, capacity: int) -> None:\n',
++    '        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:\n',
++    '            raise ValueError("capacity must be a non-negative integer")\n',
++    '        self.path_cache_size = capacity\n',
++    '        if capacity == 0:\n',
++    '            self._path_cache = None\n',
++    '        else:\n',
++    '            if self._path_cache is None:\n',
++    '                self._path_cache = collections.OrderedDict()\n',
++    '            while len(self._path_cache) > capacity:\n',
++    '                self._path_cache.popitem(last=False)\n'
++]
++lines[init_end_line:init_end_line] = new_methods
++
++# Replace get_source
++get_source_start = 0
++for i in range(init_end_line, len(lines)):
++    if 'def get_source(' in lines[i]:
++        get_source_start = i
++        break
++
++get_source_end = 0
++for i in range(get_source_start, len(lines)):
++    if 'raise TemplateNotFound(template)' in lines[i]:
++        get_source_end = i + 1
++        break
++
++new_get_source = [
++    '    def get_source(\n',
++    '        self, environment: "Environment", template: str\n',
++    '    ) -> t.Tuple[str, str, t.Callable[[], bool]]:\n',
++    '        pieces = split_template_path(template)\n',
++    '        if self._path_cache is not None:\n',
++    '            filename = self._path_cache.get(template)\n',
++    '            if filename is not None and os.path.exists(filename):\n',
++    '                higher_priority_found = False\n',
++    '                for searchpath in self.searchpath:\n',
++    '                    if os.path.join(searchpath, *pieces) == filename:\n',
++    '                        break\n',
++    '                    if os.path.exists(os.path.join(searchpath, *pieces)):\n',
++    '                        higher_priority_found = True\n',
++    '                        break\n',
++    '                if not higher_priority_found:\n',
++    '                    self._path_cache.move_to_end(template)\n',
++    '                else:\n',
++    '                    filename = self.resolve_template_path(template)\n',
++    '                    if filename is not None:\n',
++    '                        self._path_cache[template] = filename\n',
++    '            else:\n',
++    '                filename = self.resolve_template_path(template)\n',
++    '                if filename is not None:\n',
++    '                    self._path_cache[template] = filename\n',
++    '                    if len(self._path_cache) > self.path_cache_size:\n',
++    '                        self._path_cache.popitem(last=False)\n',
++    '        else:\n',
++    '            filename = self.resolve_template_path(template)\n',
++    '\n',
++    '        if filename is None:\n',
++    '            raise TemplateNotFound(template)\n',
++    '\n',
++    '        f = open_if_exists(filename)\n',
++    '        if f is None:\n',
++    '            raise TemplateNotFound(template)\n',
++    '        try:\n',
++    '            contents = f.read().decode(self.encoding)\n',
++    '        finally:\n',
++    '            f.close()\n',
++    '\n',
++    '        mtime = os.path.getmtime(filename)\n',
++    '\n',
++    '        def uptodate() -> bool:\n',
++    '            try:\n',
++    '                return os.path.getmtime(filename) == mtime\n',
++    '            except OSError:\n',
++    '                return False\n',
++    '\n',
++    '        return contents, filename, uptodate\n'
++]
++
++lines[get_source_start:get_source_end] = new_get_source
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/debug_reproduce.py b/debug_reproduce.py
+new file mode 100644
+index 0000000..d6cb30a
+--- /dev/null
++++ b/debug_reproduce.py
+@@ -0,0 +1,24 @@
++import os
++import tempfile
++from jinja2 import Environment, FileSystemLoader, TemplateNotFound
++
++with tempfile.TemporaryDirectory() as tmpdir:
++    os.makedirs(os.path.join(tmpdir, "dir1"))
++    with open(os.path.join(tmpdir, "dir1", "test.html"), "w") as f:
++        f.write("dir1")
++        
++    loader = FileSystemLoader([os.path.join(tmpdir, "dir1")], path_cache_size=10)
++    env = Environment(loader=loader)
++    
++    # First load
++    print(f"First load: {env.get_template('test.html').render()}")
++    
++    # Modify
++    with open(os.path.join(tmpdir, "dir1", "test.html"), "w") as f:
++        f.write("dir1_modified")
++        
++    # Second load
++    print(f"Second load: {env.get_template('test.html').render()}")
++    
++    # Check cache
++    print(f"Cache: {loader._path_cache}")
+diff --git a/fix_indentation.py b/fix_indentation.py
+new file mode 100644
+index 0000000..9a13cd5
+--- /dev/null
++++ b/fix_indentation.py
+@@ -0,0 +1,17 @@
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start of get_source
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def get_source(' in line:
++        start_line = i
++        break
++
++# The new_get_source I added has 4 spaces of indentation.
++# Let me check the file content.
++# It seems I added it at the beginning of the file?
++# Wait, the error says "File "/workspace/repo/src/jinja2/loaders.py", line 1".
++# That means I replaced the whole file with get_source!
++# Oh no, I must have messed up the line replacement.
++# Let me restore the file and try again.
+diff --git a/fsloader.txt b/fsloader.txt
+new file mode 100644
+index 0000000..add4b9a
+--- /dev/null
++++ b/fsloader.txt
+@@ -0,0 +1,94 @@
++class FileSystemLoader(BaseLoader):
++    """Load templates from a directory in the file system.
++
++    The path can be relative or absolute. Relative paths are relative to
++    the current working directory.
++
++    .. code-block:: python
++
++        loader = FileSystemLoader("templates")
++
++    A list of paths can be given. The directories will be searched in
++    order, stopping at the first matching template.
++
++    .. code-block:: python
++
++        loader = FileSystemLoader(["/override/templates", "/default/templates"])
++
++    :param searchpath: A path, or list of paths, to the directory that
++        contains the templates.
++    :param encoding: Use this encoding to read the text from template
++        files.
++    :param followlinks: Follow symbolic links in the path.
++
++    .. versionchanged:: 2.8
++        Added the ``followlinks`` parameter.
++    """
++
++    def __init__(
++        self,
++        searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        encoding: str = "utf-8",
++        followlinks: bool = False,
++    ) -> None:
++        if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
++            searchpath = [searchpath]
++
++        self.searchpath = [os.fspath(p) for p in searchpath]
++        self.encoding = encoding
++        self.followlinks = followlinks
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            f = open_if_exists(filename)
++            if f is None:
++                continue
++            try:
++                contents = f.read().decode(self.encoding)
++            finally:
++                f.close()
++
++            mtime = os.path.getmtime(filename)
++
++            def uptodate() -> bool:
++                try:
++                    return os.path.getmtime(filename) == mtime
++                except OSError:
++                    return False
++
++            return contents, filename, uptodate
++        raise TemplateNotFound(template)
++
++    def list_templates(self) -> t.List[str]:
++        found = set()
++        for searchpath in self.searchpath:
++            walk_dir = os.walk(searchpath, followlinks=self.followlinks)
++            for dirpath, _, filenames in walk_dir:
++                for filename in filenames:
++                    template = (
++                        os.path.join(dirpath, filename)[len(searchpath) :]
++                        .strip(os.path.sep)
++                        .replace(os.path.sep, "/")
++                    )
++                    if template[:2] == "./":
++                        template = template[2:]
++                    if template not in found:
++                        found.add(template)
++        return sorted(found)
++
++
++class PackageLoader(BaseLoader):
++    """Load templates from a directory in a Python package.
++
++    :param package_name: Import name of the package that contains the
++        template directory.
++    :param package_path: Directory within the imported package that
++        contains the templates.
++    :param encoding: Encoding of template files.
++
++    The following example looks up templates in the ``pages`` directory
++    within the ``project.ui`` package.
+diff --git a/modify_get_source.py b/modify_get_source.py
+new file mode 100644
+index 0000000..959369d
+--- /dev/null
++++ b/modify_get_source.py
+@@ -0,0 +1,85 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# Update get_source to check for higher priority paths
++new_get_source = """    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        pieces = split_template_path(template)
++        if self._path_cache is not None:
++            filename = self._path_cache.get(template)
++            # Check if the cached file is still valid and if there's no higher priority file
++            if filename is not None and os.path.exists(filename):
++                # Check if there's a higher priority file
++                higher_priority_found = False
++                for searchpath in self.searchpath:
++                    if os.path.join(searchpath, *pieces) == filename:
++                        break
++                    if os.path.exists(os.path.join(searchpath, *pieces)):
++                        higher_priority_found = True
++                        break
++                
++                if not higher_priority_found:
++                    self._path_cache.move_to_end(template)
++                else:
++                    filename = self.resolve_template_path(template)
++                    self._path_cache[template] = filename
++            else:
++                filename = self.resolve_template_path(template)
++                if filename is not None:
++                    self._path_cache[template] = filename
++                    if len(self._path_cache) > self.path_cache_size:
++                        self._path_cache.popitem(last=False)
++        else:
++            filename = self.resolve_template_path(template)
++
++        if filename is None:
++            raise TemplateNotFound(template)
++
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(template)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
++
++        mtime = os.path.getmtime(filename)
++
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        return contents, filename, uptodate"""
++
++# Replace the old get_source
++# I need to find the start and end of get_source
++start_pattern = r'    def get_source\(\n\s+self, environment: "Environment", template: str\n\s+\) -> t\.Tuple\[str, str, t\.Callable\[\[\], bool\]\]:'
++end_pattern = r'        return contents, filename, uptodate'
++
++# This is tricky with regex. Let's just use string replacement.
++# I will read the file and replace the get_source method.
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def get_source(' in line and 'FileSystemLoader' in lines[i-5:i+1]:
++        start_line = i
++        break
++
++# Find the end of get_source
++end_line = start_line
++for i in range(start_line, len(lines)):
++    if 'return contents, filename, uptodate' in lines[i]:
++        end_line = i + 1
++        break
++
++lines[start_line:end_line] = [new_get_source + '\n']
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/modify_loaders.py b/modify_loaders.py
+new file mode 100644
+index 0000000..38946a8
+--- /dev/null
++++ b/modify_loaders.py
+@@ -0,0 +1,144 @@
++import sys
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the __init__ method of FileSystemLoader
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def __init__(' in line and 'FileSystemLoader' in lines[i-5:i+1]:
++        start_line = i
++        break
++
++# Modify __init__
++# Add path_cache_size parameter
++# Add self._path_cache = None
++# Add self.path_cache_size = path_cache_size
++
++# Let's rewrite the __init__ method
++new_init = [
++    '    def __init__(\n',
++    '        self,\n',
++    '        searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],\n',
++    '        encoding: str = "utf-8",\n',
++    '        followlinks: bool = False,\n',
++    '        path_cache_size: int = 0,\n',
++    '    ) -> None:\n',
++    '        if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):\n',
++    '            searchpath = [searchpath]\n',
++    '\n',
++    '        self.searchpath = [os.fspath(p) for p in searchpath]\n',
++    '        self.encoding = encoding\n',
++    '        self.followlinks = followlinks\n',
++    '        self.path_cache_size = path_cache_size\n',
++    '        self._path_cache = collections.OrderedDict() if path_cache_size > 0 else None\n',
++]
++
++# Find the end of __init__
++end_line = start_line
++for i in range(start_line, len(lines)):
++    if 'self.followlinks = followlinks' in lines[i]:
++        end_line = i + 1
++        break
++
++lines[start_line:end_line+1] = new_init
++
++# Add resolve_template_path method
++# Add clear_path_cache method
++# Add resize_path_cache method
++
++# Let's find where to insert these methods. Maybe after __init__
++insert_pos = end_line + len(new_init) - end_line + start_line
++
++methods = [
++    '\n',
++    '    def resolve_template_path(self, template: str) -> t.Optional[str]:\n',
++    '        pieces = split_template_path(template)\n',
++    '        for searchpath in self.searchpath:\n',
++    '            filename = os.path.join(searchpath, *pieces)\n',
++    '            if os.path.exists(filename):\n',
++    '                return filename\n',
++    '        return None\n',
++    '\n',
++    '    def clear_path_cache(self) -> None:\n',
++    '        if self._path_cache is not None:\n',
++    '            self._path_cache.clear()\n',
++    '\n',
++    '    def resize_path_cache(self, capacity: int) -> None:\n',
++    '        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:\n',
++    '            raise ValueError("capacity must be a non-negative integer")\n',
++    '        self.path_cache_size = capacity\n',
++    '        if capacity == 0:\n',
++    '            self._path_cache = None\n',
++    '        else:\n',
++    '            if self._path_cache is None:\n',
++    '                self._path_cache = collections.OrderedDict()\n',
++    '            while len(self._path_cache) > capacity:\n',
++    '                self._path_cache.popitem(last=False)\n',
++]
++
++lines[insert_pos:insert_pos] = methods
++
++# Modify get_source to use the cache
++# Find get_source
++get_source_start = 0
++for i, line in enumerate(lines):
++    if 'def get_source(' in line:
++        get_source_start = i
++        break
++
++# We need to find the loop in get_source
++# The loop starts after pieces = split_template_path(template)
++# Let's replace the loop with cache logic
++
++# Actually, let's just rewrite get_source
++new_get_source = [
++    '    def get_source(\n',
++    '        self, environment: "Environment", template: str\n',
++    '    ) -> t.Tuple[str, str, t.Callable[[], bool]]:\n',
++    '        if self._path_cache is not None:\n',
++    '            filename = self._path_cache.get(template)\n',
++    '            if filename is not None and os.path.exists(filename):\n',
++    '                self._path_cache.move_to_end(template)\n',
++    '            else:\n',
++    '                filename = self.resolve_template_path(template)\n',
++    '                if filename is not None:\n',
++    '                    self._path_cache[template] = filename\n',
++    '                    if len(self._path_cache) > self.path_cache_size:\n',
++    '                        self._path_cache.popitem(last=False)\n',
++    '        else:\n',
++    '            filename = self.resolve_template_path(template)\n',
++    '\n',
++    '        if filename is None:\n',
++    '            raise TemplateNotFound(template)\n',
++    '\n',
++    '        f = open_if_exists(filename)\n',
++    '        if f is None:\n',
++    '            raise TemplateNotFound(template)\n',
++    '        try:\n',
++    '            contents = f.read().decode(self.encoding)\n',
++    '        finally:\n',
++    '            f.close()\n',
++    '\n',
++    '        mtime = os.path.getmtime(filename)\n',
++    '\n',
++    '        def uptodate() -> bool:\n',
++    '            try:\n',
++    '                return os.path.getmtime(filename) == mtime\n',
++    '            except OSError:\n',
++    '                return False\n',
++    '\n',
++    '        return contents, filename, uptodate\n',
++]
++
++# Find the end of get_source
++get_source_end = get_source_start
++for i in range(get_source_start, len(lines)):
++    if 'return contents, filename, uptodate' in lines[i]:
++        get_source_end = i + 1
++        break
++
++lines[get_source_start:get_source_end] = new_get_source
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/new_fsloader.py b/new_fsloader.py
+new file mode 100644
+index 0000000..ea57d03
+--- /dev/null
++++ b/new_fsloader.py
+@@ -0,0 +1,121 @@
++class FileSystemLoader(BaseLoader):
++    """Load templates from a directory in the file system.
++
++    The path can be relative or absolute. Relative paths are relative to
++    the current working directory.
++
++    .. code-block:: python
++
++        loader = FileSystemLoader("templates")
++
++    A list of paths can be given. The directories will be searched in
++    order, stopping at the first matching template.
++
++    .. code-block:: python
++
++        loader = FileSystemLoader(["/override/templates", "/default/templates"])
++
++    :param searchpath: A path, or list of paths, to the directory that
++        contains the templates.
++    :param encoding: Use this encoding to read the text from template
++        files.
++    :param followlinks: Follow symbolic links in the path.
++    :param path_cache_size: The size of the path cache.
++
++    .. versionchanged:: 2.8
++        Added the ``followlinks`` parameter.
++    """
++
++    def __init__(
++        self,
++        searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        encoding: str = "utf-8",
++        followlinks: bool = False,
++        path_cache_size: int = 0,
++    ) -> None:
++        if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
++            searchpath = [searchpath]
++
++        self.searchpath = [os.fspath(p) for p in searchpath]
++        self.encoding = encoding
++        self.followlinks = followlinks
++        self.path_cache_size = path_cache_size
++        self._path_cache = collections.OrderedDict() if path_cache_size > 0 else None
++
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            if os.path.exists(filename):
++                return filename
++        return None
++
++    def clear_path_cache(self) -> None:
++        if self._path_cache is not None:
++            self._path_cache.clear()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
++            raise ValueError("capacity must be a non-negative integer")
++        self.path_cache_size = capacity
++        if capacity == 0:
++            self._path_cache = None
++        else:
++            if self._path_cache is None:
++                self._path_cache = collections.OrderedDict()
++            while len(self._path_cache) > capacity:
++                self._path_cache.popitem(last=False)
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        if self._path_cache is not None:
++            filename = self._path_cache.get(template)
++            if filename is not None and os.path.exists(filename):
++                self._path_cache.move_to_end(template)
++            else:
++                filename = self.resolve_template_path(template)
++                if filename is not None:
++                    self._path_cache[template] = filename
++                    if len(self._path_cache) > self.path_cache_size:
++                        self._path_cache.popitem(last=False)
++        else:
++            filename = self.resolve_template_path(template)
++
++        if filename is None:
++            raise TemplateNotFound(template)
++
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(template)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
++
++        mtime = os.path.getmtime(filename)
++
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        return contents, filename, uptodate
++
++    def list_templates(self) -> t.List[str]:
++        found = set()
++        for searchpath in self.searchpath:
++            walk_dir = os.walk(searchpath, followlinks=self.followlinks)
++            for dirpath, _, filenames in walk_dir:
++                for filename in filenames:
++                    template = (
++                        os.path.join(dirpath, filename)[len(searchpath) :]
++                        .strip(os.path.sep)
++                        .replace(os.path.sep, "/")
++                    )
++                    if template[:2] == "./":
++                        template = template[2:]
++                    if template not in found:
++                        found.add(template)
++        return sorted(found)
+diff --git a/replace_get_source.py b/replace_get_source.py
+new file mode 100644
+index 0000000..8c7b884
+--- /dev/null
++++ b/replace_get_source.py
+@@ -0,0 +1,72 @@
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def get_source(' in line and 'FileSystemLoader' in lines[i-5:i+1]:
++        start_line = i
++        break
++
++# Find the end of get_source
++end_line = start_line
++for i in range(start_line, len(lines)):
++    if 'raise TemplateNotFound(template)' in lines[i]:
++        end_line = i + 1
++        break
++
++new_get_source = [
++    '    def get_source(\n',
++    '        self, environment: "Environment", template: str\n',
++    '    ) -> t.Tuple[str, str, t.Callable[[], bool]]:\n',
++    '        pieces = split_template_path(template)\n',
++    '        if self._path_cache is not None:\n',
++    '            filename = self._path_cache.get(template)\n',
++    '            if filename is not None and os.path.exists(filename):\n',
++    '                higher_priority_found = False\n',
++    '                for searchpath in self.searchpath:\n',
++    '                    if os.path.join(searchpath, *pieces) == filename:\n',
++    '                        break\n',
++    '                    if os.path.exists(os.path.join(searchpath, *pieces)):\n',
++    '                        higher_priority_found = True\n',
++    '                        break\n',
++    '                if not higher_priority_found:\n',
++    '                    self._path_cache.move_to_end(template)\n',
++    '                else:\n',
++    '                    filename = self.resolve_template_path(template)\n',
++    '                    if filename is not None:\n',
++    '                        self._path_cache[template] = filename\n',
++    '            else:\n',
++    '                filename = self.resolve_template_path(template)\n',
++    '                if filename is not None:\n',
++    '                    self._path_cache[template] = filename\n',
++    '                    if len(self._path_cache) > self.path_cache_size:\n',
++    '                        self._path_cache.popitem(last=False)\n',
++    '        else:\n',
++    '            filename = self.resolve_template_path(template)\n',
++    '\n',
++    '        if filename is None:\n',
++    '            raise TemplateNotFound(template)\n',
++    '\n',
++    '        f = open_if_exists(filename)\n',
++    '        if f is None:\n',
++    '            raise TemplateNotFound(template)\n',
++    '        try:\n',
++    '            contents = f.read().decode(self.encoding)\n',
++    '        finally:\n',
++    '            f.close()\n',
++    '\n',
++    '        mtime = os.path.getmtime(filename)\n',
++    '\n',
++    '        def uptodate() -> bool:\n',
++    '            try:\n',
++    '                return os.path.getmtime(filename) == mtime\n',
++    '            except OSError:\n',
++    '                return False\n',
++    '\n',
++    '        return contents, filename, uptodate\n'
++]
++
++lines[start_line:end_line] = new_get_source
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..9479508
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,37 @@
++import os
++import tempfile
++from jinja2 import Environment, FileSystemLoader, TemplateNotFound
++
++with tempfile.TemporaryDirectory() as tmpdir:
++    os.makedirs(os.path.join(tmpdir, "dir1"))
++    with open(os.path.join(tmpdir, "dir1", "test.html"), "w") as f:
++        f.write("dir1")
++        
++    loader = FileSystemLoader([os.path.join(tmpdir, "dir1")], path_cache_size=10)
++    env = Environment(loader=loader)
++    
++    # First load
++    assert env.get_template("test.html").render() == "dir1"
++    
++    # Modify
++    with open(os.path.join(tmpdir, "dir1", "test.html"), "w") as f:
++        f.write("dir1_modified")
++    
++    # Second load - should be modified because uptodate() returns False
++    assert env.get_template("test.html").render() == "dir1_modified"
++    
++    # Now, let's test the cache by not modifying the file
++    # The path should be cached.
++    # If I remove the file, it should be resolved again (and fail).
++    os.remove(os.path.join(tmpdir, "dir1", "test.html"))
++    
++    # The cache still has the old path.
++    # The get_source() method checks if the file exists.
++    # If it doesn't exist, it should call resolve_template_path() again.
++    # Let's see if it does.
++    try:
++        env.get_template("test.html")
++    except TemplateNotFound:
++        print("Caught expected TemplateNotFound")
++    
++    print("All tests passed!")
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..24cf63b 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -3,6 +3,7 @@ sources.
+ """
+ import importlib.util
+ import os
++import collections
+ import sys
+ import typing as t
+ import weakref
+@@ -180,6 +181,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_cache_size: int = 0,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,31 +189,83 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.path_cache_size = path_cache_size
++        self._path_cache = collections.OrderedDict() if path_cache_size > 0 else None
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            if os.path.exists(filename):
++                return os.path.abspath(filename)
++        return None
++
++    def clear_path_cache(self) -> None:
++        if self._path_cache is not None:
++            self._path_cache.clear()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 0:
++            raise ValueError("capacity must be a non-negative integer")
++        self.path_cache_size = capacity
++        if capacity == 0:
++            self._path_cache = None
++        else:
++            if self._path_cache is None:
++                self._path_cache = collections.OrderedDict()
++            while len(self._path_cache) > capacity:
++                self._path_cache.popitem(last=False)
++
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+         pieces = split_template_path(template)
+-        for searchpath in self.searchpath:
+-            filename = os.path.join(searchpath, *pieces)
+-            f = open_if_exists(filename)
+-            if f is None:
+-                continue
+-            try:
+-                contents = f.read().decode(self.encoding)
+-            finally:
+-                f.close()
++        if self._path_cache is not None:
++            filename = self._path_cache.get(template)
++            if filename is not None and os.path.exists(filename):
++                higher_priority_found = False
++                for searchpath in self.searchpath:
++                    path = os.path.abspath(os.path.join(searchpath, *pieces))
++                    if path == os.path.abspath(filename):
++                        break
++                    if os.path.exists(path):
++                        higher_priority_found = True
++                        break
++                if not higher_priority_found:
++                    self._path_cache.move_to_end(template)
++                else:
++                    filename = self.resolve_template_path(template)
++                    if filename is not None:
++                        self._path_cache[template] = filename
++            else:
++                filename = self.resolve_template_path(template)
++                if filename is not None:
++                    self._path_cache[template] = filename
++                    if len(self._path_cache) > self.path_cache_size:
++                        self._path_cache.popitem(last=False)
++        else:
++            filename = self.resolve_template_path(template)
++
++        if filename is None:
++            raise TemplateNotFound(template)
++
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(template)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
+ 
+-            mtime = os.path.getmtime(filename)
++        mtime = os.path.getmtime(filename)
+ 
+-            def uptodate() -> bool:
+-                try:
+-                    return os.path.getmtime(filename) == mtime
+-                except OSError:
+-                    return False
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
+ 
+-            return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        return contents, filename, uptodate
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+diff --git a/test_cache_logic.py b/test_cache_logic.py
+new file mode 100644
+index 0000000..b38672d
+--- /dev/null
++++ b/test_cache_logic.py
+@@ -0,0 +1,42 @@
++import collections
++import os
++
++class PathCache:
++    def __init__(self, capacity):
++        self.capacity = capacity
++        self.cache = collections.OrderedDict()
++
++    def get(self, key):
++        if key in self.cache:
++            self.cache.move_to_end(key)
++            return self.cache[key]
++        return None
++
++    def set(self, key, value):
++        if key in self.cache:
++            self.cache.move_to_end(key)
++        self.cache[key] = value
++        if len(self.cache) > self.capacity:
++            self.cache.popitem(last=False)
++
++    def clear(self):
++        self.cache.clear()
++
++    def resize(self, capacity):
++        self.capacity = capacity
++        while len(self.cache) > self.capacity:
++            self.cache.popitem(last=False)
++
++# Test the logic
++cache = PathCache(2)
++cache.set("a", 1)
++cache.set("b", 2)
++assert cache.get("a") == 1
++cache.set("c", 3)
++assert cache.get("b") is None
++assert cache.get("a") == 1
++assert cache.get("c") == 3
++cache.resize(1)
++assert cache.get("a") is None
++assert cache.get("c") == 3
++print("Cache logic works")

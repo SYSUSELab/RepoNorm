@@ -1,0 +1,656 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..42a1275 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,8 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from collections import OrderedDict
++import threading
++from typing import TYPE_CHECKING, Callable
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -53,12 +55,26 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self,
++        model: SteerableModel,
++        cache_compiled_grammars: bool = False,
++        max_cached_grammars: int | None = None,
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        cache_compiled_grammars
++            Whether to cache compiled grammars. When enabled, requests with the
++            same grammar kind and identical source string reuse a successful
++            compilation on this backend instance. Each request still returns a
++            fresh, independent stateful ``XGrammarLogitsProcessor``.
++        max_cached_grammars
++            Maximum number of compiled grammars to keep in the cache. ``None``
++            permits an unbounded cache. Must be a positive integer when set.
++            Least recently used entries are evicted once the limit is reached.
+ 
+         """
+         import xgrammar as xgr
+@@ -78,6 +94,103 @@ class XGrammarBackend(BaseBackend):
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
++        self.cache_compiled_grammars = cache_compiled_grammars
++        if max_cached_grammars is not None:
++            if (
++                isinstance(max_cached_grammars, bool)
++                or not isinstance(max_cached_grammars, int)
++                or max_cached_grammars <= 0
++            ):
++                raise ValueError(
++                    "max_cached_grammars must be a positive integer or None"
++                )
++        self.max_cached_grammars = max_cached_grammars
++
++        if cache_compiled_grammars:
++            self._cache = OrderedDict()
++            self._pending = {}
++            self._cache_lock = threading.Lock()
++
++    def _cache_get_or_compile(
++        self, kind: str, source: str, compile_fn: Callable[[str], str]
++    ) -> str:
++        """Return a compiled grammar, using the cache when enabled.
++
++        Parameters
++        ----------
++        kind
++            The grammar kind (e.g. ``"json_schema"``, ``"regex"``, ``"cfg"``).
++        source
++            The source string for the grammar.
++        compile_fn
++            A callable that takes the source string and returns the compiled
++            grammar.
++
++        Returns
++        -------
++        str
++            The compiled grammar.
++
++        Raises
++        ------
++        Exception
++            Any exception raised by *compile_fn* is propagated. Failed
++            compilations are not cached.
++
++        """
++        if not self.cache_compiled_grammars:
++            return compile_fn(source)
++
++        key = (kind, source)
++
++        with self._cache_lock:
++            # Fast path: already cached.
++            if key in self._cache:
++                self._cache.move_to_end(key)
++                return self._cache[key]
++
++            # Determine whether this thread must compile or wait.
++            if key in self._pending:
++                pending_result, pending_event = self._pending[key]
++                should_compile = False
++            else:
++                pending_result = [None]
++                pending_event = threading.Event()
++                self._pending[key] = (pending_result, pending_event)
++                should_compile = True
++
++        if not should_compile:
++            # Another thread is already compiling this key -- wait for it.
++            pending_event.wait()
++            result = pending_result[0]
++            if isinstance(result, Exception):
++                raise result
++            return result
++
++        # This thread is responsible for compiling.
++        try:
++            compiled = compile_fn(source)
++        except Exception as exc:
++            with self._cache_lock:
++                pending_result[0] = exc
++                pending_event.set()
++                self._pending.pop(key, None)
++            raise
++
++        with self._cache_lock:
++            pending_result[0] = compiled
++            pending_event.set()
++            self._pending.pop(key, None)
++
++            self._cache[key] = compiled
++            self._cache.move_to_end(key)
++
++            if self.max_cached_grammars is not None:
++                while len(self._cache) > self.max_cached_grammars:
++                    self._cache.popitem(last=False)
++
++        return compiled
++
+     def get_json_schema_logits_processor(
+         self, json_schema: str
+     ) -> "LogitsProcessor":
+@@ -94,8 +207,10 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_json_schema(
+-            json_schema
++        compiled_grammar = self._cache_get_or_compile(
++            "json_schema",
++            json_schema,
++            self.grammar_compiler.compile_json_schema,
+         )
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+@@ -113,7 +228,11 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_regex(regex)
++        compiled_grammar = self._cache_get_or_compile(
++            "regex",
++            regex,
++            self.grammar_compiler.compile_regex,
++        )
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+     def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+@@ -130,5 +249,9 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
++        compiled_grammar = self._cache_get_or_compile(
++            "cfg",
++            grammar,
++            self.grammar_compiler.compile_grammar,
++        )
+         return XGrammarLogitsProcessor(compiled_grammar)
+diff --git a/tests/backends/test_xgrammar_caching.py b/tests/backends/test_xgrammar_caching.py
+new file mode 100644
+index 0000000..d8fc25b
+--- /dev/null
++++ b/tests/backends/test_xgrammar_caching.py
+@@ -0,0 +1,467 @@
++"""Tests for compiled grammar caching in XGrammarBackend."""
++
++import threading
++import time
++import sys
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from outlines.backends.xgrammar import XGrammarBackend
++from outlines.models.transformers import Transformers
++
++
++class HFConfig:
++    _name_or_path = "erwanf/gpt2-mini"
++
++
++class HFModel:
++    config = HFConfig()
++
++
++class FakeModel(Transformers):
++    """Minimal fake Transformers model for testing XGrammarBackend."""
++
++    def __init__(self):
++        # Skip Transformers.__init__ by calling object.__init__
++        object.__init__(self)
++
++    model = HFModel()
++
++    class HFTokenizer:
++        pass
++
++    hf_tokenizer = HFTokenizer()
++
++
++@pytest.fixture
++def mock_xgrammar():
++    """Patch xgrammar module used internally by XGrammarBackend.
++
++    XGrammarBackend does ``import xgrammar as xgr`` inside __init__,
++    so we install a mock into sys.modules before instantiation.
++    """
++    # Build a mock xgrammar module
++    mock_xgr = MagicMock()
++    fake_tokenizer_info = MagicMock()
++    mock_xgr.TokenizerInfo.from_huggingface.return_value = fake_tokenizer_info
++
++    mock_compiler = MagicMock()
++    mock_compiler.compile_json_schema.return_value = "compiled_json"
++    mock_compiler.compile_regex.return_value = "compiled_regex"
++    mock_compiler.compile_grammar.return_value = "compiled_cfg"
++    mock_xgr.GrammarCompiler.return_value = mock_compiler
++
++    mock_xgr.contrib = MagicMock()
++    mock_xgr.contrib.hf.LogitsProcessor = MagicMock()
++
++    # Inject into sys.modules so 'import xgrammar as xgr' inside __init__ gets it
++    old_module = sys.modules.get("xgrammar")
++    sys.modules["xgrammar"] = mock_xgr
++
++    # Patch AutoConfig (lazy import inside __init__)
++    with patch("transformers.AutoConfig") as mock_auto_config:
++
++        fake_config = MagicMock()
++        fake_config.vocab_size = 50000
++        mock_auto_config.from_pretrained.return_value = fake_config
++
++        yield mock_xgr, mock_compiler
++
++    # Restore sys.modules
++    if old_module is not None:
++        sys.modules["xgrammar"] = old_module
++    else:
++        del sys.modules["xgrammar"]
++
++
++def _make_backend(mock_xgrammar, cache=False, max_size=None):
++    """Helper to create an XGrammarBackend with mocks."""
++    _, _ = mock_xgrammar
++    model = FakeModel()
++    backend = XGrammarBackend(model, cache, max_size)
++    return backend
++
++
++class TestXGrammarBackendCachingInit:
++    """Test __init__ parameter validation."""
++
++    def test_default_no_caching(self, mock_xgrammar):
++        """Caching is disabled by default."""
++        backend = _make_backend(mock_xgrammar, cache=False)
++        assert backend.cache_compiled_grammars is False
++        assert backend.max_cached_grammars is None
++        assert not hasattr(backend, "_cache")
++
++    def test_enable_caching_unbounded(self, mock_xgrammar):
++        """Enable caching with no limit."""
++        backend = _make_backend(mock_xgrammar, cache=True)
++        assert backend.cache_compiled_grammars is True
++        assert backend.max_cached_grammars is None
++        assert hasattr(backend, "_cache")
++        assert len(backend._cache) == 0
++
++    def test_enable_caching_with_limit(self, mock_xgrammar):
++        """Enable caching with a max size."""
++        backend = _make_backend(mock_xgrammar, cache=True, max_size=5)
++        assert backend.cache_compiled_grammars is True
++        assert backend.max_cached_grammars == 5
++
++    def test_limit_none_without_cache(self, mock_xgrammar):
++        """max_cached_grammars=None without caching is fine."""
++        backend = _make_backend(mock_xgrammar, cache=False, max_size=None)
++        assert backend.max_cached_grammars is None
++
++    def test_invalid_limit_zero(self, mock_xgrammar):
++        """max_cached_grammars=0 raises ValueError."""
++        with pytest.raises(ValueError, match="positive integer"):
++            _make_backend(mock_xgrammar, cache=True, max_size=0)
++
++    def test_invalid_limit_negative(self, mock_xgrammar):
++        """max_cached_grammars=-1 raises ValueError."""
++        with pytest.raises(ValueError, match="positive integer"):
++            _make_backend(mock_xgrammar, cache=True, max_size=-1)
++
++    def test_invalid_limit_bool_true(self, mock_xgrammar):
++        """max_cached_grammars=True raises ValueError."""
++        with pytest.raises(ValueError, match="positive integer"):
++            _make_backend(mock_xgrammar, cache=True, max_size=True)
++
++    def test_invalid_limit_bool_false(self, mock_xgrammar):
++        """max_cached_grammars=False raises ValueError."""
++        with pytest.raises(ValueError, match="positive integer"):
++            _make_backend(mock_xgrammar, cache=True, max_size=False)
++
++    def test_invalid_limit_float(self, mock_xgrammar):
++        """max_cached_grammars=1.5 raises ValueError."""
++        with pytest.raises(ValueError, match="positive integer"):
++            _make_backend(mock_xgrammar, cache=True, max_size=1.5)
++
++
++class TestXGrammarBackendCachingDisabled:
++    """When caching is disabled, every request compiles normally."""
++
++    def test_no_cache_json_schema(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=False)
++
++        p1 = backend.get_json_schema_logits_processor('{"type":"string"}')
++        p2 = backend.get_json_schema_logits_processor('{"type":"string"}')
++
++        # Should compile twice
++        assert mock_compiler.compile_json_schema.call_count == 2
++        # Each processor is a fresh instance
++        assert p1 is not p2
++
++    def test_no_cache_regex(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=False)
++
++        p1 = backend.get_regex_logits_processor(r"\d+")
++        p2 = backend.get_regex_logits_processor(r"\d+")
++
++        assert mock_compiler.compile_regex.call_count == 2
++        assert p1 is not p2
++
++    def test_no_cache_cfg(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=False)
++
++        p1 = backend.get_cfg_logits_processor("root ::= yes")
++        p2 = backend.get_cfg_logits_processor("root ::= yes")
++
++        assert mock_compiler.compile_grammar.call_count == 2
++        assert p1 is not p2
++
++
++class TestXGrammarBackendCachingEnabled:
++    """When caching is enabled, reuse compilations for same key."""
++
++    def test_cache_hit_json_schema(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        p1 = backend.get_json_schema_logits_processor('{"type":"string"}')
++        p2 = backend.get_json_schema_logits_processor('{"type":"string"}')
++
++        # Only one call to compile
++        assert mock_compiler.compile_json_schema.call_count == 1
++        # Fresh processors
++        assert p1 is not p2
++        assert p1.compiled_grammar == p2.compiled_grammar
++
++    def test_cache_hit_regex(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        p1 = backend.get_regex_logits_processor(r"\d+")
++        p2 = backend.get_regex_logits_processor(r"\d+")
++
++        assert mock_compiler.compile_regex.call_count == 1
++        assert p1 is not p2
++
++    def test_cache_hit_cfg(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        p1 = backend.get_cfg_logits_processor("root ::= yes")
++        p2 = backend.get_cfg_logits_processor("root ::= yes")
++
++        assert mock_compiler.compile_grammar.call_count == 1
++        assert p1 is not p2
++
++    def test_different_keys_dont_interfere(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        backend.get_json_schema_logits_processor('{"type":"string"}')
++        backend.get_regex_logits_processor(r"\d+")
++
++        assert mock_compiler.compile_json_schema.call_count == 1
++        assert mock_compiler.compile_regex.call_count == 1
++
++    def test_different_sources_different_entries(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        p1 = backend.get_json_schema_logits_processor('{"type":"string"}')
++        p2 = backend.get_json_schema_logits_processor('{"type":"integer"}')
++
++        assert mock_compiler.compile_json_schema.call_count == 2
++        assert p1 is not p2
++
++    def test_different_kinds_isolated(self, mock_xgrammar):
++        """Same source string but different kinds are cached separately."""
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        # Use same string but different kinds
++        backend.get_json_schema_logits_processor("same_string")
++        backend.get_regex_logits_processor("same_string")
++
++        assert mock_compiler.compile_json_schema.call_count == 1
++        assert mock_compiler.compile_regex.call_count == 1
++
++
++class TestXGrammarBackendLRUEviction:
++    """Test least-recently-used eviction when cache is full."""
++
++    def test_evict_lru(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True, max_size=2)
++
++        s1 = '{"type":"string"}'
++        s2 = '{"type":"integer"}'
++        s3 = '{"type":"boolean"}'
++
++        backend.get_json_schema_logits_processor(s1)
++        backend.get_json_schema_logits_processor(s2)
++        assert len(backend._cache) == 2
++
++        # Access s2 (refresh recency), then add s3 - should evict s1 (LRU)
++        backend.get_json_schema_logits_processor(s2)  # hit, refresh
++        backend.get_json_schema_logits_processor(s3)  # miss, add, evict
++
++        assert len(backend._cache) == 2
++        # s1 should have been evicted
++        assert ("json_schema", s1) not in backend._cache
++        assert ("json_schema", s2) in backend._cache
++        assert ("json_schema", s3) in backend._cache
++
++    def test_hit_refreshes_recency(self, mock_xgrammar):
++        """Accessing an entry keeps it from being evicted."""
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True, max_size=2)
++
++        s1 = '{"type":"string"}'
++        s2 = '{"type":"integer"}'
++        s3 = '{"type":"boolean"}'
++
++        backend.get_json_schema_logits_processor(s1)  # LRU = s1
++        backend.get_json_schema_logits_processor(s2)
++
++        backend.get_json_schema_logits_processor(s1)  # refresh s1
++        backend.get_json_schema_logits_processor(s3)  # evicts LRU = s2
++
++        assert len(backend._cache) == 2
++        assert ("json_schema", s1) in backend._cache
++        assert ("json_schema", s2) not in backend._cache  # evicted
++        assert ("json_schema", s3) in backend._cache
++
++
++class TestXGrammarBackendConcurrentAccess:
++    """Test thread safety of the cache."""
++
++    def test_concurrent_cold_requests_share_compilation(self, mock_xgrammar):
++        """Multiple threads requesting the same key share one compilation."""
++        mock_xgr, mock_compiler = mock_xgrammar
++
++        # Make compile_json_schema slow so threads pile up
++        def slow_compile(schema):
++            time.sleep(0.2)
++            return "compiled_" + schema
++
++        mock_compiler.compile_json_schema.side_effect = slow_compile
++
++        # Use same fixture patches but create backend directly
++        model = FakeModel()
++        with patch("transformers.AutoConfig") as mock_ac:
++            mock_ac.from_pretrained.return_value.vocab_size = 50000
++            backend = XGrammarBackend(model, True)
++
++        results = []
++        errors = []
++
++        def request():
++            try:
++                p = backend.get_json_schema_logits_processor('{"type":"string"}')
++                results.append(p.compiled_grammar)
++            except Exception as e:
++                errors.append(e)
++
++        threads = [threading.Thread(target=request) for _ in range(5)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 0
++        assert len(results) == 5
++        # Only one actual compile call
++        assert mock_compiler.compile_json_schema.call_count == 1
++
++    def test_concurrent_compilation_failure_propagates(self, mock_xgrammar):
++        """If compilation fails, all waiting threads get the exception."""
++        mock_xgr, mock_compiler = mock_xgrammar
++
++        def failing_compile(schema):
++            time.sleep(0.1)
++            raise ValueError("Compilation failed")
++
++        mock_compiler.compile_json_schema.side_effect = failing_compile
++
++        model = FakeModel()
++        with patch("transformers.AutoConfig") as mock_ac:
++            mock_ac.from_pretrained.return_value.vocab_size = 50000
++            backend = XGrammarBackend(model, True)
++
++        errors = []
++
++        def request():
++            try:
++                backend.get_json_schema_logits_processor('{"type":"string"}')
++            except ValueError as e:
++                errors.append(str(e))
++
++        threads = [threading.Thread(target=request) for _ in range(5)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++
++        assert len(errors) == 5
++        assert all(e == "Compilation failed" for e in errors)
++        # Failed entry is not cached
++        assert len(backend._cache) == 0
++
++    def test_retry_after_failure(self, mock_xgrammar):
++        """After a failed compilation, a later request can retry and succeed."""
++        mock_xgr, mock_compiler = mock_xgrammar
++
++        call_count = [0]
++
++        def first_fail_then_succeed(schema):
++            call_count[0] += 1
++            if call_count[0] == 1:
++                raise ValueError("First attempt fails")
++            return "compiled_success"
++
++        mock_compiler.compile_json_schema.side_effect = first_fail_then_succeed
++
++        model = FakeModel()
++        with patch("transformers.AutoConfig") as mock_ac:
++            mock_ac.from_pretrained.return_value.vocab_size = 50000
++            backend = XGrammarBackend(model, True)
++
++        # First attempt fails
++        with pytest.raises(ValueError, match="First attempt fails"):
++            backend.get_json_schema_logits_processor('{"type":"string"}')
++
++        assert len(backend._cache) == 0
++
++        # Second attempt succeeds
++        p = backend.get_json_schema_logits_processor('{"type":"string"}')
++        assert p.compiled_grammar == "compiled_success"
++        assert mock_compiler.compile_json_schema.call_count == 2
++
++    def test_different_keys_compile_independently(self, mock_xgrammar):
++        """Different keys can be compiled concurrently without interference."""
++        mock_xgr, mock_compiler = mock_xgrammar
++
++        barrier = threading.Barrier(2, timeout=2)
++
++        def slow_compile1(schema):
++            barrier.wait()
++            time.sleep(0.1)
++            return "compiled_1"
++
++        def slow_compile2(schema):
++            barrier.wait()
++            time.sleep(0.1)
++            return "compiled_2"
++
++        mock_compiler.compile_json_schema.side_effect = slow_compile1
++        mock_compiler.compile_regex.side_effect = slow_compile2
++
++        model = FakeModel()
++        with patch("transformers.AutoConfig") as mock_ac:
++            mock_ac.from_pretrained.return_value.vocab_size = 50000
++            backend = XGrammarBackend(model, True)
++
++        results = {"json": None, "regex": None}
++        errors = []
++
++        def request_json():
++            try:
++                p = backend.get_json_schema_logits_processor('{"type":"string"}')
++                results["json"] = p.compiled_grammar
++            except Exception as e:
++                errors.append(("json", e))
++
++        def request_regex():
++            try:
++                p = backend.get_regex_logits_processor(r"\d+")
++                results["regex"] = p.compiled_grammar
++            except Exception as e:
++                errors.append(("regex", e))
++
++        t1 = threading.Thread(target=request_json)
++        t2 = threading.Thread(target=request_regex)
++        t1.start()
++        t2.start()
++        t1.join()
++        t2.join()
++
++        assert len(errors) == 0
++        assert results["json"] == "compiled_1"
++        assert results["regex"] == "compiled_2"
++        assert mock_compiler.compile_json_schema.call_count == 1
++        assert mock_compiler.compile_regex.call_count == 1
++
++
++class TestXGrammarBackendProcessorIndependence:
++    """Each factory call returns a fresh, independent processor."""
++
++    def test_fresh_processor_each_call(self, mock_xgrammar):
++        mock_xgr, mock_compiler = mock_xgrammar
++        backend = _make_backend(mock_xgrammar, cache=True)
++
++        p1 = backend.get_json_schema_logits_processor('{"type":"string"}')
++        p2 = backend.get_json_schema_logits_processor('{"type":"string"}')
++
++        assert p1 is not p2
++        # Reset independently (reset sets xgrammar_logits_processor to None)
++        p1.reset()
++        assert p1.xgrammar_logits_processor is None
++        # p2 was not reset, but both start as None, so just check they're different objects
++        assert p2.xgrammar_logits_processor is None

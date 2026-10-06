@@ -1,0 +1,255 @@
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..e7c7524 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,250 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++def test_option_history_keeps_hidden_option_and_callback_injection(runner):
++    received = []
++
++    def inject(ctx, param, value):
++        ctx.params["derived"] = value.upper()
++        return value
++
++    @click.command(track_changes=True)
++    @click.option("--secret", expose_value=False, callback=inject)
++    @click.option("--count", type=int, default=2)
++    def cli(count, derived):
++        ctx = click.get_current_context()
++        assert "secret" not in ctx.params
++        assert ctx.get_option_history("--secret") == []
++        assert ctx.get_option_history("derived") == []
++        history = ctx.get_option_history("count")
++        assert [entry["value"] for entry in history] == [2]
++        assert history[0]["source"] is click.core.ParameterSource.DEFAULT
++        received.append((count, derived))
++
++    result = runner.invoke(cli, ["--secret", "alpha"])
++    assert result.exit_code == 0, (result.output, result.exception)
++    assert received == [(2, "ALPHA")]
++
++
++def test_option_history_disabled_by_default(runner):
++    @click.command()
++    @click.option("-c", "--count", default=1)
++    def cli(count):
++        assert click.get_current_context().get_option_history("count") is None
++
++    result = runner.invoke(cli)
++    assert result.exit_code == 0, result.output
++
++
++def test_option_history_accepts_parameter_name_and_option_spellings(runner):
++    observed = []
++
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", type=int, default=1)
++    def cli(count):
++        ctx = click.get_current_context()
++        by_name = ctx.get_option_history("count")
++        by_long_option = ctx.get_option_history("--count")
++        by_short_option = ctx.get_option_history("-c")
++        observed.extend((by_name, by_long_option, by_short_option))
++
++        assert ctx.get_option_history("--missing") == []
++
++    result = runner.invoke(cli, ["-c", "5"])
++    assert result.exit_code == 0, result.output
++    assert observed[0] == observed[1] == observed[2]
++    assert observed[0] is not observed[1]
++    assert observed[0] == [
++        {
++            "value": 5,
++            "source": click.core.ParameterSource.COMMANDLINE,
++            "timestamp": observed[0][0]["timestamp"],
++        }
++    ]
++    assert isinstance(observed[0][0]["timestamp"], float)
++    assert observed[0][0]["timestamp"] > 0
++
++
++@pytest.mark.parametrize(
++    ("invoke_kwargs", "expected_value", "expected_source"),
++    [
++        ({}, 1, click.core.ParameterSource.DEFAULT),
++        (
++            {"default_map": {"count": "2"}},
++            2,
++            click.core.ParameterSource.DEFAULT_MAP,
++        ),
++        (
++            {"env": {"CLICK_HISTORY_COUNT": "3"}},
++            3,
++            click.core.ParameterSource.ENVIRONMENT,
++        ),
++        (
++            {"args": ["--count", "4"]},
++            4,
++            click.core.ParameterSource.COMMANDLINE,
++        ),
++    ],
++)
++def test_option_history_records_final_value_and_winning_source(
++    runner, invoke_kwargs, expected_value, expected_source
++):
++    observed = []
++
++    @click.command(track_changes=True)
++    @click.option("--count", type=int, envvar="CLICK_HISTORY_COUNT", default=1)
++    def cli(count):
++        observed.extend(click.get_current_context().get_option_history("count"))
++
++    result = runner.invoke(cli, **invoke_kwargs)
++    assert result.exit_code == 0, result.output
++    assert len(observed) == 1
++    assert observed[0]["value"] == expected_value
++    assert observed[0]["source"] is expected_source
++
++
++def test_option_history_records_prompt_source(runner):
++    observed = []
++
++    @click.command(track_changes=True)
++    @click.option("--name", prompt=True)
++    def cli(name):
++        observed.extend(click.get_current_context().get_option_history("name"))
++
++    result = runner.invoke(cli, input="Ada\n")
++    assert result.exit_code == 0, result.output
++    assert len(observed) == 1
++    assert observed[0]["value"] == "Ada"
++    assert observed[0]["source"] is click.core.ParameterSource.PROMPT
++
++
++def test_option_history_records_value_after_type_and_callback(runner):
++    observed = []
++
++    def double(ctx, parameter, value):
++        return value * 2
++
++    @click.command(track_changes=True)
++    @click.option("--number", type=int, callback=double)
++    def cli(number):
++        observed.extend(click.get_current_context().get_option_history("number"))
++
++    result = runner.invoke(cli, ["--number", "6"])
++    assert result.exit_code == 0, result.output
++    assert len(observed) == 1
++    assert observed[0]["value"] == 12
++    assert observed[0]["source"] is click.core.ParameterSource.COMMANDLINE
++
++
++def test_option_history_records_multiple_value_once(runner):
++    observed = []
++
++    @click.command(track_changes=True)
++    @click.option("--item", multiple=True, type=int)
++    def cli(item):
++        observed.extend(click.get_current_context().get_option_history("item"))
++
++    result = runner.invoke(cli, ["--item", "1", "--item", "2"])
++    assert result.exit_code == 0, result.output
++    assert len(observed) == 1
++    assert observed[0]["value"] == (1, 2)
++
++
++def test_option_history_does_not_record_arguments(runner):
++    observed = []
++
++    @click.command(track_changes=True)
++    @click.argument("filename")
++    def cli(filename):
++        observed.extend(click.get_current_context().get_option_history("filename"))
++
++    result = runner.invoke(cli, ["example.txt"])
++    assert result.exit_code == 0, result.output
++    assert observed == []
++
++
++def test_option_history_group_and_subcommand_contexts_are_independent(runner):
++    parent_history = []
++    child_history = []
++    cross_context_results = []
++
++    @click.group(track_changes=True)
++    @click.option("--verbose", is_flag=True)
++    def cli(verbose):
++        ctx = click.get_current_context()
++        parent_history.extend(ctx.get_option_history("--verbose"))
++        cross_context_results.append(ctx.get_option_history("--count"))
++
++    @cli.command(track_changes=True)
++    @click.option("-c", "--count", type=int, default=1)
++    def child(count):
++        ctx = click.get_current_context()
++        child_history.extend(ctx.get_option_history("-c"))
++        cross_context_results.append(ctx.get_option_history("--verbose"))
++
++    result = runner.invoke(cli, ["--verbose", "child", "--count", "5"])
++    assert result.exit_code == 0, result.output
++    assert len(parent_history) == len(child_history) == 1
++    assert parent_history[0]["value"] is True
++    assert child_history[0]["value"] == 5
++    assert cross_context_results == [[], []]
++
++
++def test_option_history_is_fresh_for_each_invocation(runner):
++    histories = []
++
++    @click.command(track_changes=True)
++    @click.option("--count", type=int, default=1)
++    def cli(count):
++        histories.append(click.get_current_context().get_option_history("count"))
++
++    first = runner.invoke(cli)
++    second = runner.invoke(cli, ["--count", "9"])
++    assert first.exit_code == second.exit_code == 0
++    assert [len(history) for history in histories] == [1, 1]
++    assert [history[0]["value"] for history in histories] == [1, 9]
++    assert histories[0][0]["source"] is click.core.ParameterSource.DEFAULT
++    assert histories[1][0]["source"] is click.core.ParameterSource.COMMANDLINE
++
++
++def test_option_history_appends_later_context_assignments(runner):
++    snapshots = []
++
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", type=int, default=1)
++    def cli(count):
++        ctx = click.get_current_context()
++        snapshots.append(ctx.get_option_history("--count"))
++        ctx.params["count"] = 2
++        ctx.params["count"] = 3
++        snapshots.append(ctx.get_option_history("-c"))
++
++    result = runner.invoke(cli)
++    assert result.exit_code == 0, result.output
++    assert [entry["value"] for entry in snapshots[0]] == [1]
++    assert [entry["value"] for entry in snapshots[1]] == [1, 2, 3]
++    assert [entry["source"] for entry in snapshots[1]] == [
++        click.core.ParameterSource.DEFAULT,
++        None,
++        None,
++    ]
++
++
++def test_option_history_result_cannot_mutate_context_records(runner):
++    observed = []
++
++    @click.command(track_changes=True)
++    @click.option("--count", type=int, default=1)
++    def cli(count):
++        ctx = click.get_current_context()
++        first = ctx.get_option_history("count")
++        first[0]["value"] = 999
++        first.append({"value": 1000})
++        observed.extend(ctx.get_option_history("count"))
++
++    result = runner.invoke(cli)
++    assert result.exit_code == 0, result.output
++    assert len(observed) == 1
++    assert observed[0]["value"] == 1

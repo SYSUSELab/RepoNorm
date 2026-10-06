@@ -1,0 +1,200 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..5310dcb 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -3,6 +3,8 @@ sources.
+ """
+ import importlib.util
+ import os
++import threading
++import time
+ import sys
+ import typing as t
+ import weakref
+@@ -148,6 +150,7 @@ class BaseLoader:
+         )
+ 
+ 
++
+ class FileSystemLoader(BaseLoader):
+     """Load templates from a directory in the file system.
+ 
+@@ -170,9 +173,10 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param auto_reload: Whether to automatically reload templates when they change.
+ 
+     .. versionchanged:: 2.8
+-        Added the ``followlinks`` parameter.
++        Added the followlinks parameter.
+     """
+ 
+     def __init__(
+@@ -180,6 +184,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        auto_reload: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,10 +192,38 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.auto_reload = auto_reload
++        self._environments = weakref.WeakSet()
++        self._monitor = None
++        self._monitor_lock = threading.Lock()
++
++    def start_monitoring(self) -> None:
++        if not self.auto_reload:
++            return
++        with self._monitor_lock:
++            if self._monitor is None:
++                self._monitor = _FileSystemMonitor(self)
++                self._monitor.start()
++
++    def close(self) -> None:
++        with self._monitor_lock:
++            if self._monitor is not None:
++                self._monitor.stop()
++                self._monitor = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        if self.auto_reload:
++            self._environments.add(environment)
++            self.start_monitoring()
++
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+@@ -231,6 +264,7 @@ class FileSystemLoader(BaseLoader):
+         return sorted(found)
+ 
+ 
++
+ class PackageLoader(BaseLoader):
+     """Load templates from a directory in a Python package.
+ 
+@@ -650,3 +684,58 @@ class ModuleLoader(BaseLoader):
+         return environment.template_class.from_module_dict(
+             environment, mod.__dict__, globals
+         )
++
++
++class _FileSystemMonitor(threading.Thread):
++    def __init__(self, loader: FileSystemLoader) -> None:
++        super().__init__(daemon=True)
++        self.loader = weakref.proxy(loader)
++        self._stop_event = threading.Event()
++        self._last_mtimes = {}
++
++    def run(self) -> None:
++        while not self._stop_event.is_set():
++            self.scan_once()
++            time.sleep(0.5)
++
++    def stop(self) -> None:
++        self._stop_event.set()
++        self.join()
++
++    def scan_once(self) -> t.List[str]:
++        changed = []
++        current_mtimes = {}
++        for searchpath in self.loader.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.loader.followlinks):
++                for filename in filenames:
++                    path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(path)
++                    except OSError:
++                        continue
++                    current_mtimes[path] = mtime
++                    if path in self._last_mtimes and self._last_mtimes[path] != mtime:
++                        changed.append(path)
++                    elif path not in self._last_mtimes:
++                        changed.append(path)
++        
++        # Check for deleted files
++        for path in self._last_mtimes:
++            if path not in current_mtimes:
++                changed.append(path)
++        
++        self._last_mtimes = current_mtimes
++        return self.invalidate_changed(changed)
++
++    def invalidate_changed(self, paths: t.List[str]) -> t.List[str]:
++        invalidated = []
++        for path in paths:
++            for env in self.loader._environments:
++                for name, template in list(env.cache.items()):
++                    if template.filename == path:
++                        try:
++                            del env.cache[name]
++                        except KeyError:
++                            pass
++                        invalidated.append(name)
++        return invalidated
+diff --git a/tests/test_loader_auto_reload.py b/tests/test_loader_auto_reload.py
+new file mode 100644
+index 0000000..87f6f79
+--- /dev/null
++++ b/tests/test_loader_auto_reload.py
+@@ -0,0 +1,47 @@
++import os
++import time
++import unittest
++import weakref
++from jinja2 import Environment, FileSystemLoader
++import tempfile
++import shutil
++
++class TestFileSystemLoaderAutoReload(unittest.TestCase):
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.template_file = os.path.join(self.tmpdir, "test.html")
++        with open(self.template_file, "w") as f:
++            f.write("hello")
++        self.loader = FileSystemLoader(self.tmpdir, auto_reload=True)
++        self.env = Environment(loader=self.loader)
++
++    def tearDown(self):
++        self.loader.close()
++        shutil.rmtree(self.tmpdir)
++
++    def test_auto_reload_invalidates_cache(self):
++        # Load template
++        template = self.env.get_template("test.html")
++        self.assertEqual(template.render(), "hello")
++        
++        # The cache key is (weakref.ref(self.loader), "test.html")
++        cache_key = (weakref.ref(self.loader), "test.html")
++        self.assertIn(cache_key, self.env.cache)
++
++        # Modify template
++        with open(self.template_file, "w") as f:
++            f.write("world")
++
++        # Wait for monitor to pick up change (0.5s interval)
++        time.sleep(1.0)
++
++        # Template should be reloaded
++        # The cache should have been invalidated
++        self.assertNotIn(cache_key, self.env.cache)
++        
++        template = self.env.get_template("test.html")
++        self.assertEqual(template.render(), "world")
++        self.assertIn(cache_key, self.env.cache)
++
++if __name__ == "__main__":
++    unittest.main()

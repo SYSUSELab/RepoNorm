@@ -1,0 +1,106 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..011681f 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,15 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        if monitor_process is not None and not callable(monitor_process):
++            raise TypeError("monitor_process must be callable")
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -507,6 +511,16 @@ class Editor:
+ 
+     def edit_file(self, filename: str) -> None:
+         import subprocess
++        import time
++        import warnings
++        import os
++
++        def _emit(event_type, pid, cmd):
++            if self.monitor_process:
++                try:
++                    self.monitor_process(event_type, pid, cmd, time.time())
++                except Exception as e:
++                    warnings.warn(f"monitor_process callback failed: {e}", UserWarning)
+ 
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+@@ -517,7 +531,34 @@ class Editor:
+ 
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            _emit("start", c.pid, editor)
++
++            # Monitoring loop
++            if self.monitor_process and not WIN:
++                is_stopped = False
++                while True:
++                    try:
++                        pid, status = os.waitpid(c.pid, os.WNOHANG | os.WUNTRACED | os.WCONTINUED)
++                        if pid != 0:
++                            if os.WIFEXITED(status) or os.WIFSIGNALED(status):
++                                break
++                            elif os.WIFSTOPPED(status):
++                                if not is_stopped:
++                                    _emit("suspend", c.pid, editor)
++                                    is_stopped = True
++                            elif os.WIFCONTINUED(status):
++                                if is_stopped:
++                                    _emit("resume", c.pid, editor)
++                                    is_stopped = False
++                    except ChildProcessError:
++                        break
++                    time.sleep(0.1)
++                exit_code = c.wait()
++            else:
++                exit_code = c.wait()
++
++            _emit("terminate", c.pid, editor)
++
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+@@ -526,7 +567,6 @@ class Editor:
+             raise ClickException(
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+-
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..5119ed5 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,11 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param monitor_process: optionally a callback to monitor the editor process.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, monitor_process=monitor_process)
+ 
+     if filename is None:
+         return ed.edit(text)

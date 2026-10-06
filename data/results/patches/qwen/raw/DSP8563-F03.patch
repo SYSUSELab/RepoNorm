@@ -1,0 +1,201 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..1ba1f5dc 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,7 @@
+ import asyncio
+ import inspect
++import re
++from decimal import Decimal, InvalidOperation
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -15,6 +17,118 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++# Regex patterns for unit parsing
++_DURATION_PATTERN = re.compile(r'^(\s*[+-]?\d+\s*(?:ms|s|m|h)\s*)$')
++_SIZE_PATTERN = re.compile(r'^(\s*[+-]?\d+\s*(?:KB|MB|GB)\s*)$')
++
++# Duration suffixes to seconds multiplier
++_DURATION_SUFFIXES = {
++    "ms": 0.001,
++    "s": 1.0,
++    "m": 60.0,
++    "h": 3600.0,
++}
++
++# Size suffixes to bytes multiplier (decimal factors)
++_SIZE_SUFFIXES = {
++    "KB": 1000,
++    "MB": 1000000,
++    "GB": 1000000000,
++}
++
++
++def _coerce_scalar_value(value: Any, schema_type: str | None) -> Any:
++    """Coerce scalar string values according to JSON schema type.
++    
++    Args:
++        value: The value to coerce.
++        schema_type: The JSON schema type (e.g., "integer", "number", "boolean").
++        
++    Returns:
++        The coerced value, or the original value if coercion is not applicable.
++    """
++    # Only process string values
++    if not isinstance(value, str):
++        return value
++    
++    # Trim surrounding whitespace
++    trimmed = value.strip()
++    
++    # Handle empty strings
++    if not trimmed:
++        return value
++    
++    # Boolean coercion: accept case-insensitive "true" and "false"
++    if schema_type == "boolean":
++        lower = trimmed.lower()
++        if lower == "true":
++            return True
++        elif lower == "false":
++            return False
++        return value
++    
++    # Integer and number coercion
++    if schema_type in ("integer", "number"):
++        # Try to parse as duration first (for number types)
++        if schema_type == "number":
++            match = _DURATION_PATTERN.match(trimmed)
++            if match:
++                try:
++                    duration_str = match.group(1).strip()
++                    # Extract magnitude and suffix
++                    magnitude_match = re.match(r'^([+-]?\d+)\s*(ms|s|m|h)$', duration_str)
++                    if magnitude_match:
++                        magnitude = int(magnitude_match.group(1))
++                        suffix = magnitude_match.group(2)
++                        return magnitude * _DURATION_SUFFIXES[suffix]
++                except (ValueError, KeyError):
++                    pass
++        
++        # Try to parse as size (for integer types)
++        if schema_type == "integer":
++            match = _SIZE_PATTERN.match(trimmed)
++            if match:
++                try:
++                    size_str = match.group(1).strip()
++                    # Extract magnitude and suffix
++                    magnitude_match = re.match(r'^([+-]?\d+)\s*(KB|MB|GB)$', size_str)
++                    if magnitude_match:
++                        magnitude = int(magnitude_match.group(1))
++                        suffix = magnitude_match.group(2)
++                        # Truncate fractional bytes toward zero
++                        return int(magnitude * _SIZE_SUFFIXES[suffix])
++                except (ValueError, KeyError):
++                    pass
++        
++        # Try to parse as a numeric string using Decimal for precision
++        try:
++            # Check for valid numeric format (optional sign, digits, optional decimal, optional exponent)
++            numeric_pattern = r'^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$'
++            if re.match(numeric_pattern, trimmed):
++                # Use Decimal for precise parsing
++                decimal_val = Decimal(trimmed)
++                
++                # Reject NaN and Inf
++                if not decimal_val.is_finite():
++                    return value
++                
++                # For integer schema, reject non-integral values
++                if schema_type == "integer":
++                    if decimal_val != decimal_val.to_integral_value():
++                        return value
++                    # Return as int to preserve exact representation
++                    return int(decimal_val)
++                else:
++                    # For number schema, convert to float
++                    return float(decimal_val)
++        except (InvalidOperation, ValueError, TypeError):
++            pass
++        
++        return value
++    
++    # For other types (string, array, object), don't coerce
++    return value
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -116,13 +230,28 @@ class Tool(Type):
+         self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+ 
+     def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
++        # Coerce scalar string values before validation
++        coerced_kwargs = {}
+         for k, v in kwargs.items():
+             if k not in self.args:
+                 if self.has_kwargs:
++                    coerced_kwargs[k] = v
+                     continue
+                 else:
+                     raise ValueError(f"Arg {k} is not in the tool's args.")
++            
++            # Get the schema type for this argument
++            schema = self.args[k]
++            schema_type = schema.get("type")
++            
++            # Apply coercion only for string values
++            coerced_kwargs[k] = _coerce_scalar_value(v, schema_type)
++        
++        # Validate the args value comply to the json schema.
++        for k, v in coerced_kwargs.items():
++            # Skip validation for kwargs passed through **kwargs
++            if k not in self.args:
++                continue
+             try:
+                 instance = v.model_dump() if hasattr(v, "model_dump") else v
+                 type_str = self.args[k].get("type")
+@@ -133,7 +262,7 @@ class Tool(Type):
+ 
+         # Parse the args to the correct type.
+         parsed_kwargs = {}
+-        for k, v in kwargs.items():
++        for k, v in coerced_kwargs.items():
+             if k in self.arg_types and self.arg_types[k] != Any:
+                 # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+                 # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+@@ -204,6 +333,21 @@ class Tool(Type):
+ 
+         Returns:
+             A Tool object.
++
++        Example:
++
++        ```python
++        import asyncio
++        import dspy
++        from mcp import ClientSession
++
++        async def run_tool():
++            async with ClientSession() as session:
++                tool = dspy.Tool.from_mcp_tool(session, some_mcp_tool)
++                return await tool.acall(arg1="value1")
++
++        print(asyncio.run(run_tool()))
++        ```
+         """
+         from dspy.utils.mcp import convert_mcp_tool
+ 
+@@ -229,7 +373,7 @@ class Tool(Type):
+ 
+         @lc_tool
+         def add(x: int, y: int):
+-            "Add two numbers together."
++            \"Add two numbers together.\"
+             return x + y
+ 
+         dspy_tool = dspy.Tool.from_langchain(add)

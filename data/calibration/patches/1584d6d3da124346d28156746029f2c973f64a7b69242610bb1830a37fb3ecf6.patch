@@ -1,0 +1,172 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..ad77788 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,12 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add opt-in caching for pure scalar ``Option`` type conversions.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/docs/options.md b/docs/options.md
+index c2dd2b6..9fc858c 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -17,6 +17,11 @@ Useful and often used kwargs are:
+ - `required`: Makes option required.
+ - `type`: Sets {ref}`parameter type <parameter-types>`
+ 
++Options may opt in to caching successful pure scalar type conversions
++with `cache=True`. File and path types, composite values, `None`,
++unhashable values, and failed conversions are never cached. Callbacks
++still run per invocation.
++
+ ```{contents}
+ :depth: 2
+ :local: true
+@@ -449,3 +454,5 @@ value will be `flag_value`.
+     invoke(hello, args=["--name", "Value"])
+     invoke(hello, args=["--name"])
+ ```
++
++Conversion caching includes files, paths, failures, and callback results.
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..2f1b603 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2504,10 +2504,17 @@ class Option(Parameter):
+                                parameter will be pulled from an environment
+                                variable in case a prefix is defined on the
+                                context.
++    :param cache: Cache successful pure scalar type conversions for this
++                  option instance. File and path types, composite
++                  values, ``None``, unhashable values, and failures
++                  are excluded.
+     :param help: the help string.
+     :param hidden: hide this option from help outputs.
+     :param attrs: Other command arguments described in :class:`Parameter`.
+ 
++    .. versionchanged:: 8.3.0
++        Added conversion caching and ``clear_value_cache``.
++
+     .. versionchanged:: 8.2
+         ``envvar`` used with ``flag_value`` will always use the ``flag_value``,
+         previously it would use the value of the environment variable.
+@@ -2549,6 +2556,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        cache: bool = False,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2636,6 +2644,8 @@ class Option(Parameter):
+         self.show_default = show_default
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
++        self.cache = cache
++        self._value_cache: dict[t.Any, t.Any] = {}
+ 
+         if __debug__:
+             if deprecated and prompt:
+@@ -2680,6 +2690,29 @@ class Option(Parameter):
+             result += f" (env var: '{self.envvar}')"
+         return result
+ 
++    def clear_value_cache(self) -> None:
++        """Discard successful conversions cached by this option."""
++        self._value_cache.clear()
++
++    def type_cast_value(self, ctx: Context, value: t.Any) -> t.Any:
++        if (
++            not self.cache
++            or value is None
++            or self.multiple
++            or self.nargs != 1
++            or isinstance(self.type, (types.File, types.Path))
++        ):
++            return super().type_cast_value(ctx, value)
++        try:
++            hash(value)
++        except TypeError:
++            return super().type_cast_value(ctx, value)
++        if value in self._value_cache:
++            return self._value_cache[value]
++        result = super().type_cast_value(ctx, value)
++        self._value_cache[value] = result
++        return result
++
+     def _parse_decls(
+         self, decls: cabc.Sequence[str], expose_value: bool
+     ) -> tuple[str | None, list[str], list[str]]:
+diff --git a/tests/test_n4c_author_option_cache.py b/tests/test_n4c_author_option_cache.py
+new file mode 100644
+index 0000000..dd0634c
+--- /dev/null
++++ b/tests/test_n4c_author_option_cache.py
+@@ -0,0 +1,58 @@
++import click
++
++
++class Counting(click.ParamType):
++    name = "counting"
++
++    def __init__(self):
++        self.calls = []
++
++    def convert(self, value, param, ctx):
++        self.calls.append(value)
++        if value == "bad":
++            self.fail("bad", param, ctx)
++        return str(value)
++
++
++def command(kind, **kwargs):
++    @click.command()
++    @click.option("--value", type=kind, cache=True, **kwargs)
++    def cli(value):
++        click.echo(value)
++
++    return cli
++
++
++def test_success_reused_but_callback_runs_each_invocation(runner):
++    kind, callbacks = Counting(), []
++    cli = command(kind, callback=lambda c, p, v: callbacks.append(v) or v)
++    assert runner.invoke(cli, ["--value", "x"]).output == "x\n"
++    assert runner.invoke(cli, ["--value", "x"]).output == "x\n"
++    assert kind.calls == ["x"] and callbacks == ["x", "x"]
++
++
++def test_failures_are_not_cached(runner):
++    kind = Counting()
++    cli = command(kind)
++    assert runner.invoke(cli, ["--value", "bad"]).exit_code == 2
++    assert runner.invoke(cli, ["--value", "bad"]).exit_code == 2
++    assert kind.calls == ["bad", "bad"]
++
++
++def test_cache_is_per_option_and_clearable(runner):
++    left, right = Counting(), Counting()
++    left_cli, right_cli = command(left), command(right)
++    runner.invoke(left_cli, ["--value", "x"])
++    runner.invoke(left_cli, ["--value", "x"])
++    runner.invoke(right_cli, ["--value", "x"])
++    left_cli.params[0].clear_value_cache()
++    runner.invoke(left_cli, ["--value", "x"])
++    assert left.calls == ["x", "x"] and right.calls == ["x"]
++
++
++def test_multiple_is_excluded(runner):
++    kind = Counting()
++    cli = command(kind, multiple=True)
++    runner.invoke(cli, ["--value", "x"])
++    runner.invoke(cli, ["--value", "x"])
++    assert kind.calls == ["x", "x"]

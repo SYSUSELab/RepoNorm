@@ -1,0 +1,210 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 540bbe2..bfc2349 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,10 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   Add an ``on_exit`` callback to contexts. It runs once after each completed
++    teardown, ignores ordinary callback exceptions, and preserves resource
++    cleanup for exceptions that propagate.
++
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..3425c04 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,13 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param on_exit: an optional callback that is invoked when the context
++                    exits. The callback receives the context object as its
++                    argument. This is useful for logging, metrics collection,
++                    or custom cleanup operations.
++
++    .. versionchanged:: 8.2
++        Added the ``on_exit`` parameter.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +287,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        on_exit: t.Callable[[Context], t.Any] | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +435,10 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        #: Optional callback to invoke when the context exits.
++        self._on_exit: t.Callable[[Context], t.Any] | None = on_exit
++        self._exit_notified = False
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -466,6 +478,8 @@ class Context:
+         }
+ 
+     def __enter__(self) -> Context:
++        if self._depth == 0:
++            self._exit_notified = False
+         self._depth += 1
+         push_context(self)
+         return self
+@@ -477,9 +491,11 @@ class Context:
+         tb: TracebackType | None,
+     ) -> None:
+         self._depth -= 1
+-        if self._depth == 0:
+-            self.close()
+-        pop_context()
++        try:
++            if self._depth == 0:
++                self.close()
++        finally:
++            pop_context()
+ 
+     @contextmanager
+     def scope(self, cleanup: bool = True) -> cabc.Iterator[Context]:
+@@ -607,9 +623,18 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
+-        self._exit_stack = ExitStack()
++        try:
++            if self._on_exit is not None and not self._exit_notified:
++                self._exit_notified = True
++                try:
++                    self._on_exit(self)
++                except Exception:
++                    pass
++        finally:
++            try:
++                self._exit_stack.close()
++            finally:
++                self._exit_stack = ExitStack()
+ 
+     @property
+     def command_path(self) -> str:
+@@ -1140,10 +1165,14 @@ class Command:
+         :param args: the arguments to parse as list of strings.
+         :param parent: the parent context if available.
+         :param extra: extra keyword arguments forwarded to the context
+-                      constructor.
++                      constructor. This can include an `on_exit` callback
++                      that is invoked when the context exits.
+ 
+         .. versionchanged:: 8.0
+             Added the :attr:`context_class` attribute.
++
++        .. versionchanged:: 8.2
++            Added support for the `on_exit` callback parameter.
+         """
+         for key, value in self.context_settings.items():
+             if key not in extra:
+diff --git a/tests/test_on_exit_contribution.py b/tests/test_on_exit_contribution.py
+new file mode 100644
+index 0000000..6fcc382
+--- /dev/null
++++ b/tests/test_on_exit_contribution.py
+@@ -0,0 +1,90 @@
++import pytest
++
++import click
++
++
++def test_on_exit_runs_once_per_completed_teardown():
++    events = []
++    ctx = click.Context(click.Command("cmd"), on_exit=lambda ctx: events.append(ctx))
++
++    with ctx:
++        with ctx:
++            pass
++        assert events == []
++    assert events == [ctx]
++
++    with ctx.scope(cleanup=False):
++        pass
++    assert events == [ctx]
++
++    with ctx:
++        pass
++    assert events == [ctx, ctx]
++
++
++def test_on_exit_observes_final_command_and_parameters(runner):
++    observed = []
++
++    @click.command(context_settings={"on_exit": observed.append})
++    @click.option("--value", type=int)
++    def cli(value):
++        pass
++
++    result = runner.invoke(cli, ["--value", "7"])
++
++    assert result.exit_code == 0
++    assert observed[0].command is cli
++    assert observed[0].params == {"value": 7}
++
++
++def test_on_exit_ordinary_exception_does_not_prevent_lifo_cleanup():
++    events = []
++
++    def on_exit(ctx):
++        events.append("on_exit")
++        raise ValueError("ignored")
++
++    ctx = click.Context(click.Command("cmd"), on_exit=on_exit)
++    ctx.call_on_close(lambda: events.append("first"))
++    ctx.call_on_close(lambda: events.append("second"))
++
++    with ctx:
++        pass
++
++    assert events == ["on_exit", "second", "first"]
++
++
++@pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit])
++def test_on_exit_base_exception_propagates_after_cleanup(failure):
++    events = []
++
++    def on_exit(ctx):
++        events.append("on_exit")
++        raise failure("stop")
++
++    ctx = click.Context(click.Command("cmd"), on_exit=on_exit)
++    ctx.call_on_close(lambda: events.append("cleanup"))
++
++    with pytest.raises(failure):
++        with ctx:
++            pass
++
++    assert events == ["on_exit", "cleanup"]
++    assert click.get_current_context(silent=True) is None
++
++
++def test_parent_and_child_have_independent_callbacks(runner):
++    events = []
++
++    @click.group(context_settings={"on_exit": lambda ctx: events.append(ctx.info_name)})
++    def cli():
++        pass
++
++    @cli.command(context_settings={"on_exit": lambda ctx: events.append(ctx.info_name)})
++    def child():
++        pass
++
++    result = runner.invoke(cli, ["child"])
++
++    assert result.exit_code == 0
++    assert events == ["child", "cli"]

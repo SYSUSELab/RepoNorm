@@ -1,0 +1,212 @@
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..50ae0e7 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1,3 +1,5 @@
++from collections import namedtuple
++from click.shell_completion import CompletionItem
+ import os
+ import re
+ 
+@@ -1139,3 +1141,201 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++def _completion_values(option, incomplete=""):
++    ctx = click.Context(click.Command("cli", params=[option]))
++    return [item.value for item in option.shell_complete(ctx, incomplete)]
++
++
++def test_auto_complete_username_prefix_sorted_unique(monkeypatch):
++    import pwd
++    Entry = namedtuple("Entry", "pw_name")
++    monkeypatch.setattr(pwd, "getpwall", lambda: [Entry("bob"), Entry("alice"), Entry("albert"), Entry("alice"), Entry("_admin")])
++    option = click.Option(["--user-name"], auto_complete=True)
++    assert _completion_values(option, "al") == ["albert", "alice"]
++
++
++def test_auto_complete_pwd_unavailable_falls_back(monkeypatch):
++    import sys
++
++    class BlockPwd:
++        def find_spec(self, fullname, path=None, target=None):
++            if fullname == "pwd":
++                raise ModuleNotFoundError("pwd unavailable")
++            return None
++
++    monkeypatch.delitem(sys.modules, "pwd", raising=False)
++    monkeypatch.setattr(sys, "meta_path", [BlockPwd(), *sys.meta_path])
++    option = click.Option(["--username"], type=click.Choice(["alpha", "beta"]), auto_complete=True)
++    assert _completion_values(option, "a") == ["alpha"]
++
++
++def test_auto_complete_environment_prefix_names_only(monkeypatch):
++    for name in list(os.environ):
++        if name.upper().startswith("N4C_COMPLETE_"):
++            monkeypatch.delenv(name)
++    monkeypatch.setenv("N4C_COMPLETE_ONE", "value-one")
++    monkeypatch.setenv("N4C_COMPLETE_TWO", "value-two")
++    option = click.Option(["--env-var"], auto_complete=True)
++    assert _completion_values(option, "N4C_COMPLETE_") == [
++        "N4C_COMPLETE_ONE", "N4C_COMPLETE_TWO"
++    ]
++
++
++def test_auto_complete_git_branch_prefix_and_failure(monkeypatch, tmp_path):
++    import subprocess
++
++    repo = tmp_path / "repository"
++    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(repo)], check=True)
++    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c",
++                    "user.email=test@example.invalid", "commit", "--allow-empty",
++                    "-qm", "initial"], check=True)
++    for name in ("feature/z", "feature/a"):
++        subprocess.run(["git", "-C", str(repo), "branch", name], check=True)
++    monkeypatch.chdir(repo)
++    option = click.Option(["--branch"], auto_complete=True)
++    assert _completion_values(option, "feature/") == ["feature/a", "feature/z"]
++    monkeypatch.chdir(tmp_path)
++    option = click.Option(["--branch"], type=click.Choice(["fallback"]), auto_complete=True)
++    assert _completion_values(option, "f") == ["fallback"]
++
++
++def test_auto_complete_path_strategies():
++    for name, path_type in (
++        ("--input-file", click.Path()),
++        ("--output-dir", click.Path(file_okay=False)),
++    ):
++        option = click.Option([name], auto_complete=True)
++        ctx = click.Context(click.Command("cli", params=[option]))
++        actual = option.shell_complete(ctx, "project")
++        expected = path_type.shell_complete(ctx, option, "project")
++        assert [(item.value, item.type, item.help) for item in actual] == [
++            (item.value, item.type, item.help) for item in expected
++        ]
++
++
++def test_auto_complete_custom_callback_wins():
++    def custom(ctx, param, incomplete):
++        return [CompletionItem("custom")]
++    option = click.Option(["--username"], auto_complete=True, shell_complete=custom)
++    assert _completion_values(option, "") == ["custom"]
++
++
++def test_auto_complete_disabled_and_unknown_use_normal_type():
++    for option in (
++        click.Option(["--username"], type=click.Choice(["alpha"])),
++        click.Option(["--color"], type=click.Choice(["amber"]), auto_complete=True),
++    ):
++        assert _completion_values(option, "a") in (["alpha"], ["amber"])
++
++
++@pytest.mark.parametrize("provider", ["callback", "unknown_type", "failed_strategy"])
++def test_auto_complete_preserves_completion_metadata(monkeypatch, tmp_path, provider):
++    seen = []
++
++    def complete(ctx, param, incomplete):
++        seen.append((ctx, param, incomplete))
++        return [CompletionItem("alpha/", type="dir", help="Project directory")]
++
++    class ProjectType(click.ParamType):
++        name = "project"
++
++        def shell_complete(self, ctx, param, incomplete):
++            return complete(ctx, param, incomplete)
++
++    attrs = {"auto_complete": True}
++    if provider == "callback":
++        name = "--username"
++        attrs["shell_complete"] = complete
++    else:
++        name = "--project" if provider == "unknown_type" else "--branch"
++        attrs["type"] = ProjectType()
++        if provider == "failed_strategy":
++            monkeypatch.setenv("PATH", str(tmp_path))
++
++    option = click.Option([name], **attrs)
++    ctx = click.Context(click.Command("cli", params=[option]))
++    items = option.shell_complete(ctx, "al")
++    assert [(item.value, item.type, item.help) for item in items] == [
++        ("alpha/", "dir", "Project directory")
++    ]
++    assert seen
++    assert all(call == (ctx, option, "al") for call in seen)
++
++
++def test_auto_complete_custom_string_results_remain_supported():
++    option = click.Option(
++        ["--username"], auto_complete=True,
++        shell_complete=lambda ctx, param, incomplete: ["alpha", "alpine"],
++    )
++    ctx = click.Context(click.Command("cli", params=[option]))
++    items = option.shell_complete(ctx, "al")
++    assert [(item.value, item.type, item.help) for item in items] == [
++        ("alpha", "plain", None), ("alpine", "plain", None)
++    ]
++
++
++def test_auto_complete_explicit_environment_overrides_name(monkeypatch):
++    monkeypatch.setenv("N4C_EXPLICIT_VALUE", "not-a-completion")
++    @click.command()
++    @click.option("--branch", auto_complete="environment")
++    def cli(branch):
++        pass
++    assert _completion_values(cli.params[0], "N4C_EXPLICIT_") == ["N4C_EXPLICIT_VALUE"]
++
++
++@pytest.mark.parametrize("strategy", ["file", "directory"])
++def test_auto_complete_explicit_path_strategy(strategy):
++    option = click.Option(["--destination"], auto_complete=strategy)
++    ctx = click.Context(click.Command("cli", params=[option]))
++    expected = click.Path(file_okay=strategy != "directory").shell_complete(ctx, option, "proj")
++    assert [(item.value, item.type, item.help) for item in option.shell_complete(ctx, "proj")] == [
++        (item.value, item.type, item.help) for item in expected
++    ]
++
++
++def test_auto_complete_explicit_user_strategy(monkeypatch):
++    import pwd
++    entry = namedtuple("Entry", "pw_name")
++    monkeypatch.setattr(pwd, "getpwall", lambda: [entry("n4c-person")])
++    assert _completion_values(click.Option(["--identity"], auto_complete="user"), "n4c-") == ["n4c-person"]
++
++
++def test_auto_complete_explicit_branch_strategy(monkeypatch, tmp_path):
++    import subprocess
++    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(tmp_path)], check=True)
++    subprocess.run(["git", "-C", str(tmp_path), "-c", "user.name=Test", "-c",
++                    "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"], check=True)
++    subprocess.run(["git", "-C", str(tmp_path), "branch", "n4c-release"], check=True)
++    monkeypatch.chdir(tmp_path)
++    assert _completion_values(click.Option(["--selection"], auto_complete="branch"), "n4c-") == ["n4c-release"]
++
++
++@pytest.mark.parametrize("provider", ["callback", "missing_branch"])
++def test_auto_complete_explicit_strategy_keeps_completion_metadata(monkeypatch, tmp_path, provider):
++    monkeypatch.setenv("N4C_METADATA_VALUE", "secret")
++    assert _completion_values(click.Option(["--setting"], auto_complete="environment"), "N4C_METADATA_") == ["N4C_METADATA_VALUE"]
++    seen = []
++    def complete(ctx, param, incomplete):
++        seen.append((ctx, param, incomplete))
++        return [CompletionItem("alpha/", type="dir", help="Project directory")]
++    class ProjectType(click.ParamType):
++        name = "project"
++        def shell_complete(self, ctx, param, incomplete):
++            return complete(ctx, param, incomplete)
++    attrs = {"shell_complete": complete} if provider == "callback" else {"type": ProjectType()}
++    if provider == "missing_branch":
++        monkeypatch.setenv("PATH", str(tmp_path))
++    option = click.Option(["--identity"], auto_complete="branch", **attrs)
++    ctx = click.Context(click.Command("cli", params=[option]))
++    assert [(item.value, item.type, item.help) for item in option.shell_complete(ctx, "al")] == [
++        ("alpha/", "dir", "Project directory")
++    ]
++    assert seen and all(call == (ctx, option, "al") for call in seen)
++
++
++@pytest.mark.parametrize("value,error", [("unknown", ValueError), ("", ValueError), (1, TypeError), (None, TypeError)])
++def test_auto_complete_explicit_strategy_invalid_values(value, error):
++    with pytest.raises(error):
++        click.Option(["--identity"], auto_complete=value)

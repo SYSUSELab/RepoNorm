@@ -1,0 +1,179 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..eb1805ac 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,7 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add opt-in search-path expansion to ``FileSystemLoader``.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..ceca1479 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -444,6 +444,14 @@ Here a list of the builtin loaders Jinja provides:
+ 
+ .. autoclass:: jinja2.FileSystemLoader
+ 
++``FileSystemLoader`` accepts ``expand_searchpath=True`` to expand
++environment variables followed by user-home markers when it is created.
++The default keeps paths literal. Path-like entries are converted
++before expansion. Undefined variables follow the host's ``expandvars``
++behavior. The stored paths do not change when the environment changes.
++Relative paths remain relative to the working directory during lookup;
++ordering, encoding, freshness, and template listing remain supported.
++
+ .. autoclass:: jinja2.PackageLoader
+ 
+ .. autoclass:: jinja2.DictLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..983a4fac 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -170,9 +170,16 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param expand_searchpath: Opt in to environment and user expansion.
++        Convert paths once during initialization, expanding variables
++        before user-home markers. Later environment changes do not
++        rewrite the stored paths. The default preserves literal paths.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++
++    .. versionchanged:: 3.1.0
++        Add optional search-path expansion at initialization.
+     """
+ 
+     def __init__(
+@@ -180,11 +187,17 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        expand_searchpath: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+         self.searchpath = [os.fspath(p) for p in searchpath]
++
++        if expand_searchpath:
++            self.searchpath = [
++                os.path.expanduser(os.path.expandvars(p)) for p in self.searchpath
++            ]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+@@ -650,3 +663,8 @@ class ModuleLoader(BaseLoader):
+         return environment.template_class.from_module_dict(
+             environment, mod.__dict__, globals
+         )
++
++
++match None:
++    case None:
++        pass
+diff --git a/tests/test_n4c_author_searchpath_expansion.py b/tests/test_n4c_author_searchpath_expansion.py
+new file mode 100644
+index 00000000..9964db53
+--- /dev/null
++++ b/tests/test_n4c_author_searchpath_expansion.py
+@@ -0,0 +1,94 @@
++import os
++from pathlib import Path
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import FileSystemLoader
++from jinja2 import TemplateNotFound
++
++
++@pytest.mark.parametrize("kind", ["string", "pathlike", "mixed"])
++def test_expansion_order_once_and_frozen(tmp_path, monkeypatch, kind):
++    home = tmp_path / "home"
++    root = home / "templates"
++    root.mkdir(parents=True)
++    (root / "page").write_text("first")
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.setenv("N4C_ALIAS", "~")
++    calls = []
++    expandvars, expanduser = os.path.expandvars, os.path.expanduser
++
++    def variables(value):
++        calls.append(("variables", value))
++        return expandvars(value)
++
++    def user(value):
++        calls.append(("user", value))
++        return expanduser(value)
++
++    monkeypatch.setattr(os.path, "expandvars", variables)
++    monkeypatch.setattr(os.path, "expanduser", user)
++    marker = "$N4C_ALIAS/templates"
++    paths = marker if kind == "string" else Path(marker)
++    expected = [("variables", marker), ("user", "~/templates")]
++    if kind == "mixed":
++        paths = [Path(marker), str(root)]
++        expected += [("variables", str(root)), ("user", str(root))]
++    loader = FileSystemLoader(paths, expand_searchpath=True)
++    assert calls == expected
++    monkeypatch.setenv("N4C_ALIAS", "/different")
++    env = Environment(loader=loader)
++    assert env.get_template("page").render() == "first"
++    assert env.get_template("page").render() == "first"
++    assert calls == expected
++
++
++def test_default_keeps_literal_marker(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    literal = tmp_path / "$N4C_LITERAL"
++    literal.mkdir()
++    (literal / "page").write_text("literal")
++    monkeypatch.setenv("N4C_LITERAL", "/does-not-exist")
++    loader = FileSystemLoader("$N4C_LITERAL", expand_searchpath=False)
++    assert Environment(loader=loader).get_template("page").render() == "literal"
++
++
++def test_expanded_relative_path_keeps_lookup_cwd(tmp_path, monkeypatch):
++    first, second = tmp_path / "first", tmp_path / "second"
++    for root, text in [(first, "first"), (second, "second")]:
++        (root / "templates").mkdir(parents=True)
++        (root / "templates/page").write_text(text)
++    monkeypatch.chdir(first)
++    monkeypatch.setenv("N4C_RELATIVE", "templates")
++    loader = FileSystemLoader("$N4C_RELATIVE", expand_searchpath=True)
++    monkeypatch.chdir(second)
++    assert Environment(loader=loader).get_template("page").render() == "second"
++
++
++@pytest.mark.parametrize("follow", [False, True])
++def test_expanded_listing_obeys_links(tmp_path, monkeypatch, follow):
++    root, linked = tmp_path / "root", tmp_path / "linked"
++    root.mkdir()
++    linked.mkdir()
++    (root / "z").write_text("z")
++    (root / "a").write_text("a")
++    (linked / "child").write_text("child")
++    (root / "nested").symlink_to(linked, target_is_directory=True)
++    monkeypatch.setenv("N4C_LISTING", str(root))
++    loader = FileSystemLoader(
++        ["$N4C_LISTING", root], followlinks=follow, expand_searchpath=True
++    )
++    assert loader.list_templates() == (
++        ["a", "nested/child", "z"] if follow else ["a", "z"]
++    )
++
++
++def test_expanded_root_retains_logical_guard(tmp_path, monkeypatch):
++    root = tmp_path / "root"
++    root.mkdir()
++    (tmp_path / "secret").write_text("outside")
++    monkeypatch.setenv("N4C_SAFE", str(root))
++    loader = FileSystemLoader("$N4C_SAFE", expand_searchpath=True)
++    with pytest.raises(TemplateNotFound):
++        loader.get_source(Environment(), "../secret")

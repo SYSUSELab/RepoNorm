@@ -1,0 +1,157 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..8d5961c5 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -58,6 +58,10 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._hits = 0
++        self._mem_hits = 0
++        self._disk_hits = 0
++        self._misses = 0
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -100,19 +104,28 @@ class Cache:
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
++            with self._lock:
++                self._misses += 1
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
++                self._mem_hits += 1
++                self._hits += 1
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+             response = self.disk_cache[key]
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
++            with self._lock:
++                self._disk_hits += 1
++                self._hits += 1
+         else:
++            with self._lock:
++                self._misses += 1
+             return None
+ 
+         response = copy.deepcopy(response)
+@@ -152,6 +165,24 @@ class Cache:
+         with self._lock:
+             self.memory_cache.clear()
+ 
++    def stats(self) -> dict:
++        """Return a fresh dictionary with cache hit/miss statistics."""
++        with self._lock:
++            return {
++                "hits": self._hits,
++                "mem_hits": self._mem_hits,
++                "disk_hits": self._disk_hits,
++                "misses": self._misses,
++            }
++
++    def reset_stats(self) -> None:
++        """Reset cache hit/miss counters to zero without clearing entries."""
++        with self._lock:
++            self._hits = 0
++            self._mem_hits = 0
++            self._disk_hits = 0
++            self._misses = 0
++
+     def save_memory_cache(self, filepath: str) -> None:
+         if not self.enable_memory_cache:
+             return
+diff --git a/dspy/primitives/prediction.py b/dspy/primitives/prediction.py
+index 670b816b..b60d6fe1 100644
+--- a/dspy/primitives/prediction.py
++++ b/dspy/primitives/prediction.py
+@@ -10,13 +10,24 @@ class Prediction(Example):
+ 
+         self._completions = None
+         self._lm_usage = None
++        self._cache_usage = None
+ 
+     def get_lm_usage(self):
+-        return self._lm_usage
++        if self._lm_usage is not None:
++            return dict(self._lm_usage)
++        return None
+ 
+     def set_lm_usage(self, value):
+         self._lm_usage = value
+ 
++    def get_cache_usage(self):
++        if self._cache_usage is not None:
++            return dict(self._cache_usage)
++        return None
++
++    def set_cache_usage(self, value):
++        self._cache_usage = value
++
+     @classmethod
+     def from_completions(cls, list_or_dict, signature=None):
+         obj = cls()
+diff --git a/dspy/primitives/program.py b/dspy/primitives/program.py
+index 39457c36..d3e8ae9d 100644
+--- a/dspy/primitives/program.py
++++ b/dspy/primitives/program.py
+@@ -55,10 +55,22 @@ class Module(BaseModule, metaclass=ProgramMeta):
+         caller_modules.append(self)
+ 
+         with settings.context(caller_modules=caller_modules):
+-            if settings.track_usage and thread_local_overrides.get().get("usage_tracker") is None:
+-                with track_usage() as usage_tracker:
++            if settings.track_usage:
++                import dspy
++                cache_stats_before = dspy.cache.stats()
++
++                if thread_local_overrides.get().get("usage_tracker") is None:
++                    with track_usage() as usage_tracker:
++                        output = self.forward(*args, **kwargs)
++                    output.set_lm_usage(usage_tracker.get_total_tokens())
++                else:
+                     output = self.forward(*args, **kwargs)
+-                output.set_lm_usage(usage_tracker.get_total_tokens())
++
++                cache_stats_after = dspy.cache.stats()
++                if hasattr(output, 'set_cache_usage'):
++                    delta = {k: cache_stats_after[k] - cache_stats_before[k] for k in cache_stats_after}
++                    output.set_cache_usage(delta)
++
+                 return output
+ 
+             return self.forward(*args, **kwargs)
+@@ -70,11 +82,23 @@ class Module(BaseModule, metaclass=ProgramMeta):
+         caller_modules.append(self)
+ 
+         with settings.context(caller_modules=caller_modules):
+-            if settings.track_usage and thread_local_overrides.get().get("usage_tracker") is None:
+-                with track_usage() as usage_tracker:
+-                    output = await self.aforward(*args, **kwargs)
++            if settings.track_usage:
++                import dspy
++                cache_stats_before = dspy.cache.stats()
++
++                if thread_local_overrides.get().get("usage_tracker") is None:
++                    with track_usage() as usage_tracker:
++                        output = await self.aforward(*args, **kwargs)
+                     output.set_lm_usage(usage_tracker.get_total_tokens())
+-                    return output
++                else:
++                    output = await self.aforward(*args, **kwargs)
++
++                cache_stats_after = dspy.cache.stats()
++                if hasattr(output, 'set_cache_usage'):
++                    delta = {k: cache_stats_after[k] - cache_stats_before[k] for k in cache_stats_after}
++                    output.set_cache_usage(delta)
++
++                return output
+ 
+             return await self.aforward(*args, **kwargs)
+ 

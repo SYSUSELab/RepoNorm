@@ -1,0 +1,224 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..204f7302 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -33,6 +33,9 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    compress: Optional[str] = None,
++    cull_limit: Optional[int] = None,
++    eviction_policy: Optional[str] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +46,9 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        compress: Compression codec for disk-cache entries. One of 'gzip', 'zlib', or None.
++        cull_limit: Number of entries to cull when the disk cache size limit is reached.
++        eviction_policy: Eviction policy for the disk cache (e.g. 'least-recently-stored').
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,6 +78,9 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        compress=compress,
++        cull_limit=cull_limit,
++        eviction_policy=eviction_policy,
+     )
+ 
+ 
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..20454f12 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,4 +1,10 @@
+ import copy
++import gzip
++import io
++import os as _os
++import pickle
++import sqlite3
++import zlib
+ import inspect
+ import logging
+ import threading
+@@ -11,10 +17,94 @@ import pydantic
+ import ujson
+ from cachetools import LRUCache
+ from diskcache import FanoutCache
++from diskcache.core import Disk, MODE_PICKLE, MODE_RAW, UNKNOWN
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++class _CompressedDisk(Disk):
++    """Disk subclass that applies optional compression to pickled cache entries.
++
++    The persisted format for compressed entries is:
++        b"DSPC" + codec_byte + compressed_pickle_payload
++
++    Codec bytes:
++        0x00: uncompressed pickle (with DSPC header)
++        0x01: gzip-compressed pickle
++        0x02: zlib-compressed pickle
++
++    Pre-feature entries (plain pickle without header) remain readable.
++    Uncompressed writes (codec=None) use the existing backend representation
++    (plain pickle without header).
++    """
++
++    _write_codec = None
++
++    CODEC_BYTE = {None: 0x00, 'gzip': 0x01, 'zlib': 0x02}
++
++    def store(self, value, read, key=UNKNOWN):
++        type_value = type(value)
++        min_file_size = self.min_file_size
++
++        if (
++            (type_value is str and len(value) < min_file_size)
++            or (
++                type_value is int
++                and -9223372036854775808 <= value <= 9223372036854775807
++            )
++            or (type_value is float)
++        ):
++            return 0, MODE_RAW, None, value
++        if type_value is bytes or type_value is str or read:
++            return super().store(value, read, key)
++
++        result = pickle.dumps(value, protocol=self.pickle_protocol)
++        codec = self._write_codec
++
++        if codec is None:
++            payload = result
++        else:
++            codec_byte = self.CODEC_BYTE[codec]
++            if codec == 'gzip':
++                compressed = gzip.compress(result)
++            else:
++                compressed = zlib.compress(result)
++            payload = b'DSPC' + bytes([codec_byte]) + compressed
++
++        if len(payload) < min_file_size:
++            return 0, MODE_PICKLE, None, sqlite3.Binary(payload)
++        else:
++            filename, full_path = self.filename(key, payload)
++            self._write(full_path, io.BytesIO(payload), 'xb')
++            return len(payload), MODE_PICKLE, filename, None
++
++    def fetch(self, mode, filename, value, read):
++        if mode == MODE_PICKLE:
++            if value is None:
++                with open(_os.path.join(self._directory, filename), 'rb') as reader:
++                    payload = reader.read()
++            else:
++                payload = bytes(value) if isinstance(value, sqlite3.Binary) else value
++
++            if payload[:4] == b'DSPC':
++                codec_byte = payload[4]
++                if codec_byte == 0x00:
++                    data = payload[5:]
++                elif codec_byte == 0x01:
++                    data = gzip.decompress(payload[5:])
++                elif codec_byte == 0x02:
++                    data = zlib.decompress(payload[5:])
++                else:
++                    raise ValueError(
++                        f'Unknown compression codec byte: {codec_byte}'
++                    )
++                return pickle.loads(data)
++            else:
++                return pickle.loads(payload)
++        else:
++            return super().fetch(mode, filename, value, read)
++
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -30,6 +120,9 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
++        compress: Optional[str] = None,
++        cull_limit: Optional[int] = None,
++        eviction_policy: Optional[str] = None,
+ 
+     ):
+         """
+@@ -39,8 +132,18 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            compress: Compression codec for disk-cache entries. One of 'gzip', 'zlib', or None.
++            cull_limit: Number of entries to cull when the disk cache size limit is reached.
++            eviction_policy: Eviction policy for the disk cache (e.g. 'least-recently-stored').
+         """
+ 
++        if compress not in (None, 'gzip', 'zlib'):
++            raise ValueError(
++                f"Unsupported compression codec: {compress!r}. "
++                f"Expected 'gzip', 'zlib', or None."
++            )
++
++
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+         if self.enable_memory_cache:
+@@ -48,16 +151,26 @@ class Cache:
+         else:
+             self.memory_cache = {}
+         if self.enable_disk_cache:
++
++            settings = {}
++            if cull_limit is not None:
++                settings['cull_limit'] = cull_limit
++            if eviction_policy is not None:
++                settings['eviction_policy'] = eviction_policy
++            _CompressedDisk._write_codec = compress
+             self.disk_cache = FanoutCache(
+                 shards=16,
+                 timeout=10,
+                 directory=disk_cache_dir,
+                 size_limit=disk_size_limit_bytes,
++                disk=_CompressedDisk,
++                **settings,
+             )
+         else:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._compress = compress
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -168,6 +281,23 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    def set_compression(self, codec: Optional[str]) -> None:
++        """Change the compression codec for subsequent disk writes.
++
++        Args:
++            codec: Compression codec. One of 'gzip', 'zlib', or None.
++
++        Raises:
++            ValueError: If the codec is not one of 'gzip', 'zlib', or None.
++        """
++        if codec not in (None, 'gzip', 'zlib'):
++            raise ValueError(
++                f"Unsupported compression codec: {codec!r}. "
++                f"Expected 'gzip', 'zlib', or None."
++            )
++        self._compress = codec
++        _CompressedDisk._write_codec = codec
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,

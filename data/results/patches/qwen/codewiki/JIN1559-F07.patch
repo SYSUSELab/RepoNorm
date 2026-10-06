@@ -1,0 +1,542 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..fc0aede 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -6,6 +6,7 @@ import typing as t
+ from markupsafe import Markup
+ 
+ from . import defaults
++from .nodes import EvalContext
+ from . import nodes
+ from .environment import Environment
+ from .exceptions import TemplateAssertionError
+@@ -242,6 +243,404 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++def _make_fallback_gettext(
++    gettext_func: t.Callable[[str], str],
++    fallback_funcs: t.List[t.Callable[[str], str]],
++    newstyle: bool,
++    env: Environment,
++) -> t.Callable[..., str]:
++    """Create a gettext wrapper with fallback chain support."""
++
++    if newstyle:
++        def gettext(*args: t.Any, **kwargs: t.Any) -> str:
++            # Handle both template calls (with context) and direct Python calls
++            if args and isinstance(args[0], Context):
++                __context = args[0]
++                __string = args[1] if len(args) > 1 else kwargs.get('__string')
++                variables = {k: v for k, v in kwargs.items() if k != '__string'}
++            else:
++                # Direct call from Python code
++                __string = args[0] if args else kwargs.get('__string')
++                # Create minimal context for formatting/autoescaping
++                eval_ctx = EvalContext(env, '')
++                # For direct Python calls, we need to handle both context-aware and non-context-aware functions
++                def fake_call(context, func, *args, **kwargs):
++                    import inspect
++                    sig = inspect.signature(func)
++                    params = list(sig.parameters.keys())
++                    if len(params) > 0 and params[0] == '__context':
++                        # Function expects context
++                        result = func(context, *args, **kwargs)
++                        return result
++                    else:
++                        # Function doesn't expect context
++                        result = func(*args, **kwargs)
++                        return result
++                
++                __context = type('FakeContext', (), {
++                    'call': fake_call,
++                    'eval_ctx': eval_ctx,
++                    'resolve': lambda _, name: globals().get(name)
++                })()
++                variables = {}
++
++            # Try primary provider first
++            rv = __context.call(gettext_func, __string)
++
++            # Check if result is missing (equals source message)
++            if rv == __string:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = __context.call(fallback_func, __string)
++                        if rv is not None and rv != __string:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # If no provider returned a translation, return source message
++            if rv is None:
++                rv = __string
++            
++            # Apply newstyle formatting and autoescaping
++            if __context.eval_ctx.autoescape:
++                rv = Markup(rv)
++            return rv % variables  # type: ignore
++
++        return gettext
++    else:
++        def gettext(__string: str, **variables: t.Any) -> str:
++            # Try primary provider first
++            rv = gettext_func(__string)
++
++            # Check if result is missing (equals source message)
++            if rv == __string:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = fallback_func(__string)
++                        if rv is not None and rv != __string:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # If no provider returned a translation, return source message
++            if rv is None:
++                rv = __string
++            
++            # Apply newstyle formatting
++            return rv % variables  # type: ignore
++
++        return gettext
++
++
++def _make_fallback_ngettext(
++    ngettext_func: t.Callable[[str, str, int], str],
++    fallback_funcs: t.List[t.Callable[[str, str, int], str]],
++    newstyle: bool,
++    env: Environment,
++) -> t.Callable[..., str]:
++    """Create an ngettext wrapper with fallback chain support."""
++
++    if newstyle:
++        def ngettext(*args: t.Any, **kwargs: t.Any) -> str:
++            # Handle both template calls (with context) and direct Python calls
++            if args and isinstance(args[0], Context):
++                __context = args[0]
++                __singular = args[1] if len(args) > 1 else kwargs.get('__singular')
++                __plural = args[2] if len(args) > 2 else kwargs.get('__plural')
++                __num = args[3] if len(args) > 3 else kwargs.get('__num', 1)
++                variables = {k: v for k, v in kwargs.items() if k not in ('__singular', '__plural', '__num')}
++            else:
++                # Direct call from Python code
++                __singular = args[0] if len(args) > 0 else kwargs.get('__singular')
++                __plural = args[1] if len(args) > 1 else kwargs.get('__plural')
++                __num = args[2] if len(args) > 2 else kwargs.get('__num', 1)
++                # Capture any additional keyword arguments as template variables
++                variables = {k: v for k, v in kwargs.items() 
++                           if k not in ('__singular', '__plural', '__num')}
++                eval_ctx = EvalContext(env, '')
++                # For direct Python calls, we need to handle both context-aware and non-context-aware functions
++                def fake_call(context, func, *args, **kwargs):
++                    import inspect
++                    sig = inspect.signature(func)
++                    params = list(sig.parameters.keys())
++                    if len(params) > 0 and params[0] == '__context':
++                        # Function expects context
++                        result = func(context, *args, **kwargs)
++                        return result
++                    else:
++                        # Function doesn't expect context
++                        result = func(*args, **kwargs)
++                        return result
++                
++                __context = type('FakeContext', (), {
++                    'call': fake_call,
++                    'eval_ctx': eval_ctx,
++                    'resolve': lambda _, name: globals().get(name)
++                })()
++            variables.setdefault("num", __num)
++            # Determine selected source form
++            selected_source = __singular if __num == 1 else __plural
++
++            # Try primary provider first
++            rv = __context.call(ngettext_func, __singular, __plural, __num)
++
++            # Check if result is missing (equals selected source form)
++            if rv == selected_source:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = __context.call(fallback_func, __singular, __plural, __num)
++                        if rv is not None and rv != selected_source:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # If no provider returned a translation, return source message
++            if rv is None:
++                rv = selected_source
++            
++            # Apply newstyle formatting and autoescaping
++            try:
++                if __context.eval_ctx.autoescape:
++                    rv = Markup(rv)
++                result = rv % variables  # type: ignore
++                return result
++            except Exception as e:
++                raise
++
++        return ngettext
++    else:
++        def ngettext(__singular: str, __plural: str, __num: int, **variables: t.Any) -> str:
++            # Determine selected source form
++            selected_source = __singular if __num == 1 else __plural
++
++            # Try primary provider first
++            rv = ngettext_func(__singular, __plural, __num)
++
++            # Check if result is missing (equals selected source form)
++            if rv == selected_source:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = __context.call(fallback_func, __singular, __plural, __num)
++                        if rv is not None and rv != selected_source:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # If no provider returned a translation, return source message
++            if rv is None:
++                rv = selected_source
++            
++            # Apply newstyle formatting
++            return rv % variables  # type: ignore
++
++        return ngettext
++
++
++def _make_fallback_pgettext(
++    pgettext_func: t.Callable[[str, str], str],
++    fallback_funcs: t.List[t.Callable[[str, str], str]],
++    newstyle: bool,
++    env: Environment,
++) -> t.Callable[..., str]:
++    """Create a pgettext wrapper with fallback chain support."""
++
++    if newstyle:
++        def pgettext(*args: t.Any, **kwargs: t.Any) -> str:
++            # Handle both template calls (with context) and direct Python calls
++            if args and isinstance(args[0], Context):
++                __context = args[0]
++                __string_ctx = args[1] if len(args) > 1 else kwargs.get('__string_ctx')
++                __string = args[2] if len(args) > 2 else kwargs.get('__string')
++                variables = {k: v for k, v in kwargs.items() if k not in ('__string_ctx', '__string')}
++            else:
++                # Direct call from Python code
++                __string_ctx = args[0] if len(args) > 0 else kwargs.get('__string_ctx')
++                __string = args[1] if len(args) > 1 else kwargs.get('__string')
++                eval_ctx = EvalContext(env, '')
++                # For direct Python calls, we need to handle both context-aware and non-context-aware functions
++                def fake_call(context, func, *args, **kwargs):
++                    import inspect
++                    sig = inspect.signature(func)
++                    params = list(sig.parameters.keys())
++                    if len(params) > 0 and params[0] == '__context':
++                        # Function expects context
++                        result = func(context, *args, **kwargs)
++                        return result
++                    else:
++                        # Function doesn't expect context
++                        result = func(*args, **kwargs)
++                        return result
++                
++                __context = type('FakeContext', (), {
++                    'call': fake_call,
++                    'eval_ctx': eval_ctx,
++                    'resolve': lambda _, name: globals().get(name)
++                })()
++                variables = {}
++            variables.setdefault("context", __string_ctx)
++            # Try primary provider first
++            rv = __context.call(pgettext_func, __string_ctx, __string)
++
++            # Check if result is missing (equals source message)
++            if rv == __string:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = __context.call(fallback_func, __string_ctx, __string)
++                        if rv is not None and rv != __string:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # If no provider returned a translation, return source message
++            if rv is None:
++                rv = __string
++            
++            # Apply newstyle formatting and autoescaping
++            if __context.eval_ctx.autoescape:
++                rv = Markup(rv)
++            return rv % variables  # type: ignore
++
++        return pgettext
++    else:
++        def pgettext(__string_ctx: str, __string: str, **variables: t.Any) -> str:
++            # Try primary provider first
++            rv = pgettext_func(__string_ctx, __string)
++
++            # Check if result is missing (equals source message)
++            if rv == __string:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = fallback_func(__string_ctx, __string)
++                        if rv is not None and rv != __string:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # If no provider returned a translation, return source message
++            if rv is None:
++                rv = __string
++            
++            # Apply newstyle formatting
++            return rv % variables  # type: ignore
++
++        return pgettext
++
++
++def _make_fallback_npgettext(
++    npgettext_func: t.Callable[[str, str, str, int], str],
++    fallback_funcs: t.List[t.Callable[[str, str, str, int], str]],
++    newstyle: bool,
++    env: Environment,
++) -> t.Callable[..., str]:
++    """Create an npgettext wrapper with fallback chain support."""
++
++    if newstyle:
++        def npgettext(*args: t.Any, **kwargs: t.Any) -> str:
++            # Handle both template calls (with context) and direct Python calls
++            if args and isinstance(args[0], Context):
++                __context = args[0]
++                __string_ctx = args[1] if len(args) > 1 else kwargs.get('__string_ctx')
++                __singular = args[2] if len(args) > 2 else kwargs.get('__singular')
++                __plural = args[3] if len(args) > 3 else kwargs.get('__plural')
++                __num = args[4] if len(args) > 4 else kwargs.get('__num', 1)
++                variables = {k: v for k, v in kwargs.items() if k not in ('__string_ctx', '__singular', '__plural', '__num')}
++            else:
++                # Direct call from Python code
++                __string_ctx = args[0] if len(args) > 0 else kwargs.get('__string_ctx')
++                __singular = args[1] if len(args) > 1 else kwargs.get('__singular')
++                __plural = args[2] if len(args) > 2 else kwargs.get('__plural')
++                __num = args[3] if len(args) > 3 else kwargs.get('__num', 1)
++                eval_ctx = EvalContext(env, '')
++                # For direct Python calls, we need to handle both context-aware and non-context-aware functions
++                def fake_call(context, func, *args, **kwargs):
++                    import inspect
++                    sig = inspect.signature(func)
++                    params = list(sig.parameters.keys())
++                    if len(params) > 0 and params[0] == '__context':
++                        # Function expects context
++                        result = func(context, *args, **kwargs)
++                        return result
++                    else:
++                        # Function doesn't expect context
++                        result = func(*args, **kwargs)
++                        return result
++                
++                __context = type('FakeContext', (), {
++                    'call': fake_call,
++                    'eval_ctx': eval_ctx,
++                    'resolve': lambda _, name: globals().get(name)
++                })()
++                variables = {}
++            variables.setdefault("context", __string_ctx)
++            variables.setdefault("num", __num)
++            # Determine selected source form
++            selected_source = __singular if __num == 1 else __plural
++
++            # Try primary provider first
++            rv = __context.call(npgettext_func, __string_ctx, __singular, __plural, __num)
++
++            # Check if result is missing (equals selected source form)
++            if rv == selected_source:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = __context.call(fallback_func, __string_ctx, __singular, __plural, __num)
++                        if rv is not None and rv != selected_source:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # Apply newstyle formatting and autoescaping
++            if __context.eval_ctx.autoescape:
++                rv = Markup(rv)
++            return rv % variables  # type: ignore
++
++        return npgettext
++    else:
++        def npgettext(
++            __string_ctx: str,
++            __singular: str,
++            __plural: str,
++            __num: int,
++            **variables: t.Any,
++        ) -> str:
++            # Determine selected source form
++            selected_source = __singular if __num == 1 else __plural
++
++            # Try primary provider first - pass variables for formatting
++            rv = npgettext_func(__string_ctx, __singular, __plural, __num, **variables)
++
++            # Check if result is missing (equals selected source form)
++            if rv == selected_source:
++                # Try fallback providers in order
++                for fallback_func in fallback_funcs:
++                    try:
++                        rv = fallback_func(__string_ctx, __singular, __plural, __num)
++                        if rv is not None and rv != selected_source:
++                            break
++                    except Exception:
++                        # Provider exception propagates without calling later providers
++                        raise
++
++            # Apply newstyle formatting
++            return rv % variables  # type: ignore
++
++        return npgettext
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -261,6 +660,7 @@ class InternationalizationExtension(Extension):
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+             install_gettext_callables=self._install_callables,
++            install_gettext_callables_with_fallback=self._install_callables_with_fallback,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
+@@ -336,6 +736,116 @@ class InternationalizationExtension(Extension):
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
+ 
++
++
++    def _install_callables_with_fallback(
++        self,
++        gettext: t.Callable[[str], str],
++        ngettext: t.Callable[[str, str, int], str],
++        fallback_gettext_funcs: t.Optional[t.Iterable[t.Callable[[str], str]]] = None,
++        fallback_ngettext_funcs: t.Optional[t.Iterable[t.Callable[[str, str, int], str]]] = None,
++        newstyle: t.Optional[bool] = None,
++        pgettext: t.Optional[t.Callable[[str, str], str]] = None,
++        npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        fallback_pgettext_funcs: t.Optional[t.Iterable[t.Callable[[str, str], str]]] = None,
++        fallback_npgettext_funcs: t.Optional[t.Iterable[t.Callable[[str, str, str, int], str]]] = None,
++    ) -> None:
++        """Install gettext callables with optional fallback chains.
++
++        Each fallback argument is an optional finite iterable of callables matching
++        its primary provider's signature. The installer snapshots each iterable when called.
++        A missing or empty iterable behaves like install_gettext_callables. Supplying a
++        non-empty contextual fallback iterable without the matching pgettext or
++        npgettext primary raises ValueError naming the required primary.
++
++        Call the primary provider first. A gettext or pgettext result is missing when
++        it equals the source message. An ngettext or npgettext result is missing when
++        it equals the selected source form: singular for n == 1, plural otherwise. Only
++        on a miss, call matching fallback providers in their declared order and stop at
++        the first non-missing result. If every provider misses, return the selected source
++        message. Provider exceptions propagate without calling later providers. Context
++        providers receive the context string on every attempt.
++        """
++        # Validate that contextual fallbacks require matching primary providers
++        if fallback_pgettext_funcs is not None:
++            try:
++                fallback_pgettext_funcs_list = list(fallback_pgettext_funcs)
++            except TypeError:
++                fallback_pgettext_funcs_list = []
++
++            if fallback_pgettext_funcs_list and pgettext is None:
++                raise ValueError(
++                    "fallback_pgettext_funcs requires pgettext primary provider"
++                )
++
++        if fallback_npgettext_funcs is not None:
++            try:
++                fallback_npgettext_funcs_list = list(fallback_npgettext_funcs)
++            except TypeError:
++                fallback_npgettext_funcs_list = []
++
++            if fallback_npgettext_funcs_list and npgettext is None:
++                raise ValueError(
++                    "fallback_npgettext_funcs requires npgettext primary provider"
++                )
++
++        # Snapshot fallback iterables into lists
++        fallback_gettext_funcs_list = (
++            list(fallback_gettext_funcs) if fallback_gettext_funcs is not None else []
++        )
++        fallback_ngettext_funcs_list = (
++            list(fallback_ngettext_funcs) if fallback_ngettext_funcs is not None else []
++        )
++        fallback_pgettext_funcs_list = (
++            list(fallback_pgettext_funcs) if fallback_pgettext_funcs is not None else []
++        )
++        fallback_npgettext_funcs_list = (
++            list(fallback_npgettext_funcs) if fallback_npgettext_funcs is not None else []
++        )
++
++        # Set newstyle flag if provided
++        if newstyle is not None:
++            self.environment.newstyle_gettext = newstyle  # type: ignore
++
++        # Apply newstyle wrappers to primary providers
++        if self.environment.newstyle_gettext:  # type: ignore
++            gettext = _make_new_gettext(gettext)
++            ngettext = _make_new_ngettext(ngettext)
++
++            if pgettext is not None:
++                pgettext = _make_new_pgettext(pgettext)
++
++            if npgettext is not None:
++                npgettext = _make_new_npgettext(npgettext)
++
++        # Create fallback-aware wrapper functions
++        gettext_wrapper = _make_fallback_gettext(
++            gettext, fallback_gettext_funcs_list, self.environment.newstyle_gettext, self.environment  # type: ignore
++        )
++        ngettext_wrapper = _make_fallback_ngettext(
++            ngettext, fallback_ngettext_funcs_list, self.environment.newstyle_gettext, self.environment  # type: ignore
++        )
++
++        pgettext_wrapper = None
++        if pgettext is not None:
++            pgettext_wrapper = _make_fallback_pgettext(
++                pgettext, fallback_pgettext_funcs_list, self.environment.newstyle_gettext, self.environment  # type: ignore
++            )
++
++        npgettext_wrapper = None
++        if npgettext is not None:
++            npgettext_wrapper = _make_fallback_npgettext(
++                npgettext, fallback_npgettext_funcs_list, self.environment.newstyle_gettext, self.environment  # type: ignore
++            )
++
++        # Update globals with wrapper functions
++        self.environment.globals.update(
++            gettext=gettext_wrapper,
++            ngettext=ngettext_wrapper,
++            pgettext=pgettext_wrapper,
++            npgettext=npgettext_wrapper,
++        )
++
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)

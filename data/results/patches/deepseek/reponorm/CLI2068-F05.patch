@@ -1,0 +1,275 @@
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..a4a9acc 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -1,6 +1,9 @@
+ from __future__ import annotations
+ 
+ import collections.abc as cabc
++import datetime
++import errno
++import os
+ import inspect
+ import io
+ import itertools
+@@ -12,7 +15,7 @@ from gettext import gettext as _
+ from ._compat import isatty
+ from ._compat import strip_ansi
+ from .exceptions import Abort
+-from .exceptions import UsageError
++from .exceptions import ClickException, UsageError
+ from .globals import resolve_color_default
+ from .types import Choice
+ from .types import convert_type
+@@ -650,6 +653,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    lock_files: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,6 +681,13 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param lock_files: if ``True`` and *filename* is given, atomically
++        create a ``.\u200b{basename}.lock`` file in the same directory
++        before launching the editor and remove it afterwards.  An
++        existing lock file prevents editing and raises
++        :exc:`ClickException`.  The lock contains the PID and timestamp
++        of the locking process.  Has no effect when *filename* is
++        ``None``.
+     """
+     from ._termui_impl import Editor
+ 
+@@ -685,10 +696,89 @@ def edit(
+     if filename is None:
+         return ed.edit(text)
+ 
+-    ed.edit_file(filename)
++    if lock_files:
++        lockpath = _acquire_edit_lock(filename)
++
++    try:
++        ed.edit_file(filename)
++    finally:
++        if lock_files:
++            _release_edit_lock(lockpath)
++
+     return None
+ 
+ 
++def _acquire_edit_lock(filename: str) -> str:
++    """Atomically create a lock file for the given *filename*.
++
++    Returns the path to the lock file.
++
++    Raises :exc:`ClickException` if the lock already exists or if
++    creation fails for another reason.
++    """
++    lockpath = os.path.join(
++        os.path.dirname(filename) or ".",
++        f".{os.path.basename(filename)}.lock",
++    )
++
++    try:
++        fd = os.open(lockpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++    except OSError as e:
++        if e.errno == errno.EEXIST:
++            _raise_lock_exists(lockpath)
++        raise ClickException(
++            _("Failed to create lock file: {path}").format(path=lockpath)
++        ) from e
++
++    try:
++        now = datetime.datetime.now(datetime.timezone.utc)
++        content = f"PID: {os.getpid()}\nTime: {now.isoformat()}\n"
++        with os.fdopen(fd, "w") as f:
++            f.write(content)
++    except OSError as e:
++        # Clean up the lock file we just created
++        try:
++            os.unlink(lockpath)
++        except OSError:
++            pass
++        raise ClickException(
++            _("Failed to write lock file: {path}").format(path=lockpath)
++        ) from e
++
++    return lockpath
++
++
++def _raise_lock_exists(lockpath: str) -> None:
++    """Read lock info and raise :exc:`ClickException`."""
++    try:
++        with open(lockpath, "r", encoding="utf-8") as f:
++            content = f.read()
++    except OSError:
++        raise ClickException(
++            _("Lock file exists: {path}").format(path=lockpath)
++        )
++
++    raise ClickException(
++        _("Lock file exists: {path}\n{content}").format(
++            path=lockpath, content=content
++        )
++    )
++
++
++def _release_edit_lock(lockpath: str) -> None:
++    """Remove the lock file at *lockpath*.
++
++    Raises :exc:`ClickException` on failure, chaining the original
++    :exc:`OSError`.
++    """
++    try:
++        os.unlink(lockpath)
++    except OSError as e:
++        raise ClickException(
++            _("Failed to remove lock file: {path}").format(path=lockpath)
++        ) from e
++
++
+ def launch(url: str, wait: bool = False, locate: bool = False) -> int:
+     """This function launches the given URL (or filename) in the default
+     viewer application for this file type.  If this is an executable, it
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..1f9ab91 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -380,6 +380,134 @@ def test_fast_edit(runner):
+     assert result == "aTest\nbTest\n"
+ 
+ 
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_lock_file(tmp_path):
++    """Lock file is created and removed when editing a direct filename."""
++    fname = tmp_path / "test.txt"
++    fname.write_text("hello\n")
++    lockpath = tmp_path / ".test.txt.lock"
++
++    result = click.edit(
++        filename=str(fname), editor="sed -i~ 's/hello/world/'", lock_files=True
++    )
++    assert result is None  # filename form returns None
++    assert not lockpath.exists(), "Lock file should be removed after edit"
++    assert fname.read_text() == "world\n"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_lock_existing(tmp_path):
++    """Existing lock file raises ClickException with lock info."""
++    fname = tmp_path / "test.txt"
++    fname.write_text("hello\n")
++    lockpath = tmp_path / ".test.txt.lock"
++    lockpath.write_text("PID: 9999\nTime: 2024-01-01T00:00:00\n")
++
++    with pytest.raises(click.ClickException) as excinfo:
++        click.edit(
++            filename=str(fname), editor="sed -i~ 's/hello/world/'", lock_files=True
++        )
++    msg = str(excinfo.value)
++    assert str(lockpath) in msg
++    assert "PID: 9999" in msg
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_lock_removed_on_failure(tmp_path):
++    """Lock file is removed even when editor exits with non-zero status."""
++    fname = tmp_path / "test.txt"
++    fname.write_text("content\n")
++    lockpath = tmp_path / ".test.txt.lock"
++
++    with pytest.raises(click.ClickException):
++        click.edit(filename=str(fname), editor="false", lock_files=True)
++
++    assert not lockpath.exists(), "Lock should be removed after editor failure"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_lock_text_form(tmp_path):
++    """lock_files=True does not create lock for text (temp file) form."""
++    result = click.edit("test\n", editor="sed -i~ 's/test/pass/'", lock_files=True)
++    assert result == "pass\n"
++
++
++def test_edit_lock_default_false(tmp_path):
++    """Default lock_files=False preserves existing behavior."""
++    fname = tmp_path / "test.txt"
++    fname.write_text("hello\n")
++
++    # Even if a .lock file exists, lock_files=False ignores it
++    lockpath = tmp_path / ".test.txt.lock"
++    lockpath.write_text("PID: 9999\nTime: 2024-01-01T00:00:00\n")
++
++    # With lock_files=False (default), no lock is acquired,
++    # so editing should succeed even though a stale lock exists
++    result = click.edit(
++        filename=str(fname),
++        editor="sed -i~ 's/hello/world/'",
++    )
++    assert result is None
++    assert fname.read_text() == "world\n"
++
++
++def test_edit_lock_different_directories(tmp_path):
++    """Same basenames in different directories have independent locks."""
++    dir1 = tmp_path / "dir1"
++    dir2 = tmp_path / "dir2"
++    dir1.mkdir()
++    dir2.mkdir()
++    fname1 = dir1 / "shared.txt"
++    fname2 = dir2 / "shared.txt"
++    fname1.write_text("a\n")
++    fname2.write_text("b\n")
++
++    lock1 = dir1 / ".shared.txt.lock"
++    lock2 = dir2 / ".shared.txt.lock"
++
++    # Lock dir1 only
++    lock1.write_text("PID: 9999\nTime: 2024-01-01T00:00:00\n")
++
++    # Editing dir2 should succeed despite lock in dir1
++    result = click.edit(
++        filename=str(fname2),
++        editor="sed -i~ 's/b/c/'",
++        lock_files=True,
++    )
++    assert result is None
++    assert fname2.read_text() == "c\n"
++    assert not lock2.exists(), "Lock in dir2 should be cleaned up"
++    assert lock1.exists(), "Lock in dir1 should still exist (independent)"
++
++    lock1.unlink()
++
++
++def test_edit_lock_oserror_creation(tmp_path, monkeypatch):
++    """OSError during lock creation raises ClickException chaining original."""
++    import os
++    import errno
++    fname = tmp_path / "test.txt"
++    fname.write_text("content\n"
++)
++
++    # Monkeypatch os.open to raise OSError on lock files
++    original_open = os.open
++
++    def broken_open(path, flags, mode=0o777):
++        if path.endswith(".lock"):
++            raise OSError(errno.EACCES, "Permission denied")
++        return original_open(path, flags, mode)
++
++    monkeypatch.setattr(os, "open", broken_open)
++
++    with pytest.raises(click.ClickException) as excinfo:
++        click.edit(filename=str(fname), editor="sed -i~ s/a/b/", lock_files=True)
++    assert "Failed to create lock file" in str(excinfo.value)
++    # Original exception should be chained
++    assert isinstance(excinfo.value.__cause__, OSError)
++
++
++
+ @pytest.mark.parametrize(
+     ("prompt_required", "required", "args", "expect"),
+     [

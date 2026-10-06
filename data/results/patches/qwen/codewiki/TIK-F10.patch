@@ -1,0 +1,102 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..fc8e1cc 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import functools
++from collections import OrderedDict
+ from concurrent.futures import ThreadPoolExecutor
++from threading import Lock
+ from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
+ 
+ import regex
+@@ -53,6 +55,12 @@ class Encoding:
+ 
+         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
+ 
++        # Private cache for encode/encode_batch with use_cache=True
++        # Capacity 128, LRU eviction
++        self._cache: OrderedDict[tuple, list[int]] = OrderedDict()
++        self._cache_lock = Lock()
++        self._cache_capacity = 128
++
+     def __repr__(self) -> str:
+         return f"<Encoding {self.name!r}>"
+ 
+@@ -82,6 +90,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -120,6 +129,49 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        # Handle caching
++        if use_cache:
++            # Create cache key including text and special token policy
++            # Convert to hashable types for cache key
++            if isinstance(allowed_special, set):
++                allowed_key = frozenset(allowed_special)
++            elif isinstance(allowed_special, frozenset):
++                allowed_key = allowed_special
++            else:
++                allowed_key = allowed_special
++            
++            if isinstance(disallowed_special, set):
++                disallowed_key = frozenset(disallowed_special)
++            elif isinstance(disallowed_special, frozenset):
++                disallowed_key = disallowed_special
++            else:
++                disallowed_key = disallowed_special
++            
++            cache_key = (text, allowed_key, disallowed_key)
++            
++            with self._cache_lock:
++                if cache_key in self._cache:
++                    # Move to end (most recently used)
++                    self._cache.move_to_end(cache_key)
++                    # Return a copy to prevent mutation of cached value
++                    return list(self._cache[cache_key])
++                
++                # Perform encoding
++                result = self._encode_with_cache_check(text, allowed_special)
++                
++                # Insert into cache
++                self._cache[cache_key] = result
++                
++                # Evict oldest entries if over capacity
++                while len(self._cache) > self._cache_capacity:
++                    self._cache.popitem(last=False)
++                
++                return result
++        
++        return self._encode_with_cache_check(text, allowed_special)
++
++    def _encode_with_cache_check(self, text: str, allowed_special) -> list[int]:
++        """Internal method to perform encoding, handling UnicodeEncodeError."""
+         try:
+             return self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+@@ -179,6 +231,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -197,7 +250,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, use_cache=use_cache
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

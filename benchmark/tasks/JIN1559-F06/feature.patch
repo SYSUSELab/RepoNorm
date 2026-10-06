@@ -1,0 +1,102 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..2088f05 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -2,6 +2,7 @@
+ import pprint
+ import re
+ import typing as t
++from collections import OrderedDict
+ 
+ from markupsafe import Markup
+ 
+@@ -263,9 +264,62 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            clear_translation_cache=self._clear_translation_cache,
++            resize_translation_cache=self._resize_translation_cache,
++            set_translation_cache_partition=self._set_translation_cache_partition,
+             newstyle_gettext=False,
++            i18n_cache_size=0,
++            i18n_cache_partition=None,
++            i18n_translation_cache=OrderedDict(),
+         )
+ 
++    def bind(self, environment: Environment) -> "InternationalizationExtension":
++        rv = t.cast("InternationalizationExtension", super().bind(environment))
++        environment.i18n_translation_cache = OrderedDict(  # type: ignore
++            self.environment.i18n_translation_cache  # type: ignore
++        )
++        environment.clear_translation_cache = rv._clear_translation_cache  # type: ignore
++        environment.resize_translation_cache = rv._resize_translation_cache  # type: ignore
++        environment.set_translation_cache_partition = rv._set_translation_cache_partition  # type: ignore
++        return rv
++
++    def _clear_translation_cache(self) -> None:
++        self.environment.i18n_translation_cache.clear()  # type: ignore
++
++    def _resize_translation_cache(self, capacity: int) -> None:
++        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
++            raise ValueError("translation cache capacity must be a non-negative integer")
++        self.environment.i18n_cache_size = capacity  # type: ignore
++        cache = self.environment.i18n_translation_cache  # type: ignore
++        while len(cache) > capacity:
++            cache.popitem(last=False)
++        if capacity == 0:
++            cache.clear()
++
++    def _set_translation_cache_partition(self, partition: t.Hashable) -> None:
++        hash(partition)
++        if partition != self.environment.i18n_cache_partition:  # type: ignore
++            self.environment.i18n_cache_partition = partition  # type: ignore
++            self._clear_translation_cache()
++
++    def _cache_callable(self, kind: str, function: t.Callable[..., str]) -> t.Callable[..., str]:
++        @pass_context
++        def cached(context: Context, *args: t.Any) -> str:
++            capacity = self.environment.i18n_cache_size  # type: ignore
++            if capacity == 0:
++                return context.call(function, *args)
++            key = (kind, self.environment.i18n_cache_partition, args)  # type: ignore
++            cache = self.environment.i18n_translation_cache  # type: ignore
++            try:
++                result = cache.pop(key)
++            except KeyError:
++                result = context.call(function, *args)
++            cache[key] = result
++            while len(cache) > capacity:
++                cache.popitem(last=False)
++            return result
++        return cached
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -319,7 +373,18 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Hashable = None,
+     ) -> None:
++        self._clear_translation_cache()
++        self._resize_translation_cache(cache_size)
++        self._set_translation_cache_partition(cache_partition)
++        gettext = self._cache_callable("gettext", gettext)
++        ngettext = self._cache_callable("ngettext", ngettext)
++        if pgettext is not None:
++            pgettext = self._cache_callable("pgettext", pgettext)
++        if npgettext is not None:
++            npgettext = self._cache_callable("npgettext", npgettext)
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+         if self.environment.newstyle_gettext:  # type: ignore
+@@ -337,6 +402,7 @@ class InternationalizationExtension(Extension):
+         )
+ 
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
++        self._clear_translation_cache()
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+ 

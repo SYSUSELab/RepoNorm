@@ -1,0 +1,277 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..dffbe34 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1980,6 +1980,8 @@ def _check_iter(value: t.Any) -> cabc.Iterator[t.Any]:
+ 
+     return iter(value)
+ 
++# Built-in type function, saved to avoid shadowing by `type` parameter
++_builtin_type = __import__("builtins").type
+ 
+ class Parameter:
+     r"""A parameter to a command comes in two versions: they are either
+@@ -2086,6 +2088,7 @@ class Parameter:
+         expose_value: bool = True,
+         is_eager: bool = False,
+         envvar: str | cabc.Sequence[str] | None = None,
++        auto_complete: bool | str = False,
+         shell_complete: t.Callable[
+             [Context, Parameter, str], list[CompletionItem] | list[str]
+         ]
+@@ -2118,6 +2121,20 @@ class Parameter:
+         self.metavar = metavar
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
++        self._auto_complete = auto_complete
++
++        # Validate auto_complete value
++        if not isinstance(auto_complete, (bool, str)):
++            raise TypeError(
++                f"auto_complete must be a boolean or string, got {_builtin_type(auto_complete).__name__}"
++            )
++        if isinstance(auto_complete, str):
++            valid_strategies = {"user", "branch", "environment", "file", "directory"}
++            if auto_complete not in valid_strategies:
++                raise ValueError(
++                    f"Invalid auto_complete strategy: {auto_complete!r}. "
++                    f"Valid strategies are: {', '.join(sorted(valid_strategies))}"
++                )
+         self.deprecated = deprecated
+ 
+         if __debug__:
+@@ -2459,6 +2476,11 @@ class Parameter:
+ 
+             return t.cast("list[CompletionItem]", results)
+ 
++        # Check if auto_complete is enabled
++        if self._auto_complete is not False:
++            from .shell_completion import get_shell_complete_for_option
++            return get_shell_complete_for_option(ctx, self, incomplete)
++
+         return self.type.shell_complete(ctx, self, incomplete)
+ 
+ 
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 6c39d5e..12055ae 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -642,3 +642,218 @@ def _resolve_incomplete(
+     # There were no unparsed arguments, the command may be a group that
+     # will provide command name completions.
+     return ctx.command, incomplete
++
++
++# Smart completion strategies for auto_complete feature
++
++def _normalize_name(name: str) -> str:
++    """Normalize option name to lowercase with underscores."""
++    # Strip leading dashes and convert camelCase or PascalCase to snake_case
++    name = name.lstrip('-')
++    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
++    s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
++    return s2.lower()
++
++
++def _get_auto_complete_strategy(name: str) -> str | None:
++    """Determine auto-complete strategy from normalized option name.
++    
++    Returns one of: "user", "branch", "environment", "file", "directory", or None.
++    """
++    normalized = _normalize_name(name)
++    # Replace hyphens with underscores for tokenization
++    tokens = normalized.replace('-', '_').split('_')
++    
++    for token in tokens:
++        if token in ("user", "username", "owner", "author"):
++            return "user"
++        elif token in ("branch", "ref", "revision"):
++            return "branch"
++        elif token in ("env", "environment", "var"):
++            return "environment"
++        elif token in ("path", "input", "output", "file"):
++            return "file"
++        elif token in ("dir", "directory"):
++            return "directory"
++    
++    return None
++
++
++def _complete_usernames(incomplete: str) -> list[str]:
++    """Return sorted list of usernames matching incomplete prefix.
++    
++    Excludes usernames starting with underscore.
++    Returns at most 20 results.
++    Falls back to empty list if pwd module unavailable.
++    """
++    try:
++        import pwd
++    except ImportError:
++        return []
++    
++    try:
++        all_users = [entry.pw_name for entry in pwd.getpwall()]
++    except (OSError, KeyError):
++        return []
++    
++    # Filter out usernames starting with underscore
++    users = [u for u in all_users if not u.startswith("_")]
++    
++    # Find matches and sort
++    matches = [u for u in users if u.startswith(incomplete)]
++    matches.sort()
++    
++    return matches[:20]
++
++
++def _complete_branches(incomplete: str) -> list[str]:
++    """Return sorted list of git branches matching incomplete prefix.
++    
++    Returns at most 20 results.
++    Falls back to empty list if git command unavailable or fails.
++    """
++    import subprocess
++    
++    try:
++        result = subprocess.run(
++            ["git", "branch", "--format=%(refname:short)"],
++            capture_output=True,
++            text=True,
++            timeout=5,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return []
++    
++    if result.returncode != 0:
++        return []
++    
++    branches = [b.strip() for b in result.stdout.splitlines() if b.strip()]
++    
++    # Find matches and sort
++    matches = [b for b in branches if b.startswith(incomplete)]
++    matches.sort()
++    
++    return matches[:20]
++
++
++def _complete_environments(incomplete: str) -> list[str]:
++    """Return sorted list of environment variable names matching incomplete prefix.
++    
++    Returns at most 20 results.
++    Environment returns names only, never values.
++    """
++    env_vars = list(os.environ.keys())
++    
++    # Find matches and sort
++    matches = [v for v in env_vars if v.startswith(incomplete)]
++    matches.sort()
++    
++    return matches[:20]
++
++
++def _complete_paths(incomplete: str, dir_only: bool = False) -> list[str]:
++    """Return sorted list of path completions matching incomplete prefix.
++    
++    If dir_only is True, only directories are returned.
++    Otherwise, both files and directories are returned.
++    """
++    from pathlib import Path
++    
++    # Handle empty incomplete - return current directory contents
++    if not incomplete:
++        incomplete = "."
++    
++    # Expand user home directory
++    path_str = os.path.expanduser(incomplete)
++    
++    try:
++        path = Path(path_str)
++        
++        # If path exists and is a file, don't complete further
++        if path.exists() and not path.is_dir():
++            return []
++        
++        # Get parent directory and prefix
++        if path.is_dir():
++            parent = path
++            prefix = ""
++        else:
++            parent = path.parent
++            prefix = path.name
++        
++        # List directory contents
++        entries = list(parent.iterdir())
++        
++        # Sort entries
++        entries.sort(key=lambda p: p.name)
++        
++        # Filter and collect matches
++        matches = []
++        for entry in entries:
++            name = entry.name
++            if name.startswith(prefix):
++                full_path = str(entry)
++                if dir_only and not entry.is_dir():
++                    continue
++                matches.append(full_path)
++        
++        return matches[:20]
++        
++    except (OSError, PermissionError):
++        return []
++
++
++def get_shell_complete_for_option(
++    ctx: Context, param: Parameter, incomplete: str
++) -> list[CompletionItem]:
++    """Get shell completions for an option using auto_complete strategy.
++    
++    This function is called when an Option has auto_complete enabled
++    but no custom shell_complete callback.
++    """
++    from click.shell_completion import CompletionItem
++    
++    auto_complete = getattr(param, "_auto_complete", False)
++    
++    # If auto_complete is explicitly set to False, return empty
++    if auto_complete is False:
++        return []
++    
++    # Determine the strategy
++    strategy = None
++    if isinstance(auto_complete, str):
++        # Explicit string selection
++        valid_strategies = {"user", "branch", "environment", "file", "directory"}
++        if auto_complete not in valid_strategies:
++            raise ValueError(
++                f"Invalid auto_complete strategy: {auto_complete!r}. "
++                f"Valid strategies are: {', '.join(sorted(valid_strategies))}"
++            )
++        strategy = auto_complete
++    else:
++        # Boolean True - use name-based selection
++        if auto_complete is True:
++            # Use the first option name (e.g., '--my-username') for strategy detection
++            # This preserves camelCase and dashes that would be lost in param.name
++            option_name = param.opts[0] if param.opts else param.name
++            strategy = _get_auto_complete_strategy(option_name)
++    
++    if strategy is None:
++        return []
++    
++    # Execute the appropriate strategy
++    if strategy == "user":
++        results = _complete_usernames(incomplete)
++    elif strategy == "branch":
++        results = _complete_branches(incomplete)
++    elif strategy == "environment":
++        results = _complete_environments(incomplete)
++    elif strategy == "file":
++        results = _complete_paths(incomplete, dir_only=False)
++    elif strategy == "directory":
++        results = _complete_paths(incomplete, dir_only=True)
++    else:
++        return []
++    
++    # Return as CompletionItems
++    return [CompletionItem(result) for result in results]

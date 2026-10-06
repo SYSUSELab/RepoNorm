@@ -1,0 +1,122 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..a22626c 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ import functools
++from threading import Lock
++from collections import OrderedDict
+ from concurrent.futures import ThreadPoolExecutor
+ from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
+ 
+@@ -52,6 +54,9 @@ class Encoding:
+             assert self.max_token_value == explicit_n_vocab - 1
+ 
+         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
++        self._encode_cache: OrderedDict[tuple[object, ...], tuple[int, ...]] = OrderedDict()
++        self._encode_cache_capacity = 128
++        self._encode_cache_lock = Lock()
+ 
+     def __repr__(self) -> str:
+         return f"<Encoding {self.name!r}>"
+@@ -76,12 +81,35 @@ class Encoding:
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+             return self._core_bpe.encode_ordinary(text)
+ 
++    def _create_cache_key(
++        self,
++        text: str,
++        allowed_special: Literal["all"] | AbstractSet[str],
++        disallowed_special: Literal["all"] | Collection[str]
++    ) -> tuple:
++        """Create a hashable cache key from the encode parameters."""
++        # Convert allowed_special to a frozenset if it's not "all"
++        if allowed_special == "all":
++            allowed_special_key = "all"
++        else:
++            allowed_special_key = frozenset(allowed_special)
++ 
++        # Convert disallowed_special to a frozenset if it's not "all"
++        if disallowed_special == "all":
++            disallowed_special_key = "all"
++        else:
++            disallowed_special_key = frozenset(disallowed_special)
++ 
++        # Return a tuple that can be used as a dictionary key
++        return (text, allowed_special_key, disallowed_special_key)
++
+     def encode(
+         self,
+         text: str,
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -96,6 +124,7 @@ class Encoding:
+           cause all text corresponding to special tokens to be encoded as natural text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
++        - Setting `use_cache` to True will cache the results for faster repeated encoding.
+ 
+         ```
+         >>> enc.encode("hello world")
+@@ -120,8 +149,16 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if use_cache:
++            cache_key = self._create_cache_key(text, allowed_special, disallowed_special)
++            with self._encode_cache_lock:
++                cached_result = self._encode_cache.get(cache_key)
++                if cached_result is not None:
++                    self._encode_cache.move_to_end(cache_key)
++                    return list(cached_result)
++
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +167,17 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
++
++        # Add to cache if use_cache is True
++        if use_cache:
++            with self._encode_cache_lock:
++                self._encode_cache[cache_key] = tuple(result)
++                self._encode_cache.move_to_end(cache_key)
++                if len(self._encode_cache) > self._encode_cache_capacity:
++                    self._encode_cache.popitem(last=False)
++
++        return result
+ 
+     def encode_to_numpy(
+         self,
+@@ -177,6 +224,7 @@ class Encoding:
+         text: list[str],
+         *,
+         num_threads: int = 8,
++        use_cache: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+     ) -> list[list[int]]:
+@@ -197,7 +245,8 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special,
++            use_cache=use_cache,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

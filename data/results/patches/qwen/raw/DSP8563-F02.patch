@@ -1,0 +1,374 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..ef7d3448 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,11 @@
++import ast
+ import asyncio
+ import inspect
++import math
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, model_validator
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -169,6 +171,32 @@ class Tool(Type):
+ 
+         return loop.run_until_complete(coroutine)
+ 
++    @with_callbacks
++    def call(self, *args, **kwargs):
++        """Call the tool with the given arguments."""
++        if args:
++            raise ValueError("Positional arguments are not allowed.")
++        parsed_kwargs = self._validate_and_parse_args(**kwargs)
++        return self.func(**parsed_kwargs)
++
++    async def acall(self, *args, **kwargs):
++        """Asynchronously call the tool with the given arguments."""
++        if args:
++            raise ValueError("Positional arguments are not allowed.")
++        parsed_kwargs = self._validate_and_parse_args(**kwargs)
++        if asyncio.iscoroutinefunction(self.func):
++            return await self.func(**parsed_kwargs)
++        else:
++            return self.func(**parsed_kwargs)
++
++    def __repr__(self):
++        return f"Tool(name={self.name}, desc={self.desc}, args={self.args})"
++
++    def __str__(self):
++        desc = f", whose description is <desc>{self.desc}</desc>.".replace("\n", "  ") if self.desc else "."
++        arg_desc = f"It takes arguments {self.args}."
++        return f"{self.name}{desc} {arg_desc}"
++
+     @with_callbacks
+     def __call__(self, **kwargs):
+         parsed_kwargs = self._validate_and_parse_args(**kwargs)
+@@ -183,23 +211,12 @@ class Tool(Type):
+                 )
+         return result
+ 
+-    @with_callbacks
+-    async def acall(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            return await result
+-        else:
+-            # We should allow calling a sync tool in the async path.
+-            return result
+-
+     @classmethod
+-    def from_mcp_tool(cls, session: "mcp.client.session.ClientSession", tool: "mcp.types.Tool") -> "Tool":
+-        """
+-        Build a DSPy tool from an MCP tool and a ClientSession.
++    def from_mcp(cls, session: "mcp.ClientSession", tool: "mcp.Tool") -> "Tool":
++        """Build a DSPy tool from an MCP tool.
+ 
+         Args:
+-            session: The MCP session to use.
++            session: The MCP client session.
+             tool: The MCP tool to convert.
+ 
+         Returns:
+@@ -245,14 +262,6 @@ class Tool(Type):
+ 
+         return convert_langchain_tool(tool)
+ 
+-    def __repr__(self):
+-        return f"Tool(name={self.name}, desc={self.desc}, args={self.args})"
+-
+-    def __str__(self):
+-        desc = f", whose description is <desc>{self.desc}</desc>.".replace("\n", "  ") if self.desc else "."
+-        arg_desc = f"It takes arguments {self.args}."
+-        return f"{self.name}{desc} {arg_desc}"
+-
+ 
+ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+@@ -309,6 +318,281 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    @classmethod
++    def validate_input(cls, text: str) -> dict[str, Any]:
++        """Validate and parse Python-style tool calls from a string."""
++        return parse_python_calls(text)
++
++    @model_validator(mode="before")
++    @classmethod
++    def validate_model(cls, data: Any) -> Any:
++        if isinstance(data, str):
++            return parse_python_calls(data)
++        return data
++
++
++def parse_python_calls(text: str) -> dict[str, Any]:
++    """Parse Python-style tool calls from a string.
++
++    Accepts one or more top-level calls separated by newlines or semicolons, preserving source order.
++    A callee is an identifier or a dot-separated sequence of identifiers; use its final identifier as the tool name.
++    A dotted name is only a name, never an attribute lookup or an evaluated expression.
++    Calls may have no arguments or only explicit keyword arguments.
++
++    Argument values may contain strings (including Unicode), finite integers/floats, booleans, None,
++    and nested lists, tuples and dictionaries. Dictionary keys must be strings. Convert tuples recursively into lists.
++    Unary + and - are permitted only on numbers, not booleans. Preserve all other literal values.
++
++    Reject positional arguments, argument unpacking, duplicate keyword arguments or dictionary keys,
++    variables, computed/attribute values, nested calls, f-strings, comprehensions, lambdas, bytes,
++    complex numbers, Ellipsis and non-finite numbers. Reject statements other than calls and reject Python comments;
++    a # inside a string literal is ordinary string content. Empty input and malformed syntax are errors.
++
++    Raises:
++        ValueError: If the input contains invalid syntax or forbidden constructs.
++
++    Returns:
++        A dictionary with key "tool_calls" containing a list of dicts with "name" and "args" keys.
++    """
++    if not text or not text.strip():
++        raise ValueError("empty input is not allowed")
++
++    # Split by newlines or semicolons
++    parts = []
++    current_part = ""
++    in_string = False
++    string_char = None
++    i = 0
++    while i < len(text):
++        c = text[i]
++        if in_string:
++            current_part += c
++            if c == '\\' and i + 1 < len(text):
++                current_part += text[i + 1]
++                i += 1
++            elif c == string_char:
++                in_string = False
++        elif c in ('"', "'"):
++            in_string = True
++            string_char = c
++            current_part += c
++        elif c in '\n;':
++            if current_part.strip():
++                parts.append(current_part.strip())
++            current_part = ""
++        else:
++            current_part += c
++        i += 1
++    if current_part.strip():
++        parts.append(current_part.strip())
++
++    if not parts:
++        raise ValueError("empty input is not allowed")
++
++    tool_calls = []
++    for part in parts:
++        call_result = _parse_single_call(part)
++        tool_calls.append(call_result)
++
++    return {"tool_calls": tool_calls}
++
++
++def _parse_single_call(text: str) -> dict[str, Any]:
++    """Parse a single tool call from text."""
++    tree = ast.parse(text, mode='exec')
++
++    if len(tree.body) != 1:
++        raise ValueError("only one call per statement is allowed")
++
++    node = tree.body[0]
++
++    if not isinstance(node, ast.Expr):
++        raise ValueError("statements other than calls are not allowed")
++
++    call_node = node.value
++
++    if not isinstance(call_node, ast.Call):
++        raise ValueError("expected a function call")
++
++    # Check for positional arguments
++    if call_node.args:
++        raise ValueError("positional arguments are not allowed")
++
++    # Check for argument unpacking
++    for kw in call_node.keywords:
++        if kw.arg is None:
++            raise ValueError("argument unpacking (**kwargs) is not allowed")
++
++    # Extract tool name from the callee
++    callee = call_node.func
++    name_parts = _extract_name_parts(callee)
++    tool_name = name_parts[-1] if name_parts else ""
++
++    if not tool_name:
++        raise ValueError("invalid tool name")
++
++    # Check for duplicate keyword arguments
++    seen_kw = set()
++    for kw in call_node.keywords:
++        if kw.arg in seen_kw:
++            raise ValueError(f"duplicate keyword argument '{kw.arg}' is not allowed")
++        seen_kw.add(kw.arg)
++
++    # Parse arguments
++    args = {}
++    for kw in call_node.keywords:
++        _check_value(kw.value)
++        value = _convert_ast_to_python(kw.value)
++        args[kw.arg] = value
++
++    return {"name": tool_name, "args": args}
++
++
++def _extract_name_parts(node: ast.expr) -> list[str]:
++    """Extract name parts from a dotted identifier."""
++    parts = []
++    while isinstance(node, ast.Attribute):
++        parts.append(node.attr)
++        node = node.value
++    if isinstance(node, ast.Name):
++        parts.append(node.id)
++    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
++        parts.append(node.value)
++    else:
++        raise ValueError("attribute lookups are not allowed")
++    return list(reversed(parts))
++
++
++def _check_value(node: ast.AST) -> None:
++    """Check that a value node doesn't contain forbidden constructs."""
++    if isinstance(node, ast.Lambda):
++        raise ValueError("lambdas are not allowed")
++    if isinstance(node, ast.ListComp):
++        raise ValueError("comprehensions are not allowed")
++    if isinstance(node, ast.DictComp):
++        raise ValueError("comprehensions are not allowed")
++    if isinstance(node, ast.SetComp):
++        raise ValueError("comprehensions are not allowed")
++    if isinstance(node, ast.GeneratorExp):
++        raise ValueError("comprehensions are not allowed")
++    if isinstance(node, ast.Call):
++        raise ValueError("nested function calls are not allowed")
++    if isinstance(node, ast.JoinedStr):
++        raise ValueError("f-strings are not allowed")
++    if isinstance(node, ast.FormattedValue):
++        raise ValueError("f-strings are not allowed")
++    if isinstance(node, ast.Constant):
++        val = node.value
++        if isinstance(val, bytes):
++            raise ValueError("bytes literals are not allowed")
++        if isinstance(val, float) and not _is_finite_number(val):
++            raise ValueError("non-finite numbers are not allowed")
++        if val is ...:
++            raise ValueError("Ellipsis is not allowed")
++    if isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, (ast.UAdd, ast.USub)):
++            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, bool):
++                raise ValueError("unary + or - on booleans is not allowed")
++            _check_value(node.operand)
++    if isinstance(node, ast.BinOp):
++        if not isinstance(node.op, ast.Pow):
++            raise ValueError("binary operations other than exponentiation are not allowed")
++        _check_value(node.left)
++        _check_value(node.right)
++    if isinstance(node, ast.BoolOp):
++        for v in node.values:
++            _check_value(v)
++    if isinstance(node, ast.IfExp):
++        _check_value(node.test)
++        _check_value(node.body)
++        _check_value(node.orelse)
++    if isinstance(node, ast.Tuple):
++        for elt in node.elts:
++            _check_value(elt)
++    if isinstance(node, ast.List):
++        for elt in node.elts:
++            _check_value(elt)
++    if isinstance(node, ast.Dict):
++        for k in node.keys:
++            if k is not None:
++                _check_value(k)
++        for v in node.values:
++            _check_value(v)
++    if isinstance(node, ast.Subscript):
++        _check_value(node.value)
++        _check_value(node.slice)
++        _check_value(node.ctx)
++    if isinstance(node, ast.Starred):
++        _check_value(node.value)
++    if isinstance(node, ast.Name):
++        raise ValueError("variables are not allowed")
++    if isinstance(node, ast.Attribute):
++        raise ValueError("attribute lookups are not allowed")
++    if isinstance(node, ast.Compare):
++        for c in node.comparators:
++            _check_value(c)
++    if isinstance(node, ast.NamedExpr):
++        raise ValueError("assignment expressions are not allowed")
++    if isinstance(node, ast.Set):
++        for elt in node.elts:
++            _check_value(elt)
++    if isinstance(node, ast.Constant):
++        pass  # Already handled above
++
++
++def _convert_ast_to_python(node: ast.AST) -> Any:
++    """Convert an AST node to a Python value."""
++    if isinstance(node, ast.Constant):
++        val = node.value
++        if isinstance(val, float) and not _is_finite_number(val):
++            raise ValueError("non-finite numbers are not allowed")
++        return val
++    if isinstance(node, ast.NameConstant):
++        return node.value
++    if isinstance(node, ast.Tuple):
++        return [_convert_ast_to_python(elt) for elt in node.elts]
++    if isinstance(node, ast.List):
++        return [_convert_ast_to_python(elt) for elt in node.elts]
++    if isinstance(node, ast.Dict):
++        result = {}
++        for k, v in zip(node.keys, node.values):
++            if k is None:
++                raise ValueError("dictionary unpacking is not allowed")
++            key_val = _convert_ast_to_python(k)
++            if not isinstance(key_val, str):
++                raise ValueError("dictionary keys must be strings")
++            if key_val in result:
++                raise ValueError(f"duplicate dictionary key '{key_val}' is not allowed")
++            result[key_val] = _convert_ast_to_python(v)
++        return result
++    if isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, ast.UAdd):
++            operand = _convert_ast_to_python(node.operand)
++            if isinstance(operand, bool):
++                raise ValueError("unary + or - on booleans is not allowed")
++            return +operand
++        if isinstance(node.op, ast.USub):
++            operand = _convert_ast_to_python(node.operand)
++            if isinstance(operand, bool):
++                raise ValueError("unary + or - on booleans is not allowed")
++            return -operand
++    if isinstance(node, ast.BinOp):
++        left = _convert_ast_to_python(node.left)
++        right = _convert_ast_to_python(node.right)
++        if isinstance(node.op, ast.Pow):
++            return left ** right
++        raise ValueError("binary operations other than exponentiation are not allowed")
++    if isinstance(node, ast.Num):
++        return node.n
++    if isinstance(node, ast.Str):
++        return node.s
++    raise ValueError(f"unsupported expression: {type(node).__name__}")
++
++
++def _is_finite_number(val: float) -> bool:
++    """Check if a float is finite (not inf or nan)."""
++    return math.isfinite(val)
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""

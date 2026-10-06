@@ -1,0 +1,204 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..a607b15 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        auto_backup: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.auto_backup = auto_backup
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -511,6 +513,9 @@ class Editor:
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+ 
++        if self.auto_backup:
++            self._create_backup(filename)
++
+         if self.env:
+             environ = os.environ.copy()
+             environ.update(self.env)
+@@ -527,6 +532,29 @@ class Editor:
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+ 
++    def _create_backup(self, filename: str) -> None:
++        import shutil
++        from datetime import datetime
++
++        if not os.path.exists(filename):
++            return
++
++        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++        backup_base = f"{filename}.backup.{timestamp}"
++        backup_path = backup_base
++        counter = 1
++
++        while os.path.exists(backup_path):
++            backup_path = f"{backup_base}.{counter}"
++            counter += 1
++
++        try:
++            shutil.copy2(filename, backup_path)
++        except OSError as e:
++            raise ClickException(
++                _("Failed to create backup file")
++            ) from e
++
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..1af4ee1 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    auto_backup: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,13 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param auto_backup: if provided and filename is set, creates a backup
++                        of the file before editing.  Backup names follow the
++                        pattern {filename}.backup.YYYYMMDD_HHMMSS.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, auto_backup=auto_backup)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..0776bfa 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,114 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_auto_backup_no_filename(runner, monkeypatch, tmp_path):
++    """When auto_backup=True but no filename is given, no backup is created."""
++    import os
++
++    # Create a temp file to use as a marker - no backup should be created
++    marker = tmp_path / "marker"
++    marker.touch()
++    # Using text without filename - should not create backup
++    result = click.edit(
++        "test content", editor="sed -i~ 's/$/Test/'", auto_backup=True
++    )
++    assert result is not None
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_auto_backup_new_file(runner, monkeypatch, tmp_path):
++    """When auto_backup=True but the file doesn't exist, no backup is created."""
++    import os
++
++    nonexistent = tmp_path / "nonexistent.txt"
++    assert not nonexistent.exists()
++
++    # Editor will fail on nonexistent file, but we just verify no backup
++    with pytest.raises(click.ClickException):
++        click.edit(filename=str(nonexistent), editor="cat", auto_backup=True)
++
++    # Verify no backup file was created
++    assert not list(tmp_path.glob("nonexistent.txt.backup.*"))
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_auto_backup_creates_backup(runner, monkeypatch, tmp_path):
++    """When auto_backup=True and file exists, a backup is created."""
++    import os
++
++    # Create a test file
++    test_file = tmp_path / "test_edit.txt"
++    test_file.write_text("original content")
++
++    # Use cat as a no-op editor (reads and outputs file)
++    click.edit(filename=str(test_file), editor="cat", auto_backup=True)
++
++    # Check backup exists
++    backups = list(tmp_path.glob("test_edit.txt.backup.*"))
++    assert len(backups) == 1
++    assert backups[0].read_text() == "original content"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_auto_backup_preserves_mode(runner, monkeypatch, tmp_path):
++    """Backup preserves the source file's permission mode."""
++    import os
++    import stat
++
++    # Create a test file with specific permissions
++    test_file = tmp_path / "test_mode.txt"
++    test_file.write_text("content")
++    test_file.chmod(0o755)
++    original_mode = os.stat(test_file).st_mode
++
++    click.edit(filename=str(test_file), editor="cat", auto_backup=True)
++
++    backups = list(tmp_path.glob("test_mode.txt.backup.*"))
++    assert len(backups) == 1
++    backup_mode = os.stat(backups[0]).st_mode
++    assert backup_mode == original_mode
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_auto_backup_no_overwrite(runner, monkeypatch, tmp_path):
++    """Repeated edits in the same second don't overwrite earlier backups."""
++    import os
++    from datetime import datetime
++
++    test_file = tmp_path / "test_no_overwrite.txt"
++    test_file.write_text("v1")
++
++    click.edit(filename=str(test_file), editor="cat", auto_backup=True)
++    test_file.write_text("v2")
++    click.edit(filename=str(test_file), editor="cat", auto_backup=True)
++
++    backups = sorted(tmp_path.glob("test_no_overwrite.txt.backup.*"))
++    assert len(backups) == 2
++    # First backup should be v1, second backup should match regardless
++    # but both should exist
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_edit_auto_backup_oserror(runner, monkeypatch, tmp_path):
++    """OSError during backup raises ClickException and doesn't launch editor."""
++    import os
++    import stat
++
++    # Create a test file in a directory that will become unwritable
++    backup_dir = tmp_path / "backup_dir"
++    backup_dir.mkdir()
++    test_file = backup_dir / "test_oserror.txt"
++    test_file.write_text("content")
++
++    # Make the directory read-only to cause OSError when shutil.copy2 tries to write
++    backup_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
++
++    with pytest.raises(click.ClickException) as exc_info:
++        click.edit(filename=str(test_file), editor="cat", auto_backup=True)
++
++    assert str(exc_info.value).startswith("Failed to create backup file")
++
++    # Restore permissions for cleanup
++    backup_dir.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)

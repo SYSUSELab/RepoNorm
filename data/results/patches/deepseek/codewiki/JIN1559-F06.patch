@@ -1,0 +1,348 @@
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b..46f17b4 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -68,7 +68,7 @@ additional methods:
+ 
+     .. versionchanged:: 2.5 Added new-style gettext support.
+ 
+-.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None)
++.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None, cache_size=0, cache_partition=None)
+ 
+     Install the given ``gettext``, ``ngettext``, ``pgettext``, and
+     ``npgettext`` callables into the environment. They should behave
+@@ -78,12 +78,54 @@ additional methods:
+     If ``newstyle`` is activated, the callables are wrapped to work like
+     newstyle callables.  See :ref:`newstyle-gettext` for more information.
+ 
++    ``cache_size`` controls an optional bounded LRU cache of raw
++    translation results.  ``0`` (the default) disables caching and
++    calls the provider every time.  A positive integer caches results
++    of ``gettext``, ``ngettext``, ``pgettext``, and ``npgettext`` up to
++    that many entries per function, evicting least-recently-used entries.
++
++    ``cache_partition`` is an arbitrary hashable value that distinguishes
++    translation state.  Applications whose translations depend on locale
++    or request state should set this to a value unique to each state.
++    When the partition is changed with
++    :meth:`set_translation_cache_partition`, the cache is cleared.
++
++    Caching wraps the raw provider callables before new-style wrapping
++    and formatting, so formatting variables are not part of cache keys.
++
++    .. versionchanged:: 3.2
++        Added ``cache_size`` and ``cache_partition``.
++
+     .. versionchanged:: 3.0
+         Added ``pgettext`` and ``npgettext``.
+ 
+     .. versionadded:: 2.5
+         Added new-style gettext support.
+ 
++.. method:: jinja2.Environment.set_translation_cache_partition(value)
++
++    Set the current cache partition and clear all cached translation
++    results.  The partition is used as part of the cache key so that
++    different partitions (e.g. locales, request states) do not share
++    cached entries.
++
++    .. versionadded:: 3.2
++
++.. method:: jinja2.Environment.clear_translation_cache()
++
++    Clear all cached translation results.  Has no effect if caching
++    is disabled.
++
++    .. versionadded:: 3.2
++
++.. method:: jinja2.Environment.resize_translation_cache(capacity)
++
++    Resize the translation cache to ``capacity``.  A capacity of ``0``
++    disables and clears the cache.  Negative capacities raise
++    :exc:`ValueError`.
++
++    .. versionadded:: 3.2
++
+ .. method:: jinja2.Environment.uninstall_gettext_translations()
+ 
+     Uninstall the environment's globally installed translation.
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..69a58f9 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -103,6 +103,19 @@ def copy_cache(
+     return LRUCache(cache.capacity)  # type: ignore
+ 
+ 
++def copy_translation_cache(
++    cache: t.Optional[t.MutableMapping],
++) -> t.Optional[t.MutableMapping]:
++    """Create an empty copy of the given translation cache."""
++    if cache is None:
++        return None
++
++    if type(cache) is dict:
++        return {}
++
++    return LRUCache(cache.capacity)  # type: ignore
++
++
+ def load_extensions(
+     environment: "Environment",
+     extensions: t.Sequence[t.Union[str, t.Type["Extension"]]],
+@@ -437,6 +450,17 @@ class Environment:
+         if extensions is not missing:
+             rv.extensions.update(load_extensions(rv, extensions))
+ 
++        # Translation cache is independent per environment/overlay.
++        rv._translation_cache = copy_translation_cache(
++            getattr(self, "_translation_cache", None)
++        )
++        rv._translation_cache_capacity = getattr(
++            self, "_translation_cache_capacity", 0
++        )
++        rv._translation_cache_partition = getattr(
++            self, "_translation_cache_partition", None
++        )
++
+         return _environment_config_check(rv)
+ 
+     @property
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..9599137 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -15,6 +15,8 @@ from .runtime import Context
+ from .runtime import Undefined
+ from .utils import import_string
+ from .utils import pass_context
++from .utils import pass_environment
++from .utils import LRUCache
+ 
+ if t.TYPE_CHECKING:
+     import typing_extensions as te
+@@ -241,6 +243,105 @@ def _make_new_npgettext(
+ 
+     return npgettext
+ 
++def _make_cached_gettext(
++    func: t.Callable[[str], str],
++) -> t.Callable[..., str]:
++    """Wrap gettext with an LRU cache keyed by partition and message."""
++    @pass_environment
++    def gettext(env: "Environment", __string: str) -> str:
++        cache = env._translation_cache  # type: ignore
++        if cache is None:
++            return func(__string)
++        partition = env._translation_cache_partition  # type: ignore
++        key = (partition, "gettext", __string)
++        try:
++            return cache[key]
++        except KeyError:
++            rv = func(__string)
++            cache[key] = rv
++            return rv
++
++    return gettext
++
++
++def _make_cached_ngettext(
++    func: t.Callable[[str, str, int], str],
++) -> t.Callable[..., str]:
++    """Wrap ngettext with an LRU cache keyed by partition and message."""
++    @pass_environment
++    def ngettext(
++        env: "Environment", __singular: str, __plural: str, __num: int
++    ) -> str:
++        cache = env._translation_cache  # type: ignore
++        if cache is None:
++            return func(__singular, __plural, __num)
++        partition = env._translation_cache_partition  # type: ignore
++        key = (partition, "ngettext", __singular, __plural, __num)
++        try:
++            return cache[key]
++        except KeyError:
++            rv = func(__singular, __plural, __num)
++            cache[key] = rv
++            return rv
++
++    return ngettext
++
++
++def _make_cached_pgettext(
++    func: t.Callable[[str, str], str],
++) -> t.Callable[..., str]:
++    """Wrap pgettext with an LRU cache keyed by partition and message."""
++    @pass_environment
++    def pgettext(env: "Environment", __string_ctx: str, __string: str) -> str:
++        cache = env._translation_cache  # type: ignore
++        if cache is None:
++            return func(__string_ctx, __string)
++        partition = env._translation_cache_partition  # type: ignore
++        key = (partition, "pgettext", __string_ctx, __string)
++        try:
++            return cache[key]
++        except KeyError:
++            rv = func(__string_ctx, __string)
++            cache[key] = rv
++            return rv
++
++    return pgettext
++
++
++def _make_cached_npgettext(
++    func: t.Callable[[str, str, str, int], str],
++) -> t.Callable[..., str]:
++    """Wrap npgettext with an LRU cache keyed by partition and message."""
++    @pass_environment
++    def npgettext(
++        env: "Environment",
++        __string_ctx: str,
++        __singular: str,
++        __plural: str,
++        __num: int,
++    ) -> str:
++        cache = env._translation_cache  # type: ignore
++        if cache is None:
++            return func(__string_ctx, __singular, __plural, __num)
++        partition = env._translation_cache_partition  # type: ignore
++        key = (
++            partition,
++            "npgettext",
++            __string_ctx,
++            __singular,
++            __plural,
++            __num,
++        )
++        try:
++            return cache[key]
++        except KeyError:
++            rv = func(__string_ctx, __singular, __plural, __num)
++            cache[key] = rv
++            return rv
++
++    return npgettext
++
++
+ 
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+@@ -263,9 +364,40 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            set_translation_cache_partition=self._set_translation_cache_partition,
++            clear_translation_cache=self._clear_translation_cache,
++            resize_translation_cache=self._resize_translation_cache,
+             newstyle_gettext=False,
++            _translation_cache=None,
++            _translation_cache_capacity=0,
++            _translation_cache_partition=None,
+         )
+ 
++    def bind(self, environment: Environment) -> "InternationalizationExtension":
++        """Create a copy of this extension bound to another environment,
++        re-registering environment methods to reference the new instance."""
++        rv = super().bind(environment)
++        # The parent environment's methods (registered via extend in __init__)
++        # are still bound to the parent extension instance after __dict__.update.
++        # Overwrite them to reference the new extension instance.
++        _ext_to_env = {
++            "install_gettext_translations": "_install",
++            "install_null_translations": "_install_null",
++            "install_gettext_callables": "_install_callables",
++            "uninstall_gettext_translations": "_uninstall",
++            "extract_translations": "_extract",
++            "set_translation_cache_partition": "_set_translation_cache_partition",
++            "clear_translation_cache": "_clear_translation_cache",
++            "resize_translation_cache": "_resize_translation_cache",
++        }
++        for env_attr, ext_method in _ext_to_env.items():
++            setattr(environment, env_attr, getattr(rv, ext_method))
++        # Reset translation cache state for the new environment/overlay.
++        environment._translation_cache = None
++        environment._translation_cache_capacity = 0
++        environment._translation_cache_partition = None
++        return rv
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -319,9 +451,32 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Any = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
++
++        self._clear_translation_cache()
++
++        if cache_size > 0:
++            self.environment._translation_cache = LRUCache(cache_size)  # type: ignore
++            self.environment._translation_cache_capacity = cache_size  # type: ignore
++            self.environment._translation_cache_partition = cache_partition  # type: ignore
++
++            gettext = _make_cached_gettext(gettext)
++            ngettext = _make_cached_ngettext(ngettext)
++
++            if pgettext is not None:
++                pgettext = _make_cached_pgettext(pgettext)
++
++            if npgettext is not None:
++                npgettext = _make_cached_npgettext(npgettext)
++        else:
++            self.environment._translation_cache = None  # type: ignore
++            self.environment._translation_cache_capacity = 0  # type: ignore
++            self.environment._translation_cache_partition = None  # type: ignore
++
+         if self.environment.newstyle_gettext:  # type: ignore
+             gettext = _make_new_gettext(gettext)
+             ngettext = _make_new_ngettext(ngettext)
+@@ -336,10 +491,43 @@ class InternationalizationExtension(Extension):
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
+ 
+-    def _uninstall(self, translations: "_SupportedTranslations") -> None:
++    def _uninstall(self, translations: t.Optional["_SupportedTranslations"] = None) -> None:
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+ 
++        self._clear_translation_cache()
++
++    def _clear_translation_cache(self) -> None:
++        cache = getattr(self.environment, "_translation_cache", None)
++
++        if cache is not None:
++            cache.clear()
++
++    def _set_translation_cache_partition(self, value: t.Any) -> None:
++        self.environment._translation_cache_partition = value  # type: ignore
++        self._clear_translation_cache()
++
++    def _resize_translation_cache(self, capacity: int) -> None:
++        if capacity < 0:
++            raise ValueError("cache capacity must be non-negative")
++
++        env = self.environment
++        cache = getattr(env, "_translation_cache", None)
++
++        if capacity == 0:
++            if cache is not None:
++                cache.clear()
++
++            env._translation_cache = None  # type: ignore
++            env._translation_cache_capacity = 0  # type: ignore
++            return
++
++        if cache is not None:
++            cache.clear()
++
++        env._translation_cache = LRUCache(capacity)  # type: ignore
++        env._translation_cache_capacity = capacity  # type: ignore
++
+     def _extract(
+         self,
+         source: t.Union[str, nodes.Template],

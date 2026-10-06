@@ -1,0 +1,156 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..968354c 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        lock_files: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.lock_files = lock_files
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,6 +507,68 @@ class Editor:
+                 return editor
+         return "vi"
+ 
++    def _acquire_lock(self, filename: str) -> str:
++        """Atomically create a lock file for the given filename."""
++        import datetime
++
++        lock_path = os.path.join(
++            os.path.dirname(filename) or ".",
++            f".{os.path.basename(filename)}.lock",
++        )
++
++        try:
++            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++        except OSError as e:
++            if os.path.exists(lock_path):
++                try:
++                    with open(lock_path, "r", encoding="utf-8") as lf:
++                        lock_content = lf.read()
++                except OSError:
++                    lock_content = None
++
++                if lock_content:
++                    raise ClickException(
++                        _("Lock file {path} exists. Lock content:\n{content}").format(
++                            path=lock_path, content=lock_content
++                        )
++                    ) from e
++                else:
++                    raise ClickException(
++                        _("Lock file {path} exists but could not be read.").format(
++                            path=lock_path
++                        )
++                    ) from e
++            else:
++                raise ClickException(
++                    _("Could not create lock file {path}.").format(path=lock_path)
++                ) from e
++
++        try:
++            with os.fdopen(fd, "w", encoding="utf-8") as lf:
++                lf.write(f"PID: {os.getpid()}\n")
++                lf.write(
++                    f"Time: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
++                )
++        except OSError as e:
++            try:
++                os.unlink(lock_path)
++            except OSError:
++                pass
++            raise ClickException(
++                _("Could not write to lock file {path}.").format(path=lock_path)
++            ) from e
++
++        return lock_path
++
++    def _release_lock(self, lock_path: str) -> None:
++        """Remove the lock file."""
++        try:
++            os.unlink(lock_path)
++        except OSError as e:
++            raise ClickException(
++                _("Could not remove lock file {path}.").format(path=lock_path)
++            ) from e
++
+     def edit_file(self, filename: str) -> None:
+         import subprocess
+ 
+@@ -515,17 +579,26 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        lock_path: str | None = None
++
++        if self.lock_files:
++            lock_path = self._acquire_lock(filename)
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
+-            if exit_code != 0:
++            try:
++                c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++                exit_code = c.wait()
++                if exit_code != 0:
++                    raise ClickException(
++                        _("{editor}: Editing failed").format(editor=editor)
++                    )
++            except OSError as e:
+                 raise ClickException(
+-                    _("{editor}: Editing failed").format(editor=editor)
+-                )
+-        except OSError as e:
+-            raise ClickException(
+-                _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+-            ) from e
++                    _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
++                ) from e
++        finally:
++            if lock_path is not None:
++                self._release_lock(lock_path)
+ 
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..863420f 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    lock_files: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,19 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param lock_files: if ``True`` and *filename* is given, an atomic lock
++                       file is created before launching the editor and
++                       removed afterwards.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        lock_files=lock_files,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)

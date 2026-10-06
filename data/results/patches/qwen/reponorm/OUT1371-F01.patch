@@ -1,0 +1,225 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..2238346 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -6,7 +6,7 @@ import re
+ import textwrap
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Dict, Optional, Type, cast
++from typing import Any, Callable, Dict, Optional, Type, Union, cast
+ 
+ import jinja2
+ import pydantic
+@@ -23,6 +23,9 @@ class Prompt:
+ 
+     template: jinja2.Template
+     signature: Optional[inspect.Signature]
++    _filters: Dict[str, Callable]
++    _content: Optional[str] = None
++    _source: Optional[Path] = None
+ 
+     def __call__(self, *args, **kwargs) -> str:
+         """Render and return the template.
+@@ -40,7 +43,7 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(cls, content: str, filters: Optional[Dict[str, Callable]] = None):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -48,15 +51,23 @@ class Prompt:
+         ----------
+         content : str
+             The string content to be converted into a template.
++        filters : Optional[Dict[str, Callable]]
++            A mapping of filter names to callables that will be available
++            in the Jinja template. These filters are local to this prompt.
+ 
+         Returns
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(
++            cls._template_from_str(content, filters),
++            None,
++            filters or {},
++            content,
++        )
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(cls, path: Path, filters: Optional[Dict[str, Callable]] = None):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -67,6 +78,11 @@ class Prompt:
+         ----------
+         path : Path
+             The path to the file containing the Jinja template.
++        filters : Optional[Dict[str, Callable]]
++            A mapping of filter names to callables that will be available
++            in the Jinja template. These filters are local to this prompt
++            and are also available to any templates included or extended
++            by this template.
+ 
+         Returns
+         -------
+@@ -75,10 +91,19 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(
++            cls._template_from_file(path, filters),
++            None,
++            filters or {},
++            None,  # File-based prompts don't store content for with_filters
++            path,  # Store file path for with_filters
++        )
++
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(
++        _, content: str, filters: Optional[Dict[str, Callable]] = None
++    ) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -106,10 +131,17 @@ class Prompt:
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
+ 
++        # Apply custom filters - they override built-in filters if names match
++        if filters:
++            for name, func in filters.items():
++                env.filters[name] = func
++
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(
++        _, path: Path, filters: Optional[Dict[str, Callable]] = None
++    ) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,10 +150,53 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        # Apply custom filters - they override built-in filters if names match
++        if filters:
++            for name, func in filters.items():
++                env.filters[name] = func
++
+         return env.get_template(os.path.basename(path))
+ 
++    def with_filters(self, filters: Optional[Dict[str, Callable]]) -> "Prompt":
++        """Return a new Prompt derived from this one with additional/overridden filters.
++
++        The supplied mapping extends the current filters and overrides matching names,
++        without changing the original prompt or other derived prompts. Passing `None`
++        or an empty mapping retains all current filters. Derivation can be chained
++        and works for prompts created by any of the three APIs above.
++
++        Parameters
++        ----------
++        filters : Optional[Dict[str, Callable]]
++            A mapping of filter names to callables to add or override.
++
++        Returns
++        -------
++        Prompt
++            A new Prompt instance with the combined filters.
++        """
++        # Start with existing filters
++        new_filters = dict(self._filters)
++        # Update with new filters (they override existing ones)
++        if filters:
++            new_filters.update(filters)
++        
++        # Re-create the template with combined filters
++        if self._content is not None:
++            new_template = Prompt._template_from_str(self._content, new_filters)
++        elif self._source is not None:
++            new_template = Prompt._template_from_file(self._source, new_filters)
++        else:
++            # Fallback - should not happen normally
++            new_template = self.template
++        
++        # Create a new Prompt with the new template and combined filters
++        return Prompt(new_template, self.signature, new_filters, self._content, self._source)
+ 
+-def prompt(fn: Callable) -> Prompt:
++
++def prompt(
++    fn: Optional[Callable] = None, filters: Optional[Dict[str, Callable]] = None
++) -> Union[Prompt, Callable[[Callable], Prompt]]:
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -131,8 +206,8 @@ def prompt(fn: Callable) -> Prompt:
+     >>> import outlines
+     >>>
+     >>> @outlines.prompt
+-    >>> def build_prompt(question):
+-    ...    "I have a ${question}"
++    ... def build_prompt(question):
++    ...     "I have a ${question}"
+     ...
+     >>> prompt = build_prompt("How are you?")
+ 
+@@ -152,23 +227,39 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Parameters
++    ----------
++    fn : Callable
++        The function to decorate. Its docstring should contain the Jinja template.
++    filters : Optional[Dict[str, Callable]]
++        A mapping of filter names to callables that will be available
++        in the Jinja template. These filters are local to this prompt.
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
+ 
+-    signature = inspect.signature(fn)
++    def _make_prompt(fn: Callable) -> Prompt:
++        signature = inspect.signature(fn)
+ 
+-    # The docstring contains the template that will be rendered to be used
+-    # as a prompt to the language model.
+-    docstring = fn.__doc__
+-    if docstring is None:
+-        raise TypeError("Could not find a template in the function's docstring.")
++        # The docstring contains the template that will be rendered to be used
++        # as a prompt to the language model.
++        docstring = fn.__doc__
++        if docstring is None:
++            raise TypeError("Could not find a template in the function's docstring.")
++
++        template = Prompt._template_from_str(cast(str, docstring), filters)
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++        return Prompt(template, signature, filters or {}, cast(str, docstring))
+ 
+-    return Prompt(template, signature)
++    # If fn is provided, we're being used as @prompt directly
++    if fn is not None:
++        return _make_prompt(fn)
++    
++    # Otherwise, we're being used as @prompt(filters={...}), return a wrapper
++    return _make_prompt
+ 
+ 
+ def get_fn_name(fn: Callable):

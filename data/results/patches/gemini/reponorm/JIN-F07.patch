@@ -1,0 +1,140 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..00dc7e8 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1163,6 +1163,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    stable: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,10 +1211,25 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++
++    if not stable:
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value, key=expr), expr)
++        ]
++
++    groups = []
++
++    for item in value:
++        key = expr(item)
++        for existing_key, existing_items in groups:
++            if existing_key == key:
++                existing_items.append(item)
++                break
++        else:
++            groups.append(_GroupTuple(key, [item]))
++
++    return groups
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1238,29 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    stable: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    value_list = await auto_to_list(value)
++
++    if not stable:
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value_list, key=expr), expr)
++        ]
++
++    groups = []
++
++    for item in value_list:
++        key = expr(item)
++        for existing_key, existing_items in groups:
++            if existing_key == key:
++                existing_items.append(item)
++                break
++        else:
++            groups.append(_GroupTuple(key, [item]))
++
++    return groups
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_stable.py b/tests/test_groupby_stable.py
+new file mode 100644
+index 0000000..4bbe940
+--- /dev/null
++++ b/tests/test_groupby_stable.py
+@@ -0,0 +1,58 @@
++import asyncio
++import pytest
++from jinja2.environment import Environment
++from jinja2.filters import sync_do_groupby, do_groupby
++
++class Item:
++    def __init__(self, name, key):
++        self.name = name
++        self.key = key
++    def __repr__(self):
++        return f"Item({self.name}, {self.key})"
++
++class Unorderable:
++    def __init__(self, val):
++        self.val = val
++    def __eq__(self, other):
++        return self.val == other.val
++    def __repr__(self):
++        return f"U({self.val})"
++
++def test_stable_groupby():
++    env = Environment()
++    items = [
++        Item("a", Unorderable(1)),
++        Item("b", Unorderable(2)),
++        Item("c", Unorderable(1)),
++    ]
++
++    # Test stable=True
++    result = sync_do_groupby(env, items, "key", stable=True)
++    assert len(result) == 2
++    assert result[0].grouper == Unorderable(1)
++    assert result[0].list == [items[0], items[2]]
++    assert result[1].grouper == Unorderable(2)
++    assert result[1].list == [items[1]]
++
++    # Test stable=False (default)
++    with pytest.raises(TypeError):
++        sync_do_groupby(env, items, "key", stable=False)
++
++def test_stable_groupby_async():
++    async def run():
++        env = Environment()
++        env.is_async = True
++        items = [
++            Item("a", Unorderable(1)),
++            Item("b", Unorderable(2)),
++            Item("c", Unorderable(1)),
++        ]
++        
++        result = await do_groupby(env, items, "key", stable=True)
++        assert len(result) == 2
++        assert result[0].grouper == Unorderable(1)
++        assert result[0].list == [items[0], items[2]]
++        assert result[1].grouper == Unorderable(2)
++        assert result[1].list == [items[1]]
++    
++    asyncio.run(run())

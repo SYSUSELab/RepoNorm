@@ -1,0 +1,111 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..9ade7d43 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,9 +2,10 @@ import copy
+ import inspect
+ import logging
+ import threading
++from contextlib import contextmanager
+ from functools import wraps
+ from hashlib import sha256
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, Optional, List
+ 
+ import cloudpickle
+ import pydantic
+@@ -15,6 +16,45 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++class _BypassState:
++    """Thread-local storage for bypass state."""
++    
++    def __init__(self):
++        self._local = threading.local()
++    
++    def get_bypass_stack(self) -> List[bool]:
++        """Get the bypass stack for the current thread."""
++        if not hasattr(self._local, 'bypass_stack'):
++            self._local.bypass_stack = []
++        return self._local.bypass_stack
++    
++    def is_bypassed(self) -> bool:
++        """Check if bypass is active in the current thread."""
++        return len(self.get_bypass_stack()) > 0
++    
++    def push_bypass(self):
++        """Push a new bypass level."""
++        self.get_bypass_stack().append(True)
++    
++    def pop_bypass(self):
++        """Pop the top bypass level."""
++        if self.get_bypass_stack():
++            self.get_bypass_stack().pop()
++
++
++# Global bypass state registry - maps Cache instances to their bypass states
++_bypass_states: dict = {}
++_bypass_lock = threading.Lock()
++
++
++def _get_or_create_bypass_state(cache: "Cache") -> _BypassState:
++    """Get or create a bypass state for a cache instance."""
++    with _bypass_lock:
++        if id(cache) not in _bypass_states:
++            _bypass_states[id(cache)] = _BypassState()
++        return _bypass_states[id(cache)]
++
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -58,6 +98,7 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._bypass_state = _get_or_create_bypass_state(self)
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -103,6 +144,10 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
++        # Check if bypass is active for this cache instance
++        if self._bypass_state.is_bypassed():
++            return None
++
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
+@@ -168,6 +213,29 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    @contextmanager
++    def bypass(self):
++        """Context manager to temporarily bypass cache reads while retaining writes.
++        
++        Within this context, cache reads behave as cache misses even when a value is stored.
++        Writes remain enabled according to the existing memory/disk configuration.
++        After the context ends, newly written values can be read normally.
++        
++        Nested contexts retain bypass until their outer context exits.
++        Normal and exceptional exits restore the previous state.
++        Bypass is local to the current thread/asynchronous execution context.
++        
++        Example:
++            >>> with dspy.cache.bypass():
++            ...     result = cache.get(request)  # Always returns None (cache miss)
++            ...     cache.put(request, value)    # Write still works
++        """
++        self._bypass_state.push_bypass()
++        try:
++            yield
++        finally:
++            self._bypass_state.pop_bypass()
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,

@@ -1,0 +1,161 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 2db769f..6885219 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,7 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   ``click.edit`` can dispatch selected editor exit codes to callbacks.
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..3002464 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        handle_exit_codes: dict[int, t.Callable[[int], t.Any]] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.handle_exit_codes = handle_exit_codes
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -518,6 +520,19 @@ class Editor:
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+             exit_code = c.wait()
++
++            # Handle exit codes if custom handlers are provided
++            if self.handle_exit_codes and exit_code in self.handle_exit_codes:
++                try:
++                    self.handle_exit_codes[exit_code](exit_code)
++                    return
++                except Exception as e:
++                    raise ClickException(
++                        _("{editor}: Exit code handler failed: {e}").format(
++                            editor=editor, e=e
++                        )
++                    ) from e
++
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..70c62d9 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,37 +650,17 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    handle_exit_codes: dict[int, t.Callable[[int], t.Any]] | None = None,
+ ) -> t.AnyStr | None:
+-    r"""Edits the given text in the defined editor.  If an editor is given
+-    (should be the full path to the executable but the regular operating
+-    system search path is used for finding the executable) it overrides
+-    the detected editor.  Optionally, some environment variables can be
+-    used.  If the editor is closed without changes, `None` is returned.  In
+-    case a file is edited directly the return value is always `None` and
+-    `require_save` and `extension` are ignored.
+-
+-    If the editor cannot be opened a :exc:`UsageError` is raised.
+-
+-    Note for Windows: to simplify cross-platform usage, the newlines are
+-    automatically converted from POSIX to Windows and vice versa.  As such,
+-    the message here will have ``\n`` as newline markers.
+-
+-    :param text: the text to edit.
+-    :param editor: optionally the editor to use.  Defaults to automatic
+-                   detection.
+-    :param env: environment variables to forward to the editor.
+-    :param require_save: if this is true, then not saving in the editor
+-                         will make the return value become `None`.
+-    :param extension: the extension to tell the editor about.  This defaults
+-                      to `.txt` but changing this might change syntax
+-                      highlighting.
+-    :param filename: if provided it will edit this file instead of the
+-                     provided text contents.  It will not use a temporary
+-                     file as an indirection in that case.
+-    """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        handle_exit_codes=handle_exit_codes,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_n4c_author_edit_exit_codes.py b/tests/test_n4c_author_edit_exit_codes.py
+new file mode 100644
+index 0000000..d0ab58a
+--- /dev/null
++++ b/tests/test_n4c_author_edit_exit_codes.py
+@@ -0,0 +1,55 @@
++import pytest
++
++import click
++
++
++class _Process:
++    def __init__(self, code):
++        self.code = code
++
++    def wait(self):
++        return self.code
++
++
++@pytest.mark.parametrize("code", [0, 7])
++def test_matching_handler_runs_once_for_direct_edit(code, monkeypatch):
++    calls = []
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process(code))
++    assert (
++        click.edit(
++            filename="one",
++            editor="editor",
++            handle_exit_codes={code: lambda value: calls.append(value)},
++        )
++        is None
++    )
++    assert calls == [code]
++
++
++def test_handler_return_is_ignored_in_text_mode(monkeypatch):
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process(0))
++    result = click.edit(
++        "unchanged",
++        editor="editor",
++        require_save=False,
++        handle_exit_codes={0: lambda code: "replacement"},
++    )
++    assert result == "unchanged\n"
++
++
++@pytest.mark.parametrize("mapping", [None, {}, {3: lambda code: None}])
++def test_unmatched_nonzero_preserves_failure(mapping, monkeypatch):
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process(4))
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(filename="one", editor="editor", handle_exit_codes=mapping)
++
++
++def test_handler_failure_is_wrapped_and_chained(monkeypatch):
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Process(2))
++
++    def fail(code):
++        raise RuntimeError("handler broke")
++
++    with pytest.raises(click.ClickException, match="handler failed") as exc_info:
++        click.edit(filename="one", editor="editor", handle_exit_codes={2: fail})
++    assert isinstance(exc_info.value.__cause__, RuntimeError)

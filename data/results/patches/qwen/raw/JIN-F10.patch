@@ -1,0 +1,327 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..3ae95cb 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1,4 +1,5 @@
+ """Built-in template filters used with the ``|`` operator."""
++import inspect
+ import math
+ import random
+ import re
+@@ -1163,6 +1164,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    filter_groups: t.Optional[t.Callable[[t.List[V]], t.Any]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1203,17 +1205,48 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    You can also filter groups based on their members using the
++    ``filter_groups`` parameter. This receives the complete member list
++    of each group once; retain that group only when its result is truthy.
++    ``None`` retains all groups.
++
++    .. sourcecode:: jinja
++
++        {# Only show cities with more than one person #}
++        <ul>{% for city, items in users|groupby("city", filter_groups=lambda x: len(x) > 1) %}
++          <li>{{ city }}: {{ items|length }} people</li>
++        {% endfor %}</ul>
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
++
++    .. versionadded:: NEXTVERSION
++        Added the ``filter_groups`` parameter.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    result = []
++    
++    for key, values in groupby(sorted(value, key=expr), expr):
++        values_list = list(values)
++        
++        if filter_groups is not None:
++            # Call the predicate with the complete member list
++            # Check if it's a @pass_environment decorated function
++            from .utils import _PassArg
++            pass_arg = _PassArg.from_obj(filter_groups)
++            if pass_arg is _PassArg.environment:
++                if filter_groups(environment, values_list):
++                    result.append(_GroupTuple(key, values_list))
++            else:
++                if filter_groups(values_list):
++                    result.append(_GroupTuple(key, values_list))
++        else:
++            result.append(_GroupTuple(key, values_list))
++    
++    return result
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1255,36 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    filter_groups: t.Optional[t.Callable[[t.List[V]], t.Any]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    from .utils import _PassArg
++    
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    result = []
++    
++    # Convert the groupby iterator to an async iterator
++    grouped = groupby(sorted(await auto_to_list(value), key=expr), expr)
++    async for key, values in auto_aiter(grouped):
++        values_list = await auto_to_list(values)
++        
++        if filter_groups is not None:
++            # Check if it's a @pass_environment decorated function
++            pass_arg = _PassArg.from_obj(filter_groups)
++            if pass_arg is _PassArg.environment:
++                predicate_result = filter_groups(environment, values_list)
++                if inspect.isawaitable(predicate_result):
++                    predicate_result = await predicate_result
++            else:
++                predicate_result = filter_groups(values_list)
++                if inspect.isawaitable(predicate_result):
++                    predicate_result = await predicate_result
++            
++            if predicate_result:
++                result.append(_GroupTuple(key, values_list))
++        else:
++            result.append(_GroupTuple(key, values_list))
++    
++    return result
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..d1cff6c 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -251,3 +251,70 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "emma", "city": "NY"},
++        {"name": "john", "city": "NY"},
++        {"name": "smith", "city": "WA"},
++    ],
++)
++def test_groupby_filter_groups(env_async, items):
++    """Test filter_groups with async environment."""
++    def predicate(items_list):
++        return len(items_list) > 1
++    
++    tmpl = env_async.from_string(
++        "{% for city, list in items()|groupby('city', filter_groups=predicate) %}"
++        "{{ city }}:{{ list|length }}|{% endfor %}"
++    )
++    result = tmpl.render(items=items, predicate=predicate)
++    # Only NY has more than 1 person
++    assert result == "NY:2|"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [],
++)
++def test_groupby_filter_groups_empty_input(env_async, items):
++    """Test that empty input does not invoke predicate."""
++    called = []
++    
++    def predicate(items_list):
++        called.append(True)
++        return True
++    
++    tmpl = env_async.from_string(
++        "{% for city, list in items()|groupby('city', filter_groups=predicate) %}"
++        "{{ city }}|{% endfor %}"
++    )
++    result = tmpl.render(items=items, predicate=predicate)
++    assert result == ""
++    assert len(called) == 0
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "emma", "city": "NY"},
++        {"name": "john", "city": "NY"},
++        {"name": "smith", "city": "WA"},
++    ],
++)
++def test_groupby_filter_groups_pass_environment(env_async, items):
++    """Test filter_groups with @pass_environment decorated function."""
++    from jinja2 import pass_environment
++    
++    @pass_environment
++    def predicate(environment, items_list):
++        return len(items_list) > 1
++    
++    tmpl = env_async.from_string(
++        "{% for city, list in items()|groupby('city', filter_groups=predicate) %}"
++        "{{ city }}:{{ list|length }}|{% endfor %}"
++    )
++    result = tmpl.render(items=items, predicate=predicate)
++    assert result == "NY:2|"
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..efaa0f2 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -852,3 +852,135 @@ class TestFilter:
+         with pytest.raises(TemplateRuntimeError, match="No filter named 'f'"):
+             t1.render(x=42)
+             t2.render(x=42)
++
++    def test_groupby_filter_groups_none(self, env):
++        """Test that filter_groups=None retains all groups."""
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=None) %}"
++            "{{ city }}:{{ items|length }}|{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "john", "city": "NY"},
++                {"name": "smith", "city": "WA"},
++            ]
++        )
++        assert out == "NY:2|WA:1|"
++
++    def test_groupby_filter_groups_lambda(self, env):
++        """Test filter_groups with a lambda predicate passed via Python API."""
++        def predicate(items):
++            return len(items) > 1
++        
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=predicate) %}"
++            "{{ city }}:{{ items|length }}|{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "john", "city": "NY"},
++                {"name": "smith", "city": "WA"},
++            ],
++            predicate=predicate
++        )
++        # Only NY has more than 1 person
++        assert out == "NY:2|"
++
++    def test_groupby_filter_groups_empty_input(self, env):
++        """Test that empty input does not invoke predicate."""
++        called = []
++        
++        def predicate(items):
++            called.append(True)
++            return True
++        
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=predicate) %}"
++            "{{ city }}|{% endfor %}"
++        )
++        out = tmpl.render(users=[], predicate=predicate)
++        assert out == ""
++        assert len(called) == 0
++
++    def test_groupby_filter_groups_pass_environment(self, env):
++        """Test filter_groups with @pass_environment decorated function."""
++        from jinja2 import pass_environment
++        
++        @pass_environment
++        def predicate(environment, items):
++            return len(items) > 1
++        
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=predicate) %}"
++            "{{ city }}:{{ items|length }}|{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "john", "city": "NY"},
++                {"name": "smith", "city": "WA"},
++            ],
++            predicate=predicate
++        )
++        assert out == "NY:2|"
++
++    def test_groupby_filter_groups_preserves_order(self, env):
++        """Test that group order and member order are preserved."""
++        def predicate(items):
++            return True
++        
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=predicate) %}"
++            "{{ city }}:{% for u in items %}{{ u.name }}-{% endfor %}|{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "b", "city": "A"},
++                {"name": "a", "city": "B"},
++                {"name": "d", "city": "A"},
++                {"name": "c", "city": "B"},
++            ],
++            predicate=predicate
++        )
++        # Groups should be sorted by key (A, B), members within each group
++        assert out == "A:b-d-|B:a-c-|"
++
++    def test_groupby_filter_groups_false_result(self, env):
++        """Test that false predicate result excludes group."""
++        def predicate(items):
++            return False
++        
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=predicate) %}"
++            "{{ city }}|{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "john", "city": "NY"},
++            ],
++            predicate=predicate
++        )
++        assert out == ""
++
++    def test_groupby_filter_groups_exception_propagation(self, env):
++        """Test that exceptions propagate unchanged."""
++        def predicate(items):
++            raise ValueError("Test exception")
++        
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby('city', filter_groups=predicate) %}"
++            "{{ city }}|{% endfor %}"
++        )
++        try:
++            tmpl.render(
++                users=[
++                    {"name": "emma", "city": "NY"},
++                ],
++                predicate=predicate
++            )
++            assert False, "Should have raised ValueError"
++        except ValueError as e:
++            assert str(e) == "Test exception"

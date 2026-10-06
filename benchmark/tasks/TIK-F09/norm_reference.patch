@@ -1,0 +1,118 @@
+diff --git a/tests/test_compression_contribution.py b/tests/test_compression_contribution.py
+new file mode 100644
+index 0000000..6e55b7e
+--- /dev/null
++++ b/tests/test_compression_contribution.py
+@@ -0,0 +1,48 @@
++import pytest
++
++import tiktoken
++
++
++@pytest.fixture(scope="module")
++def byte_encoding():
++    return tiktoken.Encoding(
++        "byte-compression",
++        pat_str=r"[\s\S]",
++        mergeable_ranks={bytes([i]): i for i in range(256)},
++        special_tokens={"<X>": 256},
++    )
++
++
++@pytest.mark.parametrize(
++    "text,expected",
++    [
++        ("", []),
++        ("a", [97]),
++        ("aaabbaa", [97, 98, 97]),
++        ("abab", [97, 98, 97, 98]),
++    ],
++)
++def test_compression_collapses_only_adjacent_runs(byte_encoding, text, expected) -> None:
++    assert byte_encoding.encode(text, compress=True) == expected
++
++
++def test_default_result_is_unchanged(byte_encoding) -> None:
++    assert byte_encoding.encode("aaabbaa", compress=False) == byte_encoding.encode(
++        "aaabbaa"
++    )
++
++
++def test_special_policy_and_surrogate_recovery_are_preserved(byte_encoding) -> None:
++    with pytest.raises(ValueError, match="disallowed special token"):
++        byte_encoding.encode("<X>", compress=True)
++    assert byte_encoding.encode(
++        "<X><X>", allowed_special="all", compress=True
++    ) == [256]
++
++    text = "before \ud800 after"
++    ordinary = byte_encoding.encode(text)
++    expected = [ordinary[0]]
++    for token in ordinary[1:]:
++        if token != expected[-1]:
++            expected.append(token)
++    assert byte_encoding.encode(text, compress=True) == expected
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..3e32024 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        compress: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -96,6 +97,7 @@ class Encoding:
+           cause all text corresponding to special tokens to be encoded as natural text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
++        - Setting `compress` to True will remove adjacent repeated tokens in the output.
+ 
+         ```
+         >>> enc.encode("hello world")
+@@ -108,6 +110,8 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> enc.encode(" like like like", compress=True)
++        [1093]
+         ```
+         """
+         if allowed_special == "all":
+@@ -121,7 +125,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +134,24 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if compress:
++            tokens = self._compress_tokens(tokens)
++
++        return tokens
++
++    def _compress_tokens(self, tokens: list[int]) -> list[int]:
++        """Collapse each run of adjacent equal token IDs."""
++        if not tokens:
++            return tokens
++
++        compressed: list[int] = [tokens[0]]
++        for token in tokens[1:]:
++            if token != compressed[-1]:
++                compressed.append(token)
++
++        return compressed
+ 
+     def encode_to_numpy(
+         self,

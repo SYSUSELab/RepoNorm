@@ -1,0 +1,383 @@
+diff --git a/docs/features/advanced/logits_processors.md b/docs/features/advanced/logits_processors.md
+index 4a05609e..3c26f86a 100644
+--- a/docs/features/advanced/logits_processors.md
++++ b/docs/features/advanced/logits_processors.md
+@@ -97,3 +97,15 @@ response = generator(formatted_prompt)
+ 
+ print(response) # "101111"
+ ```
++
++### Supplying a custom tensor adapter to XGrammar
++
++XGrammar processor factories accept `tensor_library_name="custom"` together
++with a `custom_adapter`. The adapter is used by the shared processor call path
++for input validation and one- or two-dimensional shape normalization. Selecting
++`"custom"` without an adapter, or supplying one for another library name, is an
++error.
++
++This hook customizes Outlines tensor handling only. XGrammar's underlying
++processor can still impose runtime-specific requirements, so adapter injection
++does not by itself make an arbitrary tensor runtime supported.
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672d..ca9bf598 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,14 +1,15 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+ from outlines.models.transformers import Transformers
+ from outlines.processors.base_logits_processor import (
+     OutlinesLogitsProcessor,
+-    TensorType
++    TensorType,
+ )
++from outlines.processors.tensor_adapters.base import TensorAdapter
+ 
+ if TYPE_CHECKING:
+     from xgrammar.contrib.hf import LogitsProcessor
+@@ -22,20 +23,48 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(
++        self,
++        compiled_grammar: str,
++        tensor_library_name: str = "torch",
++        custom_adapter: Optional[TensorAdapter] = None,
++    ):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        tensor_library_name: str
++            The name of the tensor library to use. Can be "torch", "mlx",
++            "numpy", "jax", "tensorflow", or "custom".
++        custom_adapter: Optional[TensorAdapter]
++            Custom tensor adapter to use when tensor_library_name is "custom".
++            Must implement the TensorAdapter interface.
+ 
+         """
+         import xgrammar as xgr
+ 
++        if tensor_library_name == "custom" and custom_adapter is None:
++            raise ValueError(
++                "custom_adapter must be provided when tensor_library_name is 'custom'"
++            )
++
++        if tensor_library_name != "custom" and custom_adapter is not None:
++            raise ValueError(
++                "custom_adapter should only be provided when tensor_library_name is 'custom'"
++            )
++
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
+-        super().__init__("torch")
++        self.custom_adapter = custom_adapter
++
++        # Initialize the parent class with the tensor library
++        super().__init__(tensor_library_name)
++
++        # Override tensor_adapter if custom adapter is provided
++        if custom_adapter is not None:
++            self.tensor_adapter = custom_adapter
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+@@ -47,7 +76,7 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -65,21 +94,21 @@ class XGrammarBackend(BaseBackend):
+         from transformers import AutoConfig
+ 
+         if not isinstance(model, Transformers):
+-            raise ValueError(
+-                "The xgrammar backend only supports Transformers models"
+-            )
++            raise ValueError("The xgrammar backend only supports Transformers models")
+ 
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+-            model.hf_tokenizer,
+-            vocab_size=vocab_size
++            model.hf_tokenizer, vocab_size=vocab_size
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self,
++        json_schema: str,
++        tensor_library_name: str = "torch",
++        custom_adapter: Optional[TensorAdapter] = None,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +116,11 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        tensor_library_name: str
++            The name of the tensor library to use. Can be "torch", "mlx",
++            "numpy", "jax", "tensorflow", or "custom".
++        custom_adapter: Optional[TensorAdapter]
++            Custom tensor adapter to use when tensor_library_name is "custom".
+ 
+         Returns
+         -------
+@@ -94,18 +128,28 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_json_schema(
+-            json_schema
++        compiled_grammar = self.grammar_compiler.compile_json_schema(json_schema)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, tensor_library_name, custom_adapter
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self,
++        regex: str,
++        tensor_library_name: str = "torch",
++        custom_adapter: Optional[TensorAdapter] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        tensor_library_name: str
++            The name of the tensor library to use. Can be "torch", "mlx",
++            "numpy", "jax", "tensorflow", or "custom".
++        custom_adapter: Optional[TensorAdapter]
++            Custom tensor adapter to use when tensor_library_name is "custom".
+ 
+         Returns
+         -------
+@@ -114,15 +158,27 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, tensor_library_name, custom_adapter
++        )
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self,
++        grammar: str,
++        tensor_library_name: str = "torch",
++        custom_adapter: Optional[TensorAdapter] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        tensor_library_name: str
++            The name of the tensor library to use. Can be "torch", "mlx",
++            "numpy", "jax", "tensorflow", or "custom".
++        custom_adapter: Optional[TensorAdapter]
++            Custom tensor adapter to use when tensor_library_name is "custom".
+ 
+         Returns
+         -------
+@@ -131,4 +187,6 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, tensor_library_name, custom_adapter
++        )
+diff --git a/outlines/processors/base_logits_processor.py b/outlines/processors/base_logits_processor.py
+index 9b4e4fe5..1cbe0f04 100644
+--- a/outlines/processors/base_logits_processor.py
++++ b/outlines/processors/base_logits_processor.py
+@@ -8,7 +8,7 @@ from outlines.processors.tensor_adapters import (
+     tensor_adapters,
+ )
+ 
+-TensorType = TypeVar('TensorType')
++TensorType = TypeVar("TensorType")
+ 
+ 
+ class OutlinesLogitsProcessor:
+@@ -20,6 +20,7 @@ class OutlinesLogitsProcessor:
+     tensor library name specified in the constructor, is used to manipulate the
+     tensors using the appropriate library for the model (numpy, torch...).
+     """
++
+     tensor_adapter: TensorAdapterImplementation
+ 
+     def __init__(self, tensor_library_name: str):
+@@ -28,8 +29,9 @@ class OutlinesLogitsProcessor:
+         ----------
+         tensor_library_name
+             The name of the library to use to manipulate tensors. Possible
+-            values are "jax", "mlx", "numpy", "tensorflow" and "torch". You
+-            must choose the library that your model is using.
++            values are "jax", "mlx", "numpy", "tensorflow", "torch", and "custom".
++            You must choose the library that your model is using. When using "custom",
++            the tensor_adapter should be set manually by the subclass.
+         """
+         # Temporary fix as torch raises a warning that can cause can an error
+         # with python 3.12.
+@@ -38,11 +40,14 @@ class OutlinesLogitsProcessor:
+ 
+             torch._dynamo.config.suppress_errors = True
+ 
++        # Skip tensor adapter initialization for custom adapters
++        if tensor_library_name == "custom":
++            # tensor_adapter will be set by the subclass
++            return
++
+         tensor_adapter_class = tensor_adapters.get(tensor_library_name)
+         if tensor_adapter_class is None:
+-            raise NotImplementedError(
+-                f"Library {tensor_library_name} is not available"
+-            )
++            raise NotImplementedError(f"Library {tensor_library_name} is not available")
+         self.tensor_adapter = tensor_adapter_class()  # type: ignore
+ 
+     def reset(self):
+@@ -55,9 +60,7 @@ class OutlinesLogitsProcessor:
+         pass
+ 
+     @abstractmethod
+-    def process_logits(
+-        self, input_ids: TensorType, logits: TensorType
+-    ) -> TensorType:
++    def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Main method to implement for logits processors subclasses.
+         This method applies a mask on the logits to bias the generation.
+         It is called by the `__call__` method that standardizes the shape of
+@@ -82,9 +85,7 @@ class OutlinesLogitsProcessor:
+         """
+         ...
+ 
+-    def __call__(
+-        self, input_ids: TensorType, logits: TensorType
+-    ) -> TensorType:
++    def __call__(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Entrypoint for logits processors, this is the method that is
+         called by the model.
+         Because different models use different structures to store the
+diff --git a/outlines/processors/tensor_adapters/__init__.py b/outlines/processors/tensor_adapters/__init__.py
+index 8e3afe7f..2b7458af 100644
+--- a/outlines/processors/tensor_adapters/__init__.py
++++ b/outlines/processors/tensor_adapters/__init__.py
+@@ -2,6 +2,7 @@
+ 
+ from typing import Union
+ 
++from .base import TensorAdapter
+ from .jax import JAXTensorAdapter
+ from .mlx import MLXTensorAdapter
+ from .numpy import NumpyTensorAdapter
+@@ -23,4 +24,5 @@ TensorAdapterImplementation = Union[
+     NumpyTensorAdapter,
+     TensorFlowTensorAdapter,
+     TorchTensorAdapter,
++    TensorAdapter,
+ ]
+diff --git a/tests/backends/test_xgrammar_contribution.py b/tests/backends/test_xgrammar_contribution.py
+new file mode 100644
+index 00000000..fb03a564
+--- /dev/null
++++ b/tests/backends/test_xgrammar_contribution.py
+@@ -0,0 +1,73 @@
++from unittest.mock import Mock
++
++import pytest
++import torch
++import xgrammar as xgr
++
++from outlines.backends.xgrammar import XGrammarBackend, XGrammarLogitsProcessor
++from outlines.processors.tensor_adapters.torch import TorchTensorAdapter
++
++
++class RecordingAdapter(TorchTensorAdapter):
++    def __init__(self):
++        super().__init__()
++        self.shapes = []
++
++    def shape(self, tensor):
++        self.shapes.append(tuple(tensor.shape))
++        return super().shape(tensor)
++
++
++@pytest.fixture
++def passthrough_wrapper(monkeypatch):
++    class PassthroughProcessor:
++        def __init__(self, grammar):
++            self.grammar = grammar
++
++        def __call__(self, input_ids, logits):
++            return logits
++
++    monkeypatch.setattr(xgr.contrib.hf, "LogitsProcessor", PassthroughProcessor)
++
++
++def test_custom_adapter_is_used_by_public_shape_path(passthrough_wrapper):
++    adapter = RecordingAdapter()
++    processor = XGrammarLogitsProcessor(
++        object(), tensor_library_name="custom", custom_adapter=adapter
++    )
++
++    one = processor(torch.tensor([1]), torch.zeros(4))
++    two = processor(torch.tensor([[1], [1]]), torch.zeros(2, 4))
++
++    assert processor.tensor_adapter is adapter
++    assert one.shape == (4,)
++    assert two.shape == (2, 4)
++    assert (4,) in adapter.shapes and (2, 4) in adapter.shapes
++
++
++def test_custom_adapter_parameter_combinations_are_validated():
++    adapter = RecordingAdapter()
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor(object(), tensor_library_name="custom")
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor(object(), custom_adapter=adapter)
++
++
++def test_all_backend_factories_forward_custom_adapter():
++    backend = object.__new__(XGrammarBackend)
++    backend.grammar_compiler = Mock()
++    adapter = RecordingAdapter()
++    processors = [
++        backend.get_json_schema_logits_processor(
++            "{}", tensor_library_name="custom", custom_adapter=adapter
++        ),
++        backend.get_regex_logits_processor(
++            "a", tensor_library_name="custom", custom_adapter=adapter
++        ),
++        backend.get_cfg_logits_processor(
++            'root ::= "a"',
++            tensor_library_name="custom",
++            custom_adapter=adapter,
++        ),
++    ]
++    assert all(processor.tensor_adapter is adapter for processor in processors)

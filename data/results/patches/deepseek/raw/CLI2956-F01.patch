@@ -1,0 +1,207 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..35c6333 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2462,6 +2462,96 @@ class Parameter:
+         return self.type.shell_complete(ctx, self, incomplete)
+ 
+ 
++def _complete_by_strategy(
++    strategy: str, ctx: Context, param: Parameter, incomplete: str
++) -> list[CompletionItem]:
++    """Use a built-in completion strategy."""
++    from click.shell_completion import CompletionItem
++
++    if strategy == "user":
++        return _complete_username(incomplete)
++    elif strategy == "branch":
++        return _complete_branch(incomplete)
++    elif strategy == "environment":
++        return _complete_environment(incomplete)
++    elif strategy == "file":
++        return [CompletionItem(incomplete, type="file")]
++    elif strategy == "directory":
++        return [CompletionItem(incomplete, type="dir")]
++    return []
++
++
++def _complete_username(incomplete: str) -> list[CompletionItem]:
++    """Complete usernames from the password database."""
++    from click.shell_completion import CompletionItem
++
++    try:
++        import pwd
++    except ImportError:
++        return []
++
++    try:
++        users = pwd.getpwall()
++    except Exception:
++        return []
++
++    results = []
++    for pw in users:
++        name = pw.pw_name
++        if name.startswith("_"):
++            continue
++        if incomplete and not name.startswith(incomplete):
++            continue
++        results.append(name)
++
++    results = sorted(set(results))
++    return [CompletionItem(v) for v in results[:20]]
++
++
++def _complete_branch(incomplete: str) -> list[CompletionItem]:
++    """Complete Git branch and ref names."""
++    from click.shell_completion import CompletionItem
++
++    import subprocess
++
++    try:
++        result = subprocess.run(
++            ["git", "branch", "--list", "--format=%(refname:short)"],
++            capture_output=True,
++            text=True,
++            timeout=5,
++        )
++        if result.returncode != 0:
++            return []
++        branches = result.stdout.strip().splitlines()
++    except Exception:
++        return []
++
++    results = []
++    for name in branches:
++        if incomplete and not name.startswith(incomplete):
++            continue
++        results.append(name)
++
++    results = sorted(set(results))
++    return [CompletionItem(v) for v in results[:20]]
++
++
++def _complete_environment(incomplete: str) -> list[CompletionItem]:
++    """Complete environment variable names (not values)."""
++    from click.shell_completion import CompletionItem
++    import os
++
++    results = []
++    for name in os.environ:
++        if incomplete and not name.startswith(incomplete):
++            continue
++        results.append(name)
++
++    results = sorted(set(results))
++    return [CompletionItem(v) for v in results[:20]]
++
++
+ class Option(Parameter):
+     """Options are usually optional values on the command line and
+     have some extra features that arguments don't have.
+@@ -2506,6 +2596,20 @@ class Option(Parameter):
+                                context.
+     :param help: the help string.
+     :param hidden: hide this option from help outputs.
++    :param auto_complete: Enable automatic smart completion based on the
++        option's name. When ``True`` (the default is ``False``), the
++        option's normalized name is checked for keywords to select a
++        built-in completion strategy. The recognized keywords are
++        ``user``, ``username``, ``owner``, ``author`` for username
++        completion; ``branch``, ``ref``, ``revision`` for branch
++        completion; ``env``, ``environment``, ``var`` for environment
++        variable name completion; ``file``, ``path``, ``input``,
++        ``output`` for file path completion; and ``dir``, ``directory``
++        for directory path completion. Can also be a string to
++        explicitly select a strategy: ``"user"``, ``"branch"``,
++        ``"environment"``, ``"file"``, or ``"directory"``. An
++        explicit :paramref:`shell_complete` callback always takes
++        precedence.
+     :param attrs: Other command arguments described in :class:`Parameter`.
+ 
+     .. versionchanged:: 8.2
+@@ -2548,6 +2652,7 @@ class Option(Parameter):
+         hidden: bool = False,
+         show_choices: bool = True,
+         show_envvar: bool = False,
++        auto_complete: bool | str = False,
+         deprecated: bool | str = False,
+         **attrs: t.Any,
+     ) -> None:
+@@ -2637,6 +2742,20 @@ class Option(Parameter):
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
+ 
++        if isinstance(auto_complete, str):
++            valid_strategies = {"user", "branch", "environment", "file", "directory"}
++            if auto_complete not in valid_strategies:
++                raise ValueError(
++                    f"Invalid auto_complete strategy {auto_complete!r}. Must be one"
++                    f" of {sorted(valid_strategies)}."
++                )
++        elif not isinstance(auto_complete, bool):
++            raise TypeError(
++                f"auto_complete must be a bool or a string, not {auto_complete.__class__.__name__!r}."
++            )
++
++        self.auto_complete = auto_complete
++
+         if __debug__:
+             if deprecated and prompt:
+                 raise ValueError("`deprecated` options cannot use `prompt`.")
+@@ -2674,6 +2793,55 @@ class Option(Parameter):
+         )
+         return info_dict
+ 
++    def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
++        """Return a list of completions for the incomplete value. If a
++        ``shell_complete`` function was given during init, it is used.
++        Otherwise, the :attr:`type`
++        :meth:`~click.types.ParamType.shell_complete` function is used.
++        When :attr:`auto_complete` is enabled, a built-in strategy is
++        selected based on the option's name or the explicit string value.
++
++        :param ctx: Invocation context for this command.
++        :param incomplete: Value being completed. May be empty.
++
++        .. versionadded:: 8.3
++        """
++        from click.shell_completion import CompletionItem
++
++        # Explicit shell_complete callback always takes precedence.
++        if self._custom_shell_complete is not None:
++            results = self._custom_shell_complete(ctx, self, incomplete)
++            if results and isinstance(results[0], str):
++                results = [CompletionItem(c) for c in results]
++            return t.cast("list[CompletionItem]", results)
++
++        # Determine the strategy to use.
++        strategy: str | None = None
++
++        if isinstance(self.auto_complete, str):
++            # Explicit string strategy.
++            strategy = self.auto_complete
++        elif self.auto_complete is True:
++            # Automatic name-based detection.
++            if self.name is not None:
++                tokens = set(self.name.lower().split("_"))
++                if tokens & {"user", "username", "owner", "author"}:
++                    strategy = "user"
++                elif tokens & {"branch", "ref", "revision"}:
++                    strategy = "branch"
++                elif tokens & {"env", "environment", "var"}:
++                    strategy = "environment"
++                elif tokens & {"file", "path", "input", "output"}:
++                    strategy = "file"
++                elif tokens & {"dir", "directory"}:
++                    strategy = "directory"
++
++        if strategy is not None:
++            return _complete_by_strategy(strategy, ctx, self, incomplete)
++
++        # Fall through to the type's normal completion.
++        return self.type.shell_complete(ctx, self, incomplete)
++
+     def get_error_hint(self, ctx: Context) -> str:
+         result = super().get_error_hint(ctx)
+         if self.show_envvar:

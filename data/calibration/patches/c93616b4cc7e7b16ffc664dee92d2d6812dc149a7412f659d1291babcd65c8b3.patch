@@ -1,0 +1,168 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..82c8785e 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add optional fallback filesystem search paths for template lookup
++    and listing.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..4a0f2729 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -444,6 +444,14 @@ Here a list of the builtin loaders Jinja provides:
+ 
+ .. autoclass:: jinja2.FileSystemLoader
+ 
++    ``fallback_searchpath`` accepts a path or an ordered path sequence.
++    Lookup searches all primary paths before the fallback paths. Leaving
++    it unset, or using an empty sequence, keeps the original behavior.
++    Listings include both groups with duplicate logical names removed.
++    Encoding, ``followlinks``, path checks, and source freshness keep
++    their existing meaning. If a primary template is removed, reloading
++    may select the same name from a fallback directory.
++
+ .. autoclass:: jinja2.PackageLoader
+ 
+ .. autoclass:: jinja2.DictLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..66d7af34 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -170,6 +170,11 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param fallback_searchpath: Optional path or ordered path sequence
++        searched after every primary search path.
++
++    .. note:: Changed behavior
++        Add optional fallback search paths to lookup and listing.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
+@@ -180,11 +185,23 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        fallback_searchpath: t.Optional[
++            t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
++        ] = None,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+         self.searchpath = [os.fspath(p) for p in searchpath]
++
++        if fallback_searchpath is None:
++            fallback_searchpath = []
++        elif not isinstance(fallback_searchpath, abc.Iterable) or isinstance(
++            fallback_searchpath, str
++        ):
++            fallback_searchpath = [fallback_searchpath]
++
++        self.fallback_searchpath = [os.fspath(p) for p in fallback_searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+@@ -192,7 +209,7 @@ class FileSystemLoader(BaseLoader):
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+         pieces = split_template_path(template)
+-        for searchpath in self.searchpath:
++        for searchpath in [*self.searchpath, *self.fallback_searchpath]:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+             if f is None:
+@@ -215,7 +232,7 @@ class FileSystemLoader(BaseLoader):
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+-        for searchpath in self.searchpath:
++        for searchpath in [*self.searchpath, *self.fallback_searchpath]:
+             walk_dir = os.walk(searchpath, followlinks=self.followlinks)
+             for dirpath, _, filenames in walk_dir:
+                 for filename in filenames:
+diff --git a/tests/test_n4c_author_fallback_paths.py b/tests/test_n4c_author_fallback_paths.py
+new file mode 100644
+index 00000000..e772b9c3
+--- /dev/null
++++ b/tests/test_n4c_author_fallback_paths.py
+@@ -0,0 +1,72 @@
++from pathlib import Path
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import FileSystemLoader
++from jinja2 import TemplateNotFound
++
++
++@pytest.mark.parametrize("empty", [None, []])
++def test_empty_fallback_keeps_normal_paths(tmp_path, empty):
++    (tmp_path / "main").write_text("base")
++    loader = FileSystemLoader(tmp_path, fallback_searchpath=empty)
++    assert loader.fallback_searchpath == []
++    assert Environment(loader=loader).get_template("main").render() == "base"
++    assert loader.list_templates() == ["main"]
++
++
++@pytest.mark.parametrize("convert", [str, Path])
++def test_single_fallback_path_and_lookup_order(tmp_path, convert):
++    first, second, fallback = (tmp_path / n for n in ("a", "b", "c"))
++    for directory in (first, second, fallback):
++        directory.mkdir()
++    (second / "page").write_text("second primary")
++    (fallback / "page").write_text("fallback")
++    (fallback / "extra").write_text("extra")
++    loader = FileSystemLoader([first, second], fallback_searchpath=convert(fallback))
++    assert loader.fallback_searchpath == [str(fallback)]
++    env = Environment(loader=loader)
++    assert env.get_template("page").render() == "second primary"
++    assert env.get_template("extra").render() == "extra"
++
++
++def test_multiple_fallbacks_keep_order_and_deduplicate_listing(tmp_path):
++    one, two = tmp_path / "one", tmp_path / "two"
++    for directory in (one, two):
++        directory.mkdir()
++        (directory / "shared").write_text(directory.name)
++    (two / "only").write_text("only")
++    loader = FileSystemLoader(tmp_path / "absent", fallback_searchpath=[one, two, one])
++    assert Environment(loader=loader).get_template("shared").render() == "one"
++    assert loader.list_templates() == ["only", "shared"]
++
++
++def test_primary_removal_reloads_fallback_with_encoding(tmp_path):
++    first, fallback = tmp_path / "first", tmp_path / "fallback"
++    for directory in (first, fallback):
++        directory.mkdir()
++    old = first / "page"
++    old.write_bytes("première".encode("latin-1"))
++    (fallback / "page").write_bytes("deuxième".encode("latin-1"))
++    env = Environment(
++        loader=FileSystemLoader(first, "latin-1", False, fallback_searchpath=fallback)
++    )
++    before = env.get_template("page")
++    assert before.render() == "première"
++    old.unlink()
++    assert before.is_up_to_date is False
++    after = env.get_template("page")
++    assert after is not before
++    assert after.render() == "deuxième"
++
++
++def test_missing_and_escaping_names_keep_original_error(tmp_path):
++    fallback = tmp_path / "fallback"
++    fallback.mkdir()
++    (tmp_path / "secret").write_text("outside")
++    loader = FileSystemLoader([], fallback_searchpath=fallback)
++    for name in ("not-here", "../secret"):
++        with pytest.raises(TemplateNotFound) as caught:
++            loader.get_source(Environment(), name)
++        assert caught.value.name == name

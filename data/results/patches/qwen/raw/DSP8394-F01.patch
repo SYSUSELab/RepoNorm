@@ -1,0 +1,109 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..11ee8441 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,6 +2,7 @@ import copy
+ import inspect
+ import logging
+ import threading
++from contextlib import contextmanager
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -15,6 +16,10 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++# Context variable to track bypass state per thread/async context
++_bypass_stack = threading.local()
++
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -31,7 +36,7 @@ class Cache:
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+ 
+-    ):
++    ) -> None:
+         """
+         Args:
+             enable_disk_cache: Whether to enable on-disk cache.
+@@ -63,6 +68,65 @@ class Cache:
+         """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache
+ 
++    def _get_bypass_state(self) -> int:
++        """Get the current bypass nesting level for this Cache instance.
++        
++        Returns:
++            The number of active bypass contexts (0 if none active).
++        """
++        # Use thread-local storage to track bypass state
++        if not hasattr(_bypass_stack, 'cache_states'):
++            _bypass_stack.cache_states = {}
++        
++        states = _bypass_stack.cache_states
++        if id(self) not in states:
++            states[id(self)] = []
++        
++        return len(states[id(self)])
++
++    def _set_bypass_state(self, state: int) -> None:
++        """Set the bypass nesting level for this Cache instance."""
++        if not hasattr(_bypass_stack, 'cache_states'):
++            _bypass_stack.cache_states = {}
++        
++        states = _bypass_stack.cache_states
++        if id(self) not in states:
++            states[id(self)] = []
++        
++        # Adjust the stack to match the desired state
++        while len(states[id(self)]) < state:
++            states[id(self)].append(None)
++        while len(states[id(self)]) > state:
++            states[id(self)].pop()
++
++    @contextmanager
++    def bypass(self) -> Any:
++        """Context manager to temporarily bypass cache reads.
++        
++        When entered, cache reads behave as cache misses even when a value is stored.
++        Writes remain enabled according to the existing memory/disk configuration.
++        
++        Nested contexts retain bypass until their outer context exits. Normal and
++        exceptional exits restore the previous state. Bypass is local to the current
++        thread/asynchronous execution context; an independently started thread or 
++        sibling async task must retain its own state.
++        
++        Example:
++            >>> with dspy.cache.bypass():
++            ...     result = cache.get(request)  # Always returns None (cache miss)
++            ...     cache.put(request, new_value)  # Write still works
++        
++        Note:
++            This synchronous context manager can be used inside an async function
++            and remains effective across awaits.
++        """
++        old_state = self._get_bypass_state()
++        self._set_bypass_state(old_state + 1)
++        try:
++            yield
++        finally:
++            self._set_bypass_state(old_state)
++
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+         Obtain a unique cache key for the given request dictionary by hashing its JSON
+@@ -103,6 +167,10 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
++        # Check if bypass is active - if so, always return None (cache miss)
++        if self._get_bypass_state() > 0:
++            return None
++
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]

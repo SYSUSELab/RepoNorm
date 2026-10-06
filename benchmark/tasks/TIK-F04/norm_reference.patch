@@ -1,0 +1,187 @@
+diff --git a/tests/test_chunking_contribution.py b/tests/test_chunking_contribution.py
+new file mode 100644
+index 0000000..56b862c
+--- /dev/null
++++ b/tests/test_chunking_contribution.py
+@@ -0,0 +1,49 @@
++import pytest
++
++import tiktoken
++
++
++@pytest.fixture(scope="module")
++def encoding():
++    return tiktoken.get_encoding("cl100k_base")
++
++
++@pytest.mark.parametrize(
++    "text,size,overlap,windows",
++    [
++        ("abcde", 3, 1, ["abc", "cde"]),
++        ("abcdef", 3, 1, ["abc", "cde", "ef"]),
++        ("你😀好呀", 2, 1, ["你😀", "😀好", "好呀"]),
++        ("", 3, 1, [""]),
++    ],
++)
++def test_character_windows(encoding, text, size, overlap, windows) -> None:
++    assert encoding.encode(text, chunk_size=size, chunk_overlap=overlap) == [
++        encoding.encode(window) for window in windows
++    ]
++
++
++@pytest.mark.parametrize(
++    "size,overlap",
++    [(0, 0), (-1, 0), (True, 0), (2.5, 0), (3, 3), (3, -1), (3, True), (None, 1)],
++)
++def test_invalid_chunk_options(encoding, size, overlap) -> None:
++    with pytest.raises(ValueError):
++        encoding.encode("text", chunk_size=size, chunk_overlap=overlap)
++
++
++def test_complete_input_special_policy_is_checked_before_chunking(encoding) -> None:
++    special = "<|endoftext|>"
++    with pytest.raises(ValueError, match="disallowed special token"):
++        encoding.encode(special, chunk_size=3, chunk_overlap=1)
++    actual = encoding.encode(
++        special, allowed_special="all", chunk_size=3, chunk_overlap=1
++    )
++    windows = ["<|e", "end", "dof", "fte", "ext", "t|>"]
++    assert actual == [encoding.encode(window, allowed_special="all") for window in windows]
++
++
++def test_nonchunked_default_and_surrogate_paths_are_unchanged(encoding) -> None:
++    assert isinstance(encoding.encode("ordinary"), list)
++    text = "before \ud800 after"
++    assert encoding.encode(text) == encoding.encode_batch([text])[0]
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..0879cf0 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,9 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        chunk_size: int | None = None,
++        chunk_overlap: int = 0,
++    ) -> list[int] | list[list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -97,6 +99,12 @@ class Encoding:
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
+ 
++        If `chunk_size` is provided, the text is split into Python-character windows of
++        exactly that maximum size and each window is encoded independently. Adjacent
++        windows share `chunk_overlap` characters. The result is one token list per
++        window; an empty string returns `[[]]`. Without `chunk_size`, `chunk_overlap`
++        must be zero and the ordinary token-list return type is preserved.
++
+         ```
+         >>> enc.encode("hello world")
+         [31373, 995]
+@@ -108,6 +116,8 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> enc.encode("This is a long text", chunk_size=10)
++        [[1212, 318, 257], [2420, 1310]]
+         ```
+         """
+         if allowed_special == "all":
+@@ -120,17 +130,83 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        try:
+-            return self._core_bpe.encode(text, allowed_special)
+-        except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+-            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++        if type(chunk_overlap) is not int or chunk_overlap < 0:
++            raise ValueError("chunk_overlap must be a nonnegative integer")
++        if chunk_size is None:
++            if chunk_overlap:
++                raise ValueError("chunk_overlap requires chunk_size")
++        elif type(chunk_size) is not int or chunk_size <= 0 or chunk_overlap >= chunk_size:
++            raise ValueError("chunk_size must be positive and greater than chunk_overlap")
++
++        # If no chunking is requested, use the original behavior
++        if chunk_size is None:
++            try:
++                return self._core_bpe.encode(text, allowed_special)
++            except UnicodeEncodeError:
++                # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++                # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++                # fixup for any surrogate pairs that may have sneaked their way into the text.
++                # Technically, this introduces a place where encode + decode doesn't roundtrip a
++                # Python string, but given that this is input we want to support, maybe that's okay.
++                # Also we use errors="replace" to handle weird things like lone surrogates.
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                return self._core_bpe.encode(text, allowed_special)
++
++        # Implement chunking
++        return self._encode_with_chunking(
++            text=text,
++            allowed_special=allowed_special,
++            chunk_size=chunk_size,
++            chunk_overlap=chunk_overlap,
++        )
++
++    def _encode_with_chunking(
++        self,
++        text: str,
++        allowed_special: AbstractSet[str],
++        chunk_size: int,
++        chunk_overlap: int = 0,
++    ) -> list[list[int]]:
++        """Split text into overlapping character windows and encode each one."""
++        # If the text is short enough to fit in one chunk, encode it directly
++        if len(text) <= chunk_size:
++            try:
++                tokens = self._core_bpe.encode(text, allowed_special)
++            except UnicodeEncodeError:
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                tokens = self._core_bpe.encode(text, allowed_special)
++            return [tokens]
++
++        # Split the text into chunks of chunk_size characters
++        chunks = []
++        start_pos = 0
++        text_length = len(text)
++
++        while start_pos < text_length:
++            # Determine the end position for the current chunk
++            end_pos = min(start_pos + chunk_size, text_length)
++
++            # Extract the current chunk
++            chunk_text = text[start_pos:end_pos]
++
++            # Encode the chunk
++            try:
++                chunk_tokens = self._core_bpe.encode(chunk_text, allowed_special)
++            except UnicodeEncodeError:
++                chunk_text = chunk_text.encode("utf-16", "surrogatepass").decode(
++                    "utf-16", "replace"
++                )
++                chunk_tokens = self._core_bpe.encode(chunk_text, allowed_special)
++
++            # Add the encoded chunk to our results
++            chunks.append(chunk_tokens)
++
++            # Move to the next chunk
++            if end_pos == text_length:
++                break
++            start_pos = end_pos - chunk_overlap
++
++        return chunks
+ 
+     def encode_to_numpy(
+         self,

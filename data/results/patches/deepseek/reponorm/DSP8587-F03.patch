@@ -1,0 +1,275 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..0b006b83 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,6 +1,7 @@
+ import re
+ from collections import defaultdict
+ from queue import Queue
++import time
+ from typing import TYPE_CHECKING, Any
+ 
+ from litellm import ModelResponseStream
+@@ -48,6 +49,12 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Metrics for the active field stream
++        self._chunk_count = 0
++        self._char_count = 0
++        self._first_ts = None
++        self._last_ts = None
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -72,6 +79,31 @@ class StreamListener:
+                 return True
+         return False
+ 
++    def _reset_stats(self):
++        self._chunk_count = 0
++        self._char_count = 0
++        self._first_ts = None
++        self._last_ts = None
++
++    def stats(self) -> dict:
++        """Return serialization-friendly metrics for the active field stream."""
++        duration_s = None
++        if self._first_ts is not None and self._last_ts is not None:
++            duration_s = self._last_ts - self._first_ts
++        avg_chunk_chars = 0.0
++        if self._chunk_count > 0:
++            avg_chunk_chars = self._char_count / self._chunk_count
++        return {
++            'predict_name': self.predict_name,
++            'field': self.signature_field_name,
++            'chunk_count': self._chunk_count,
++            'char_count': self._char_count,
++            'first_ts': self._first_ts,
++            'last_ts': self._last_ts,
++            'duration_s': duration_s,
++            'avg_chunk_chars': avg_chunk_chars,
++        }
++
+     def receive(self, chunk: ModelResponseStream):
+         adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
+         if adapter_name not in self.adapter_identifiers:
+@@ -91,6 +123,7 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                self._reset_stats()
+             else:
+                 return
+ 
+@@ -112,6 +145,7 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
++                self._reset_stats()
+                 return
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+@@ -164,8 +198,17 @@ class StreamListener:
+                 last_token = self.flush()
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
++                self._reset_stats()
++                if token:
++                    return StreamResponse(self.predict_name, self.signature_field_name, token)
++                return
+ 
+             if token:
++                self._chunk_count += 1
++                self._char_count += len(token)
++                if self._first_ts is None:
++                    self._first_ts = time.time()
++                self._last_ts = time.time()
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6d..634a2e92 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -7,7 +7,7 @@ import pytest
+ from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+ 
+ import dspy
+-from dspy.streaming import StatusMessage, StatusMessageProvider, streaming_response
++from dspy.streaming import StatusMessage, StatusMessageProvider, StreamListener, streaming_response
+ 
+ 
+ @pytest.mark.anyio
+@@ -837,3 +837,170 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+     assert all_chunks[1].predict_name == "predict2"
+     assert all_chunks[1].signature_field_name == "judgement"
+     assert all_chunks[1].chunk == "The answer is humorous."
++
++
++@pytest.mark.anyio
++async def test_stream_listener_stats():
++    """Test StreamListener.stats() behavior throughout the lifecycle."""
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener = StreamListener(
++            signature_field_name="answer",
++            predict_name="predict1",
++        )
++
++        # --- 1. Initial state (before any emission) ---
++        s = listener.stats()
++        assert s["predict_name"] == "predict1"
++        assert s["field"] == "answer"
++        assert s["chunk_count"] == 0
++        assert s["char_count"] == 0
++        assert s["first_ts"] is None
++        assert s["last_ts"] is None
++        assert s["duration_s"] is None
++        assert s["avg_chunk_chars"] == 0.0
++
++        # --- 2. Feed start identifier tokens ---
++        for content in ["[[", " ##", " answer", " ##", " ]]"]:
++            chunk = ModelResponseStream(
++                model="gpt-4o-mini",
++                choices=[StreamingChoices(delta=Delta(content=content))],
++            )
++            result = listener.receive(chunk)
++            assert result is None  # Not yet emitting
++
++        # --- 3. Feed content tokens (need >10 to get individual emits) ---
++        # The first 10 tokens are buffered; token 11+ are emitted individually.
++        # When token 11 arrives, token 1 is dequeued and emitted.
++        tokens = [
++            "Hello", " world", " this", " is", " a", " test", " of", " the",
++            " stats", " method", "!", " More", " text", " here", "."
++        ]
++        emitted_count = 0
++        for token in tokens:
++            chunk = ModelResponseStream(
++                model="gpt-4o-mini",
++                choices=[StreamingChoices(delta=Delta(content=token))],
++            )
++            result = listener.receive(chunk)
++            if result is not None:
++                emitted_count += 1
++                assert isinstance(result, dspy.streaming.StreamResponse)
++
++        # Check that some tokens were emitted (first 10 buffered, rest emitted)
++        assert emitted_count > 0
++
++        # Stats should now reflect emitted chunks
++        s = listener.stats()
++        assert s["predict_name"] == "predict1"
++        assert s["field"] == "answer"
++        assert s["chunk_count"] == emitted_count
++        if emitted_count > 0:
++            assert s["first_ts"] is not None
++            assert s["last_ts"] is not None
++            assert s["duration_s"] is not None
++            assert s["duration_s"] >= 0
++
++        # --- 4. End the stream with end identifier ---
++        for content in ["\n\n", "[[ ##", " completed", " ##", " ]]"]:
++            chunk = ModelResponseStream(
++                model="gpt-4o-mini",
++                choices=[StreamingChoices(delta=Delta(content=content))],
++            )
++            result = listener.receive(chunk)
++
++        # After stream end, stats should be reset to zero
++        s = listener.stats()
++        assert s["chunk_count"] == 0, "Stats should reset after stream end"
++        assert s["char_count"] == 0
++        assert s["first_ts"] is None
++        assert s["last_ts"] is None
++        assert s["duration_s"] is None
++        assert s["avg_chunk_chars"] == 0.0
++
++
++@pytest.mark.anyio
++async def test_stream_listener_stats_cache_hit():
++    """Test stats reset on cache hit (full response in one chunk)."""
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener = StreamListener(
++            signature_field_name="answer",
++            predict_name="predict1",
++        )
++
++        # Verify initial zero state
++        s = listener.stats()
++        assert s["chunk_count"] == 0
++
++        # Send a chunk that contains both start and end identifiers
++        chunk = ModelResponseStream(
++            model="gpt-4o-mini",
++            choices=[StreamingChoices(delta=Delta(
++                content="[[ ## answer ## ]]\n\nHello world!\n\n[[ ## completed ## ]]"
++            ))],
++        )
++        result = listener.receive(chunk)
++        assert result is None  # Cache hit returns None (no individual emissions)
++
++        # Stats should be reset (zeroed) since stream_end was set
++        s = listener.stats()
++        assert s["chunk_count"] == 0
++        assert s["char_count"] == 0
++        assert s["first_ts"] is None
++        assert s["last_ts"] is None
++
++
++@pytest.mark.anyio
++async def test_stream_listener_stats_allow_reuse():
++    """Test stats reset on stream reuse with allow_reuse=True."""
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener = StreamListener(
++            signature_field_name="answer",
++            predict_name="predict1",
++            allow_reuse=True,
++        )
++
++        def make_chunk(content):
++            return ModelResponseStream(
++                model="gpt-4o-mini",
++                choices=[StreamingChoices(delta=Delta(content=content))],
++            )
++
++        # First stream: feed start identifier and content to generate some stats
++        for c in ["[[", " ##", " answer", " ##", " ]]"]:
++            listener.receive(make_chunk(c))
++
++        tokens = ["A", " B", " C", " D", " E", " F", " G", " H", " I", " J", " K"]
++        for t in tokens:
++            listener.receive(make_chunk(t))
++
++        # End first stream
++        for c in ["\n\n", "[[ ##", " completed", " ##", " ]]"]:
++            listener.receive(make_chunk(c))
++
++        # After first stream ends, stats should be zero
++        s = listener.stats()
++        assert s["chunk_count"] == 0
++
++        # Second stream on the same listener (reused)
++        for c in ["[[", " ##", " answer", " ##", " ]]"]:
++            listener.receive(make_chunk(c))
++
++        # Before any content emission, stats should still be zero
++        s = listener.stats()
++        assert s["chunk_count"] == 0
++
++        # Feed content to the second stream
++        for t in ["X", " Y", " Z"]:
++            listener.receive(make_chunk(t))
++
++        # Still no emits yet (buffer < 10)
++        s = listener.stats()
++        assert s["chunk_count"] == 0
++
++        # End second stream - flush triggers
++        for c in ["\n\n", "[[ ##", " completed", " ##", " ]]"]:
++            result = listener.receive(make_chunk(c))
++
++        # After stream end, stats reset to zero
++        s = listener.stats()
++        assert s["chunk_count"] == 0

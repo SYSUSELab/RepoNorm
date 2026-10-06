@@ -1,0 +1,265 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..a302a8c 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,12 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add opt-in per-context option assignment history.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..bce7352 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -165,6 +165,18 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++class _OptionValueDict(dict[str, t.Any]):
++    """Context params mapping observing direct option assignment."""
++
++    def __init__(self, context: Context) -> None:
++        super().__init__()
++        self._context = context
++
++    def __setitem__(self, name: str, value: t.Any) -> None:
++        super().__setitem__(name, value)
++        self._context._record_option_assignment(name, value, source=None)
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -296,7 +308,7 @@ class Context:
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+-        self.params: dict[str, t.Any] = {}
++        self.params: dict[str, t.Any] = _OptionValueDict(self)
+         #: the leftover arguments.
+         self.args: list[str] = []
+         #: protected arguments.  These are arguments that are prepended
+@@ -438,6 +450,8 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._track_changes = command.track_changes
++        self._option_history: dict[str, list[dict[str, t.Any]]] = {}
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -839,54 +853,58 @@ class Context:
+         """
+         return self._parameter_source.get(name)
+ 
++    def _resolve_option_name(self, name: str) -> str | None:
++        """Resolve a parameter name or spelling to an option name."""
++        for parameter in self.command.params:
++            if not isinstance(parameter, Option) or parameter.name is None:
++                continue
+ 
+-class Command:
+-    """Commands are the basic building block of command line interfaces in
+-    Click.  A basic command handles command line parsing and might dispatch
+-    more parsing to commands nested below it.
+-
+-    :param name: the name of the command to use unless a group overrides it.
+-    :param context_settings: an optional dictionary with defaults that are
+-                             passed to the context object.
+-    :param callback: the callback to invoke.  This is optional.
+-    :param params: the parameters to register with this command.  This can
+-                   be either :class:`Option` or :class:`Argument` objects.
+-    :param help: the help string to use for this command.
+-    :param epilog: like the help string but it's printed at the end of the
+-                   help page after everything else.
+-    :param short_help: the short help to use for this command.  This is
+-                       shown on the command listing of the parent command.
+-    :param add_help_option: by default each command registers a ``--help``
+-                            option.  This can be disabled by this parameter.
+-    :param no_args_is_help: this controls what happens if no arguments are
+-                            provided.  This option is disabled by default.
+-                            If enabled this will add ``--help`` as argument
+-                            if no arguments are passed
+-    :param hidden: hide this command from help outputs.
+-    :param deprecated: If ``True`` or non-empty string, issues a message
+-                        indicating that the command is deprecated and highlights
+-                        its deprecation in --help. The message can be customized
+-                        by using a string as the value.
++            if (
++                name == parameter.name
++                or name in parameter.opts + parameter.secondary_opts
++            ):
++                return parameter.name
+ 
+-    .. versionchanged:: 8.2
+-        This is the base class for all commands, not ``BaseCommand``.
+-        ``deprecated`` can be set to a string as well to customize the
+-        deprecation message.
++        return None
+ 
+-    .. versionchanged:: 8.1
+-        ``help``, ``epilog``, and ``short_help`` are stored unprocessed,
+-        all formatting is done when outputting help text, not at init,
+-        and is done even if not using the ``@command`` decorator.
++    def _record_option_assignment(
++        self, name: str, value: t.Any, source: ParameterSource | None
++    ) -> None:
++        if not self._track_changes or self._resolve_option_name(name) != name:
++            return
+ 
+-    .. versionchanged:: 8.0
+-        Added a ``repr`` showing the command name.
++        import time
+ 
+-    .. versionchanged:: 7.1
+-        Added the ``no_args_is_help`` parameter.
++        self._option_history.setdefault(name, []).append(
++            {"value": value, "source": source, "timestamp": time.time()}
++        )
+ 
+-    .. versionchanged:: 2.0
+-        Added the ``context_settings`` parameter.
+-    """
++    def _assign_parameter_value(self, parameter: Parameter, value: t.Any) -> None:
++        if parameter.name is None:
++            return
++
++        dict.__setitem__(self.params, parameter.name, value)
++
++        if isinstance(parameter, Option):
++            self._record_option_assignment(
++                parameter.name,
++                value,
++                source=self.get_parameter_source(parameter.name),
++            )
++
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self._track_changes:
++            return None
++
++        resolved_name = self._resolve_option_name(name)
++
++        if resolved_name is None:
++            return []
++
++        return [record.copy() for record in self._option_history.get(resolved_name, ())]
++
++
++class Command:
+ 
+     #: The context class to create with :meth:`make_context`.
+     #:
+@@ -916,6 +934,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        track_changes: bool = False,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -945,6 +964,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -2421,7 +2441,7 @@ class Parameter:
+                 value = None
+ 
+         if self.expose_value:
+-            ctx.params[self.name] = value  # type: ignore
++            ctx._assign_parameter_value(self, value)
+ 
+         return value, args
+ 
+diff --git a/tests/test_n4c_author_option_history.py b/tests/test_n4c_author_option_history.py
+new file mode 100644
+index 0000000..8c374c7
+--- /dev/null
++++ b/tests/test_n4c_author_option_history.py
+@@ -0,0 +1,75 @@
++import click
++from click.core import ParameterSource
++
++
++def test_final_value_source_and_alias_lookup(runner):
++    seen = []
++
++    @click.command(track_changes=True)
++    @click.option("-c", "--count", type=int, callback=lambda c, p, v: v + 1)
++    def cli(count):
++        ctx = click.get_current_context()
++        seen.extend(
++            (
++                ctx.get_option_history("count"),
++                ctx.get_option_history("--count"),
++                ctx.get_option_history("-c"),
++            )
++        )
++
++    assert runner.invoke(cli, ["-c", "2"]).exit_code == 0
++    assert all(
++        items[0]["value"] == 3 and items[0]["source"] is ParameterSource.COMMANDLINE
++        for items in seen
++    )
++
++
++def test_disabled_unknown_and_argument_boundaries(runner):
++    values = []
++
++    @click.command()
++    @click.option("--value")
++    def off(value):
++        values.append(click.get_current_context().get_option_history("value"))
++
++    @click.command(track_changes=True)
++    @click.argument("item")
++    def on(item):
++        ctx = click.get_current_context()
++        values.extend(
++            (ctx.get_option_history("missing"), ctx.get_option_history("item"))
++        )
++
++    runner.invoke(off, ["--value", "x"])
++    runner.invoke(on, ["x"])
++    assert values == [None, [], []]
++
++
++def test_later_assignment_and_snapshot_copy(runner):
++    captured = []
++
++    @click.command(track_changes=True)
++    @click.option("--value")
++    def cli(value):
++        ctx = click.get_current_context()
++        first = ctx.get_option_history("value")
++        ctx.params["value"] = "later"
++        second = ctx.get_option_history("value")
++        first[0]["value"] = "mutated"
++        captured.extend((first, second, ctx.get_option_history("value")))
++
++    runner.invoke(cli, ["--value", "initial"])
++    assert captured[1][-1]["source"] is None and captured[2][0]["value"] == "initial"
++
++
++def test_each_invocation_has_fresh_history(runner):
++    histories = []
++
++    @click.command(track_changes=True)
++    @click.option("--item", multiple=True)
++    def cli(item):
++        histories.append(click.get_current_context().get_option_history("item"))
++
++    runner.invoke(cli, ["--item", "a", "--item", "b"])
++    runner.invoke(cli)
++    assert histories[0][0]["value"] == ("a", "b") and len(histories[1]) == 1

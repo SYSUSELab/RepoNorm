@@ -1,0 +1,197 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..7cdca4d 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -570,6 +570,167 @@ class InternationalizationExtension(Extension):
+                 )
+         return nodes.Output([node])
+ 
++class TranslationExtractorExtension(Extension):
++    """Adds ``{% extract key=constant, ... %}...{% endextract %}`` tags
++    that mark template sections for translation extraction with metadata.
++
++    Metadata values must be compile-time constants; dynamic expressions
++    and duplicate keys raise ``TemplateSyntaxError`` naming the key.
++    Marker bodies are ordinary Jinja bodies and render unchanged.
++    They may contain control structures and any gettext calls supported
++    by normal extraction.
++    """
++
++    tags = {"extract"}
++
++    def __init__(self, environment: Environment) -> None:
++        super().__init__(environment)
++        environment.extend(
++            extract_marked_translations=self._extract_marked,
++            extract_marked_translations_from_templates=self._extract_marked_from_templates,
++        )
++
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        lineno = next(parser.stream).lineno
++        metadata: t.Dict[str, t.Any] = {}
++        seen_keys: t.Set[str] = set()
++
++        # Parse keyword arguments: key=value, key2=value2, ...
++        while parser.stream.current.type != "block_end":
++            if metadata:
++                parser.stream.expect("comma")
++                # Allow trailing comma before block_end
++                if parser.stream.current.type == "block_end":
++                    break
++
++            key_token = parser.stream.expect("name")
++            key = key_token.value
++
++            if key in seen_keys:
++                parser.fail(
++                    f"duplicate extract metadata key {key!r}.",
++                    key_token.lineno,
++                    exc=TemplateSyntaxError,
++                )
++
++            parser.stream.expect("assign")
++            value_node = parser.parse_expression()
++
++            # Metadata values must be compile-time constants.
++            if not isinstance(value_node, nodes.Const):
++                parser.fail(
++                    f"extract metadata value for {key!r} must be a"
++                    f" compile-time constant.",
++                    key_token.lineno,
++                    exc=TemplateSyntaxError,
++                )
++
++            metadata[key] = value_node.value
++            seen_keys.add(key)
++
++        parser.stream.expect("block_end")
++
++        # Parse body until endextract using subparse directly.
++        # subparse handles block tokens and stops when it sees
++        # the endextract tag name. The outer subparse call will
++        # consume the closing %} token.
++        body = parser.subparse(("name:endextract",))
++        next(parser.stream)  # skip endextract name token
++
++        return nodes.ExtractMarker(metadata, body, lineno=lineno)
++
++    def _extract_marked(
++        self,
++        source: t.Union[str, nodes.Template],
++        source_name: t.Optional[str] = None,
++        gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Parse *source* (a string or a parsed :class:`nodes.Template`)
++        and yield a record for each ``{% extract %}`` marker block.
++
++        Each record is a dict with keys:
++        ``source``
++            The *source_name* string, or ``None``.
++        ``lineno``
++            The line number of the ``{% extract %}`` tag.
++        ``metadata``
++            A copy of the marker's metadata dict.
++        ``messages``
++            A list of dicts, one per gettext call found inside the
++            marker body.  Each message dict has keys ``lineno``,
++            ``function`` and ``message`` (as returned by
++            :func:`extract_from_ast`).
++        """
++        if isinstance(source, str):
++            source = self.environment.parse(source)
++
++        for marker_node in source.find_all(nodes.ExtractMarker):
++            messages: t.List[t.Dict[str, t.Any]] = []
++            for call_node in marker_node.find_all(nodes.Call):
++                if (
++                    not isinstance(call_node.node, nodes.Name)
++                    or call_node.node.name not in gettext_functions
++                ):
++                    continue
++                strings: t.List[t.Optional[str]] = []
++                for arg in call_node.args:
++                    if isinstance(arg, nodes.Const) and isinstance(arg.value, str):
++                        strings.append(arg.value)
++                    else:
++                        strings.append(None)
++                if len(strings) == 1:
++                    message: t.Union[t.Optional[str], t.Tuple[t.Optional[str], ...]] = (
++                        strings[0]
++                    )
++                else:
++                    message = tuple(strings)
++                messages.append(
++                    {
++                        "lineno": call_node.lineno,
++                        "function": call_node.node.name,
++                        "message": message,
++                    }
++                )
++
++            yield {
++                "source": source_name,
++                "lineno": marker_node.lineno,
++                "metadata": dict(marker_node.metadata),
++                "messages": messages,
++            }
++
++    def _extract_marked_from_templates(
++        self,
++        names: t.Optional[t.Iterable[str]] = None,
++        gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Yield marked-translation records for templates supplied by
++        the configured :attr:`~Environment.loader`.
++
++        *names* is a finite iterable of logical template names,
++        processed in iteration order.  When omitted, all templates
++        listed by the loader are processed.
++
++        Each record's ``source`` is the logical name being processed.
++
++        Extraction does not render templates or recursively follow
++        includes or inheritance.
++        """
++        if self.environment.loader is None:
++            raise TypeError(
++                "no loader for this environment specified"
++            )
++
++        if names is None:
++            names = self.environment.list_templates()
++
++        for name in names:
++            source, _, _ = self.environment.loader.get_source(
++                self.environment, name
++            )
++            yield from self._extract_marked(
++                source, name, gettext_functions
++            )
+ 
+ class ExprStmtExtension(Extension):
+     """Adds a `do` tag to Jinja that works like the print statement just
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index b2f88d9..dbf54bd 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -402,6 +402,20 @@ class Block(Stmt):
+     required: bool
+ 
+ 
++class ExtractMarker(Stmt):
++    """A node that marks a section for translation extraction with
++    associated metadata.
++
++    The *metadata* dict maps constant keys to their constant values.
++    The *body* is a list of regular template nodes that may contain
++    gettext calls to be extracted.
++    """
++
++    fields = ("metadata", "body")
++    metadata: t.Dict[str, t.Any]
++    body: t.List[Node]
++
++
+ class Include(Stmt):
+     """A node that represents the include tag."""
+ 

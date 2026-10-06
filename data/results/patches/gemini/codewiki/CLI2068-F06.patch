@@ -1,0 +1,166 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..e2af08f 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -484,12 +484,13 @@ class Editor:
+         editor: str | None = None,
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+-        extension: str = ".txt",
++        extension: str = ".txt", process_priority: str | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.process_priority = process_priority
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -515,8 +516,71 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
+-        try:
++        if self.process_priority:
++            priorities = {
++                "low": 19,
++                "below_normal": 10,
++                "normal": 0,
++                "above_normal": -5,
++                "high": -10
++            }
++            if self.process_priority not in priorities:
++                raise ValueError(f"Invalid process_priority: {self.process_priority}")
++            
++            # On Windows, we need a different approach, but the task says:
++            # "The task does not require renice, wmic, a post-launch PID update, or any private adapter."
++            # "If the platform lacks priority support or permission is denied, continue the edit at the platform default rather than failing."
++            
++            if WIN:
++                # Windows priority classes
++                # IDLE_PRIORITY_CLASS = 0x00000040
++                # BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
++                # NORMAL_PRIORITY_CLASS = 0x00000020
++                # ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
++                # HIGH_PRIORITY_CLASS = 0x00000080
++                
++                # We can use creationflags in Popen
++                # But we need to define the constants if they are not available
++                
++                win_priorities = {
++                    "low": 0x00000040,
++                    "below_normal": 0x00004000,
++                    "normal": 0x00000020,
++                    "above_normal": 0x00008000,
++                    "high": 0x00000080
++                }
++                creationflags = win_priorities[self.process_priority]
++                
++                try:
++                    c = subprocess.Popen(
++                        f'{editor} "{filename}"',
++                        env=environ,
++                        shell=True,
++                        creationflags=creationflags
++                    )
++                except Exception:
++                    # Fallback to default
++                    c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            else:
++                # Linux/Unix
++                # We can use preexec_fn to set nice value
++                def set_priority():
++                    os.nice(priorities[self.process_priority])
++                
++                try:
++                    c = subprocess.Popen(
++                        f'{editor} "{filename}"',
++                        env=environ,
++                        shell=True,
++                        preexec_fn=set_priority
++                    )
++                except Exception:
++                    # Fallback to default
++                    c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++        else:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++
++        try:
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -527,6 +591,7 @@ class Editor:
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+ 
++
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..5d04b5f 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -648,7 +648,7 @@ def edit(
+     editor: str | None = None,
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+-    extension: str = ".txt",
++    extension: str = ".txt", process_priority: str | None = None,
+     filename: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+@@ -671,6 +671,9 @@ def edit(
+     :param env: environment variables to forward to the editor.
+     :param require_save: if this is true, then not saving in the editor
+                          will make the return value become `None`.
++    :param process_priority: if provided, this sets the CPU scheduling priority
++        for the editor process. Valid values are 'low', 'below_normal',
++        'normal', 'above_normal', and 'high'.
+     :param extension: the extension to tell the editor about.  This defaults
+                       to `.txt` but changing this might change syntax
+                       highlighting.
+@@ -680,7 +683,7 @@ def edit(
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, process_priority=process_priority)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_process_priority.py b/tests/test_process_priority.py
+new file mode 100644
+index 0000000..76ee05f
+--- /dev/null
++++ b/tests/test_process_priority.py
+@@ -0,0 +1,28 @@
++import click
++import pytest
++import os
++from unittest.mock import patch, MagicMock
++
++def test_process_priority_invalid():
++    with pytest.raises(ValueError):
++        click.edit("hello", process_priority="invalid")
++
++def test_process_priority_valid():
++    # Mock subprocess.Popen to verify it's called with the right arguments
++    with patch('subprocess.Popen') as mock_popen:
++        mock_popen.return_value.wait.return_value = 0
++        
++        # We need to mock the editor detection to avoid issues
++        with patch('click._termui_impl.Editor.get_editor', return_value='true'):
++            click.edit("hello", process_priority="high")
++            
++            # Check if Popen was called
++            assert mock_popen.called
++            
++            # Check if preexec_fn was passed (on Linux)
++            if os.name != 'nt':
++                args, kwargs = mock_popen.call_args
++                assert 'preexec_fn' in kwargs
++                # Verify the preexec_fn sets the priority
++                # We can't easily check the value of preexec_fn, but we can check if it's a callable
++                assert callable(kwargs['preexec_fn'])

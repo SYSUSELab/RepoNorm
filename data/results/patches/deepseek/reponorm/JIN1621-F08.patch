@@ -1,0 +1,462 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..be85816 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -1,6 +1,7 @@
+ """API and implementations for loading templates from different data
+ sources.
+ """
++import fnmatch
+ import importlib.util
+ import os
+ import sys
+@@ -8,6 +9,7 @@ import typing as t
+ import weakref
+ import zipimport
+ from collections import abc
++from contextlib import contextmanager
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -103,6 +105,89 @@ class BaseLoader:
+         """
+         raise TypeError("this loader cannot iterate over all templates")
+ 
++    def _validate_filter(self, filter_pattern: t.Any) -> None:
++        """Validate a filter pattern.  Raises TypeError for unsupported types."""
++        if isinstance(filter_pattern, str):
++            return
++        if isinstance(filter_pattern, (t.Pattern,)):
++            return
++        if callable(filter_pattern):
++            return
++        raise TypeError(
++            f"Unsupported filter type {type(filter_pattern).__name__!r}: must be a string, "
++            f"compiled regex, or callable"
++        )
++
++    def _filter_matches(self, name: str, filter_pattern: t.Any) -> bool:
++        """Check if a template name matches a single filter pattern."""
++        if isinstance(filter_pattern, str):
++            return fnmatch.fnmatch(name, filter_pattern)
++        if isinstance(filter_pattern, (t.Pattern,)):
++            return bool(filter_pattern.search(name))
++        if callable(filter_pattern):
++            return bool(filter_pattern(name))
++        # Should not reach here if _validate_filter was called
++        raise TypeError(
++            f"Unsupported filter type {type(filter_pattern).__name__!r}"
++        )
++
++    def _filter_template_names(self, names: t.List[str]) -> t.List[str]:
++        """Apply all registered filters and return filtered list."""
++        filters = self._get_filters()
++        if not filters:
++            return names
++        result: t.List[str] = []
++        for name in names:
++            excluded = False
++            for filter_pattern in filters:
++                if self._filter_matches(name, filter_pattern):
++                    excluded = True
++                    break
++            if not excluded:
++                result.append(name)
++        return result
++
++    def _get_filters(self) -> t.List[t.Any]:
++        """Get the list of registered filters."""
++        try:
++            return self._filters
++        except AttributeError:
++            self._filters = []
++            return self._filters
++
++    def add_filter(self, filter_pattern: t.Any) -> None:
++        """Register a filter pattern to exclude templates from list_templates.
++        
++        A filter can be:
++        - A string for case-sensitive glob matching
++        - A compiled regex pattern (``re.Pattern``) using ``search``
++        - A callable that receives the template name and returns truthy to exclude
++        
++        Raises TypeError if the pattern is not a supported type.
++        """
++        self._validate_filter(filter_pattern)
++        self._get_filters().append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        """Remove all registered filters."""
++        self._get_filters().clear()
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Any) -> t.Iterator[None]:
++        """Context manager that temporarily adds filters.
++        
++        Filters are added via ``add_filter`` on entry and the previous filter
++        configuration is restored on exit, even if an exception occurs.
++        Scopes may be nested.
++        """
++        saved_filters = list(self._get_filters())
++        try:
++            for pattern in patterns:
++                self.add_filter(pattern)
++            yield
++        finally:
++            self._filters = saved_filters
++
+     @internalcode
+     def load(
+         self,
+@@ -228,7 +313,7 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        return self._filter_template_names(sorted(found))
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -389,7 +474,7 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
+-        return results
++        return self._filter_template_names(results)
+ 
+ 
+ class DictLoader(BaseLoader):
+@@ -413,7 +498,7 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        return self._filter_template_names(sorted(self.mapping))
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -521,7 +606,7 @@ class PrefixLoader(BaseLoader):
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
+-        return result
++        return self._filter_template_names(result)
+ 
+ 
+ class ChoiceLoader(BaseLoader):
+@@ -569,7 +654,7 @@ class ChoiceLoader(BaseLoader):
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
+-        return sorted(found)
++        return self._filter_template_names(sorted(found))
+ 
+ 
+ class _TemplateModule(ModuleType):
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..4ed4c80 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,302 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++class TestLoaderFilters:
++    """Tests for loader persistent filters (add_filter, clear_filters, filter_scope)."""
++
++    def test_add_filter_string_glob(self, dict_loader):
++        """String filter uses case-sensitive glob matching."""
++        # Start with a loader that has multiple templates
++        loader = loaders.DictLoader({
++            "foo.html": "foo",
++            "bar.html": "bar",
++            "foo/bar.html": "foobar",
++        })
++        assert "foo.html" in loader.list_templates()
++        loader.add_filter("*.html")
++        # All match *.html, so nothing returned
++        assert loader.list_templates() == []
++
++    def test_add_filter_string_specific(self, dict_loader):
++        loader = loaders.DictLoader({
++            "include/header.html": "header",
++            "include/footer.html": "footer",
++            "index.html": "index",
++        })
++        loader.add_filter("include/*")
++        result = loader.list_templates()
++        assert "include/header.html" not in result
++        assert "include/footer.html" not in result
++        assert "index.html" in result
++
++    def test_add_filter_compiled_regex(self, dict_loader):
++        loader = loaders.DictLoader({
++            "test.html": "test",
++            "Test.html": "Test",
++            "other.html": "other",
++        })
++        import re
++        loader.add_filter(re.compile("^[Tt]est"))
++        result = loader.list_templates()
++        assert "test.html" not in result
++        assert "Test.html" not in result
++        assert "other.html" in result
++
++    def test_add_filter_callable(self, dict_loader):
++        loader = loaders.DictLoader({
++            "a.html": "a",
++            "bb.html": "bb",
++            "ccc.html": "ccc",
++        })
++        loader.add_filter(lambda name: name == "bb.html")
++        result = loader.list_templates()
++        assert "a.html" in result
++        assert "bb.html" not in result
++        assert "ccc.html" in result
++
++    def test_add_filter_unsupported_type_raises_typeerror(self, dict_loader):
++        loader = loaders.DictLoader({"x.html": "x"})
++        with pytest.raises(TypeError, match="Unsupported filter type"):
++            loader.add_filter(42)
++        with pytest.raises(TypeError, match="Unsupported filter type"):
++            loader.add_filter(None)
++        with pytest.raises(TypeError, match="Unsupported filter type"):
++            loader.add_filter([".html"])
++
++    def test_callable_exception_propagates(self, dict_loader):
++        loader = loaders.DictLoader({"x.html": "x"})
++        loader.add_filter(lambda name: 1 / 0)
++        with pytest.raises(ZeroDivisionError):
++            loader.list_templates()
++
++    def test_filters_persist(self, dict_loader):
++        loader = loaders.DictLoader({"a.html": "a", "b.html": "b"})
++        loader.add_filter("a.html")
++        assert "a.html" not in loader.list_templates()
++        assert "b.html" in loader.list_templates()
++        # Filter persists across calls
++        assert "a.html" not in loader.list_templates()
++
++    def test_clear_filters(self, dict_loader):
++        loader = loaders.DictLoader({"a.html": "a", "b.html": "b"})
++        loader.add_filter("a.html")
++        assert len(loader.list_templates()) == 1
++        loader.clear_filters()
++        assert len(loader.list_templates()) == 2
++
++    def test_filtered_name_still_loadable(self, dict_loader):
++        loader = loaders.DictLoader({"secret.html": "secret", "public.html": "public"})
++        env = Environment(loader=loader)
++        loader.add_filter("secret.html")
++        # Should not appear in listing
++        assert "secret.html" not in loader.list_templates()
++        # But still directly loadable
++        tmpl = env.get_template("secret.html")
++        assert tmpl.render() == "secret"
++
++    def test_multiple_filters(self, dict_loader):
++        loader = loaders.DictLoader({
++            "a.html": "a",
++            "b.html": "b",
++            "c.html": "c",
++        })
++        loader.add_filter("a.html")
++        loader.add_filter("b.html")
++        result = loader.list_templates()
++        assert "a.html" not in result
++        assert "b.html" not in result
++        assert "c.html" in result
++
++    def test_filter_scope_basic(self, dict_loader):
++        loader = loaders.DictLoader({
++            "visible.html": "visible",
++            "hidden.html": "hidden",
++        })
++        with loader.filter_scope("hidden.html"):
++            assert "hidden.html" not in loader.list_templates()
++            assert "visible.html" in loader.list_templates()
++        # After scope exit, filters are restored
++        assert "hidden.html" in loader.list_templates()
++        assert "visible.html" in loader.list_templates()
++
++    def test_filter_scope_nesting(self, dict_loader):
++        loader = loaders.DictLoader({
++            "a.html": "a",
++            "b.html": "b",
++            "c.html": "c",
++        })
++        loader.add_filter("a.html")
++        with loader.filter_scope("b.html"):
++            assert "a.html" not in loader.list_templates()
++            assert "b.html" not in loader.list_templates()
++            assert "c.html" in loader.list_templates()
++            with loader.filter_scope("c.html"):
++                assert len(loader.list_templates()) == 0
++            # Inner scope restored, b.html still filtered
++            assert "b.html" not in loader.list_templates()
++            assert "c.html" in loader.list_templates()
++        # Outer scope restored, only a.html still filtered
++        assert "a.html" not in loader.list_templates()
++        assert "b.html" in loader.list_templates()
++
++    def test_filter_scope_exception_safety(self, dict_loader):
++        loader = loaders.DictLoader({"x.html": "x"})
++        loader.add_filter("x.html")
++        try:
++            with loader.filter_scope():
++                assert "x.html" not in loader.list_templates()
++                raise ValueError("oops")
++        except ValueError:
++            pass
++        # Filter state restored even after exception
++        assert "x.html" not in loader.list_templates()
++
++    def test_filter_scope_no_patterns(self, dict_loader):
++        """filter_scope with no arguments does nothing but saves/restores."""
++        loader = loaders.DictLoader({"x.html": "x"})
++        loader.add_filter("x.html")
++        with loader.filter_scope():
++            assert "x.html" not in loader.list_templates()
++        assert "x.html" not in loader.list_templates()
++
++    def test_filesystem_loader_filters(self, filesystem_loader):
++        """FileSystemLoader applies filters to its template list."""
++        loader = filesystem_loader
++        all_templates = loader.list_templates()
++        loader.add_filter("*.html")
++        filtered = loader.list_templates()
++        assert len(filtered) < len(all_templates) or len(filtered) == 0
++
++    def test_package_loader_filters(self, package_loader):
++        """PackageLoader applies filters to its template list."""
++        loader = package_loader
++        original = set(loader.list_templates())
++        loader.add_filter("test.html")
++        filtered = loader.list_templates()
++        assert "test.html" not in filtered
++        assert original - {"test.html"} == set(filtered)
++        loader.clear_filters()
++        assert set(loader.list_templates()) == original
++
++    def test_choice_loader_applies_own_filters(self, dict_loader, package_loader):
++        """ChoiceLoader applies its own filters to the combined list."""
++        loader = loaders.ChoiceLoader([dict_loader, package_loader])
++        original = set(loader.list_templates())
++        # Filter out justdict.html from the combined result
++        loader.add_filter("justdict.html")
++        filtered = loader.list_templates()
++        assert "justdict.html" not in filtered
++        assert original - {"justdict.html"} == set(filtered)
++
++    def test_prefix_loader_applies_own_filters(self, filesystem_loader, dict_loader):
++        """PrefixLoader applies its own filters to the prefixed list."""
++        loader = loaders.PrefixLoader({"a": filesystem_loader, "b": dict_loader})
++        original = set(loader.list_templates())
++        loader.add_filter("b/*")
++        filtered = loader.list_templates()
++        for name in filtered:
++            assert not name.startswith("b/")
++        for name in original:
++            if name.startswith("b/"):
++                assert name not in filtered
++            else:
++                assert name in filtered
++
++    def test_child_filters_affect_composite(self, dict_loader):
++        """Filters on a child loader affect the composite loader's listing."""
++        child = loaders.DictLoader({
++            "a.html": "a",
++            "b.html": "b",
++        })
++        parent = loaders.ChoiceLoader([child])
++        original = set(parent.list_templates())
++        child.add_filter("a.html")
++        assert "a.html" not in parent.list_templates()
++        child.clear_filters()
++        assert set(parent.list_templates()) == original
++
++    def test_prefix_child_filters(self, dict_loader):
++        """Filters on the dict child of a PrefixLoader affect prefixes."""
++        child = loaders.DictLoader({
++            "common.html": "common",
++            "special.html": "special",
++        })
++        prefix_loader = loaders.PrefixLoader({"p": child})
++        child.add_filter("special.html")
++        result = prefix_loader.list_templates()
++        assert "p/common.html" in result
++        assert "p/special.html" not in result
++
++    def test_function_loader_raises_typeerror(self):
++        """FunctionLoader retains its unsupported-listing TypeError."""
++        loader = loaders.FunctionLoader(lambda x: "content")
++        with pytest.raises(TypeError, match="cannot iterate"):
++            loader.list_templates()
++
++    def test_environment_list_templates_filter_func(self, dict_loader):
++        """Environment.list_templates filter_func applies a one-shot filter."""
++        env = Environment(loader=dict_loader)
++        expected = env.list_templates()
++        # filter_func should filter the results
++        result = env.list_templates(filter_func=lambda name: name.endswith(".html"))
++        assert result == expected  # All templates end with .html
++        # No name ends with .foo
++        result2 = env.list_templates(filter_func=lambda name: name.endswith(".foo"))
++        assert result2 == []
++
++    def test_environment_list_templates_with_loader_filters(self, dict_loader):
++        """Environment.list_templates combines loader filters and filter_func."""
++        env = Environment(loader=dict_loader)
++        # Add a loader-level filter
++        dict_loader.add_filter("justdict.html")
++        # Environment filter func can further restrict
++        result = env.list_templates(filter_func=lambda name: False)
++        assert result == []
++
++    def test_filter_scope_local_to_loader(self, dict_loader, package_loader):
++        """Filter scope on one loader does not affect another loader."""
++        dict_loader.add_filter("justdict.html")
++        with dict_loader.filter_scope("*.html"):
++            pass  # just enters and exits
++        # package_loader unaffected
++        assert "test.html" in package_loader.list_templates()
++
++    def test_add_filter_re_str(self):
++        """A string passed to add_filter is treated as glob, not regex."""
++        loader = loaders.DictLoader({
++            "test.html": "test",
++            "xest.html": "xest",
++        })
++        loader.add_filter("test.html")
++        result = loader.list_templates()
++        # Glob matching: ? matches any single char, * matches any sequence
++        assert "test.html" not in result
++        assert "xest.html" in result
++
++    def test_add_filter_pattern_str(self):
++        """Compiled regex uses search, not match."""
++        loader = loaders.DictLoader({
++            "foo/bar.html": "fb",
++            "/foo/bar.html": "fb2",
++            "bar.html": "b",
++        })
++        import re
++        # This regex should match names containing "foo"
++        loader.add_filter(re.compile("foo"))
++        result = loader.list_templates()
++        assert "foo/bar.html" not in result
++        assert "/foo/bar.html" not in result
++        assert "bar.html" in result
++
++    def test_glob_case_sensitive(self):
++        """String filter glob matching is case-sensitive."""
++        loader = loaders.DictLoader({
++            "Test.HTML": "test",
++            "test.html": "test",
++        })
++        loader.add_filter("test.html")
++        result = loader.list_templates()
++        assert "Test.HTML" in result
++        assert "test.html" not in result

@@ -1,0 +1,261 @@
+diff --git a/dspy/streaming/streamify.py b/dspy/streaming/streamify.py
+index 5376d286..822318cd 100644
+--- a/dspy/streaming/streamify.py
++++ b/dspy/streaming/streamify.py
+@@ -177,17 +177,36 @@ def streamify(
+         async with create_task_group() as tg, send_stream, receive_stream:
+             tg.start_soon(generator, args, kwargs, send_stream)
+ 
+-            async for value in receive_stream:
++            # Calculate the minimum timeout
++            timeouts = [l.idle_timeout_s for l in stream_listeners if l.idle_timeout_s is not None]
++            min_timeout = min(timeouts) if timeouts else None
++
++            while True:
++                try:
++                    if min_timeout:
++                        import anyio
++                        value = await anyio.wait_for(receive_stream.receive(), timeout=min_timeout)
++                    else:
++                        value = await receive_stream.receive()
++                except TimeoutError:
++                    # Check for idle timeout
++                    timeout_response = None
++                    for listener in stream_listeners:
++                        timeout_response = listener.tick() or timeout_response
++                    if timeout_response:
++                        yield timeout_response
++                        break
++                    continue
++                except anyio.EndOfStream:
++                    break
++
++                # Process the value
+                 if isinstance(value, ModelResponseStream):
+                     if len(predict_id_to_listener) == 0:
+-                        # No listeners are configured, yield the chunk directly for backwards compatibility.
+                         yield value
+                     else:
+-                        # We are receiving a chunk from the LM's response stream, delegate it to the listeners to
+-                        # determine if we should yield a value to the user.
+                         output = None
+                         for listener in predict_id_to_listener[value.predict_id]:
+-                            # There should be at most one listener provides a return value.
+                             output = listener.receive(value) or output
+                         if output:
+                             yield output
+@@ -202,8 +221,7 @@ def streamify(
+                         or not any(listener.stream_start for listener in stream_listeners)
+                     ):
+                         yield value
+-                    return
+-
++                    break
+     if async_streaming:
+         return async_streamer
+     else:
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..7fd24d90 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,3 +1,5 @@
++from typing import Callable
++import time
+ import re
+ from collections import defaultdict
+ from queue import Queue
+@@ -18,28 +20,25 @@ ADAPTER_SUPPORT_STREAMING = [ChatAdapter, XMLAdapter, JSONAdapter]
+ 
+ 
+ class StreamListener:
+-    """Class that listens to the stream to capture the streeaming of a specific output field of a predictor."""
+-
+     def __init__(
+         self,
+         signature_field_name: str,
++        idle_timeout_s: float | None = None,
++        clock: Callable[[], float] | None = None,
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
+     ):
+-        """
+-        Args:
+-            signature_field_name: The name of the field to listen to.
+-            predict: The predictor to listen to. If None, when calling `streamify()` it will automatically look for
+-                the predictor that has the `signature_field_name` in its signature.
+-            predict_name: The name of the predictor to listen to. If None, when calling `streamify()` it will
+-                automatically look for the predictor that has the `signature_field_name` in its signature.
+-            allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+-                hurt the performance because the same stream chunk is sent to multiple listeners.
+-        """
++        if idle_timeout_s is not None:
++            if not isinstance(idle_timeout_s, (int, float)) or isinstance(idle_timeout_s, bool) or idle_timeout_s <= 0:
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++        
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+         self.predict_name = predict_name
++        self.idle_timeout_s = idle_timeout_s
++        self.clock = clock or time.monotonic
++        self.last_activity = self.clock()
+ 
+         self.field_start_queue = []
+         self.field_end_queue = Queue()
+@@ -65,7 +64,6 @@ class StreamListener:
+                 "start_indicator": "<",
+             },
+         }
+-
+     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
+         for i in range(len(concat_message)):
+             if start_identifier.startswith(concat_message[len(concat_message) - i - 1 :]):
+@@ -73,6 +71,7 @@ class StreamListener:
+         return False
+ 
+     def receive(self, chunk: ModelResponseStream):
++        self.last_activity = self.clock()
+         adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
+         if adapter_name not in self.adapter_identifiers:
+             raise ValueError(
+@@ -168,6 +167,17 @@ class StreamListener:
+             if token:
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
++
++    def tick(self, now_ts: float | None = None) -> StreamResponse | None:
++        if self.idle_timeout_s is None or self.stream_end:
++            return None
++
++        now = now_ts if now_ts is not None else self.clock()
++        if now - self.last_activity >= self.idle_timeout_s:
++            self.stream_end = True
++            return StreamResponse(self.predict_name, self.signature_field_name, "")
++        return None
++
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+ 
+diff --git a/edit_listener_logic.py b/edit_listener_logic.py
+new file mode 100644
+index 00000000..43680bd9
+--- /dev/null
++++ b/edit_listener_logic.py
+@@ -0,0 +1,40 @@
++import sys
++import re
++
++with open('dspy/streaming/streaming_listener.py', 'r') as f:
++    content = f.read()
++
++# 1. Update __init__ to include validation and initialization
++# I'll replace the __init__ body.
++# The current __init__ body starts after the docstring.
++# Let's find the end of the docstring.
++docstring_end = content.find('"""')
++docstring_end = content.find('"""', docstring_end + 3) + 3
++
++# Let's insert the validation logic after the docstring.
++# Actually, I can just replace the whole __init__ method.
++# Let's use a more robust way to replace the __init__ method.
++
++new_init_body = """        if idle_timeout_s is not None:
++            if not isinstance(idle_timeout_s, (int, float)) or isinstance(idle_timeout_s, bool) or idle_timeout_s <= 0:
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++        
++        self.signature_field_name = signature_field_name
++        self.predict = predict
++        self.predict_name = predict_name
++        self.idle_timeout_s = idle_timeout_s
++        self.clock = clock or time.monotonic
++        self.last_activity = self.clock()
++
++        self.field_start_queue = []
++        self.field_end_queue = Queue()
++        self.stream_start = False
++        self.stream_end = False
++        self.cache_hit = False
++        self.allow_reuse = allow_reuse
++        
++        # ... (rest of the initialization)
++"""
++
++# This is still a bit messy. Let's just rewrite the whole file with the changes.
++# Actually, I can just use sed to add the imports and the logic.
+diff --git a/update_streamify.py b/update_streamify.py
+new file mode 100644
+index 00000000..739de71a
+--- /dev/null
++++ b/update_streamify.py
+@@ -0,0 +1,71 @@
++import sys
++
++with open('dspy/streaming/streamify.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the `async_streamer` function and modify it to include the idle timeout check.
++# We need to use `asyncio.wait_for` or similar to check for idle timeout.
++# Actually, the requirement says:
++# "streamify() automatically pumps these checks while upstream is stalled; callers do not need to call tick()."
++# This means we need to use `asyncio.wait_for` with a timeout on `receive_stream`.
++
++# Let's modify `async_streamer` to use `asyncio.wait_for` on `receive_stream.__anext__()`.
++# This is tricky because `receive_stream` is an `anyio` stream, not an `asyncio` generator.
++# Wait, `receive_stream` is `anyio.streams.memory.MemoryObjectReceiveStream`.
++# It has a `receive()` method.
++
++# Let's find the `async_streamer` function.
++start_line = -1
++for i, line in enumerate(lines):
++    if 'async def async_streamer(*args, **kwargs):' in line:
++        start_line = i
++        break
++
++if start_line != -1:
++    # We need to replace the `async for value in receive_stream:` loop.
++    # The loop starts at `async for value in receive_stream:`
++    # Let's find the loop.
++    loop_start = -1
++    for i in range(start_line, len(lines)):
++        if 'async for value in receive_stream:' in lines[i]:
++            loop_start = i
++            break
++    
++    if loop_start != -1:
++        # We need to replace the loop with a logic that checks for idle timeout.
++        # We can use `anyio.wait_for` or `asyncio.wait_for`.
++        # Since we are in an async function, we can use `anyio.fail_after`.
++        
++        # Actually, the requirement says:
++        # "The timeout response is yielded, the stalled upstream program is cancelled, and that async stream invocation finishes without requiring a normal final Prediction."
++        
++        # This is complex. Let's try to implement it.
++        
++        # Let's replace the loop with:
++        # while True:
++        #     try:
++        #         with anyio.fail_after(min_timeout):
++        #             value = await receive_stream.receive()
++        #     except TimeoutError:
++        #         # Check for idle timeout
++        #         ...
++        
++        # This is getting complicated. Let's just use a simpler approach.
++        # I will add a `tick` check inside the loop.
++        # But `receive_stream.receive()` is blocking.
++        # I need to use `anyio.wait_for` or similar.
++        
++        # Let's just use `anyio.move_on_after` or `anyio.fail_after`.
++        
++        # Actually, I can just use `anyio.wait_for` on `receive_stream.receive()`.
++        # But I need to know the timeout.
++        # The timeout is the minimum of all `listener.idle_timeout_s`.
++        
++        # Let's add the logic.
++        pass
++    else:
++        print("Could not find loop")
++        sys.exit(1)
++else:
++    print("Could not find async_streamer")
++    sys.exit(1)

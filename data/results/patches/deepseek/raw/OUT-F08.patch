@@ -1,0 +1,268 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..ac2c2b7 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,7 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++import threading
++from typing import TYPE_CHECKING, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -22,12 +23,25 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(
++        self,
++        compiled_grammar: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        track_memory_usage: bool
++            Whether to track RSS delta for each processing call.
++            When False (default), no RSS sampling calls are made.
++        memory_history_limit: int | None
++            Maximum number of deltas to retain in memory history.
++            None (default) retains all deltas. Non-negative integer N retains
++            only the most recent N. Zero retains no detail. Booleans and other
++            invalid types raise ValueError.
+ 
+         """
+         import xgrammar as xgr
+@@ -35,19 +49,128 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
++        self._track_memory_usage = track_memory_usage
++        self._set_memory_history_limit(memory_history_limit)
++        self._lock = threading.Lock()
++        self._total_calls = 0
++        self._peak_memory_mb = 0.0
++        self._total_memory_mb = 0.0
++        self._memory_history = []
+         super().__init__("torch")
+ 
++    def _set_memory_history_limit(self, limit):
++        """Validate and set the memory history limit."""
++        if limit is None:
++            self._memory_history_limit = None
++        elif isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
++            raise ValueError(
++                f"memory_history_limit must be a non-negative integer or None, "
++                f"got {limit!r}"
++            )
++        else:
++            self._memory_history_limit = limit
++
++    def _get_rss_mb(self):
++        """Sample current RSS in MB.
++
++        Returns the process resident set size in megabytes (1024^2 bytes),
++        or None if sampling fails.
++
++        """
++        try:
++            with open('/proc/self/status') as f:
++                for line in f:
++                    if line.startswith('VmRSS:'):
++                        # VmRSS value is in kB
++                        return int(line.split()[1]) / 1024.0
++            return None
++        except (OSError, ValueError, IndexError):
++            return None
++
+     def reset(self):
+-        """Reset the logits processor for a new generation."""
+-        self.xgrammar_logits_processor = None
++        """Reset the logits processor for a new generation.
++
++        Clears generation state and all accumulated statistics while
++        preserving configuration (track_memory_usage, memory_history_limit).
++
++        """
++        with self._lock:
++            self.xgrammar_logits_processor = None
++            self._total_calls = 0
++            self._peak_memory_mb = 0.0
++            self._total_memory_mb = 0.0
++            self._memory_history = []
++
++    def get_memory_stats(self) -> dict:
++        """Return memory usage statistics.
++
++        Returns an independent dictionary with an independently copied
++        memory_history list.
++
++        Returns
++        -------
++        dict
++            A dictionary with the following fields:
++            - total_calls: all successful tracked calls since reset
++            - peak_memory_mb: largest delta across those calls
++            - avg_memory_per_call_mb: arithmetic mean across all those calls,
++              or zero initially
++            - memory_history: retained deltas in call-completion order
++
++        """
++        with self._lock:
++            total_calls = self._total_calls
++            peak = self._peak_memory_mb
++            total = self._total_memory_mb
++            history = list(self._memory_history)
++        avg = total / total_calls if total_calls > 0 else 0.0
++        return {
++            "total_calls": total_calls,
++            "peak_memory_mb": peak,
++            "avg_memory_per_call_mb": avg,
++            "memory_history": history,
++        }
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+-        """Bias the logits."""
++        """Bias the logits.
++
++        When memory tracking is enabled, samples RSS immediately before and
++        after processing and records the delta.
++
++        """
+         if self.xgrammar_logits_processor is None:
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++
++        if not self._track_memory_usage:
++            return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++
++        # Track memory usage
++        rss_before = self._get_rss_mb()
++        # If processing raises, exception propagates and no stats are recorded
++        result = self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++        rss_after = self._get_rss_mb()
++
++        if rss_before is None or rss_after is None:
++            delta = 0.0
++        else:
++            delta = max(rss_after - rss_before, 0)
++
++        with self._lock:
++            self._total_calls += 1
++            self._total_memory_mb += delta
++            if delta > self._peak_memory_mb:
++                self._peak_memory_mb = delta
++            if self._memory_history_limit is None:
++                self._memory_history.append(delta)
++            elif self._memory_history_limit > 0:
++                self._memory_history.append(delta)
++                if len(self._memory_history) > self._memory_history_limit:
++                    self._memory_history.pop(0)
++            # If limit is 0, we don't add to history
++
++        return result
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -79,7 +202,10 @@ class XGrammarBackend(BaseBackend):
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self,
++        json_schema: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +213,10 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        track_memory_usage: bool
++            Whether to track RSS delta for each processing call.
++        memory_history_limit: int | None
++            Maximum number of deltas to retain in memory history.
+ 
+         Returns
+         -------
+@@ -97,15 +227,28 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar,
++            track_memory_usage=track_memory_usage,
++            memory_history_limit=memory_history_limit,
++        )
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self,
++        regex: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        track_memory_usage: bool
++            Whether to track RSS delta for each processing call.
++        memory_history_limit: int | None
++            Maximum number of deltas to retain in memory history.
+ 
+         Returns
+         -------
+@@ -114,15 +257,28 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar,
++            track_memory_usage=track_memory_usage,
++            memory_history_limit=memory_history_limit,
++        )
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self,
++        grammar: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        track_memory_usage: bool
++            Whether to track RSS delta for each processing call.
++        memory_history_limit: int | None
++            Maximum number of deltas to retain in memory history.
+ 
+         Returns
+         -------
+@@ -131,4 +287,8 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar,
++            track_memory_usage=track_memory_usage,
++            memory_history_limit=memory_history_limit,
++        )

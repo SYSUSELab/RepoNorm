@@ -1,0 +1,188 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..8e6af6a 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -7,7 +7,7 @@ import sys
+ import typing as t
+ import weakref
+ import zipimport
+-from collections import abc
++from collections import abc, OrderedDict
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -180,6 +180,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_cache_size: int = 0,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,31 +188,71 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.path_cache_size = path_cache_size
++        self._path_cache: t.MutableMapping[str, t.Optional[str]] = OrderedDict()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        if not isinstance(capacity, int) or capacity < 0:
++            raise ValueError("capacity must be a non-negative integer")
++        self.path_cache_size = capacity
++        if capacity == 0:
++            self.clear_path_cache()
++        else:
++            while len(self._path_cache) > capacity:
++                self._path_cache.popitem(last=False)
+ 
+-    def get_source(
+-        self, environment: "Environment", template: str
+-    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++    def clear_path_cache(self) -> None:
++        self._path_cache.clear()
++
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+-            f = open_if_exists(filename)
+-            if f is None:
+-                continue
+-            try:
+-                contents = f.read().decode(self.encoding)
+-            finally:
+-                f.close()
++            if os.path.exists(filename):
++                return filename
++        return None
+ 
+-            mtime = os.path.getmtime(filename)
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        filename = None
++        if self.path_cache_size > 0:
++            filename = self._path_cache.get(template)
++            if filename is not None:
++                if not os.path.exists(filename):
++                    filename = None
++                    del self._path_cache[template]
++                else:
++                    self._path_cache.move_to_end(template)
++
++        if filename is None:
++            filename = self.resolve_template_path(template)
++            if filename is None:
++                raise TemplateNotFound(template)
++            
++            if self.path_cache_size > 0:
++                self._path_cache[template] = filename
++                self._path_cache.move_to_end(template)
++                if len(self._path_cache) > self.path_cache_size:
++                    self._path_cache.popitem(last=False)
++
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(template)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
+ 
+-            def uptodate() -> bool:
+-                try:
+-                    return os.path.getmtime(filename) == mtime
+-                except OSError:
+-                    return False
++        mtime = os.path.getmtime(filename)
+ 
+-            return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        return contents, filename, uptodate
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+diff --git a/tests/test_filesystem_loader_cache.py b/tests/test_filesystem_loader_cache.py
+new file mode 100644
+index 0000000..1a38265
+--- /dev/null
++++ b/tests/test_filesystem_loader_cache.py
+@@ -0,0 +1,71 @@
++import os
++import pytest
++from jinja2 import FileSystemLoader, TemplateNotFound
++
++class TestFileSystemLoaderCache:
++    @pytest.fixture
++    def tmp_templates(self, tmp_path):
++        d1 = tmp_path / "d1"
++        d1.mkdir()
++        d2 = tmp_path / "d2"
++        d2.mkdir()
++        (d1 / "test.html").write_text("d1")
++        (d2 / "test.html").write_text("d2")
++        return d1, d2
++
++    def test_cache_init(self, tmp_templates):
++        d1, d2 = tmp_templates
++        loader = FileSystemLoader([str(d1), str(d2)], path_cache_size=10)
++        assert loader.path_cache_size == 10
++
++    def test_cache_disabled_by_default(self, tmp_templates):
++        d1, d2 = tmp_templates
++        loader = FileSystemLoader([str(d1), str(d2)])
++        assert loader.path_cache_size == 0
++
++    def test_cache_priority(self, tmp_templates):
++        d1, d2 = tmp_templates
++        loader = FileSystemLoader([str(d1), str(d2)], path_cache_size=10)
++        
++        # First load, should be from d1
++        _, filename, _ = loader.get_source(None, "test.html")
++        assert filename == str(d1 / "test.html")
++        
++        # Remove d1/test.html, should be from d2
++        (d1 / "test.html").unlink()
++        
++        # Should re-resolve
++        _, filename, _ = loader.get_source(None, "test.html")
++        assert filename == str(d2 / "test.html")
++
++    def test_cache_eviction(self, tmp_templates):
++        d1, _ = tmp_templates
++        loader = FileSystemLoader([str(d1)], path_cache_size=1)
++        
++        # Fill cache
++        loader.get_source(None, "test.html")
++        assert len(loader._path_cache) == 1
++        
++        # Add another template
++        (d1 / "other.html").write_text("other")
++        loader.get_source(None, "other.html")
++        
++        assert len(loader._path_cache) == 1
++        assert "other.html" in loader._path_cache
++        assert "test.html" not in loader._path_cache
++
++    def test_resize_cache(self, tmp_templates):
++        d1, _ = tmp_templates
++        loader = FileSystemLoader([str(d1)], path_cache_size=2)
++        (d1 / "a.html").write_text("a")
++        (d1 / "b.html").write_text("b")
++        
++        loader.get_source(None, "a.html")
++        loader.get_source(None, "b.html")
++        assert len(loader._path_cache) == 2
++        
++        loader.resize_path_cache(1)
++        assert len(loader._path_cache) == 1
++        
++        loader.resize_path_cache(0)
++        assert len(loader._path_cache) == 0

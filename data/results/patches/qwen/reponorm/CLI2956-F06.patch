@@ -1,0 +1,348 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..de4bae1 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -112,6 +112,184 @@ def augment_usage_errors(
+         raise
+ 
+ 
++
++def _looks_like_dynamic_default(default: t.Any) -> bool:
++    """Check if a default value looks like a dynamic default dictionary.
++    
++    Returns True if the default is a non-empty dict where all keys are
++    full long option names starting with '--'. Values may or may not be dicts.
++    This is used to detect potential dynamic defaults for validation.
++    """
++    if not isinstance(default, dict):
++        return False
++    if not default:  # Empty dict is not dynamic
++        return False
++    for key, value in default.items():
++        # Key must be a full long option name starting with --
++        if not isinstance(key, str) or not key.startswith("--"):
++            return False
++    return True
++
++
++def _is_dynamic_default(default: t.Any) -> bool:
++    """Check if a default value is a valid dynamic default dictionary.
++    
++    Returns True if the default is a non-empty dict where all keys are
++    full long option names starting with '--' and all values are dicts.
++    """
++    if not _looks_like_dynamic_default(default):
++        return False
++    for key, value in default.items():
++        if not isinstance(value, dict):
++            return False
++        for dep_value, target_default in value.items():
++            if not isinstance(dep_value, str):
++                return False
++    return True
++
++
++def _validate_dynamic_mapping(dynamic_default: dict[str, dict[str, t.Any]]) -> None:
++    """Validate that a dynamic default mapping has proper structure.
++    
++    Raises TypeError if any mapping value is not a dict.
++    """
++    for dep_option_name, dep_values_to_targets in dynamic_default.items():
++        if not isinstance(dep_values_to_targets, dict):
++            raise TypeError(
++                f"Dynamic default mapping for '{dep_option_name}' must be a dict, "
++                f"got {type(dep_values_to_targets).__name__}"
++            )
++        for dep_value, target_default in dep_values_to_targets.items():
++            if not isinstance(dep_value, str):
++                raise TypeError(
++                    f"Dependency value in dynamic default for '{dep_option_name}' "
++                    f"must be a string, got {type(dep_value).__name__}"
++                )
++
++
++def _resolve_dynamic_default(
++    param: Parameter,
++    ctx: Context,
++    dynamic_default: dict[str, dict[str, t.Any]],
++) -> tuple[t.Any, ParameterSource]:
++    """Resolve a dynamic default based on dependency values.
++    
++    Returns the resolved default value and its source.
++    Raises UsageError for unknown options or cycles.
++    Raises TypeError for invalid dynamic mappings.
++    """
++    # Validate the dynamic mapping structure first
++    _validate_dynamic_mapping(dynamic_default)
++    
++    # Build a map of option names to their actual parameter objects
++    param_map = {p.name: p for p in ctx.command.get_params(ctx)}
++    
++    # Build dependency graph: which params have dynamic defaults and what do they depend on
++    # Key: param name, Value: set of param names it depends on
++    dep_graph: dict[str, set[str]] = {}
++    
++    for dep_option_name, dep_values_to_targets in dynamic_default.items():
++        # Find the parameter for this dependency
++        dep_param = None
++        for p in ctx.command.get_params(ctx):
++            if dep_option_name in p.opts:
++                dep_param = p
++                break
++        
++        if dep_param is None:
++            raise UsageError(
++                f"Unknown option in dynamic default: {dep_option_name}"
++            )
++        
++        # Record that the current param depends on dep_param
++        if param.name not in dep_graph:
++            dep_graph[param.name] = set()
++        dep_graph[param.name].add(dep_param.name)
++    
++    # Detect cycles using DFS with coloring
++    # WHITE = 0 (unvisited), GRAY = 1 (in progress), BLACK = 2 (done)
++    # Initialize color for all params, not just those with dynamic defaults
++    all_param_names = {p.name for p in ctx.command.get_params(ctx)}
++    color: dict[str, int] = {name: 0 for name in all_param_names}
++    
++    def dfs_detect_cycle(node: str, path: list[str]) -> None:
++        if color[node] == 1:  # GRAY - back edge found, cycle detected
++            cycle_start = path.index(node)
++            cycle_path = path[cycle_start:] + [node]
++            raise UsageError(
++                f"Dependency cycle detected: {' -> '.join(cycle_path)}"
++            )
++        if color[node] == 2:  # BLACK - already fully processed
++            return
++        
++        color[node] = 1  # GRAY - in progress
++        path.append(node)
++        
++        for neighbor in dep_graph.get(node, set()):
++            dfs_detect_cycle(neighbor, path)
++        
++        path.pop()
++        color[node] = 2  # BLACK - done
++    
++    # Check for cycles starting from each node
++    for node in dep_graph:
++        if color[node] == 0:  # WHITE - unvisited
++            dfs_detect_cycle(node, [])
++    
++    # Resolve each dependency in the dynamic default
++    resolved_deps: dict[str, t.Any] = {}
++    
++    for dep_option_name, dep_values_to_targets in dynamic_default.items():
++        # Find the parameter by matching the long option
++        dep_param = None
++        for p in ctx.command.get_params(ctx):
++            if dep_option_name in p.opts:
++                dep_param = p
++                break
++        
++        if dep_param is None:
++            raise UsageError(
++                f"Unknown option in dynamic default: {dep_option_name}"
++            )
++        
++        # Get the resolved value of the dependency
++        dep_value = ctx.params.get(dep_param.name)
++        
++        # Convert boolean values to strings for matching
++        if isinstance(dep_value, bool):
++            dep_str = "True" if dep_value else "False"
++        else:
++            dep_str = str(dep_value) if dep_value is not None else ""
++        
++        resolved_deps[dep_param.name] = (dep_str, dep_value)
++    
++    # Select the target default based on resolved dependency values
++    for dep_option_name, dep_values_to_targets in dynamic_default.items():
++        dep_param = None
++        for p in ctx.command.get_params(ctx):
++            if dep_option_name in p.opts:
++                dep_param = p
++                break
++        
++        if dep_param is None:
++            continue
++            
++        dep_value = ctx.params.get(dep_param.name)
++        
++        # Convert boolean values to strings for matching
++        if isinstance(dep_value, bool):
++            dep_str = "True" if dep_value else "False"
++        else:
++            dep_str = str(dep_value) if dep_value is not None else ""
++        
++        # Look up the target default
++        if dep_str in dep_values_to_targets:
++            return dep_values_to_targets[dep_str], ParameterSource.DEFAULT
++    
++    # No match found - return None
++    return None, ParameterSource.DEFAULT
++
++
+ def iter_params_for_processing(
+     invocation_order: cabc.Sequence[Parameter],
+     declaration_order: cabc.Sequence[Parameter],
+@@ -1196,6 +1374,102 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        # Resolve dynamic defaults after all parameters are parsed
++        if hasattr(ctx, '_dynamic_default_params'):
++            # First, build a complete dependency graph across all params with dynamic defaults
++            # to detect cycles properly
++            dep_graph: dict[str, set[str]] = {}
++            
++            for param_name in ctx._dynamic_default_params:
++                param = None
++                for p in self.get_params(ctx):
++                    if p.name == param_name:
++                        param = p
++                        break
++                
++                if param is None:
++                    continue
++                
++                dynamic_default = param.default
++                if not _is_dynamic_default(dynamic_default):
++                    continue
++                
++                # Build dependency edges for this param
++                for dep_option_name in dynamic_default.keys():
++                    dep_param = None
++                    for p in self.get_params(ctx):
++                        if dep_option_name in p.opts:
++                            dep_param = p
++                            break
++                    
++                    if dep_param is not None:
++                        if param.name not in dep_graph:
++                            dep_graph[param.name] = set()
++                        dep_graph[param.name].add(dep_param.name)
++            
++            # Detect cycles using DFS with coloring
++            # WHITE = 0 (unvisited), GRAY = 1 (in progress), BLACK = 2 (done)
++            all_param_names = {p.name for p in self.get_params(ctx)}
++            color: dict[str, int] = {name: 0 for name in all_param_names}
++            
++            def dfs_detect_cycle(node: str, path: list[str]) -> None:
++                if color[node] == 1:  # GRAY - back edge found, cycle detected
++                    cycle_start = path.index(node)
++                    cycle_path = path[cycle_start:] + [node]
++                    raise UsageError(
++                        f"Dependency cycle detected: {' -> '.join(cycle_path)}"
++                    )
++                if color[node] == 2:  # BLACK - already fully processed
++                    return
++                
++                color[node] = 1  # GRAY - in progress
++                path.append(node)
++                
++                for neighbor in dep_graph.get(node, set()):
++                    dfs_detect_cycle(neighbor, path)
++                
++                path.pop()
++                color[node] = 2  # BLACK - done
++            
++            # Check for cycles starting from each node
++            for node in dep_graph:
++                if color[node] == 0:  # WHITE - unvisited
++                    dfs_detect_cycle(node, [])
++            
++            # Now resolve each dynamic default
++            for param_name in ctx._dynamic_default_params:
++                param = None
++                for p in self.get_params(ctx):
++                    if p.name == param_name:
++                        param = p
++                        break
++                
++                if param is None:
++                    continue
++                
++                # Get the dynamic default dict
++                dynamic_default = param.default
++                if not _is_dynamic_default(dynamic_default):
++                    continue
++                
++                try:
++                    resolved_value, resolved_source = _resolve_dynamic_default(
++                        param, ctx, dynamic_default
++                    )
++                except (UsageError, TypeError) as e:
++                    raise
++                
++                # Process the resolved value through the normal pipeline
++                try:
++                    resolved_value = param.process_value(ctx, resolved_value)
++                except Exception:
++                    if not ctx.resilient_parsing:
++                        raise
++                    resolved_value = None
++                
++                ctx.params[param_name] = resolved_value  # type: ignore
++                ctx.set_parameter_source(param_name, resolved_source)  # type: ignore
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2283,6 +2557,20 @@ class Parameter:
+             value = self.get_default(ctx)
+             source = ParameterSource.DEFAULT
+ 
++        # Check if this looks like a dynamic default (for validation)
++        if source == ParameterSource.DEFAULT and _looks_like_dynamic_default(value):
++            # Validate the structure - raise TypeError if invalid
++            try:
++                _validate_dynamic_mapping(value)
++            except TypeError:
++                raise
++            # If valid, mark for later resolution
++            if _is_dynamic_default(value):
++                if not hasattr(ctx, '_pending_dynamic_defaults'):
++                    ctx._pending_dynamic_defaults = {}
++                ctx._pending_dynamic_defaults[self.name] = value
++                value = None
++
+         return value, source
+ 
+     def type_cast_value(self, ctx: Context, value: t.Any) -> t.Any:
+@@ -2412,6 +2700,18 @@ class Parameter:
+ 
+             ctx.set_parameter_source(self.name, source)  # type: ignore
+ 
++            # Check if this parameter has a dynamic default that needs resolution
++            if source == ParameterSource.DEFAULT and _is_dynamic_default(self.default):
++                # Dynamic defaults are resolved after all params are parsed
++                # Mark this param for later processing
++                if not hasattr(ctx, '_dynamic_default_params'):
++                    ctx._dynamic_default_params = []
++                ctx._dynamic_default_params.append(self.name)
++                # Don't process_value yet - will be done after resolution
++                if self.expose_value:
++                    ctx.params[self.name] = None  # Placeholder
++                return None, args
++
+             try:
+                 value = self.process_value(ctx, value)
+             except Exception:
+@@ -2861,9 +3161,14 @@ class Option(Parameter):
+         elif ctx.show_default is not None:
+             show_default = ctx.show_default
+ 
+-        if show_default_is_str or (show_default and (default_value is not None)):
++        # Check if this is a dynamic default
++        is_dynamic = _is_dynamic_default(self.default)
++        
++        if show_default_is_str or (show_default and (default_value is not None or is_dynamic)):
+             if show_default_is_str:
+                 default_string = f"({self.show_default})"
++            elif is_dynamic:
++                default_string = _("(dynamic)")
+             elif isinstance(default_value, (list, tuple)):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):

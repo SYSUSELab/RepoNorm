@@ -1,0 +1,606 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..ccc6845a 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import inspect
++import re
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -258,31 +259,137 @@ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
++        note: str | None = None
++        comment: str | None = None
++        annotation: str | None = None
++        tags: list[str] | None = None
++        priority: str | int | None = None
++        meta: dict[str, Any] | None = None
+ 
+     tool_calls: list[ToolCall]
++    _combined_comment: str | None = None
+ 
+     @classmethod
+-    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
++    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]], comments: list[str] | None = None) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+ 
+         Args:
+-            dict_list: A list of dictionaries, where each dictionary should have 'name' and 'args' keys.
++            tool_calls_dicts: A list of dictionaries, where each dictionary should have 'name' and 'args' keys.
++                Optional metadata fields include: note, comment, annotation, tags, priority, meta.
++            comments: Optional list of comment strings. If provided, these comments are combined and applied
++                as the _combined_comment to every call in the parsed input, overriding explicit comment fields.
+ 
+         Returns:
+             A ToolCalls instance.
+ 
+-        Example:
++        Raises:
++            ValueError: If JSON is invalid or contains invalid call/metadata fields.
++        """
++        # Validate comments parameter
++        if comments is not None:
++            for i, c in enumerate(comments):
++                if not isinstance(c, str):
++                    raise ValueError(f"Comment at index {i} must be a string, got {type(c).__name__}")
++
++        # Combine comments if provided
++        combined_comment = None
++        if comments:
++            # Filter out empty/blank comments
++            non_blank_comments = [c for c in comments if c.strip()]
++            if non_blank_comments:
++                combined_comment = "\n".join(c.strip() for c in non_blank_comments)
++
++        tool_calls = []
++        for item in tool_calls_dicts:
++            # Extract metadata fields
++            metadata = {}
++            for key in ["note", "comment", "annotation", "tags", "priority", "meta"]:
++                if key in item:
++                    metadata[key] = item[key]
++
++            # Create ToolCall with metadata
++            tc = cls.ToolCall(**{k: v for k, v in item.items() if k in ["name", "args"]})
++            
++            # Apply metadata
++            if metadata.get("note") is not None:
++                tc.note = metadata["note"]
++            if metadata.get("comment") is not None:
++                tc.comment = metadata["comment"]
++            if metadata.get("annotation") is not None:
++                tc.annotation = metadata["annotation"]
++            if metadata.get("tags") is not None:
++                tc.tags = metadata["tags"]
++            if metadata.get("priority") is not None:
++                tc.priority = metadata["priority"]
++            if metadata.get("meta") is not None:
++                tc.meta = metadata["meta"]
++            
++            # Override comment with combined comment if present
++            if combined_comment is not None:
++                tc.comment = combined_comment
++            
++            tool_calls.append(tc)
++
++        result = cls(tool_calls=tool_calls)
++        result._combined_comment = combined_comment
++        return result
++
++    @classmethod
++    def from_string(cls, text: str) -> "ToolCalls":
++        """Parse ToolCalls from JSON text with optional Python-style # comments.
++
++        Supports JSON with Python-style # comments outside quoted strings, on their own lines
++        or after JSON content. Accepts a single call, a bare list or the canonical tool_calls container.
++        Preserves # and escaped quotes inside JSON strings.
++
++        Combined nonblank comment bodies in source order are trimmed and joined with newlines.
++        As document-level annotations, the combined comment applies to every call in the parsed input
++        and overrides explicit comment fields; note remains independent.
++
++        Args:
++            text: JSON text with optional # comments.
++
++        Returns:
++            A ToolCalls instance.
+ 
+-            ```python
+-            tool_calls_dict = [
+-                {"name": "search", "args": {"query": "hello"}},
+-                {"name": "translate", "args": {"text": "world"}}
+-            ]
+-            tool_calls = ToolCalls.from_dict_list(tool_calls_dict)
+-            ```
++        Raises:
++            ValueError: If JSON is invalid or contains invalid call/metadata fields.
+         """
+-        tool_calls = [cls.ToolCall(**item) for item in tool_calls_dicts]
+-        return cls(tool_calls=tool_calls)
++        import json
++
++        # Remove # comments that are outside quoted strings
++        cleaned_text = _remove_python_comments(text)
++
++        # Parse JSON
++        try:
++            data = json.loads(cleaned_text)
++        except json.JSONDecodeError as e:
++            raise ValueError(f"Invalid JSON: {e}")
++
++        # Normalize to list of tool calls
++        if isinstance(data, dict):
++            if "tool_calls" in data:
++                items = data["tool_calls"]
++            elif "name" in data and "args" in data:
++                items = [data]
++            else:
++                raise ValueError("JSON must contain either 'tool_calls' array or a single call object")
++        elif isinstance(data, list):
++            items = data
++        else:
++            raise ValueError("JSON must be an array or object containing tool calls")
++
++        # Validate items
++        for i, item in enumerate(items):
++            if not isinstance(item, dict):
++                raise ValueError(f"Item {i} must be a dictionary")
++            if "name" not in item or "args" not in item:
++                raise ValueError(f"Item {i} must have 'name' and 'args' keys")
++
++        # Extract comments from original text
++        comments = _extract_comments(text)
++
++        return cls.from_dict_list(items, comments=comments)
+ 
+     @classmethod
+     def description(cls) -> str:
+@@ -309,6 +416,166 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    def format_with_metadata(self) -> list[dict[str, Any]]:
++        """Format tool calls with metadata included beside type/function fields.
++
++        Returns the same envelope as format() but includes non-None metadata fields
++        alongside each call's type/function fields, not inside arguments.
++        Unset metadata is omitted; explicit empty strings/lists/dictionaries and zero priority are preserved.
++        """
++        result = []
++        for tool_call in self.tool_calls:
++            call_data = {
++                "type": "function",
++                "function": {
++                    "name": tool_call.name,
++                    "arguments": tool_call.args,
++                },
++            }
++            # Add metadata fields if they are not None
++            if tool_call.note is not None:
++                call_data["note"] = tool_call.note
++            if tool_call.comment is not None:
++                call_data["comment"] = tool_call.comment
++            if tool_call.annotation is not None:
++                call_data["annotation"] = tool_call.annotation
++            if tool_call.tags is not None:
++                call_data["tags"] = tool_call.tags
++            if tool_call.priority is not None:
++                call_data["priority"] = tool_call.priority
++            if tool_call.meta is not None:
++                call_data["meta"] = tool_call.meta
++            result.append(call_data)
++
++        return [
++            {
++                "type": "tool_calls",
++                "tool_calls": result,
++            }
++        ]
++
++
++def _remove_python_comments(text: str) -> str:
++    """Remove Python-style # comments from text while preserving # inside quoted strings.
++
++    Args:
++        text: Text potentially containing # comments.
++
++    Returns:
++        Text with # comments removed.
++    """
++    result = []
++    in_string = False
++    escape_next = False
++
++    i = 0
++    while i < len(text):
++        char = text[i]
++
++        if escape_next:
++            # Previous char was backslash, so this char is escaped
++            # Just append it and reset escape flag
++            result.append(char)
++            escape_next = False
++            i += 1
++            continue
++
++        if char == '\\':
++            # Start of escape sequence
++            result.append(char)
++            escape_next = True
++            i += 1
++            continue
++
++        if char == '"':
++            # Toggle string state only if not escaping
++            in_string = not in_string
++            result.append(char)
++            i += 1
++            continue
++
++        if not in_string and char == '#':
++            # Skip until end of line
++            while i < len(text) and text[i] != '\n':
++                i += 1
++            # Keep the newline
++            if i < len(text):
++                result.append('\n')
++                i += 1
++            continue
++
++        result.append(char)
++        i += 1
++
++    return ''.join(result)
++
++
++def _extract_comments(text: str) -> list[str]:
++    """Extract Python-style # comments from text.
++
++    Args:
++        text: Text potentially containing # comments.
++
++    Returns:
++        List of comment strings (without the leading #).
++    """
++    comments = []
++    in_string = False
++    escape_next = False
++
++    i = 0
++    current_comment = []
++
++    while i < len(text):
++        char = text[i]
++
++        if escape_next:
++            # Previous char was backslash, so this char is escaped
++            if current_comment:
++                current_comment.append(char)
++            escape_next = False
++            i += 1
++            continue
++
++        if char == '\\':
++            # Start of escape sequence
++            if current_comment:
++                current_comment.append(char)
++            escape_next = True
++            i += 1
++            continue
++
++        if char == '"':
++            # Toggle string state only if not escaping
++            in_string = not in_string
++            if current_comment:
++                current_comment.append(char)
++            i += 1
++            continue
++
++        if not in_string and char == '#':
++            # Start collecting comment
++            current_comment = []
++            i += 1
++            # Collect until end of line
++            while i < len(text) and text[i] != '\n':
++                current_comment.append(text[i])
++                i += 1
++            # End of comment
++            if current_comment:
++                comment_text = ''.join(current_comment).strip()
++                if comment_text:
++                    comments.append(comment_text)
++            current_comment = []
++            continue
++
++        if current_comment:
++            current_comment.append(char)
++
++        i += 1
++
++    return comments
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..6196e4f0 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,273 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# Tests for ToolCalls metadata functionality
++class TestToolCallsMetadata:
++    """Tests for ToolCall metadata fields and ToolCalls.from_string/from_dict_list with comments."""
++
++    def test_toolcall_with_all_metadata_fields(self):
++        """Test creating a ToolCall with all metadata fields."""
++        tc = ToolCalls.ToolCall(
++            name="search",
++            args={"query": "hello"},
++            note="This is a note",
++            comment="This is a comment",
++            annotation="This is an annotation",
++            tags=["tag1", "tag2"],
++            priority=1,
++            meta={"key": "value"}
++        )
++        assert tc.name == "search"
++        assert tc.args == {"query": "hello"}
++        assert tc.note == "This is a note"
++        assert tc.comment == "This is a comment"
++        assert tc.annotation == "This is an annotation"
++        assert tc.tags == ["tag1", "tag2"]
++        assert tc.priority == 1
++        assert tc.meta == {"key": "value"}
++
++    def test_toolcall_default_metadata_values(self):
++        """Test that metadata fields default to None when not provided."""
++        tc = ToolCalls.ToolCall(name="test", args={})
++        assert tc.note is None
++        assert tc.comment is None
++        assert tc.annotation is None
++        assert tc.tags is None
++        assert tc.priority is None
++        assert tc.meta is None
++
++    def test_from_dict_list_with_metadata(self):
++        """Test from_dict_list preserves metadata fields."""
++        items = [
++            {"name": "search", "args": {"query": "hello"}, "note": "Search note"},
++            {"name": "translate", "args": {"text": "world"}, "priority": 2}
++        ]
++        calls = ToolCalls.from_dict_list(items)
++        assert len(calls.tool_calls) == 2
++        assert calls.tool_calls[0].note == "Search note"
++        assert calls.tool_calls[0].comment is None
++        assert calls.tool_calls[1].priority == 2
++
++    def test_format_with_metadata_includes_non_none_fields(self):
++        """Test format_with_metadata includes only non-None metadata fields."""
++        calls = ToolCalls.from_dict_list([
++            {"name": "search", "args": {"query": "hello"}, "note": "Search note"},
++            {"name": "translate", "args": {"text": "world"}}
++        ])
++        result = calls.format_with_metadata()
++        assert len(result) == 1
++        assert len(result[0]["tool_calls"]) == 2
++        
++        # First call has note
++        assert result[0]["tool_calls"][0]["note"] == "Search note"
++        assert "comment" not in result[0]["tool_calls"][0]
++        
++        # Second call has no metadata
++        assert "note" not in result[0]["tool_calls"][1]
++        assert "comment" not in result[0]["tool_calls"][1]
++
++    def test_format_with_metadata_preserves_empty_values(self):
++        """Test format_with_metadata preserves explicit empty values."""
++        calls = ToolCalls.from_dict_list([
++            {
++                "name": "test",
++                "args": {},
++                "note": "",
++                "comment": "",
++                "annotation": "",
++                "tags": [],
++                "priority": 0,
++                "meta": {}
++            }
++        ])
++        result = calls.format_with_metadata()
++        call_data = result[0]["tool_calls"][0]
++        assert call_data["note"] == ""
++        assert call_data["comment"] == ""
++        assert call_data["annotation"] == ""
++        assert call_data["tags"] == []
++        assert call_data["priority"] == 0
++        assert call_data["meta"] == {}
++
++    def test_from_string_single_call_object(self):
++        """Test from_string with a single call object (not wrapped)."""
++        text = '''{
++            "name": "search",
++            "args": {"query": "hello"}
++        }'''
++        calls = ToolCalls.from_string(text)
++        assert len(calls.tool_calls) == 1
++        assert calls.tool_calls[0].name == "search"
++
++    def test_from_string_tool_calls_container(self):
++        """Test from_string with canonical tool_calls container."""
++        text = '''{
++            "tool_calls": [
++                {"name": "search", "args": {"query": "hello"}},
++                {"name": "translate", "args": {"text": "world"}}
++            ]
++        }'''
++        calls = ToolCalls.from_string(text)
++        assert len(calls.tool_calls) == 2
++        assert calls.tool_calls[0].name == "search"
++        assert calls.tool_calls[1].name == "translate"
++
++    def test_from_string_bare_list(self):
++        """Test from_string with bare list of calls."""
++        text = '''[
++            {"name": "search", "args": {"query": "hello"}},
++            {"name": "translate", "args": {"text": "world"}}
++        ]'''
++        calls = ToolCalls.from_string(text)
++        assert len(calls.tool_calls) == 2
++
++    def test_from_string_with_comments(self):
++        """Test from_string extracts and combines comments."""
++        text = '''# Comment 1
++# Comment 2
++{
++    "tool_calls": [
++        {"name": "search", "args": {"query": "hello"}}
++    ]
++}'''
++        calls = ToolCalls.from_string(text)
++        assert calls._combined_comment == "Comment 1\nComment 2"
++
++    def test_from_string_hash_inside_json_string(self):
++        """Test from_string preserves # inside JSON strings."""
++        text = '''{
++            "tool_calls": [
++                {"name": "search", "args": {"query": "hello # world"}}
++            ]
++        }'''
++        calls = ToolCalls.from_string(text)
++        assert len(calls.tool_calls) == 1
++        assert calls.tool_calls[0].args["query"] == "hello # world"
++        assert calls._combined_comment is None
++
++    def test_from_string_escaped_quotes_in_json(self):
++        """Test from_string handles escaped quotes in JSON strings."""
++        text = r'''{
++            "tool_calls": [
++                {"name": "search", "args": {"query": "hello \"world\""}}
++            ]
++        }'''
++        calls = ToolCalls.from_string(text)
++        assert len(calls.tool_calls) == 1
++        assert calls.tool_calls[0].args["query"] == 'hello "world"'
++
++    def test_from_string_invalid_json_raises_error(self):
++        """Test from_string raises ValueError for invalid JSON."""
++        text = '''{
++            "tool_calls": [
++                {"name": "search", "args": {"query": "hello"
++            ]
++        }'''
++        with pytest.raises(ValueError) as exc_info:
++            ToolCalls.from_string(text)
++        assert "Invalid JSON" in str(exc_info.value)
++
++    def test_from_string_combined_comments_override_explicit(self):
++        """Test combined comments override explicit comment fields."""
++        text = '''# Combined comment
++{
++    "tool_calls": [
++        {"name": "search", "args": {"query": "hello"}, "comment": "Explicit"}
++    ]
++}'''
++        calls = ToolCalls.from_string(text)
++        assert calls._combined_comment == "Combined comment"
++        assert calls.tool_calls[0].comment == "Combined comment"
++
++    def test_from_string_note_independent_of_combined_comment(self):
++        """Test note remains independent of combined comment."""
++        text = '''# Combined comment
++{
++    "tool_calls": [
++        {"name": "search", "args": {"query": "hello"}, "note": "My note"}
++    ]
++}'''
++        calls = ToolCalls.from_string(text)
++        assert calls._combined_comment == "Combined comment"
++        assert calls.tool_calls[0].note == "My note"
++        assert calls.tool_calls[0].comment == "Combined comment"
++
++    def test_from_string_trailing_comment(self):
++        """Test from_string handles # after JSON content."""
++        text = '''{
++            "tool_calls": [{"name": "search", "args": {"query": "hello"}}]
++        } # Trailing comment'''
++        calls = ToolCalls.from_string(text)
++        assert calls._combined_comment == "Trailing comment"
++
++    def test_from_string_blank_comments_ignored(self):
++        """Test from_string ignores blank comments."""
++        text = '''# Valid comment
++
++# Another valid comment
++
++{
++    "tool_calls": [{"name": "search", "args": {"query": "hello"}}]
++}'''
++        calls = ToolCalls.from_string(text)
++        assert calls._combined_comment == "Valid comment\nAnother valid comment"
++
++    def test_from_dict_list_non_string_comment_raises_error(self):
++        """Test from_dict_list rejects non-string comment-list members."""
++        items = [{"name": "search", "args": {"query": "hello"}}]
++        with pytest.raises(ValueError) as exc_info:
++            ToolCalls.from_dict_list(items, comments=["valid", 123])
++        assert "must be a string" in str(exc_info.value)
++
++    def test_from_dict_list_invalid_item_raises_error(self):
++        """Test from_dict_list rejects invalid call items."""
++        items = [{"name": "search"}, {"name": "translate", "args": {"text": "world"}}]
++        with pytest.raises(ValueError) as exc_info:
++            ToolCalls.from_dict_list(items)
++        assert "Field required" in str(exc_info.value) or "must have" in str(exc_info.value)
++
++    def test_from_dict_list_empty_comments_dont_override(self):
++        """Test from_dict_list empty/blank comments don't override explicit comment."""
++        items = [{"name": "search", "args": {"query": "hello"}, "comment": "Explicit"}]
++        calls = ToolCalls.from_dict_list(items, comments=["", "   ", "\n"])
++        assert calls._combined_comment is None
++        assert calls.tool_calls[0].comment == "Explicit"
++
++    def test_from_dict_list_valid_comments_override(self):
++        """Test from_dict_list valid comments override explicit comment."""
++        items = [{"name": "search", "args": {"query": "hello"}, "comment": "Explicit"}]
++        calls = ToolCalls.from_dict_list(items, comments=["Combined 1", "Combined 2"])
++        assert calls._combined_comment == "Combined 1\nCombined 2"
++        assert calls.tool_calls[0].comment == "Combined 1\nCombined 2"
++
++    def test_format_method_unchanged(self):
++        """Test format method returns unchanged schema (no metadata)."""
++        calls = ToolCalls.from_dict_list([
++            {"name": "search", "args": {"query": "hello"}},
++            {"name": "translate", "args": {"text": "world"}}
++        ])
++        result = calls.format()
++        expected = [
++            {
++                "type": "tool_calls",
++                "tool_calls": [
++                    {
++                        "type": "function",
++                        "function": {
++                            "name": "search",
++                            "arguments": {"query": "hello"}
++                        }
++                    },
++                    {
++                        "type": "function",
++                        "function": {
++                            "name": "translate",
++                            "arguments": {"text": "world"}
++                        }
++                    }
++                ]
++            }
++        ]
++        assert result == expected

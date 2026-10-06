@@ -1,0 +1,239 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..091be81 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2091,6 +2091,8 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        validators: cabc.Sequence[t.Callable[[Context, Parameter, t.Any], t.Any]] 
++        | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2121,7 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.validators = validators
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2168,6 +2171,14 @@ class Parameter:
+                     f"{self.param_type_name} cannot be required."
+                 )
+ 
++            # Validate validators are all callables
++            if validators is not None:
++                for i, validator in enumerate(validators):
++                    if not callable(validator):
++                        raise TypeError(
++                            f"Validator at index {i} must be callable, got {validator!r}"
++                        )
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         """Gather information that could be useful for a tool generating
+         user-facing documentation.
+@@ -2354,6 +2365,10 @@ class Parameter:
+         if self.callback is not None:
+             value = self.callback(ctx, self, value)
+ 
++        if self.validators is not None:
++            for validator in self.validators:
++                value = validator(ctx, self, value)
++
+         return value
+ 
+     def resolve_envvar_value(self, ctx: Context) -> str | None:
+@@ -2549,6 +2564,8 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        validators: cabc.Sequence[t.Callable[[Context, Parameter, t.Any], t.Any]] 
++        | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2556,7 +2573,12 @@ class Option(Parameter):
+ 
+         default_is_missing = "default" not in attrs
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls,
++            type=type,
++            multiple=multiple,
++            deprecated=deprecated,
++            validators=validators,
++            **attrs,
+         )
+ 
+         if prompt is True:
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..9139e45 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,164 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++# Tests for validators parameter
++def test_validators_basic(runner):
++    """Test basic validator functionality."""
++    def validate_positive(ctx, param, value):
++        if value < 0:
++            raise click.BadParameter("Value must be positive")
++        return value * 2
++
++    @click.command()
++    @click.option("--foo", type=int, default=5, validators=[validate_positive])
++    def cmd(foo):
++        click.echo(f"foo={foo}")
++
++    # Valid value - should be doubled
++    result = runner.invoke(cmd, ["--foo", "10"])
++    assert result.exit_code == 0
++    assert result.output.strip() == "foo=20"
++
++    # Invalid value - should fail validation
++    result = runner.invoke(cmd, ["--foo", "-5"])
++    assert result.exit_code == 2
++    assert "Value must be positive" in result.output
++
++
++def test_validators_chain(runner):
++    """Test that validators are called in order and chained."""
++    def double(ctx, param, value):
++        return value * 2
++
++    def triple(ctx, param, value):
++        return value * 3
++
++    @click.command()
++    @click.option("--foo", type=int, default=1, validators=[double, triple])
++    def cmd(foo):
++        click.echo(f"foo={foo}")
++
++    # 1 * 2 * 3 = 6
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert result.output.strip() == "foo=6"
++
++
++def test_validators_non_callable_error():
++    """Test that non-callable validators raise TypeError at construction."""
++    with pytest.raises(TypeError) as exc_info:
++        @click.command()
++        @click.option("--foo", type=int, validators=["not callable"])
++        def cmd(foo):
++            pass
++    assert "must be callable" in str(exc_info.value)
++
++
++def test_validators_empty_sequence_disabled():
++    """Test that empty sequence disables validators."""
++    @click.command()
++    @click.option("--foo", type=int, default=5, validators=[])
++    def cmd(foo):
++        click.echo(f"foo={foo}")
++
++    from click.testing import CliRunner
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert result.output.strip() == "foo=5"
++
++
++def test_validators_none_disabled():
++    """Test that None disables validators."""
++    @click.command()
++    @click.option("--foo", type=int, default=5, validators=None)
++    def cmd(foo):
++        click.echo(f"foo={foo}")
++
++    from click.testing import CliRunner
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert result.output.strip() == "foo=5"
++
++
++def test_validators_with_envvar(runner):
++    """Test validators work with environment variables."""
++    def validate_positive(ctx, param, value):
++        if value < 0:
++            raise click.BadParameter("Value must be positive")
++        return value * 2
++
++    @click.command()
++    @click.option("--foo", type=int, envvar="FOO_VAL", validators=[validate_positive])
++    def cmd(foo):
++        click.echo(f"foo={foo}")
++
++    import os
++    os.environ["FOO_VAL"] = "5"
++    try:
++        result = runner.invoke(cmd, [])
++        assert result.exit_code == 0
++        assert result.output.strip() == "foo=10"
++    finally:
++        del os.environ["FOO_VAL"]
++
++
++def test_validators_with_prompt(runner):
++    """Test validators work with prompts."""
++    def validate_not_empty(ctx, param, value):
++        if not value:
++            raise click.BadParameter("Value cannot be empty")
++        return value.upper()
++
++    @click.command()
++    @click.option("--name", prompt=True, validators=[validate_not_empty])
++    def cmd(name):
++        click.echo(f"name={name}")
++
++    result = runner.invoke(cmd, input="hello\n")
++    assert result.exit_code == 0
++    assert "HELLO" in result.output
++
++
++def test_validators_with_multiple(runner):
++    """Test validators work with multiple=True."""
++    def validate_non_negative_tuple(ctx, param, value):
++        # value is a tuple when multiple=True
++        if any(v < 0 for v in value):
++            raise click.BadParameter("Values must be non-negative")
++        return tuple(v + 1 for v in value)
++
++    @click.command()
++    @click.option("--nums", type=int, multiple=True, validators=[validate_non_negative_tuple])
++    def cmd(nums):
++        click.echo(f"nums={list(nums)}")
++
++    result = runner.invoke(cmd, ["--nums", "1", "--nums", "2"])
++    assert result.exit_code == 0
++    assert "nums=[2, 3]" in result.output
++
++
++def test_validators_short_circuit_on_exception(runner):
++    """Test that remaining validators are not called on exception."""
++    call_order = []
++
++    def first_validator(ctx, param, value):
++        call_order.append("first")
++        raise click.BadParameter("First failed")
++
++    def second_validator(ctx, param, value):
++        call_order.append("second")
++        return value
++
++    @click.command()
++    @click.option("--foo", type=int, default=5, validators=[first_validator, second_validator])
++    def cmd(foo):
++        click.echo(f"foo={foo}")
++
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 2
++    assert "First failed" in result.output
++    assert call_order == ["first"]  # Second validator should not be called

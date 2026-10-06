@@ -1,0 +1,231 @@
+diff --git a/outlines/backends/__init__.py b/outlines/backends/__init__.py
+index 680e549..5bd8ab0 100644
+--- a/outlines/backends/__init__.py
++++ b/outlines/backends/__init__.py
+@@ -45,6 +45,7 @@ def get_json_schema_logits_processor(
+     backend_name: str | None,
+     model: SteerableModel,
+     json_schema: str,
++    temperature: float = 1.0,
+ ) -> LogitsProcessorType:
+     """Create a logits processor from a JSON schema.
+ 
+@@ -56,6 +57,10 @@ def get_json_schema_logits_processor(
+         The Outlines model of the user.
+     json_schema: str
+         The JSON schema to create a logits processor from.
++    temperature: float
++        The temperature value to apply to logits before grammar constraints.
++        Must be a finite numeric value greater than zero. Default is 1.0.
++        Only used by the xgrammar backend.
+ 
+     Returns
+     -------
+@@ -67,13 +72,18 @@ def get_json_schema_logits_processor(
+         backend_name or JSON_SCHEMA_DEFAULT_BACKEND,
+         model,
+     )
+-    return backend.get_json_schema_logits_processor(json_schema)
++    # Only pass temperature to backends that support it
++    if isinstance(backend, XGrammarBackend):
++        return backend.get_json_schema_logits_processor(json_schema, temperature)
++    else:
++        return backend.get_json_schema_logits_processor(json_schema)
+ 
+ 
+ def get_regex_logits_processor(
+     backend_name: str | None,
+     model: SteerableModel,
+     regex: str,
++    temperature: float = 1.0,
+ ) -> LogitsProcessorType:
+     """Create a logits processor from a regex.
+ 
+@@ -85,6 +95,10 @@ def get_regex_logits_processor(
+         The Outlines model of the user.
+     regex: str
+         The regex to create a logits processor from.
++    temperature: float
++        The temperature value to apply to logits before grammar constraints.
++        Must be a finite numeric value greater than zero. Default is 1.0.
++        Only used by the xgrammar backend.
+ 
+     Returns
+     -------
+@@ -96,13 +110,18 @@ def get_regex_logits_processor(
+         backend_name or REGEX_DEFAULT_BACKEND,
+         model,
+     )
+-    return backend.get_regex_logits_processor(regex)
++    # Only pass temperature to backends that support it
++    if isinstance(backend, XGrammarBackend):
++        return backend.get_regex_logits_processor(regex, temperature)
++    else:
++        return backend.get_regex_logits_processor(regex)
+ 
+ 
+ def get_cfg_logits_processor(
+     backend_name: str | None,
+     model: SteerableModel,
+     grammar: str,
++    temperature: float = 1.0,
+ ) -> LogitsProcessorType:
+     """Create a logits processor from a context-free grammar.
+ 
+@@ -114,6 +133,10 @@ def get_cfg_logits_processor(
+         The Outlines model of the user.
+     grammar: str
+         The context-free grammar to create a logits processor from.
++    temperature: float
++        The temperature value to apply to logits before grammar constraints.
++        Must be a finite numeric value greater than zero. Default is 1.0.
++        Only used by the xgrammar backend.
+ 
+     Returns
+     -------
+@@ -125,4 +148,8 @@ def get_cfg_logits_processor(
+         backend_name or CFG_DEFAULT_BACKEND,
+         model,
+     )
+-    return backend.get_cfg_logits_processor(grammar)
++    # Only pass temperature to backends that support it
++    if isinstance(backend, XGrammarBackend):
++        return backend.get_cfg_logits_processor(grammar, temperature)
++    else:
++        return backend.get_cfg_logits_processor(grammar)
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..1c4c3eb 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,5 +1,6 @@
+ """Backend class for XGrammar."""
+ 
++import math
+ from typing import TYPE_CHECKING
+ 
+ from outlines.backends.base import BaseBackend
+@@ -22,18 +23,40 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: str, temperature: float = 1.0):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        temperature: float
++            The temperature value to apply to logits before grammar constraints.
++            Must be a finite numeric value greater than zero. Default is 1.0.
++
++        Raises
++        ------
++        ValueError
++            If temperature is not a finite positive number.
+ 
+         """
++        if not isinstance(temperature, (int, float)):
++            raise ValueError(
++                f"temperature must be a numeric value, got {type(temperature)}"
++            )
++        if not math.isfinite(temperature):
++            raise ValueError(
++                f"temperature must be a finite value, got {temperature}"
++            )
++        if temperature <= 0:
++            raise ValueError(
++                f"temperature must be greater than zero, got {temperature}"
++            )
++
+         import xgrammar as xgr
+ 
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
++        self.temperature = temperature
+         self.xgrammar_logits_processor = None
+         super().__init__("torch")
+ 
+@@ -43,11 +66,14 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
++        # Apply temperature scaling before grammar constraints
++        scaled_logits = logits / self.temperature
++
+         if self.xgrammar_logits_processor is None:
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        return self.xgrammar_logits_processor(input_ids, scaled_logits)  # type: ignore
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -79,7 +105,7 @@ class XGrammarBackend(BaseBackend):
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self, json_schema: str, temperature: float = 1.0
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +113,9 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        temperature: float
++            The temperature value to apply to logits before grammar constraints.
++            Must be a finite numeric value greater than zero. Default is 1.0.
+ 
+         Returns
+         -------
+@@ -97,15 +126,18 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, temperature)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(self, regex: str, temperature: float = 1.0) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        temperature: float
++            The temperature value to apply to logits before grammar constraints.
++            Must be a finite numeric value greater than zero. Default is 1.0.
+ 
+         Returns
+         -------
+@@ -114,15 +146,18 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, temperature)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(self, grammar: str, temperature: float = 1.0) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        temperature: float
++            The temperature value to apply to logits before grammar constraints.
++            Must be a finite numeric value greater than zero. Default is 1.0.
+ 
+         Returns
+         -------
+@@ -131,4 +166,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, temperature)

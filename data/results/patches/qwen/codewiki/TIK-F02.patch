@@ -1,0 +1,173 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 64dc6a1..b56a1b0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -287,6 +287,83 @@ impl CoreBPE {
+         (ret, last_piece_token_len)
+     }
+ 
++
++    pub fn encode_with_positions(
++        &self, 
++        text: &str, 
++        allowed_special: &HashSet<&str>
++    ) -> (Vec<Rank>, Vec<usize>) {
++        let special_regex = self._get_tl_special_regex();
++        let regex = self._get_tl_regex();
++        let mut ret = vec![];
++        let mut positions = vec![];
++
++        let mut start = 0;
++        let mut last_piece_token_len = 0;
++        
++        loop {
++            let mut next_special;
++            let mut start_find = start;
++            loop {
++                // Find the next allowed special token, if any
++                next_special = special_regex.find_from_pos(text, start_find).unwrap();
++                match next_special {
++                    Some(m) => {
++                        if allowed_special.contains(&text[m.start()..m.end()]) {
++                            break;
++                        }
++                        start_find = m.start() + 1;
++                    }
++                    None => break,
++                }
++            }
++            let end = next_special.map_or(text.len(), |m| m.start());
++
++            // Okay, here we go, compare this logic to encode_ordinary
++            for mat in regex.find_iter(&text[start..end]) {
++                let mat = mat.unwrap();
++                let piece = mat.as_str().as_bytes();
++                
++                // Calculate character position for this token
++                let mat_byte_start = mat.start();
++                let mat_char_start = text[..start + mat_byte_start].chars().count();
++                
++                if let Some(token) = self.encoder.get(piece) {
++                    last_piece_token_len = 1;
++                    ret.push(*token);
++                    positions.push(mat_char_start);
++                    continue;
++                }
++                let tokens = byte_pair_encode(piece, &self.encoder);
++                last_piece_token_len = tokens.len();
++                ret.extend(&tokens);
++                // All BPE tokens from this piece have the same starting position
++                for _ in 0..tokens.len() {
++                    positions.push(mat_char_start);
++                }
++            }
++
++            match next_special {
++                // And here we push the special token
++                Some(m) => {
++                    let piece = m.as_str();
++                    let token = self.special_tokens_encoder[piece];
++                    
++                    // Calculate character position for special token
++                    let special_char_start = text[..m.start()].chars().count();
++                    
++                    ret.push(token);
++                    positions.push(special_char_start);
++                    start = m.end();
++                    last_piece_token_len = 0;
++                }
++                None => break,
++            }
++        }
++
++        (ret, positions)
++    }
++
+     fn _increase_last_piece_token_len(
+         &self,
+         tokens: Vec<Rank>,
+diff --git a/src/py.rs b/src/py.rs
+index ed107b4..a1e580e 100644
+--- a/src/py.rs
++++ b/src/py.rs
+@@ -50,6 +50,24 @@ impl CoreBPE {
+         })
+     }
+ 
++    #[pyo3(name = "encode_with_positions")]
++    fn py_encode_with_positions(
++        &self,
++        py: Python,
++        text: &str,
++        allowed_special: HashSet<PyBackedStr>,
++    ) -> Py<PyTuple> {
++        let allowed_special: HashSet<&str> =
++            allowed_special.iter().map(|s| s.as_ref()).collect();
++        let (tokens, positions) = py.allow_threads(|| {
++            self.encode_with_positions(text, &allowed_special)
++        });
++        let py_tokens = PyList::new_bound(py, tokens).unbind();
++        let py_positions = PyList::new_bound(py, positions).unbind();
++        (py_tokens, py_positions).into_py(py)
++    }
++
++
+     fn encode_to_tiktoken_buffer(
+         &self,
+         py: Python,
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..d93d4f9 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -80,9 +80,10 @@ class Encoding:
+         self,
+         text: str,
+         *,
++        return_positions: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++    ) -> list[int] | tuple[list[int], list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -121,6 +122,8 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
++            if return_positions:
++                return self._core_bpe.encode_with_positions(text, allowed_special)
+             return self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+@@ -130,6 +133,8 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            if return_positions:
++                return self._core_bpe.encode_with_positions(text, allowed_special)
+             return self._core_bpe.encode(text, allowed_special)
+ 
+     def encode_to_numpy(
+@@ -176,10 +181,11 @@ class Encoding:
+         self,
+         text: list[str],
+         *,
++        return_positions: bool = False,
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[list[int]]:
++    ) -> list[list[int]] | list[tuple[list[int], list[int]]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+@@ -197,7 +203,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, return_positions=return_positions, allowed_special=allowed_special, disallowed_special=disallowed_special
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

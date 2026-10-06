@@ -1,0 +1,7 @@
+# Smart option value completion
+
+Add `auto_complete: bool | str = False` to `click.Option` and `@click.option`. An explicit `shell_complete` callback always takes precedence. Otherwise, when enabled, choose a built-in strategy from underscore-delimited tokens in the normalized parameter name: user/username/owner/author names, branch/ref/revision names, env/environment/var names, and file/path/input/output or dir/directory paths. Unknown names retain the option type's normal completion.
+
+Also accept the strings `"user"`, `"branch"`, `"environment"`, `"file"`, and `"directory"` for `auto_complete`. A string explicitly selects that built-in strategy regardless of the option's name, so an application can give an option any domain-specific name. Boolean `True` keeps automatic name-based selection and `False` keeps smart completion disabled. Reject unknown strategy strings with `ValueError` and values other than booleans or strings with `TypeError` at option construction.
+
+Return sorted, unique prefix matches and at most 20 username, branch, or environment results. Environment completion returns names only, never values. Exclude usernames beginning `_`. Directory strategies return directories; other path strategies use ordinary Path completion. Load the POSIX `pwd` module only for a username strategy and fall back to normal completion when it is unavailable. A missing/failing Git command or account database also falls back without failing completion. The task does not prescribe private strategy helpers.

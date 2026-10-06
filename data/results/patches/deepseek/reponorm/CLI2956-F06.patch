@@ -1,0 +1,613 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..6813c2f 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -165,6 +165,130 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++def _is_dynamic_default(default: t.Any) -> bool:
++    """Check if a default is a dynamic option default.
++
++    A dynamic default is a non-empty dictionary whose keys are full
++    long option names beginning with ``--`` and whose values are
++    dictionaries from stringified dependency values to target defaults.
++    """
++    if not isinstance(default, dict) or not default:
++        return False
++    return all(isinstance(k, str) and k.startswith("--") for k in default)
++
++
++def _resolve_dynamic_defaults(ctx: Context) -> None:
++    """Resolve dynamic defaults for all options whose source is DEFAULT."""
++    params = ctx.command.get_params(ctx)
++
++    # Build mapping from long opt (--name) to option name (name)
++    opt_to_name: dict[str, str] = {}
++    dynamic_options: list[Option] = []
++
++    for param in params:
++        if not isinstance(param, Option) or not _is_dynamic_default(param.default):
++            continue
++        for opt in param.opts:
++            if opt.startswith("--"):
++                opt_to_name[opt] = param.name
++        dynamic_options.append(param)
++
++    if not dynamic_options:
++        return
++
++    if ctx.resilient_parsing:
++        return
++
++    # Build resolution map: option_name -> {dep_name: {str_value: target_default}}
++    resolution_map: dict[str, dict[str, dict[str, t.Any]]] = {}
++    all_dynamic_names: set[str] = set()
++
++    for opt in dynamic_options:
++        name = opt.name
++        all_dynamic_names.add(name)
++        dep_entries: dict[str, dict[str, t.Any]] = {}
++
++        for dep_opt_str, dep_values in opt.default.items():
++            # dep_opt_str is like "--verbose" or "--output-format"
++            # Convert to param name: --verbose -> verbose, --output-format -> output_format
++            dep_name = dep_opt_str.lstrip("-").replace("-", "_")
++
++            # Validate dependency option exists
++            if dep_name not in {p.name for p in params if isinstance(p, Option)}:
++                raise UsageError(
++                    f"Unknown option '{dep_opt_str}' referenced in dynamic "
++                    f"default for option '--{name.replace('_', '-')}'."
++                )
++
++            if not isinstance(dep_values, dict):
++                raise TypeError(
++                    f"Value for option '{dep_opt_str}' in dynamic default for option "
++                    f"'--{name.replace('_', '-')}' must be a dict, "
++                    f"got {type(dep_values).__name__}."
++                )
++
++            dep_entries[dep_name] = dep_values
++
++        resolution_map[name] = dep_entries
++
++    # Topological sort for dependency resolution
++    visited: set[str] = set()
++    in_progress: set[str] = set()
++    order: list[str] = []
++
++    def _visit(opt_name: str) -> None:
++        if opt_name in in_progress:
++            raise UsageError(
++                "Circular dependency detected in dynamic defaults involving "
++                f"option '--{opt_name.replace('_', '-')}'."
++            )
++        if opt_name in visited:
++            return
++        in_progress.add(opt_name)
++        for dep_name in resolution_map.get(opt_name, {}):
++            if dep_name in all_dynamic_names:
++                _visit(dep_name)
++        in_progress.remove(opt_name)
++        visited.add(opt_name)
++        order.append(opt_name)
++
++    for name in resolution_map:
++        _visit(name)
++
++    # Resolve in topological order (dependencies first)
++    for opt_name in order:
++        source = ctx.get_parameter_source(opt_name)
++        if source is not ParameterSource.DEFAULT:
++            continue
++
++        opt = None
++        for param in params:
++            if isinstance(param, Option) and param.name == opt_name:
++                opt = param
++                break
++
++        if opt is None:
++            continue
++
++        # Resolve the raw default value
++        resolved_raw: t.Any = None
++        for dep_name, dep_values in resolution_map[opt_name].items():
++            dep_value = ctx.params.get(dep_name)
++            str_key = str(dep_value)
++            if str_key in dep_values:
++                resolved_raw = dep_values[str_key]
++
++        # Pass exactly once through the normal pipeline
++        try:
++            processed = opt.process_value(ctx, resolved_raw)
++        except Exception:
++            if not ctx.resilient_parsing:
++                raise
++            processed = None
++
++        ctx.params[opt_name] = processed
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -1196,6 +1320,8 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        _resolve_dynamic_defaults(ctx)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2413,7 +2539,14 @@ class Parameter:
+             ctx.set_parameter_source(self.name, source)  # type: ignore
+ 
+             try:
+-                value = self.process_value(ctx, value)
++                if (
++                    isinstance(self, Option)
++                    and source is ParameterSource.DEFAULT
++                    and _is_dynamic_default(self.default)
++                ):
++                    pass  # Value will be resolved by _resolve_dynamic_defaults
++                else:
++                    value = self.process_value(ctx, value)
+             except Exception:
+                 if not ctx.resilient_parsing:
+                     raise
+@@ -2868,6 +3001,8 @@ class Option(Parameter):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):
+                 default_string = _("(dynamic)")
++            elif _is_dynamic_default(default_value):
++                default_string = _("(dynamic)")
+             elif self.is_bool_flag and self.secondary_opts:
+                 # For boolean flags that have distinct True/False opts,
+                 # use the opt without prefix instead of the value.
+diff --git a/tests/test_dynamic_defaults.py b/tests/test_dynamic_defaults.py
+new file mode 100644
+index 0000000..0b9636a
+--- /dev/null
++++ b/tests/test_dynamic_defaults.py
+@@ -0,0 +1,438 @@
++"""Tests for dynamic option defaults."""
++import pytest
++import click
++from click import UsageError
++from click.core import _is_dynamic_default, ParameterSource
++
++
++def test_is_dynamic_default():
++    """Test the _is_dynamic_default helper."""
++    # Valid dynamic default
++    assert _is_dynamic_default({"--verbose": {"True": "yes", "False": "no"}})
++    # Empty dict is not dynamic
++    assert not _is_dynamic_default({})
++    # Non-dict is not dynamic
++    assert not _is_dynamic_default("string")
++    assert not _is_dynamic_default(None)
++    assert not _is_dynamic_default(42)
++    assert not _is_dynamic_default(["--foo"])
++    # Dict with non-option key is not dynamic (static default for custom type)
++    assert not _is_dynamic_default({"foo": "bar"})
++    # Dict with mixed keys is not dynamic
++    assert not _is_dynamic_default({"--foo": {"a": 1}, "bar": {"b": 2}})
++    # Empty value dict is valid
++    assert _is_dynamic_default({"--opt": {}})
++
++
++def test_basic_dynamic_default(runner):
++    """Basic dynamic default resolved from another option."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}})
++    def cli(verbose, name):
++        click.echo(f"verbose={verbose} name={name}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "verbose=False name=no" in result.output
++
++    result = runner.invoke(cli, ["--verbose"])
++    assert not result.exception
++    assert "verbose=True name=yes" in result.output
++
++    result = runner.invoke(cli, ["--no-verbose"])
++    assert not result.exception
++    assert "verbose=False name=no" in result.output
++
++
++def test_dynamic_default_explicit_override(runner):
++    """Explicit value from command line overrides dynamic default."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}})
++    def cli(verbose, name):
++        click.echo(f"verbose={verbose} name={name}")
++
++    result = runner.invoke(cli, ["--name", "explicit"])
++    assert not result.exception
++    assert "verbose=False name=explicit" in result.output
++
++    result = runner.invoke(cli, ["--verbose", "--name", "explicit"])
++    assert not result.exception
++    assert "verbose=True name=explicit" in result.output
++
++
++def test_dynamic_default_with_type_cast(runner):
++    """Dynamic default value goes through type conversion."""
++    @click.command()
++    @click.option("--flag", default=False, is_flag=True)
++    @click.option("--count", type=click.INT, default={"--flag": {"True": "42", "False": "7"}})
++    def cli(flag, count):
++        click.echo(f"flag={flag} count={count}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "flag=False count=7" in result.output
++
++    result = runner.invoke(cli, ["--flag"])
++    assert not result.exception
++    assert "flag=True count=42" in result.output
++
++
++def test_dynamic_default_no_match(runner):
++    """No matching dependency value yields None."""
++    @click.command()
++    @click.option("--mode", default="other")
++    @click.option("--param", default={"--mode": {"a": 1, "b": 2}})
++    def cli(mode, param):
++        click.echo(f"mode={mode} param={param}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "mode=other param=None" in result.output
++
++
++def test_dynamic_default_unknown_option(runner):
++    """Referencing an unknown option raises UsageError."""
++    @click.command()
++    @click.option("--name", default={"--nonexistent": {"True": "yes"}})
++    def cli(name):
++        click.echo(name)
++
++    result = runner.invoke(cli, [], standalone_mode=False)
++    assert result.exit_code != 0
++    assert isinstance(result.exception, UsageError)
++    assert "Unknown option" in str(result.exception)
++
++
++def test_dynamic_default_cycle(runner):
++    """Circular dependency raises UsageError."""
++    @click.command()
++    @click.option("--a", default={"--b": {"x": "a-val"}})
++    @click.option("--b", default={"--a": {"y": "b-val"}})
++    def cli(a, b):
++        click.echo(f"{a} {b}")
++
++    result = runner.invoke(cli, [], standalone_mode=False)
++    assert result.exit_code != 0
++    assert isinstance(result.exception, UsageError)
++    assert "Circular dependency" in str(result.exception)
++
++
++def test_dynamic_default_self_reference(runner):
++    """Self-referencing cycle raises UsageError."""
++    @click.command()
++    @click.option("--a", default={"--a": {"x": "y"}})
++    def cli(a):
++        click.echo(a)
++
++    result = runner.invoke(cli, [], standalone_mode=False)
++    assert result.exit_code != 0
++    assert isinstance(result.exception, UsageError)
++    assert "Circular dependency" in str(result.exception)
++
++
++def test_dynamic_default_non_dict_value(runner):
++    """Value is not a dict raises TypeError."""
++    @click.command()
++    @click.option("--verbose", default=False, is_flag=True)
++    @click.option("--name", default={"--verbose": "not-a-dict"})
++    def cli(verbose, name):
++        click.echo(name)
++
++    result = runner.invoke(cli, [], standalone_mode=False)
++    assert result.exit_code != 0
++    assert isinstance(result.exception, TypeError)
++    assert "must be a dict" in str(result.exception)
++
++
++def test_dynamic_default_chained_deps(runner):
++    """Chained dependencies resolve correctly (A -> B -> C)."""
++    @click.command()
++    @click.option("--c", default="c2")
++    @click.option("--b", default={"--c": {"c1": "b1", "c2": "b2"}})
++    @click.option("--a", default={"--b": {"b1": "a1", "b2": "a2"}})
++    def cli(a, b, c):
++        click.echo(f"a={a} b={b} c={c}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "a=a2 b=b2 c=c2" in result.output
++
++    # Change C's default
++    @click.command()
++    @click.option("--c", default="c1")
++    @click.option("--b", default={"--c": {"c1": "b1", "c2": "b2"}})
++    @click.option("--a", default={"--b": {"b1": "a1", "b2": "a2"}})
++    def cli2(a, b, c):
++        click.echo(f"a={a} b={b} c={c}")
++
++    result = runner.invoke(cli2, [])
++    assert not result.exception
++    assert "a=a1 b=b1 c=c1" in result.output
++
++
++def test_dynamic_default_later_overrides_earlier(runner):
++    """Later dependency entries override earlier matching entries."""
++    @click.command()
++    @click.option("--mode", default="a")
++    @click.option("--val", default={"--mode": {"a": "first", "a": "second"}})
++    def cli(mode, val):
++        click.echo(val)
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "second" in result.output
++
++
++def test_dynamic_default_with_callback(runner):
++    """Dynamic default goes through callback."""
++    def cb(ctx, param, value):
++        return f"cb_{value}"
++
++    @click.command()
++    @click.option("--flag", default=False, is_flag=True)
++    @click.option("--name", default={"--flag": {"True": "yes", "False": "no"}}, callback=cb)
++    def cli(flag, name):
++        click.echo(f"name={name}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "name=cb_no" in result.output
++
++    result = runner.invoke(cli, ["--flag"])
++    assert not result.exception
++    assert "name=cb_yes" in result.output
++
++
++def test_dynamic_default_with_required(runner):
++    """Dynamic default satisfies required when it resolves to a value."""
++    @click.command()
++    @click.option("--flag", default=False, is_flag=True)
++    @click.option("--name", required=True, default={"--flag": {"True": "yes", "False": "no"}})
++    def cli(flag, name):
++        click.echo(f"name={name}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "name=no" in result.output
++
++    # Required fails when dynamic default resolves to None
++    @click.command()
++    @click.option("--flag", default=False, is_flag=True)
++    @click.option("--name", required=True, default={"--flag": {"True": "yes"}})
++    def cli2(flag, name):
++        click.echo(f"name={name}")
++
++    result = runner.invoke(cli2, [])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output or "required" in result.output
++
++
++def test_dynamic_default_show_default(runner):
++    """show_default=True displays (dynamic) for dynamic defaults."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}}, show_default=True)
++    def cli(verbose, name):
++        click.echo(name)
++
++    result = runner.invoke(cli, ["--help"])
++    assert not result.exception
++    assert "(dynamic)" in result.output
++
++
++def test_dynamic_default_envvar_override(runner):
++    """Environment variable overrides dynamic default."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}}, envvar="TEST_NAME")
++    def cli(verbose, name):
++        click.echo(f"name={name}")
++
++    result = runner.invoke(cli, [], env={"TEST_NAME": "from_env"})
++    assert not result.exception
++    assert "name=from_env" in result.output
++
++    result = runner.invoke(cli, ["--verbose"], env={"TEST_NAME": "from_env"})
++    assert not result.exception
++    assert "name=from_env" in result.output
++
++
++def test_dynamic_default_default_map_override(runner):
++    """Default map overrides dynamic default."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}})
++    def cli(verbose, name):
++        click.echo(f"name={name}")
++
++    result = runner.invoke(cli, [], default_map={"name": "from_map"})
++    assert not result.exception
++    assert "name=from_map" in result.output
++
++    result = runner.invoke(cli, ["--verbose"], default_map={"name": "from_map"})
++    assert not result.exception
++    assert "name=from_map" in result.output
++
++
++def test_dynamic_default_boolean_matching(runner):
++    """Boolean dependency values match 'True' and 'False' strings."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--val", default={"--verbose": {"True": "is_true", "False": "is_false"}})
++    def cli(verbose, val):
++        click.echo(f"verbose={verbose} val={val}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "verbose=False val=is_false" in result.output
++
++    result = runner.invoke(cli, ["--verbose"])
++    assert not result.exception
++    assert "verbose=True val=is_true" in result.output
++
++
++def test_dynamic_default_multiple_deps(runner):
++    """Option depends on multiple other options."""
++    @click.command()
++    @click.option("--a/--no-a", default=False)
++    @click.option("--b/--no-b", default=False)
++    @click.option("--val", default={
++        "--a": {"True": "a_enabled"},
++        "--b": {"True": "b_enabled"},
++    })
++    def cli(a, b, val):
++        click.echo(f"a={a} b={b} val={val}")
++
++    # Last matching entry wins
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "a=False b=False val=None" in result.output
++
++    result = runner.invoke(cli, ["--a"])
++    assert not result.exception
++    assert "a=True b=False val=a_enabled" in result.output
++
++    result = runner.invoke(cli, ["--b"])
++    assert not result.exception
++    assert "a=False b=True val=b_enabled" in result.output
++
++    result = runner.invoke(cli, ["--a", "--b"])
++    assert not result.exception
++    assert "a=True b=True val=b_enabled" in result.output
++
++
++def test_dynamic_default_independent_decoration_order(runner):
++    """Dynamic defaults resolve regardless of decorator order."""
++    # A uses B as dependency, but A decorated first
++    @click.command()
++    @click.option("--a", default={"--b": {"x": "a-val"}})
++    @click.option("--b", default="x")
++    def cli1(a, b):
++        click.echo(f"a={a} b={b}")
++
++    result = runner.invoke(cli1, [])
++    assert not result.exception
++    assert "a=a-val b=x" in result.output
++
++    # B uses A as dependency, but B decorated first
++    @click.command()
++    @click.option("--b", default={"--a": {"y": "b-val"}})
++    @click.option("--a", default="y")
++    def cli2(a, b):
++        click.echo(f"a={a} b={b}")
++
++    result = runner.invoke(cli2, [])
++    assert not result.exception
++    assert "a=y b=b-val" in result.output
++
++
++def test_dynamic_default_none_value(runner):
++    """Explicit None match passes None through process_value."""
++    @click.command()
++    @click.option("--mode", default="a")
++    @click.option("--opt", default={"--mode": {"a": None}})
++    def cli(mode, opt):
++        click.echo(f"opt={opt}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "opt=None" in result.output
++
++
++def test_dynamic_default_resilient_parsing(runner):
++    """Resilient parsing skips resolution."""
++    @click.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}})
++    def cli(verbose, name):
++        click.echo(f"name={name}")
++
++    # Use standalone_mode=False and resilient_parsing=True via context
++    ctx = click.Context(cli, resilient_parsing=True)
++    with ctx:
++        rv = cli.main(args=[], standalone_mode=False, parent=ctx)
++    # When resilient_parsing is True, resolution is skipped
++    # and no error should occur
++    assert True  # No assertion failure means success
++
++
++def test_dynamic_default_with_count(runner):
++    """Count options work as dependencies."""
++    @click.command()
++    @click.option("-v", "--verbose", count=True)
++    @click.option("--name", default={"--verbose": {"0": "none", "1": "some", "2": "lots"}})
++    def cli(verbose, name):
++        click.echo(f"verbose={verbose} name={name}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "verbose=0 name=none" in result.output
++
++    result = runner.invoke(cli, ["-v"])
++    assert not result.exception
++    assert "verbose=1 name=some" in result.output
++
++    result = runner.invoke(cli, ["-vv"])
++    assert not result.exception
++    assert "verbose=2 name=lots" in result.output
++
++
++def test_dynamic_default_grouped_command(runner):
++    """Dynamic defaults work in subcommands of a group."""
++    @click.group()
++    def cli():
++        pass
++
++    @cli.command()
++    @click.option("--verbose/--no-verbose", default=False)
++    @click.option("--name", default={"--verbose": {"True": "yes", "False": "no"}})
++    def sub(verbose, name):
++        click.echo(f"verbose={verbose} name={name}")
++
++    result = runner.invoke(cli, ["sub"])
++    assert not result.exception
++    assert "verbose=False name=no" in result.output
++
++    result = runner.invoke(cli, ["sub", "--verbose"])
++    assert not result.exception
++    assert "verbose=True name=yes" in result.output
++
++
++def test_dynamic_default_with_float_type(runner):
++    """Dynamic default with float type casting."""
++    @click.command()
++    @click.option("--scale", default="small")
++    @click.option("--value", type=click.FLOAT, default={"--scale": {"small": "1.5", "large": "10.0"}})
++    def cli(scale, value):
++        click.echo(f"scale={scale} value={value}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert "scale=small value=1.5" in result.output
++    assert "scale=small value=1.5" in result.output
++
++
++if __name__ == "__main__":
++    pytest.main(["-v", __file__])

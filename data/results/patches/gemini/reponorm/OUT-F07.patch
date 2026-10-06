@@ -1,0 +1,242 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..39c5788 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,7 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++import warnings
++from typing import TYPE_CHECKING, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -22,12 +23,14 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: str, fallback_processor: Optional["XGrammarLogitsProcessor"] = None):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        fallback_processor: XGrammarLogitsProcessor, optional
++            The fallback logits processor to use if the primary one fails.
+ 
+         """
+         import xgrammar as xgr
+@@ -35,19 +38,35 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
++        self.fallback_processor = fallback_processor
++        self.use_fallback = False
+         super().__init__("torch")
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+         self.xgrammar_logits_processor = None
++        self.use_fallback = False
++        if self.fallback_processor:
++            self.fallback_processor.reset()
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
+-        if self.xgrammar_logits_processor is None:
+-            self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+-                self.compiled_grammar
+-            )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        if self.use_fallback and self.fallback_processor:
++            return self.fallback_processor.process_logits(input_ids, logits)
++
++        try:
++            if self.xgrammar_logits_processor is None:
++                self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
++                    self.compiled_grammar
++                )
++            return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        except Exception as e:
++            if self.fallback_processor:
++                warnings.warn("Primary XGrammar processor failed, switching to fallback.")
++                self.use_fallback = True
++                return self.fallback_processor.process_logits(input_ids, logits)
++            else:
++                raise e
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -79,7 +98,7 @@ class XGrammarBackend(BaseBackend):
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self, json_schema: str, fallback_processor: Optional[XGrammarLogitsProcessor] = None
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +106,8 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        fallback_processor: XGrammarLogitsProcessor, optional
++            The fallback logits processor to use if the primary one fails.
+ 
+         Returns
+         -------
+@@ -97,15 +118,17 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor=fallback_processor)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(self, regex: str, fallback_processor: Optional[XGrammarLogitsProcessor] = None) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        fallback_processor: XGrammarLogitsProcessor, optional
++            The fallback logits processor to use if the primary one fails.
+ 
+         Returns
+         -------
+@@ -114,15 +137,17 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor=fallback_processor)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(self, grammar: str, fallback_processor: Optional[XGrammarLogitsProcessor] = None) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        fallback_processor: XGrammarLogitsProcessor, optional
++            The fallback logits processor to use if the primary one fails.
+ 
+         Returns
+         -------
+@@ -131,4 +156,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor=fallback_processor)
+diff --git a/tests/backends/test_xgrammar_fallback.py b/tests/backends/test_xgrammar_fallback.py
+new file mode 100644
+index 0000000..0f560dc
+--- /dev/null
++++ b/tests/backends/test_xgrammar_fallback.py
+@@ -0,0 +1,102 @@
++import pytest
++import torch
++import warnings
++from outlines.backends.xgrammar import XGrammarLogitsProcessor
++from unittest.mock import MagicMock, patch
++import sys
++
++def test_xgrammar_logits_processor_fallback():
++    # Mock the primary processor to raise an exception
++    class FailingProcessor:
++        def __init__(self, *args, **kwargs):
++            pass
++        def __call__(self, input_ids, logits):
++            raise RuntimeError("Primary failed")
++
++    # Mock the fallback processor
++    class FallbackProcessor:
++        def __init__(self, *args, **kwargs):
++            pass
++        def __call__(self, input_ids, logits):
++            return logits + 1.0
++
++    # Mock xgrammar
++    mock_xgr = MagicMock()
++    mock_logits_processor_class = MagicMock(side_effect=[FailingProcessor(), FallbackProcessor()])
++    mock_xgr.contrib.hf.LogitsProcessor = mock_logits_processor_class
++    
++    # Patch sys.modules to return our mock when 'xgrammar' is imported
++    with patch.dict(sys.modules, {"xgrammar": mock_xgr}):
++        processor = XGrammarLogitsProcessor("compiled_grammar")
++        
++        # Set the fallback
++        fallback = XGrammarLogitsProcessor("fallback_grammar")
++        processor.fallback_processor = fallback
++        
++        input_ids = torch.tensor([[1, 2]])
++        logits = torch.tensor([[0.0, 0.0]])
++        
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            result = processor.process_logits(input_ids, logits)
++            
++            assert len(w) == 1
++            assert issubclass(w[-1].category, UserWarning)
++            assert "Primary XGrammar processor failed" in str(w[-1].message)
++            
++        assert torch.equal(result, logits + 1.0)
++        
++        # Second call should use fallback directly
++        result2 = processor.process_logits(input_ids, logits)
++        assert torch.equal(result2, logits + 1.0)
++        
++        # Reset should reset both
++        processor.reset()
++        assert processor.xgrammar_logits_processor is None
++        assert processor.use_fallback is False
++        # The fallback processor's xgrammar_logits_processor should be reset too
++        assert processor.fallback_processor.xgrammar_logits_processor is None
++
++def test_xgrammar_backend_fallback():
++    from outlines.backends.xgrammar import XGrammarBackend
++    from outlines.models.transformers import Transformers
++    from unittest.mock import MagicMock, patch
++    import sys
++    
++    mock_xgr = MagicMock()
++    mock_grammar_compiler = MagicMock()
++    mock_xgr.GrammarCompiler.return_value = mock_grammar_compiler
++    
++    with patch.dict(sys.modules, {"xgrammar": mock_xgr}):
++        # Create a mock that inherits from Transformers
++        class MockTransformers(Transformers):
++            def __init__(self):
++                pass
++        
++        mock_model = MockTransformers()
++        mock_model.model = MagicMock()
++        mock_model.model.config = MagicMock()
++        mock_model.model.config._name_or_path = "test"
++        mock_model.hf_tokenizer = MagicMock()
++        
++        # We also need to mock AutoConfig.from_pretrained
++        with patch("transformers.AutoConfig.from_pretrained") as mock_config:
++            mock_config.return_value.vocab_size = 100
++            backend = XGrammarBackend(mock_model)
++            
++            # Mock XGrammarLogitsProcessor to avoid torch import issues
++            with patch("outlines.backends.xgrammar.XGrammarLogitsProcessor") as MockProcessor:
++                fallback = MagicMock()
++                
++                # Test get_json_schema_logits_processor
++                backend.get_json_schema_logits_processor("{}", fallback_processor=fallback)
++                # Check if MockProcessor was called with the correct fallback_processor
++                assert MockProcessor.call_args[1]['fallback_processor'] == fallback
++                
++                # Test get_regex_logits_processor
++                backend.get_regex_logits_processor(".*", fallback_processor=fallback)
++                assert MockProcessor.call_args[1]['fallback_processor'] == fallback
++                
++                # Test get_cfg_logits_processor
++                backend.get_cfg_logits_processor("grammar", fallback_processor=fallback)
++                assert MockProcessor.call_args[1]['fallback_processor'] == fallback

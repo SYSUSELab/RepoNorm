@@ -1,0 +1,649 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..46db1c6 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -1,17 +1,199 @@
+ import functools
++import html
+ import inspect
++import io
+ import json
++import csv
+ import os
+ import re
+ import textwrap
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, Callable, Dict, Optional, Type, cast
++from typing import Any, Callable, Dict, List, Optional, Type, cast
+ 
+ import jinja2
+ import pydantic
+ 
+ 
++# ── Builtin filter category implementations ────────────────────────────────
++
++# string_utils
++
++def _string_upper(value):
++    return str(value).upper()
++
++
++def _string_lower(value):
++    return str(value).lower()
++
++
++def _string_title(value):
++    return str(value).title()
++
++
++def _string_reverse(value):
++    return str(value)[::-1]
++
++
++def _string_truncate(value, length, end="..."):
++    text = str(value)
++    if length < 0:
++        raise ValueError("negative length")
++    if len(text) <= length:
++        return text
++
++    remaining = length
++    end_len = min(len(end), remaining)
++    keep_len = remaining - end_len
++    if keep_len < 0:
++        keep_len = 0
++    return text[:keep_len] + end[:end_len]
++
++
++def _string_pad_left(value, width, fill=" "):
++    return str(value).rjust(width, fill)
++
++
++def _string_pad_right(value, width, fill=" "):
++    return str(value).ljust(width, fill)
++
++
++# math_utils
++
++def _math_add(a, b):
++    return a + b
++
++
++def _math_subtract(a, b):
++    return a - b
++
++
++def _math_multiply(a, b):
++    return a * b
++
++
++def _math_divide(a, b):
++    return a / b
++
++
++def _math_round(value, ndigits=None):
++    return round(value, ndigits)
++
++
++def _math_abs(value):
++    return abs(value)
++
++
++def _math_min(value, *others):
++    if not others:
++        return value
++    return min(value, *others)
++
++
++def _math_max(value, *others):
++    if not others:
++        return value
++    return max(value, *others)
++
++
++# format_utils
++
++def _format_json(value):
++    return json.dumps(value)
++
++
++def _format_csv(value):
++    out = io.StringIO()
++    writer = csv.writer(out)
++    writer.writerow(value)
++    result = out.getvalue()
++    # csv.writer always adds a line terminator; strip it
++    return result.rstrip("\r\n")
++
++
++def _format_indent(value, width=4):
++    lines = str(value).splitlines(keepends=True)
++    result = []
++    for line in lines:
++        if line.strip():
++            result.append(" " * width + line)
++        else:
++            result.append(line)
++    return "".join(result)
++
++
++def _format_wrap(value, width=70):
++    return textwrap.fill(str(value), width=width)
++
++
++def _format_escape(value):
++    return html.escape(str(value), quote=True)
++
++
++def _format_unescape(value):
++    return html.unescape(str(value))
++
++
++# ── Category registry ──────────────────────────────────────────────────────
++
++BUILTIN_FILTER_CATEGORIES: Dict[str, Dict[str, Callable]] = {
++    "string_utils": {
++        "upper": _string_upper,
++        "lower": _string_lower,
++        "title": _string_title,
++        "reverse": _string_reverse,
++        "truncate": _string_truncate,
++        "pad_left": _string_pad_left,
++        "pad_right": _string_pad_right,
++    },
++    "math_utils": {
++        "add": _math_add,
++        "subtract": _math_subtract,
++        "multiply": _math_multiply,
++        "divide": _math_divide,
++        "round": _math_round,
++        "abs": _math_abs,
++        "min": _math_min,
++        "max": _math_max,
++    },
++    "format_utils": {
++        "json": _format_json,
++        "csv": _format_csv,
++        "indent": _format_indent,
++        "wrap": _format_wrap,
++        "escape": _format_escape,
++        "unescape": _format_unescape,
++    },
++}
++
++
++def _add_builtin_filters(env: jinja2.Environment, builtin_filters: Optional[List[str]]):
++    """Add builtin filter categories to a Jinja2 environment.
++
++    Parameters
++    ----------
++    env : jinja2.Environment
++        The environment to add filters to.
++    builtin_filters : list of str or None
++        Category names to load. ``None`` or an empty list does nothing.
++        Unknown names raise ``ValueError``.
++
++    Raises
++    ------
++    ValueError
++        If any category name is not one of the known builtin filter categories.
++    """
++    if not builtin_filters:
++        return
++    for name in builtin_filters:
++        if name not in BUILTIN_FILTER_CATEGORIES:
++            raise ValueError(f"Unknown builtin filter category: {name}")
++        for filter_name, filter_fn in BUILTIN_FILTER_CATEGORIES[name].items():
++            env.filters[filter_name] = filter_fn
++
++
++# ── Prompt class ───────────────────────────────────────────────────────────
++
+ @dataclass
+ class Prompt:
+     """Represents a prompt function.
+@@ -40,7 +222,7 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(cls, content: str, builtin_filters: Optional[List[str]] = None):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -48,15 +230,20 @@ class Prompt:
+         ----------
+         content : str
+             The string content to be converted into a template.
++        builtin_filters : list of str, optional
++            Builtin filter categories to add to the Jinja2 environment.
++            ``None`` or an empty list adds no additional builtin filters.
+ 
+         Returns
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(
++            cls._template_from_str(content, builtin_filters=builtin_filters), None
++        )
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(cls, path: Path, builtin_filters: Optional[List[str]] = None):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -67,18 +254,27 @@ class Prompt:
+         ----------
+         path : Path
+             The path to the file containing the Jinja template.
++        builtin_filters : list of str, optional
++            Builtin filter categories to add to the Jinja2 environment.
++            ``None`` or an empty list adds no additional builtin filters.
+ 
+         Returns
+         -------
+         Prompt
+             An instance of the Prompt class with the template loaded from the file.
+         """
+-        # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+-        # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        # We don't use a `Signature` here because it seems not feasible to infer
++        # one from a Jinja2 environment that is split across multiple files
++        # (since e.g. we support features like Jinja2 includes and template
++        # inheritance)
++        return cls(
++            cls._template_from_file(path, builtin_filters=builtin_filters), None
++        )
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(
++        _, content: str, builtin_filters: Optional[List[str]] = None
++    ) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -88,9 +284,10 @@ class Prompt:
+         if ends_with_linebreak:
+             cleaned_template += "\n"
+ 
+-        # Remove extra whitespaces, except those that immediately follow a newline symbol.
+-        # This is necessary to avoid introducing whitespaces after backslash `\` characters
+-        # used to continue to the next line without linebreak.
++        # Remove extra whitespaces, except those that immediately follow a
++        # newline symbol.  This is necessary to avoid introducing whitespaces
++        # after backslash `\` characters used to continue to the next line
++        # without linebreak.
+         cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
+ 
+         env = jinja2.Environment(
+@@ -106,10 +303,14 @@ class Prompt:
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
+ 
++        _add_builtin_filters(env, builtin_filters)
++
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(
++        _, path: Path, builtin_filters: Optional[List[str]] = None
++    ) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,15 +319,20 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++
++        _add_builtin_filters(env, builtin_filters)
++
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++# ── Decorator ──────────────────────────────────────────────────────────────
++
++def prompt(fn: Callable = None, *, builtin_filters: Optional[List[str]] = None):
+     """Decorate a function that contains a prompt template.
+ 
+-    This allows to define prompts in the docstring of a function and simplify their
+-    manipulation by providing some degree of encapsulation. It uses the `render`
+-    function internally to render templates.
++    This allows to define prompts in the docstring of a function and simplify
++    their manipulation by providing some degree of encapsulation. It uses the
++    `render` function internally to render templates.
+ 
+     >>> import outlines
+     >>>
+@@ -136,9 +342,10 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> prompt = build_prompt("How are you?")
+ 
+-    This API can also be helpful in an "agent" context where parts of the prompt
+-    are set when the agent is initialized and never modified later. In this situation
+-    we can partially apply the prompt function at initialization.
++    This API can also be helpful in an "agent" context where parts of the
++    prompt are set when the agent is initialized and never modified later.
++    In this situation we can partially apply the prompt function at
++    initialization.
+ 
+     >>> import outlines
+     >>> import functools as ft
+@@ -152,11 +359,24 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Parameters
++    ----------
++    fn : callable, optional
++        The function to decorate. If ``None``, the decorator is being called
++        with keyword arguments (e.g. ``@prompt(builtin_filters=[...])``).
++    builtin_filters : list of str, optional
++        Builtin filter categories to add to the Jinja2 environment.
++        ``None`` or an empty list adds no additional builtin filters.
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
++    if fn is None:
++        # Called with arguments, e.g.
++        #   @outlines.prompt(builtin_filters=["string_utils"])
++        return functools.partial(prompt, builtin_filters=builtin_filters)
+ 
+     signature = inspect.signature(fn)
+ 
+@@ -166,11 +386,15 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(
++        cast(str, docstring), builtin_filters=builtin_filters
++    )
+ 
+     return Prompt(template, signature)
+ 
+ 
++# ── Existing Outlines filter helpers ───────────────────────────────────────
++
+ def get_fn_name(fn: Callable):
+     """Returns the name of a callable."""
+     if not callable(fn):
+@@ -185,7 +409,8 @@ def get_fn_name(fn: Callable):
+ 
+ 
+ def get_fn_args(fn: Callable):
+-    """Returns the arguments of a function with annotations and default values if provided."""
++    """Returns the arguments of a function with annotations and default values
++    if provided."""
+     if not callable(fn):
+         raise TypeError("The `args` filter only applies to callables.")
+ 
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..ad469f1 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -403,3 +403,254 @@ def test_template_from_str_with_extra_linebreaks():
+     """
+     template = Prompt._template_from_str(content)
+     assert template.render(name="World") == "Hello, World!\n"
++
++
++# ── Builtin filter category tests ──────────────────────────────────────────────
++
++
++def test_builtin_filters_from_str():
++    """Use Prompt.from_str with string_utils filters."""
++    content = "{{ value|upper }} {{ value|lower }} {{ value|title }}"
++    prompt = Prompt.from_str(content, builtin_filters=["string_utils"])
++    assert prompt(value="hello World") == "HELLO WORLD hello world Hello World"
++
++
++def test_builtin_filters_from_str_reverse():
++    content = "{{ value|reverse }}"
++    prompt = Prompt.from_str(content, builtin_filters=["string_utils"])
++    assert prompt(value="abc") == "cba"
++
++
++def test_builtin_filters_from_str_truncate():
++    content = "{{ value|truncate(5) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["string_utils"])
++    assert prompt(value="hello world") == "he..."
++
++    content2 = "{{ value|truncate(5, end='!!') }}"
++    prompt2 = Prompt.from_str(content2, builtin_filters=["string_utils"])
++    assert prompt2(value="hello world") == "hel!!"
++
++
++def test_builtin_filters_from_str_truncate_negative_length():
++    """truncate with negative length raises ValueError at construction time (template
++    rendering fails because Jinja2 calls the filter with the negative value)."""
++    content = "{{ value|truncate(-1) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["string_utils"])
++    with pytest.raises(ValueError, match="negative length"):
++        prompt(value="hello")
++
++
++def test_builtin_filters_from_str_pad_left():
++    content = "{{ value|pad_left(5) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["string_utils"])
++    assert prompt(value="ab") == "   ab"
++
++    content2 = '{{ value|pad_left(5, fill="0") }}'
++    prompt2 = Prompt.from_str(content2, builtin_filters=["string_utils"])
++    assert prompt2(value="ab") == "000ab"
++
++
++def test_builtin_filters_from_str_pad_right():
++    content = "{{ value|pad_right(5) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["string_utils"])
++    assert prompt(value="ab") == "ab   "
++
++    content2 = '{{ value|pad_right(5, fill=".") }}'
++    prompt2 = Prompt.from_str(content2, builtin_filters=["string_utils"])
++    assert prompt2(value="ab") == "ab..."
++
++
++def test_builtin_filters_math_utils():
++    content = "{{ a|add(b) }} {{ a|subtract(b) }} {{ a|multiply(b) }} {{ a|divide(b) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["math_utils"])
++    assert prompt(a=10, b=3) == "13 7 30 3.3333333333333335"
++
++
++def test_builtin_filters_math_round():
++    content = "{{ value|round }} {{ value|round(2) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["math_utils"])
++    assert prompt(value=3.14159) == "3 3.14"
++
++
++def test_builtin_filters_math_abs():
++    content = "{{ value|abs }}"
++    prompt = Prompt.from_str(content, builtin_filters=["math_utils"])
++    assert prompt(value=-5) == "5"
++
++
++def test_builtin_filters_math_min_max():
++    content = "{{ a|min(b) }} {{ a|max(b) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["math_utils"])
++    assert prompt(a=3, b=7) == "3 7"
++
++
++def test_builtin_filters_math_min_single():
++    """min with a single value returns that value."""
++    content = "{{ value|min }}"
++    prompt = Prompt.from_str(content, builtin_filters=["math_utils"])
++    assert prompt(value=42) == "42"
++
++
++def test_builtin_filters_math_max_single():
++    """max with a single value returns that value."""
++    content = "{{ value|max }}"
++    prompt = Prompt.from_str(content, builtin_filters=["math_utils"])
++    assert prompt(value=99) == "99"
++
++
++def test_builtin_filters_format_json():
++    content = '{{ value|json }}'
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value={"a": 1}) == '{"a": 1}'
++
++
++def test_builtin_filters_format_csv():
++    content = "{{ value|csv }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value=["a", "b", "c"]) == "a,b,c"
++
++
++def test_builtin_filters_format_csv_empty():
++    """CSV filter with an empty iterable produces an empty string."""
++    content = "{{ value|csv }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value=[]) == ""
++
++
++def test_builtin_filters_format_indent():
++    content = "{{ value|indent }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value="line1\nline2") == "    line1\n    line2"
++
++
++def test_builtin_filters_format_indent_width():
++    content = "{{ value|indent(2) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value="line1\nline2") == "  line1\n  line2"
++
++
++def test_builtin_filters_format_indent_empty_lines():
++    """indent should not add spaces to empty lines."""
++    content = "{{ value|indent }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    result = prompt(value="line1\n\nline2")
++    # Using splitlines to check
++    lines = result.splitlines()
++    assert lines[0] == "    line1"
++    assert lines[1] == ""
++    assert lines[2] == "    line2"
++
++
++def test_builtin_filters_format_wrap():
++    content = "{{ value|wrap(20) }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    result = prompt(value="hello world foo bar baz qux")
++    for line in result.splitlines():
++        assert len(line) <= 20
++
++
++def test_builtin_filters_format_escape():
++    content = "{{ value|escape }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value="<test>") == "&lt;test&gt;"
++
++
++def test_builtin_filters_format_unescape():
++    content = "{{ value|unescape }}"
++    prompt = Prompt.from_str(content, builtin_filters=["format_utils"])
++    assert prompt(value="&lt;test&gt;") == "<test>"
++
++
++def test_builtin_filters_multiple_categories():
++    """Multiple categories can be combined."""
++    content = "{{ value|upper }} {{ value|add(1) }} {{ value|json }}"
++    prompt = Prompt.from_str(
++        content, builtin_filters=["string_utils", "math_utils", "format_utils"]
++    )
++    assert prompt(value=2) == '2 3 2'
++
++
++def test_builtin_filters_repeat_category():
++    """Repeating a category is harmless."""
++    content = "{{ value|upper }}"
++    prompt = Prompt.from_str(
++        content, builtin_filters=["string_utils", "string_utils"]
++    )
++    assert prompt(value="hello") == "HELLO"
++
++
++def test_builtin_filters_none_no_filters():
++    """None builtin_filters retains default behavior."""
++    content = "{{ value }}"
++    prompt = Prompt.from_str(content, builtin_filters=None)
++    assert prompt(value="hello") == "hello"
++
++
++def test_builtin_filters_empty_list_no_filters():
++    """Empty list builtin_filters retains default behavior."""
++    content = "{{ value }}"
++    prompt = Prompt.from_str(content, builtin_filters=[])
++    assert prompt(value="hello") == "hello"
++
++
++def test_builtin_filters_unknown_category():
++    """An unknown category raises ValueError."""
++    with pytest.raises(ValueError, match="Unknown builtin filter category: bogus"):
++        Prompt.from_str("{{ value }}", builtin_filters=["bogus"])
++
++
++def test_builtin_filters_unknown_category_empty_string():
++    """The empty string as a category name raises ValueError."""
++    with pytest.raises(ValueError, match="Unknown builtin filter category: "):
++        Prompt.from_str("{{ value }}", builtin_filters=[""])
++
++
++def test_builtin_filters_from_file(temp_prompt_file):
++    """Builtin filters work with Prompt.from_file."""
++    # Create a template file that uses builtin filters
++    test_dir = tempfile.mkdtemp()
++    filter_file = os.path.join(test_dir, "filter_test.txt")
++    with open(filter_file, "w") as f:
++        f.write("{{ value|upper }} {{ value|lower }}")
++
++    prompt = Prompt.from_file(filter_file, builtin_filters=["string_utils"])
++    assert prompt(value="Hello") == "HELLO hello"
++
++
++def test_builtin_filters_decorator():
++    """Builtin filters work with the @prompt decorator."""
++
++    @outlines.prompt(builtin_filters=["string_utils", "math_utils"])
++    def my_prompt(s, n):
++        """{{ s|upper }} {{ n|add(10) }}"""
++
++    assert my_prompt(s="hello", n=5) == "HELLO 15"
++
++
++def test_builtin_filters_decorator_bare():
++    """The bare @prompt decorator (no parentheses) still works."""
++
++    @outlines.prompt
++    def simple_prompt(value):
++        """{{ value }}"""
++
++    assert simple_prompt(value="test") == "test"
++
++
++def test_builtin_filters_decorator_empty_parens():
++    """The @prompt() decorator (with empty parentheses) still works."""
++
++    @outlines.prompt()
++    def simple_prompt(value):
++        """{{ value }}"""
++
++    assert simple_prompt(value="test") == "test"
++
++
++def test_builtin_filters_decorator_with_inheritance(temp_prompt_file):
++    """Builtin filters work with file-based prompts (already tested via from_file)."""
++    # Re-use the temp_prompt_file fixture which returns a path
++    # We cannot easily add builtin filters to extends/include templates
++    # since those are separate files. But from_file with builtin_filters
++    # is tested above.
++    pass

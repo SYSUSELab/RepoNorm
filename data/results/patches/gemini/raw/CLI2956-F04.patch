@@ -1,0 +1,158 @@
+diff --git a/debug.txt b/debug.txt
+new file mode 100644
+index 0000000..a6c3ea3
+--- /dev/null
++++ b/debug.txt
+@@ -0,0 +1,24 @@
++DEBUG: process_value called for help
++DEBUG: _check_required_if called for help, required_if=None, value=False
++DEBUG: process_value called for auth_mode
++DEBUG: _check_required_if called for auth_mode, required_if=None, value=password
++DEBUG: process_value called for password
++DEBUG: _check_required_if called for password, required_if=None, value=None
++DEBUG: process_value called for help
++DEBUG: _check_required_if called for help, required_if=None, value=False
++DEBUG: process_value called for auth_mode
++DEBUG: _check_required_if called for auth_mode, required_if=None, value=password
++DEBUG: process_value called for password
++DEBUG: _check_required_if called for password, required_if={'auth_mode': 'password'}, value=None
++DEBUG: process_value called for help
++DEBUG: _check_required_if called for help, required_if=None, value=False
++DEBUG: process_value called for auth_mode
++DEBUG: _check_required_if called for auth_mode, required_if=None, value=password
++DEBUG: process_value called for password
++DEBUG: _check_required_if called for password, required_if={'auth_mode': 'password'}, value=secret
++DEBUG: process_value called for help
++DEBUG: _check_required_if called for help, required_if=None, value=False
++DEBUG: process_value called for auth_mode
++DEBUG: _check_required_if called for auth_mode, required_if=None, value=none
++DEBUG: process_value called for password
++DEBUG: _check_required_if called for password, required_if={'auth_mode': 'password'}, value=None
+diff --git a/output.txt b/output.txt
+new file mode 100644
+index 0000000..ed306a4
+--- /dev/null
++++ b/output.txt
+@@ -0,0 +1,8 @@
++Traceback (most recent call last):
++  File "/workspace/repo/reproduce_issue.py", line 31, in <module>
++    test_required_if_mapping()
++  File "/workspace/repo/reproduce_issue.py", line 16, in test_required_if_mapping
++    assert result.exit_code != 0
++           ^^^^^^^^^^^^^^^^^^^^^
++AssertionError
++Test failed: 
+diff --git a/required_if_logic.py b/required_if_logic.py
+new file mode 100644
+index 0000000..9cba106
+--- /dev/null
++++ b/required_if_logic.py
+@@ -0,0 +1,25 @@
++def check_required_if(ctx, param, value):
++    if param.required_if is None:
++        return
++
++    # If the target already has a non-missing value, validation succeeds.
++    if not param.value_is_missing(value):
++        return
++
++    required = False
++    if callable(param.required_if):
++        required = param.required_if(ctx, param)
++    elif isinstance(param.required_if, dict):
++        required = True
++        for key, expected_value in param.required_if.items():
++            # Get the value of the parameter from the context
++            # The key is the normalized Python parameter name
++            if ctx.params.get(key) != expected_value:
++                required = False
++                break
++    else:
++        raise TypeError(f"required_if must be a mapping or a callable, not {type(param.required_if)}")
++
++    if required:
++        from click.exceptions import MissingParameter
++        raise MissingParameter(ctx=ctx, param=param)
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..0a179df 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import builtins
+ 
+ import collections.abc as cabc
+ import enum
+@@ -2091,13 +2092,12 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        required_if: t.Any = None,
+     ) -> None:
+-        self.name: str | None
+-        self.opts: list[str]
+-        self.secondary_opts: list[str]
+-        self.name, self.opts, self.secondary_opts = self._parse_decls(
+-            param_decls or (), expose_value
+-        )
++        self.name, self.opts, self.secondary_opts = self._parse_decls(param_decls or (), expose_value)
++        self.required_if = required_if
++        if self.required_if is not None and not callable(self.required_if) and not isinstance(self.required_if, dict):
++            raise TypeError(f'required_if must be a mapping or a callable, not {builtins.type(self.required_if)}')
+         self.type: types.ParamType = types.convert_type(type, default)
+ 
+         # Default nargs to what the type tells us if we have that
+@@ -2345,8 +2345,29 @@ class Parameter:
+ 
+         return False
+ 
++    def _check_required_if(self, ctx: Context, value: t.Any) -> None:
++        if self.required_if is None:
++            return
++
++        if not self.value_is_missing(value):
++            return
++
++        required = False
++        if callable(self.required_if):
++            required = self.required_if(ctx, self)
++        elif isinstance(self.required_if, dict):
++            required = True
++            for key, expected_value in self.required_if.items():
++                if key not in ctx.params:
++                    raise UsageError(f'Parameter {key!r} is not defined.')
++                if ctx.params.get(key) != expected_value:
++                    required = False
++                    break
++        if required:
++            raise MissingParameter(ctx=ctx, param=self)
+     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
+         value = self.type_cast_value(ctx, value)
++        self._check_required_if(ctx, value)
+ 
+         if self.required and self.value_is_missing(value):
+             raise MissingParameter(ctx=ctx, param=self)
+@@ -2549,6 +2570,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        required_if: t.Any = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2556,7 +2578,7 @@ class Option(Parameter):
+ 
+         default_is_missing = "default" not in attrs
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls, type=type, multiple=multiple, deprecated=deprecated, required_if=required_if, **attrs
+         )
+ 
+         if prompt is True:
+diff --git a/src/click/core.py.new b/src/click/core.py.new
+new file mode 100644
+index 0000000..5ba4323
+--- /dev/null
++++ b/src/click/core.py.new
+@@ -0,0 +1 @@
++# I will just edit the file manually with a script.

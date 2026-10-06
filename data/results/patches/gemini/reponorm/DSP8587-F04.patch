@@ -1,0 +1,216 @@
+diff --git a/dspy/streaming/streamify.py b/dspy/streaming/streamify.py
+index 5376d286..f9240fec 100644
+--- a/dspy/streaming/streamify.py
++++ b/dspy/streaming/streamify.py
+@@ -1,3 +1,4 @@
++from dspy.streaming.messages import StreamResponse
+ import asyncio
+ import contextvars
+ import logging
+@@ -24,6 +25,16 @@ if TYPE_CHECKING:
+     from dspy.primitives.module import Module
+ 
+ 
++
++async def timeout_checker(listeners, send_stream):
++    while True:
++        await asyncio.sleep(0.1)
++        for listener in listeners:
++            response = listener.tick()
++            if response:
++                await send_stream.send(response)
++                return
++
+ def streamify(
+     program: "Module",
+     status_message_provider: StatusMessageProvider | None = None,
+@@ -175,6 +186,8 @@ def streamify(
+     async def async_streamer(*args, **kwargs):
+         send_stream, receive_stream = create_memory_object_stream(16)
+         async with create_task_group() as tg, send_stream, receive_stream:
++            if stream_listeners:
++                tg.start_soon(timeout_checker, stream_listeners, send_stream)
+             tg.start_soon(generator, args, kwargs, send_stream)
+ 
+             async for value in receive_stream:
+@@ -191,6 +204,8 @@ def streamify(
+                             output = listener.receive(value) or output
+                         if output:
+                             yield output
++                elif isinstance(value, StreamResponse):
++                    yield value
+                 elif isinstance(value, StatusMessage):
+                     yield value
+                 elif isinstance(value, Prediction):
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..1ddb61f4 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,8 @@
+ import re
+ from collections import defaultdict
++import time
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        idle_timeout_s: float | None = None,
++        clock: Callable[[], float] | None = None,
+     ):
+         """
+         Args:
+@@ -47,6 +50,15 @@ class StreamListener:
+         self.stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
++        if idle_timeout_s is not None:
++            if not isinstance(idle_timeout_s, (int, float)) or isinstance(idle_timeout_s, bool) or idle_timeout_s <= 0:
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++        
++        self.idle_timeout_s = idle_timeout_s
++        self.clock = clock or time.monotonic
++        self.last_activity = self.clock()
++        self.timed_out = False
++
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -73,6 +85,9 @@ class StreamListener:
+         return False
+ 
+     def receive(self, chunk: ModelResponseStream):
++        if self.idle_timeout_s:
++            self.last_activity = self.clock()
++
+         adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
+         if adapter_name not in self.adapter_identifiers:
+             raise ValueError(
+@@ -168,6 +183,19 @@ class StreamListener:
+             if token:
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
++
++    def tick(self, now_ts: float | None = None) -> StreamResponse | None:
++        if not self.idle_timeout_s or self.timed_out:
++            return None
++        
++        now = now_ts if now_ts is not None else self.clock()
++        if now - self.last_activity >= self.idle_timeout_s:
++            self.timed_out = True
++            self.stream_end = True
++            return StreamResponse(self.predict_name, self.signature_field_name, "")
++        return None
++
++
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+ 
+diff --git a/tests/streaming/test_idle_timeout.py b/tests/streaming/test_idle_timeout.py
+new file mode 100644
+index 00000000..2bd59b83
+--- /dev/null
++++ b/tests/streaming/test_idle_timeout.py
+@@ -0,0 +1,51 @@
++import time
++import pytest
++from dspy.streaming.streaming_listener import StreamListener
++from dspy.streaming.messages import StreamResponse
++
++def test_idle_timeout():
++    # Mock clock
++    current_time = 0.0
++    def clock():
++        return current_time
++
++    listener = StreamListener("a", idle_timeout_s=1.0, clock=clock)
++    
++    # Initial tick, no timeout
++    assert listener.tick() is None
++    
++    # Advance time
++    current_time = 0.5
++    assert listener.tick() is None
++    
++    # Advance time to timeout
++    current_time = 1.0
++    response = listener.tick()
++    assert isinstance(response, StreamResponse)
++    assert response.chunk == ""
++    
++    # Subsequent tick should be None
++    assert listener.tick() is None
++
++def test_activity_refreshes_timeout():
++    # Mock clock
++    current_time = 0.0
++    def clock():
++        return current_time
++
++    listener = StreamListener("a", idle_timeout_s=1.0, clock=clock)
++    
++    # Advance time
++    current_time = 0.5
++    # Simulate activity
++    listener.receive(None) # This should refresh last_activity
++    
++    # Advance time to 1.0, should not timeout because of activity at 0.5
++    current_time = 1.0
++    assert listener.tick() is None
++    
++    # Advance time to 1.5, should timeout
++    current_time = 1.5
++    response = listener.tick()
++    assert isinstance(response, StreamResponse)
++    assert response.chunk == ""
+diff --git a/tests/streaming/test_streamify_timeout.py b/tests/streaming/test_streamify_timeout.py
+new file mode 100644
+index 00000000..749db011
+--- /dev/null
++++ b/tests/streaming/test_streamify_timeout.py
+@@ -0,0 +1,40 @@
++import asyncio
++import pytest
++import dspy
++from dspy.streaming.streaming_listener import StreamListener
++from dspy.streaming.streamify import streamify
++from dspy.streaming.messages import StreamResponse
++
++class SlowLM(dspy.LM):
++    def __init__(self):
++        super().__init__("test/model")
++    def __call__(self, prompt, **kwargs):
++        # Simulate a slow response
++        import time
++        time.sleep(0.5)
++        return {"choices": [{"message": {"content": "answer"}}]}
++
++@pytest.mark.asyncio
++async def test_streamify_idle_timeout():
++    # Use the slow LM
++    lm = SlowLM()
++    dspy.settings.configure(lm=lm)
++
++    # The listener needs to be configured with a short timeout
++    listener = StreamListener("a", idle_timeout_s=0.1)
++
++    # Wrap the program
++    predict = dspy.Predict("q->a")
++    wrapped_program = streamify(predict, stream_listeners=[listener], is_async_program=False, async_streaming=False)
++
++    # Run the program
++    # Since it's a sync generator, we can iterate over it
++    output = wrapped_program(q="test")
++
++    results = []
++    for value in output:
++        results.append(value)
++
++    # Check if we got the timeout response
++    timeout_responses = [r for r in results if isinstance(r, StreamResponse) and r.chunk == ""]
++    assert len(timeout_responses) > 0

@@ -1,0 +1,87 @@
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..4921a26 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -1,3 +1,4 @@
++import os
+ import platform
+ import time
+ 
+@@ -470,3 +471,77 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++class _MonitorProcess:
++    pid = 1011
++
++    def __init__(self, code=0):
++        self.code = code
++        self.returncode = None
++
++    def poll(self):
++        return self.returncode
++
++    def wait(self):
++        self.returncode = self.code
++        return self.returncode
++
++
++def test_edit_monitor_start_and_terminate_order(monkeypatch):
++    events = []
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _MonitorProcess())
++    click.edit(filename="file.txt", editor="editor", monitor_process=lambda *event: events.append(event))
++    assert [event[0] for event in events] == ["start", "terminate"]
++    assert all(event[1] == 1011 and event[2] == "editor" and isinstance(event[3], float) for event in events)
++
++
++def test_edit_monitor_callback_errors_warn_and_continue(monkeypatch):
++    called = []
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _MonitorProcess())
++    def callback(event, *args):
++        called.append(event)
++        raise RuntimeError(event)
++    with pytest.warns(UserWarning) as warnings_seen:
++        click.edit(filename="file.txt", editor="editor", monitor_process=callback)
++    assert called == ["start", "terminate"]
++    assert len(warnings_seen) == 2
++
++
++def test_edit_monitor_rejects_non_callable(monkeypatch):
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: pytest.fail("must not launch"))
++    with pytest.raises(TypeError, match="must be callable"):
++        click.edit(filename="file.txt", editor="editor", monitor_process=object())
++
++
++def test_edit_monitor_nonzero_keeps_failure_and_terminate(monkeypatch):
++    events = []
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _MonitorProcess(2))
++    with pytest.raises(click.ClickException, match="Editing failed"):
++        click.edit(filename="file.txt", editor="editor", monitor_process=lambda event, *args: events.append(event))
++    assert events == ["start", "terminate"]
++
++
++@pytest.mark.skipif(os.name == "nt", reason="fixed POSIX stopped-state protocol")
++def test_edit_monitor_observes_suspend_resume_protocol(tmp_path):
++    script = tmp_path / "monitor.py"
++    output = tmp_path / "ready"
++    script.write_text(
++        "import os, signal, sys, time\n"
++        "child = os.fork()\n"
++        "if child == 0:\n"
++        "    time.sleep(0.2)\n"
++        "    os.kill(os.getppid(), signal.SIGCONT)\n"
++        "    os._exit(0)\n"
++        "open(sys.argv[1], 'w').write('ready')\n"
++        "os.kill(os.getpid(), signal.SIGSTOP)\n"
++        "os.waitpid(child, 0)\n"
++        "time.sleep(0.2)\n"
++    )
++    events = []
++    click.edit(
++        filename=str(output),
++        editor=f"exec python {script}",
++        monitor_process=lambda event, *args: events.append(event),
++    )
++    assert output.read_text() == "ready"
++    assert events == ["start", "suspend", "resume", "terminate"]

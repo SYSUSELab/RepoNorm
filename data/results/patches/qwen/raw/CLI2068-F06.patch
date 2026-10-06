@@ -1,0 +1,143 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..caa6716 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -37,6 +37,61 @@ else:
+     BEFORE_BAR = "\r\033[?25l"
+     AFTER_BAR = "\033[?25h\n"
+ 
++def _set_process_priority(pid: int, priority: str) -> None:
++    """Set the CPU scheduling priority of a process.
++    
++    :param pid: The process ID to set the priority for.
++    :param priority: One of ``low``, ``below_normal``, ``normal``, 
++                     ``above_normal``, or ``high``.
++    """
++    # Validate priority value
++    valid_priorities = {"low", "below_normal", "normal", "above_normal", "high"}
++    if priority not in valid_priorities:
++        raise ValueError(
++            f"Invalid process priority: {priority!r}. "
++            f"Must be one of: {', '.join(valid_priorities)}"
++        )
++    
++    try:
++        if WIN:
++            import win32process
++            import winerror
++            
++            # Map priority names to Windows priority classes
++            priority_map = {
++                "low": win32process.IDLE_PRIORITY_CLASS,
++                "below_normal": win32process.BELOW_NORMAL_PRIORITY_CLASS,
++                "normal": win32process.NORMAL_PRIORITY_CLASS,
++                "above_normal": win32process.ABOVE_NORMAL_PRIORITY_CLASS,
++                "high": win32process.HIGH_PRIORITY_CLASS,
++            }
++            
++            priority_class = priority_map[priority]
++            handle = win32process.OpenProcess(
++                win32process.PROCESS_SET_INFORMATION, False, pid
++            )
++            try:
++                win32process.SetPriorityClass(handle, priority_class)
++            finally:
++                win32process.CloseHandle(handle)
++        else:
++            # Unix-like systems use nice values (lower = higher priority)
++            # Range is typically -20 to 19, with 0 being normal
++            nice_map = {
++                "low": 19,
++                "below_normal": 10,
++                "normal": 0,
++                "above_normal": -10,
++                "high": -20,
++            }
++            nice_value = nice_map[priority]
++            os.setpriority(os.PRIO_PROCESS, pid, nice_value)
++    except (OSError, ImportError, AttributeError):
++        # If we can't set the priority (no permission, platform doesn't support),
++        # just continue without setting it
++        pass
++
++
+ 
+ class ProgressBar(t.Generic[V]):
+     def __init__(
+@@ -485,11 +540,20 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        process_priority: str | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        if process_priority is not None:
++            valid_priorities = {"low", "below_normal", "normal", "above_normal", "high"}
++            if process_priority not in valid_priorities:
++                raise ValueError(
++                    f"Invalid process priority: {process_priority!r}. "
++                    f"Must be one of: {', '.join(valid_priorities)}"
++                )
++        self.process_priority = process_priority
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -517,6 +581,9 @@ class Editor:
+ 
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            # Set process priority if requested
++            if self.process_priority is not None:
++                _set_process_priority(c.pid, self.process_priority)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..8ae0792 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    process_priority: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,24 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param process_priority: set the CPU scheduling priority of the editor
++                             process.  One of ``low``, ``below_normal``,
++                             ``normal``, ``above_normal``, or ``high``.
++                             ``None`` preserves the default behavior.
++                             Raises :exc:`ValueError` for invalid values.
++
++    .. versionadded:: 8.2
++        The ``process_priority`` parameter.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        process_priority=process_priority,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+@@ -688,7 +703,6 @@ def edit(
+     ed.edit_file(filename)
+     return None
+ 
+-
+ def launch(url: str, wait: bool = False, locate: bool = False) -> int:
+     """This function launches the given URL (or filename) in the default
+     viewer application for this file type.  If this is an executable, it

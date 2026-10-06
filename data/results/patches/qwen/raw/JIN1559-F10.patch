@@ -1,0 +1,192 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..89821b9 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -421,6 +421,10 @@ class Environment:
+         rv.__dict__.update(self.__dict__)
+         rv.overlayed = True
+         rv.linked_to = self
++        
++        # Copy translation_versions dict for isolation in overlays
++        if hasattr(self, 'translation_versions'):
++            rv.translation_versions = dict(self.translation_versions)
+ 
+         for key, value in args.items():
+             if value is not missing:
+@@ -434,6 +438,16 @@ class Environment:
+         rv.extensions = {}
+         for key, value in self.extensions.items():
+             rv.extensions[key] = value.bind(rv)
++        
++        # Re-add translation version methods from the new extension instance
++        for ext in rv.iter_extensions():
++            if hasattr(ext, 'set_translation_version'):
++                rv.set_translation_version = ext.set_translation_version
++                rv.get_translation_version = ext.get_translation_version
++                rv.compare_translation_versions = ext.compare_translation_versions
++                rv.remove_translation_version = ext.remove_translation_version
++                rv.clear_translation_versions = ext.clear_translation_versions
++                break
+         if extensions is not missing:
+             rv.extensions.update(load_extensions(rv, extensions))
+ 
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..15ea8f3 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -257,6 +257,7 @@ class InternationalizationExtension(Extension):
+     def __init__(self, environment: Environment) -> None:
+         super().__init__(environment)
+         environment.globals["_"] = _gettext_alias
++        environment.translation_versions = {}
+         environment.extend(
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+@@ -264,6 +265,11 @@ class InternationalizationExtension(Extension):
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
++            set_translation_version=self.set_translation_version,
++            get_translation_version=self.get_translation_version,
++            compare_translation_versions=self.compare_translation_versions,
++            remove_translation_version=self.remove_translation_version,
++            clear_translation_versions=self.clear_translation_versions,
+         )
+ 
+     def _install(
+@@ -351,6 +357,31 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++
++    def set_translation_version(self, message: str, version: str) -> None:
++        """Set the version for a translation message."""
++        self.environment.translation_versions[message] = version
++
++    def get_translation_version(self, message: str) -> t.Optional[str]:
++        """Get the version for a translation message. Returns None if not found."""
++        return self.environment.translation_versions.get(message)
++
++    def compare_translation_versions(self, message1: str, message2: str) -> bool:
++        """Compare two translation versions. Returns True only when both messages are
++        registered and their versions are equal.
++        """
++        v1 = self.environment.translation_versions.get(message1)
++        v2 = self.environment.translation_versions.get(message2)
++        return v1 is not None and v2 is not None and v1 == v2
++
++    def remove_translation_version(self, message: str) -> None:
++        """Remove a translation version entry. Harmless for unknown messages."""
++        self.environment.translation_versions.pop(message, None)
++
++    def clear_translation_versions(self) -> None:
++        """Remove all translation version entries."""
++        self.environment.translation_versions.clear()
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..6cc3253 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -8,7 +8,7 @@ from jinja2 import Environment
+ from jinja2 import nodes
+ from jinja2 import pass_context
+ from jinja2.exceptions import TemplateAssertionError
+-from jinja2.ext import Extension
++from jinja2.ext import Extension, InternationalizationExtension
+ from jinja2.lexer import count_newlines
+ from jinja2.lexer import Token
+ 
+@@ -466,6 +466,90 @@ class TestInternationalization:
+         ]
+ 
+ 
++
++    def test_translation_version_tracking(self):
++        """Test basic set/get/remove/clear of translation versions."""
++        env = Environment(extensions=[InternationalizationExtension])
++        
++        # Test set_translation_version
++        env.set_translation_version("hello", "v1")
++        assert env.get_translation_version("hello") == "v1"
++        
++        # Test get on unknown message returns None
++        assert env.get_translation_version("unknown") is None
++        
++        # Test remove_translation_version
++        env.remove_translation_version("hello")
++        assert env.get_translation_version("hello") is None
++        
++        # Test clear_translation_versions
++        env.set_translation_version("msg1", "v1")
++        env.set_translation_version("msg2", "v2")
++        env.clear_translation_versions()
++        assert env.get_translation_version("msg1") is None
++        assert env.get_translation_version("msg2") is None
++
++    def test_compare_translation_versions(self):
++        """Test compare_translation_versions function."""
++        env = Environment(extensions=[InternationalizationExtension])
++        
++        # Both messages registered with same version -> True
++        env.set_translation_version("msg1", "v1")
++        env.set_translation_version("msg2", "v1")
++        assert env.compare_translation_versions("msg1", "msg2") == True
++        
++        # Both messages registered with different versions -> False
++        env.set_translation_version("msg3", "v2")
++        assert env.compare_translation_versions("msg1", "msg3") == False
++        
++        # One or both messages not registered -> False
++        assert env.compare_translation_versions("msg1", "unknown") == False
++        assert env.compare_translation_versions("unknown", "msg2") == False
++        assert env.compare_translation_versions("unknown", "unknown") == False
++
++    def test_overlay_copies_versions(self):
++        """Test that overlay copies version state from parent and isolates updates."""
++        env = Environment(extensions=[InternationalizationExtension])
++        
++        # Set some versions in parent
++        env.set_translation_version("parent_msg", "v1")
++        env.set_translation_version("shared_msg", "v1")
++        
++        # Create overlay
++        overlay = env.overlay()
++        
++        # Overlay should have parent's versions
++        assert overlay.get_translation_version("parent_msg") == "v1"
++        assert overlay.get_translation_version("shared_msg") == "v1"
++        
++        # Updates in overlay are isolated
++        overlay.set_translation_version("parent_msg", "v2")
++        overlay.set_translation_version("overlay_msg", "v1")
++        
++        # Parent unchanged
++        assert env.get_translation_version("parent_msg") == "v1"
++        assert env.get_translation_version("overlay_msg") is None
++        
++        # Overlay has its own updates
++        assert overlay.get_translation_version("parent_msg") == "v2"
++        assert overlay.get_translation_version("overlay_msg") == "v1"
++
++    def test_translation_version_empty_unicode_long_strings(self):
++        """Test empty, Unicode, and long strings."""
++        env = Environment(extensions=[InternationalizationExtension])
++        
++        # Empty string
++        env.set_translation_version("", "v1")
++        assert env.get_translation_version("") == "v1"
++        
++        # Unicode string
++        env.set_translation_version("你好世界", "v1")
++        assert env.get_translation_version("你好世界") == "v1"
++        
++        # Long string
++        long_msg = "a" * 10000
++        env.set_translation_version(long_msg, "v1")
++        assert env.get_translation_version(long_msg) == "v1"
+ class TestScope:
+     def test_basic_scope_behavior(self):
+         # This is what the old with statement compiled down to

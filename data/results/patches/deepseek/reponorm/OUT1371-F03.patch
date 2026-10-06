@@ -1,0 +1,663 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..17f3638 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -11,6 +11,51 @@ from typing import Any, Callable, Dict, Optional, Type, cast
+ import jinja2
+ import pydantic
+ 
++def _resolve_condition(conditional_filters):
++    """Determine which condition key to select based on environment variables.
++
++    Parameters
++    ----------
++    conditional_filters : dict or None
++        Mapping of condition names to filter dicts.
++
++    Returns
++    -------
++    str or None
++        The selected condition key, or None if no conditional filters.
++    """
++    if not conditional_filters:
++        return None
++
++    # Priority-ordered standard conditions (ASCII case-insensitive)
++    standard_conditions = [
++        (
++            "debug",
++            lambda: os.environ.get("OUTLINES_DEBUG", "").lower() == "true",
++        ),
++        (
++            "production",
++            lambda: os.environ.get("ENVIRONMENT", "").lower() == "production",
++        ),
++        (
++            "testing",
++            lambda: (
++                os.environ.get("ENV", "").lower() == "testing"
++                or os.environ.get("OUTLINES_TESTING", "").lower() == "true"
++                or os.environ.get("TESTING_MODE", "").lower() == "on"
++            ),
++        ),
++    ]
++
++    for name, check in standard_conditions:
++        if name in conditional_filters and check():
++            return name
++
++    # Fallback: alphabetically first supplied key
++    return sorted(conditional_filters.keys())[0]
++
++
++
+ 
+ @dataclass
+ class Prompt:
+@@ -40,25 +85,37 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
+-        """
+-        Create an instance of the class from a string.
++    def from_str(
++        cls,
++        content: str,
++        conditional_filters: Optional[Dict[str, Dict[str, Any]]] = None,
++    ):
++        """Create an instance of the class from a string.
+ 
+         Parameters
+         ----------
+         content : str
+             The string content to be converted into a template.
++        conditional_filters : dict of dict, optional
++            Mapping of condition names to Jinja filter dicts.
++            Environment variables select which condition's filters are installed.
+ 
+         Returns
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(
++            cls._template_from_str(content, conditional_filters=conditional_filters),
++            None,
++        )
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
+-        """
+-        Create a Prompt instance from a file containing a Jinja template.
++    def from_file(
++        cls,
++        path: Path,
++        conditional_filters: Optional[Dict[str, Dict[str, Any]]] = None,
++    ):
++        """Create a Prompt instance from a file containing a Jinja template.
+ 
+         Note: This method does not allow to include and inheritance to reference files
+         that are outside the folder or subfolders of the file given to `from_file`.
+@@ -67,6 +124,9 @@ class Prompt:
+         ----------
+         path : Path
+             The path to the file containing the Jinja template.
++        conditional_filters : dict of dict, optional
++            Mapping of condition names to Jinja filter dicts.
++            Environment variables select which condition's filters are installed.
+ 
+         Returns
+         -------
+@@ -75,10 +135,17 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(
++            cls._template_from_file(path, conditional_filters=conditional_filters),
++            None,
++        )
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(
++        _,
++        content: str,
++        conditional_filters: Optional[Dict[str, Dict[str, Any]]] = None,
++    ) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -106,10 +173,19 @@ class Prompt:
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
+ 
++        # Apply conditional filters if a condition is selected
++        condition = _resolve_condition(conditional_filters)
++        if condition is not None:
++            env.filters.update(conditional_filters[condition])
++
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(
++        _,
++        path: Path,
++        conditional_filters: Optional[Dict[str, Dict[str, Any]]] = None,
++    ) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,10 +194,26 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        env.filters["name"] = get_fn_name
++        env.filters["description"] = get_fn_description
++        env.filters["source"] = get_fn_source
++        env.filters["signature"] = get_fn_signature
++        env.filters["schema"] = get_schema
++        env.filters["args"] = get_fn_args
++
++        # Apply conditional filters if a condition is selected
++        condition = _resolve_condition(conditional_filters)
++        if condition is not None:
++            env.filters.update(conditional_filters[condition])
++
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++def prompt(
++    fn: Optional[Callable] = None,
++    *,
++    conditional_filters: Optional[Dict[str, Dict[str, Any]]] = None,
++) -> Prompt:
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -152,11 +244,21 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Parameters
++    ----------
++    fn : callable, optional
++        The function whose docstring contains the prompt template.
++    conditional_filters : dict of dict, optional
++        Mapping of condition names to Jinja filter dicts.
++        Environment variables select which condition's filters are installed.
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
++    if fn is None:
++        return functools.partial(prompt, conditional_filters=conditional_filters)
+ 
+     signature = inspect.signature(fn)
+ 
+@@ -166,7 +268,7 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(cast(str, docstring), conditional_filters=conditional_filters)
+ 
+     return Prompt(template, signature)
+ 
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..967f3ab 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -403,3 +403,447 @@ def test_template_from_str_with_extra_linebreaks():
+     """
+     template = Prompt._template_from_str(content)
+     assert template.render(name="World") == "Hello, World!\n"
++
++
++# =============================================================================
++# Tests for conditional_filters
++# =============================================================================
++
++
++def test_resolve_condition_none():
++    """None or empty mapping returns None."""
++    from outlines.prompts import _resolve_condition
++
++    assert _resolve_condition(None) is None
++    assert _resolve_condition({}) is None
++
++
++def test_resolve_condition_debug_env(monkeypatch):
++    """OUTLINES_DEBUG=true selects 'debug'."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {"debug": {"myfilter": lambda x: x}, "production": {}}
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    assert _resolve_condition(conditional_filters) == "debug"
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "TRUE")
++    assert _resolve_condition(conditional_filters) == "debug"
++
++    # Not set -> should fall through to alphabetical first
++    monkeypatch.delenv("OUTLINES_DEBUG")
++    # Now no standard condition is active, no env set for production either
++    # Fallback: alphabetical first key -> "debug"
++    assert _resolve_condition(conditional_filters) == "debug"
++
++
++def test_resolve_condition_production_env(monkeypatch):
++    """ENVIRONMENT=production selects 'production'."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {"debug": {}, "production": {"myfilter": lambda x: x}}
++
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    assert _resolve_condition(conditional_filters) == "production"
++
++    monkeypatch.setenv("ENVIRONMENT", "PRODUCTION")
++    assert _resolve_condition(conditional_filters) == "production"
++
++
++def test_resolve_condition_testing_env(monkeypatch):
++    """ENV=testing, OUTLINES_TESTING=true, TESTING_MODE=on all select 'testing'."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {"testing": {"myfilter": lambda x: x}}
++
++    monkeypatch.setenv("ENV", "testing")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.setenv("ENV", "TESTING")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.delenv("ENV")
++
++    monkeypatch.setenv("OUTLINES_TESTING", "true")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.delenv("OUTLINES_TESTING")
++
++    monkeypatch.setenv("TESTING_MODE", "on")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.setenv("TESTING_MODE", "ON")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++
++def test_resolve_condition_priority(monkeypatch):
++    """debug > production > testing priority."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {
++        "debug": {},
++        "production": {},
++        "testing": {},
++    }
++
++    # All three env vars set -> debug wins
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    monkeypatch.setenv("ENV", "testing")
++    assert _resolve_condition(conditional_filters) == "debug"
++
++    # Only production and testing -> production wins
++    monkeypatch.delenv("OUTLINES_DEBUG")
++    assert _resolve_condition(conditional_filters) == "production"
++
++    # Only testing -> testing wins
++    monkeypatch.delenv("ENVIRONMENT")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++
++def test_resolve_condition_missing_standard_skipped(monkeypatch):
++    """Active standard condition absent from mapping is skipped."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {
++        "production": {"f": lambda x: x},
++        "testing": {"f": lambda x: x},
++    }
++
++    # OUTLINES_DEBUG is active but "debug" not in mapping
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    # debug is not in mapping, production is -> production wins
++    assert _resolve_condition(conditional_filters) == "production"
++
++
++def test_resolve_condition_fallback_alphabetical(monkeypatch):
++    """No standard condition active -> alphabetically first key."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {
++        "zeta": {},
++        "alpha": {},
++        "beta": {},
++    }
++
++    # No standard env vars set
++    monkeypatch.delenv("OUTLINES_DEBUG", raising=False)
++    monkeypatch.delenv("ENVIRONMENT", raising=False)
++    monkeypatch.delenv("ENV", raising=False)
++    monkeypatch.delenv("OUTLINES_TESTING", raising=False)
++    monkeypatch.delenv("TESTING_MODE", raising=False)
++
++    assert _resolve_condition(conditional_filters) == "alpha"
++
++
++def test_from_str_conditional_filters(monkeypatch):
++    """Conditional filters are installed and work when rendered."""
++    monkeypatch.setenv("TESTING_MODE", "on")
++
++    def shout(s):
++        return s.upper()
++
++    content = "Hello, {{ name | shout }}!"
++    prompt = Prompt.from_str(content, conditional_filters={"testing": {"shout": shout}})
++    assert prompt(name="world") == "Hello, WORLD!"
++
++
++def test_from_str_conditional_filters_override(monkeypatch):
++    """Conditional filters take precedence over built-in filters."""
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++
++    # Override the built-in 'name' filter
++    def fake_name(fn):
++        return "FAKE_NAME"
++
++    @outlines.prompt
++    def my_fn():
++        """docstring"""
++
++    content = "{{ fn | name }}"
++    prompt = Prompt.from_str(
++        content,
++        conditional_filters={"debug": {"name": fake_name}},
++    )
++    assert prompt(fn=my_fn) == "FAKE_NAME"
++
++
++def test_from_str_conditional_filters_not_active(monkeypatch):
++    """Filters from unselected conditions are not installed."""
++    import jinja2
++
++    monkeypatch.delenv("OUTLINES_DEBUG", raising=False)
++    monkeypatch.delenv("ENVIRONMENT", raising=False)
++    monkeypatch.delenv("ENV", raising=False)
++    monkeypatch.delenv("OUTLINES_TESTING", raising=False)
++    monkeypatch.delenv("TESTING_MODE", raising=False)
++
++    def shout(s):
++        return s.upper()
++
++    def reverse_it(s):
++        return s[::-1]
++
++    # Two conditions; no env var is set so alphabetical fallback picks "alpha"
++    # "beta" filter "reverse_it" should NOT be available
++    content = "Hello, {{ name | reverse_it }}!"
++    with pytest.raises(jinja2.exceptions.TemplateError):
++        Prompt.from_str(
++            content,
++            conditional_filters={
++                "alpha": {"shout": shout},
++                "beta": {"reverse_it": reverse_it},
++            },
++        )
++
++    # The "alpha" condition's filter "shout" should work
++    content2 = "Hello, {{ name | shout }}!"
++    prompt = Prompt.from_str(
++            content2,
++            conditional_filters={
++                "alpha": {"shout": shout},
++                "beta": {"reverse_it": reverse_it},
++            },
++        )
++    assert prompt(name="world") == "Hello, WORLD!"
++
++
++def test_from_str_no_conditional_filters():
++    """False-y conditional_filters installs no extra filters."""
++    content = "Hello, {{ name }}!"
++    prompt = Prompt.from_str(content, conditional_filters=None)
++    assert prompt(name="world") == "Hello, world!"
++
++    prompt = Prompt.from_str(content, conditional_filters={})
++    assert prompt(name="world") == "Hello, world!"
++
++
++def test_prompt_decorator_bare_still_works():
++    """Existing bare decorator usage remains supported."""
++    @outlines.prompt
++    def greet(name):
++        """Hello, {{ name }}!"""
++    assert greet("World") == "Hello, World!"
++    assert greet(name="Alice") == "Hello, Alice!"
++
++# =============================================================================
++# Tests for conditional_filters
++# =============================================================================
++
++
++def test_resolve_condition_none():
++    """None or empty mapping returns None."""
++    from outlines.prompts import _resolve_condition
++
++    assert _resolve_condition(None) is None
++    assert _resolve_condition({}) is None
++
++
++def test_resolve_condition_debug_env(monkeypatch):
++    """OUTLINES_DEBUG=true selects 'debug'."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {"debug": {"myfilter": lambda x: x}, "production": {}}
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    assert _resolve_condition(conditional_filters) == "debug"
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "TRUE")
++    assert _resolve_condition(conditional_filters) == "debug"
++
++    # Not set -> should fall through to alphabetical first
++    monkeypatch.delenv("OUTLINES_DEBUG")
++    # Now no standard condition is active, no env set for production either
++    # Fallback: alphabetical first key -> "debug"
++    assert _resolve_condition(conditional_filters) == "debug"
++
++
++def test_resolve_condition_production_env(monkeypatch):
++    """ENVIRONMENT=production selects 'production'."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {"debug": {}, "production": {"myfilter": lambda x: x}}
++
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    assert _resolve_condition(conditional_filters) == "production"
++
++    monkeypatch.setenv("ENVIRONMENT", "PRODUCTION")
++    assert _resolve_condition(conditional_filters) == "production"
++
++
++def test_resolve_condition_testing_env(monkeypatch):
++    """ENV=testing, OUTLINES_TESTING=true, TESTING_MODE=on all select 'testing'."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {"testing": {"myfilter": lambda x: x}}
++
++    monkeypatch.setenv("ENV", "testing")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.setenv("ENV", "TESTING")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.delenv("ENV")
++
++    monkeypatch.setenv("OUTLINES_TESTING", "true")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.delenv("OUTLINES_TESTING")
++
++    monkeypatch.setenv("TESTING_MODE", "on")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++    monkeypatch.setenv("TESTING_MODE", "ON")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++
++def test_resolve_condition_priority(monkeypatch):
++    """debug > production > testing priority."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {
++        "debug": {},
++        "production": {},
++        "testing": {},
++    }
++
++    # All three env vars set -> debug wins
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    monkeypatch.setenv("ENV", "testing")
++    assert _resolve_condition(conditional_filters) == "debug"
++
++    # Only production and testing -> production wins
++    monkeypatch.delenv("OUTLINES_DEBUG")
++    assert _resolve_condition(conditional_filters) == "production"
++
++    # Only testing -> testing wins
++    monkeypatch.delenv("ENVIRONMENT")
++    assert _resolve_condition(conditional_filters) == "testing"
++
++
++def test_resolve_condition_missing_standard_skipped(monkeypatch):
++    """Active standard condition absent from mapping is skipped."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {
++        "production": {"f": lambda x: x},
++        "testing": {"f": lambda x: x},
++    }
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    # debug is not in mapping, production is -> production wins
++    assert _resolve_condition(conditional_filters) == "production"
++
++
++def test_resolve_condition_fallback_alphabetical(monkeypatch):
++    """No standard condition active -> alphabetically first key."""
++    from outlines.prompts import _resolve_condition
++
++    conditional_filters = {
++        "zeta": {},
++        "alpha": {},
++        "beta": {},
++    }
++
++    # No standard env vars set
++    monkeypatch.delenv("OUTLINES_DEBUG", raising=False)
++    monkeypatch.delenv("ENVIRONMENT", raising=False)
++    monkeypatch.delenv("ENV", raising=False)
++    monkeypatch.delenv("OUTLINES_TESTING", raising=False)
++    monkeypatch.delenv("TESTING_MODE", raising=False)
++
++    assert _resolve_condition(conditional_filters) == "alpha"
++
++
++def test_from_str_conditional_filters(monkeypatch):
++    """Conditional filters are installed and work when rendered."""
++    monkeypatch.setenv("TESTING_MODE", "on")
++
++    def shout(s):
++        return s.upper()
++
++    content = "Hello, {{ name | shout }}!"
++    prompt = Prompt.from_str(content, conditional_filters={"testing": {"shout": shout}})
++    assert prompt(name="world") == "Hello, WORLD!"
++
++
++def test_from_str_conditional_filters_override(monkeypatch):
++    """Conditional filters take precedence over built-in filters."""
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++
++    # Override the built-in 'name' filter
++    def fake_name(fn):
++        return "FAKE_NAME"
++
++    @outlines.prompt
++    def my_fn():
++        """docstring"""
++
++    content = "{{ fn | name }}"
++    prompt = Prompt.from_str(
++        content,
++        conditional_filters={"debug": {"name": fake_name}},
++    )
++    assert prompt(fn=my_fn) == "FAKE_NAME"
++
++
++def test_from_str_conditional_filters_not_active(monkeypatch):
++    """Filters from unselected conditions are not installed."""
++    import jinja2
++
++    monkeypatch.delenv("OUTLINES_DEBUG", raising=False)
++    monkeypatch.delenv("ENVIRONMENT", raising=False)
++    monkeypatch.delenv("ENV", raising=False)
++    monkeypatch.delenv("OUTLINES_TESTING", raising=False)
++    monkeypatch.delenv("TESTING_MODE", raising=False)
++
++    def shout(s):
++        return s.upper()
++
++    def reverse_it(s):
++        return s[::-1]
++
++    # Two conditions; no env var is set so alphabetical fallback picks "alpha"
++    # "beta" filter "reverse_it" should NOT be available
++    content = "Hello, {{ name | reverse_it }}!"
++    with pytest.raises(jinja2.exceptions.TemplateError):
++        Prompt.from_str(
++            content,
++            conditional_filters={
++                "alpha": {"shout": shout},
++                "beta": {"reverse_it": reverse_it},
++            },
++        )
++
++    # The "alpha" condition's filter "shout" should work
++    content2 = "Hello, {{ name | shout }}!"
++    prompt = Prompt.from_str(
++            content2,
++            conditional_filters={
++                "alpha": {"shout": shout},
++                "beta": {"reverse_it": reverse_it},
++            },
++        )
++    assert prompt(name="world") == "Hello, WORLD!"
++
++
++def test_from_str_no_conditional_filters():
++    """False-y conditional_filters installs no extra filters."""
++    content = "Hello, {{ name }}!"
++    prompt = Prompt.from_str(content, conditional_filters=None)
++    assert prompt(name="world") == "Hello, world!"
++
++    prompt = Prompt.from_str(content, conditional_filters={})
++    assert prompt(name="world") == "Hello, world!"
++
++
++def test_prompt_decorator_bare_still_works():
++    """Existing bare decorator usage remains supported."""
++    @outlines.prompt
++    def greet(name):
++        """Hello, {{ name }}!"""
++    assert greet("World") == "Hello, World!"
++    assert greet(name="Alice") == "Hello, Alice!"

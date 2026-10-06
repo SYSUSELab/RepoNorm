@@ -1,0 +1,167 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..8888fc8 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -25,15 +25,28 @@ def split_template_path(template: str) -> t.List[str]:
+     """Split a path into segments and perform a sanity check.  If it detects
+     '..' in the path it will raise a `TemplateNotFound` error.
+     """
++    # Reject names beginning with / or \ (absolute paths and UNC forms).
++    if template.startswith("/") or template.startswith("\\"):
++        raise TemplateNotFound(template)
++
++    # Reject names beginning with an ASCII drive prefix such as C:.
++    if (
++        len(template) >= 2
++        and template[1] == ":"
++        and template[0].isascii()
++        and template[0].isalpha()
++    ):
++        raise TemplateNotFound(template)
++
+     pieces = []
+-    for piece in template.split("/"):
+-        if (
+-            os.path.sep in piece
+-            or (os.path.altsep and os.path.altsep in piece)
+-            or piece == os.path.pardir
+-        ):
+-            raise TemplateNotFound(template)
+-        elif piece and piece != ".":
++    for piece in template.replace("\\", "/").split("/"):
++        if piece == "" or piece == ".":
++            continue
++        elif piece == "..":
++            if not pieces:
++                raise TemplateNotFound(template)
++            pieces.pop()
++        else:
+             pieces.append(piece)
+     return pieces
+ 
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..20362f1 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -116,6 +116,64 @@ class TestLoaders:
+         assert split_template_path("./foo/bar") == ["foo", "bar"]
+         pytest.raises(TemplateNotFound, split_template_path, "../foo")
+ 
++    def test_split_template_path_normalization(self):
++        """Test logical path normalization in split_template_path."""
++        # Normal paths unchanged
++        assert split_template_path("foo/bar") == ["foo", "bar"]
++        assert split_template_path("foo/bar/baz") == ["foo", "bar", "baz"]
++
++        # Dot segments removed
++        assert split_template_path("./foo/bar") == ["foo", "bar"]
++        assert split_template_path("foo/./bar") == ["foo", "bar"]
++        assert split_template_path("././foo") == ["foo"]
++        assert split_template_path(".") == []
++
++        # Backslash as separator
++        assert split_template_path("foo\\bar") == ["foo", "bar"]
++        assert split_template_path(".\\foo\\bar") == ["foo", "bar"]
++        assert split_template_path("foo\\..\\test.html") == ["test.html"]
++
++        # Mixed separators
++        assert split_template_path("foo/bar\\baz") == ["foo", "bar", "baz"]
++        assert split_template_path("foo\\bar/baz") == ["foo", "bar", "baz"]
++
++        # Internal .. resolution
++        assert split_template_path("foo/../test.html") == ["test.html"]
++        assert split_template_path("foo/bar/../../baz") == ["baz"]
++        assert split_template_path("a/b/c/../../d") == ["a", "d"]
++        assert split_template_path("foo/..") == []
++        assert split_template_path("foo/../bar/..") == []
++
++        # Leading .. rejected
++        pytest.raises(TemplateNotFound, split_template_path, "../foo")
++        pytest.raises(TemplateNotFound, split_template_path, "..\\foo")
++
++        # .. that pops beyond root
++        pytest.raises(TemplateNotFound, split_template_path, "foo/../../bar")
++        pytest.raises(TemplateNotFound, split_template_path, "..")
++        pytest.raises(TemplateNotFound, split_template_path, "foo/../..")
++
++        # Absolute paths rejected
++        pytest.raises(TemplateNotFound, split_template_path, "/foo")
++        pytest.raises(TemplateNotFound, split_template_path, "\\foo")
++        pytest.raises(TemplateNotFound, split_template_path, "/")
++        pytest.raises(TemplateNotFound, split_template_path, "\\")
++
++        # UNC forms rejected
++        pytest.raises(TemplateNotFound, split_template_path, "\\\\server\\share")
++
++        # Drive prefixes rejected (on any OS)
++        pytest.raises(TemplateNotFound, split_template_path, "C:foo")
++        pytest.raises(TemplateNotFound, split_template_path, "C:\\foo")
++        pytest.raises(TemplateNotFound, split_template_path, "c:foo/bar")
++
++        # Triple dot is not special
++        assert split_template_path("foo/...") == ["foo", "..."]
++        assert split_template_path(".../foo") == ["...", "foo"]
++
++        # Empty string
++        assert split_template_path("") == []
++
+ 
+ class TestFileSystemLoader:
+     searchpath = (Path(__file__) / ".." / "res" / "templates").resolve()
+@@ -171,6 +229,56 @@ class TestFileSystemLoader:
+         t = e.get_template("mojibake.txt")
+         assert t.render() == expect
+ 
++    def test_normalize_separators(self):
++        """FileSystemLoader normalizes both / and backslash separators."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        # foo/test.html exists; backslash version should work the same
++        tmpl = env.get_template("foo\\test.html")
++        assert tmpl.render().strip() == "FOO"
++
++    def test_normalize_dot_segments(self):
++        """FileSystemLoader removes . segments."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        tmpl = env.get_template("./test.html")
++        assert tmpl.render().strip() == "BAR"
++
++    def test_normalize_internal_dotdot(self):
++        """FileSystemLoader resolves internal .. within root boundary."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        # foo/../test.html resolves to test.html
++        tmpl = env.get_template("foo/../test.html")
++        assert tmpl.render().strip() == "BAR"
++
++    def test_normalize_rejects_leading_dotdot(self):
++        """FileSystemLoader rejects names with leading .."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        with pytest.raises(TemplateNotFound):
++            env.get_template("../test.html")
++
++    def test_normalize_rejects_absolute(self):
++        """FileSystemLoader rejects absolute paths."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        with pytest.raises(TemplateNotFound):
++            env.get_template("/test.html")
++
++    def test_normalize_original_name_in_exception(self):
++        """FileSystemLoader raises TemplateNotFound with the original name."""
++        loader = loaders.FileSystemLoader(self.searchpath)
++        env = Environment(loader=loader)
++        try:
++            env.get_template("../foo.html")
++        except TemplateNotFound as e:
++            assert e.name == "../foo.html"
++        try:
++            env.get_template("/foo.html")
++        except TemplateNotFound as e:
++            assert e.name == "/foo.html"
++
+ 
+ class TestModuleLoader:
+     archive = None

@@ -1,0 +1,104 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..019df7e 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1196,6 +1196,54 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        params = self.get_params(ctx)
++        long_options = {
++            opt: param
++            for param in params if isinstance(param, Option)
++            for opt in param.opts if opt.startswith("--")
++        }
++        resolving: set[Option] = set()
++        resolved: set[Option] = set()
++
++        def resolve_dynamic(param: Option) -> None:
++            if param in resolved or not param._is_dynamic_default():
++                return
++            if param in resolving:
++                raise UsageError("Circular dynamic default dependency", ctx=ctx)
++            resolving.add(param)
++            selected = None
++            for option_name, value_mapping in t.cast(dict[str, dict[str, t.Any]], param.default).items():
++                dependency = long_options.get(option_name)
++                if dependency is None:
++                    raise UsageError(
++                        f"Unknown option in dynamic default: {option_name}", ctx=ctx
++                    )
++                resolve_dynamic(dependency)
++                current = ctx.params.get(dependency.name)
++                key = str(current)
++                if key in value_mapping:
++                    selected = value_mapping[key]
++            resolving.remove(param)
++            key = f"click.dynamic-default.{id(param)}"
++            ctx.meta[key] = True
++            try:
++                value = param.process_value(ctx, selected)
++            finally:
++                ctx.meta.pop(key, None)
++            if param.name is not None:
++                ctx.params[param.name] = value
++                ctx.set_parameter_source(param.name, ParameterSource.DEFAULT)
++            resolved.add(param)
++
++        for param in params:
++            if (
++                isinstance(param, Option)
++                and param._is_dynamic_default()
++                and param.name is not None
++                and ctx.get_parameter_source(param.name) == ParameterSource.DEFAULT
++            ):
++                resolve_dynamic(param)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2662,6 +2710,8 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+@@ -2864,6 +2914,8 @@ class Option(Parameter):
+         if show_default_is_str or (show_default and (default_value is not None)):
+             if show_default_is_str:
+                 default_string = f"({self.show_default})"
++            elif self._is_dynamic_default():
++                default_string = _("(dynamic)")
+             elif isinstance(default_value, (list, tuple)):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):
+@@ -2923,8 +2975,26 @@ class Option(Parameter):
+ 
+             return None
+ 
++        if self._is_dynamic_default():
++            return self.default if not call else None
+         return super().get_default(ctx, call=call)
+ 
++    def _is_dynamic_default(self) -> bool:
++        value = self.default
++        if not isinstance(value, dict) or not value:
++            return False
++        if not all(isinstance(key, str) and key.startswith("--") for key in value):
++            return False
++        if not all(isinstance(mapping, dict) for mapping in value.values()):
++            raise TypeError("Dynamic default values must be dictionaries")
++        return True
++
++    def process_value(self, ctx: Context, value: t.Any) -> t.Any:
++        key = f"click.dynamic-default.{id(self)}"
++        if self._is_dynamic_default() and value is None and key not in ctx.meta:
++            return None
++        return super().process_value(ctx, value)
++
+     def prompt_for_value(self, ctx: Context) -> t.Any:
+         """This is an alternative flow that can be activated in the full
+         value processing if a value does not exist.  It will prompt the

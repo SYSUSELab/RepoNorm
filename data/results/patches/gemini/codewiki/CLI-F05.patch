@@ -1,0 +1,133 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..d707245 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -255,6 +255,8 @@ class Context:
+     .. versionchanged:: 2.0
+         Added the ``resilient_parsing``, ``help_option_names``, and
+         ``token_normalize_func`` parameters.
++    :param retry_cleanup: The number of retries for cleanup callbacks.
++    :param retry_cleanup_backoff: The initial backoff delay for cleanup retries.
+     """
+ 
+     #: The formatter class to create with :meth:`make_formatter`.
+@@ -280,7 +282,21 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
+     ) -> None:
++        self.retry_cleanup = retry_cleanup
++        if retry_cleanup_backoff is not None:
++            if not isinstance(retry_cleanup_backoff, (int, float)) or isinstance(retry_cleanup_backoff, bool) or retry_cleanup_backoff < 0:
++                raise ValueError("retry_cleanup_backoff must be a finite positive number.")
++        self.retry_cleanup_backoff = retry_cleanup_backoff
++
++        if self.retry_cleanup is None:
++            self.retry_cleanup = parent.retry_cleanup if parent is not None else 0
++
++        if self.retry_cleanup_backoff is None:
++            self.retry_cleanup_backoff = parent.retry_cleanup_backoff if parent is not None else 0.1
++
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+         #: the :class:`Command` for this context.
+@@ -600,7 +616,18 @@ class Context:
+ 
+         :param f: The function to execute on teardown.
+         """
+-        return self._exit_stack.callback(f)
++        def wrapper():
++            import time
++            for i in range(self.retry_cleanup + 1):
++                try:
++                    return f()
++                except (KeyboardInterrupt, SystemExit):
++                    raise
++                except Exception:
++                    if i == self.retry_cleanup:
++                        raise
++                    time.sleep(self.retry_cleanup_backoff * (2 ** i))
++        return self._exit_stack.callback(wrapper)
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+diff --git a/tests/test_retry_cleanup.py b/tests/test_retry_cleanup.py
+new file mode 100644
+index 0000000..a981bbc
+--- /dev/null
++++ b/tests/test_retry_cleanup.py
+@@ -0,0 +1,72 @@
++import click
++import pytest
++import time
++
++def test_retry_cleanup_success():
++    attempts = 0
++    
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.retry_cleanup = 2
++        ctx.retry_cleanup_backoff = 0.01
++        
++        def cleanup():
++            nonlocal attempts
++            attempts += 1
++            if attempts < 3:
++                raise Exception("Transient failure")
++        
++        ctx.call_on_close(cleanup)
++    
++    cli.main(args=[], standalone_mode=False)
++    assert attempts == 3
++
++def test_retry_cleanup_exhaustion():
++    attempts = 0
++    
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.retry_cleanup = 1
++        ctx.retry_cleanup_backoff = 0.01
++        
++        def cleanup():
++            nonlocal attempts
++            attempts += 1
++            raise Exception("Persistent failure")
++        
++        ctx.call_on_close(cleanup)
++    
++    with pytest.raises(Exception, match="Persistent failure"):
++        cli.main(args=[], standalone_mode=False)
++    assert attempts == 2
++
++def test_retry_cleanup_inheritance():
++    attempts = 0
++    
++    @click.group()
++    @click.pass_context
++    def cli(ctx):
++        ctx.retry_cleanup = 2
++        ctx.retry_cleanup_backoff = 0.01
++        
++    @cli.command()
++    @click.pass_context
++    def sub(ctx):
++        def cleanup():
++            nonlocal attempts
++            attempts += 1
++            if attempts < 3:
++                raise Exception("Transient failure")
++        
++        ctx.call_on_close(cleanup)
++        
++    cli.main(args=["sub"], standalone_mode=False)
++    assert attempts == 3
++
++def test_retry_cleanup_invalid_backoff():
++    # Test that invalid backoff raises ValueError in constructor
++    with pytest.raises(ValueError, match="retry_cleanup_backoff must be a finite positive number."):
++        click.Command("test", callback=lambda: None).make_context("test", [], retry_cleanup_backoff=-1)
++

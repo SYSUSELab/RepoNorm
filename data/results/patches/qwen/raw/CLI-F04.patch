@@ -1,0 +1,113 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..4907427 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,11 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param cleanup_timeout: The maximum time in seconds to wait for cleanup
++        functions to complete. If `None`, cleanup runs synchronously without
++        timeout. Child contexts inherit the parent's timeout unless explicitly
++        overridden. A positive numeric value must be provided; zero or negative
++        values raise ``ValueError``.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +285,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +433,18 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        # Handle cleanup_timeout: None means no timeout (synchronous),
++        # a positive number sets the timeout, child inherits from parent
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++        
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be a positive number or None")
++        
++        #: Maximum time in seconds to wait for cleanup functions.
++        #: None means no timeout (synchronous cleanup).
++        self.cleanup_timeout: float | None = cleanup_timeout
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -600,14 +618,68 @@ class Context:
+ 
+         :param f: The function to execute on teardown.
+         """
++        self._close_callbacks.append(f)
+         return self._exit_stack.callback(f)
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        If :attr:`cleanup_timeout` is set, this method will wait at most
++        that many seconds for cleanup to complete. If cleanup does not
++        complete within the timeout, a warning is issued but no exception
++        is raised. New callbacks registered during cleanup belong to the
++        next close() call.
+         """
+-        self._exit_stack.close()
++        import threading
++        import warnings
++        
++        if self.cleanup_timeout is None:
++            # No timeout: synchronous cleanup
++            self._exit_stack.close()
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
++            return
++        
++        # Capture the current state of callbacks and exit stack
++        # These are the callbacks that belong to this close() call
++        callbacks_to_run = list(self._close_callbacks)
++        exit_stack_to_close = self._exit_stack
++        
++        # Create a thread to run the cleanup with timeout
++        cleanup_done = threading.Event()
++        cleanup_error = [None]
++        
++        def run_cleanup():
++            try:
++                exit_stack_to_close.close()
++            except Exception as e:
++                cleanup_error[0] = e
++            finally:
++                cleanup_done.set()
++        
++        # Start the cleanup thread
++        thread = threading.Thread(target=run_cleanup, daemon=True)
++        thread.start()
++        
++        # Wait for cleanup with timeout
++        if not cleanup_done.wait(timeout=self.cleanup_timeout):
++            # Timeout reached - issue warning but don't raise exception
++            warnings.warn(
++                f"Cleanup did not complete within {self.cleanup_timeout} seconds. "
++                f"The cleanup thread is still running.",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++            # Don't join the thread - let it finish in the background
++            # Any errors from the background thread will be lost unless we track them
++            # For now, we just warn about the timeout
++        else:
++            # Cleanup completed - check for errors
++            if cleanup_error[0] is not None:
++                raise cleanup_error[0]
++        
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 

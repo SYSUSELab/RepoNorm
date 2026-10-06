@@ -1,0 +1,120 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed1..7768ed665 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,12 @@
+ import asyncio
++import hashlib
+ import inspect
+-from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
++import json
++import math
++from typing import TYPE_CHECKING, Any, Callable, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, PrivateAttr, TypeAdapter, create_model
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -254,10 +257,63 @@ class Tool(Type):
+         return f"{self.name}{desc} {arg_desc}"
+ 
+ 
++def _canonicalize_args(args: Any) -> Any:
++    """Canonicalize arguments for consistent fingerprinting.
++
++    This function normalizes arguments to ensure that identical calls produce
++    the same fingerprint, ignoring harmless differences like:
++    - Dictionary key order
++    - Tuple vs list differences
++    - Leading/trailing whitespace in strings
++
++    Args:
++        args: The arguments to canonicalize
++
++    Returns:
++        Canonicalized arguments with consistent representation
++    """
++    if isinstance(args, dict):
++        if any(not isinstance(key, str) for key in args):
++            raise ValueError("Fingerprint argument keys must be strings")
++        return {k: _canonicalize_args(v) for k, v in sorted(args.items())}
++    elif isinstance(args, list):
++        # Canonicalize each element in the list
++        return [_canonicalize_args(item) for item in args]
++    elif isinstance(args, tuple):
++        # Convert tuples to lists for consistency
++        return [_canonicalize_args(item) for item in args]
++    elif isinstance(args, str):
++        # Strip leading/trailing whitespace
++        return args.strip()
++    else:
++        if args is not None and type(args) not in (int, float, bool):
++            raise ValueError("Fingerprint arguments must be JSON values or tuples")
++        if isinstance(args, float) and not math.isfinite(args):
++            raise ValueError("Fingerprint arguments must be finite")
++        return args
++
++
+ class ToolCalls(Type):
++    """Validated tool calls with stable execution serialization and computed identity metadata."""
++
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
++        _fingerprint: str = PrivateAttr()
++
++        def __init__(self, **data):
++            super().__init__(**data)
++            canonical = {"name": self.name, "args": _canonicalize_args(self.args)}
++            encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
++            self._fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
++
++        @property
++        def fingerprint(self):
++            return self._fingerprint
++
++        @property
++        def id(self):
++            return self._fingerprint[:8]
+ 
+     tool_calls: list[ToolCall]
+ 
+@@ -338,7 +394,7 @@ def _resolve_json_schema_reference(schema: dict) -> dict:
+ 
+ def convert_input_schema_to_tool_args(
+     schema: dict[str, Any],
+-) -> tuple[dict[str, Any], dict[str, Type], dict[str, str]]:
++) -> tuple[dict[str, Any], dict[str, type], dict[str, str]]:
+     """Convert an input json schema to tool arguments compatible with DSPy Tool.
+ 
+     Args:
+diff --git a/tests/adapters/test_tool_fingerprint_contribution.py b/tests/adapters/test_tool_fingerprint_contribution.py
+new file mode 100644
+index 000000000..636e8f7e5
+--- /dev/null
++++ b/tests/adapters/test_tool_fingerprint_contribution.py
+@@ -0,0 +1,22 @@
++import pytest
++
++from dspy.adapters.types.tool import ToolCalls
++
++
++def test_fingerprint_is_stable_read_only_and_not_serialized():
++    call = ToolCalls.ToolCall(name="search", args={"b": (" x ", 2), "a": True})
++    same = ToolCalls.ToolCall(name="search", args={"a": True, "b": ["x", 2]})
++
++    assert call.fingerprint == same.fingerprint
++    assert call.id == call.fingerprint[:8]
++    original = call.fingerprint
++    call.args["a"] = False
++    assert call.fingerprint == original
++    assert set(call.model_dump()) == {"name", "args"}
++    with pytest.raises(AttributeError):
++        call.id = "override"
++
++
++def test_fingerprint_rejects_non_json_values():
++    with pytest.raises(ValueError):
++        ToolCalls.ToolCall(name="bad", args={"value": float("inf")})

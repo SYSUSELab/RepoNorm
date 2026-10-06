@@ -1,0 +1,161 @@
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 6fd9e54..f6287ce 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -270,9 +270,16 @@ class ShellComplete:
+         :param args: List of complete args before the incomplete value.
+         :param incomplete: Value being completed. May be empty.
+         """
+-        ctx = _resolve_context(self.cli, self.ctx_args, self.prog_name, args)
+-        obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
+-        return obj.shell_complete(ctx, incomplete)
++        ctx, all_contexts = _resolve_context(self.cli, self.ctx_args, self.prog_name, args)
++        try:
++            obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++            return obj.shell_complete(ctx, incomplete)
++        finally:
++            # Close all contexts to release resources (e.g., files) opened
++            # during context resolution. This must happen even if an exception
++            # occurs during completion.
++            for c in reversed(all_contexts):
++                c.close()
+ 
+     def format_completion(self, item: CompletionItem) -> str:
+         """Format a completion item into the form recognized by the
+@@ -534,7 +541,7 @@ def _resolve_context(
+     ctx_args: cabc.MutableMapping[str, t.Any],
+     prog_name: str,
+     args: list[str],
+-) -> Context:
++) -> tuple[Context, list[Context]]:
+     """Produce the context hierarchy starting with the command and
+     traversing the complete arguments. This only follows the commands,
+     it doesn't trigger input prompts or callbacks.
+@@ -542,9 +549,12 @@ def _resolve_context(
+     :param cli: Command being called.
+     :param prog_name: Name of the executable in the shell.
+     :param args: List of complete args before the incomplete value.
++    :return: A tuple of the final context and a list of all contexts
++             created during resolution (including the final one).
+     """
+     ctx_args["resilient_parsing"] = True
+     ctx = cli.make_context(prog_name, args.copy(), **ctx_args)
++    all_contexts: list[Context] = [ctx]
+     args = ctx._protected_args + ctx.args
+ 
+     while args:
+@@ -555,9 +565,10 @@ def _resolve_context(
+                 name, cmd, args = command.resolve_command(ctx, args)
+ 
+                 if cmd is None:
+-                    return ctx
++                    return ctx, all_contexts
+ 
+                 ctx = cmd.make_context(name, args, parent=ctx, resilient_parsing=True)
++                all_contexts.append(ctx)
+                 args = ctx._protected_args + ctx.args
+             else:
+                 sub_ctx = ctx
+@@ -566,7 +577,7 @@ def _resolve_context(
+                     name, cmd, args = command.resolve_command(ctx, args)
+ 
+                     if cmd is None:
+-                        return ctx
++                        return ctx, all_contexts
+ 
+                     sub_ctx = cmd.make_context(
+                         name,
+@@ -576,6 +587,7 @@ def _resolve_context(
+                         allow_interspersed_args=False,
+                         resilient_parsing=True,
+                     )
++                    all_contexts.append(sub_ctx)
+                     args = sub_ctx.args
+ 
+                 ctx = sub_ctx
+@@ -583,8 +595,7 @@ def _resolve_context(
+         else:
+             break
+ 
+-    return ctx
+-
++    return ctx, all_contexts
+ 
+ def _resolve_incomplete(
+     ctx: Context, args: list[str], incomplete: str
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index 3e7a2bd..b6adab2 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -414,3 +414,71 @@ def test_add_completion_class_decorator():
+     # Using `add_completion_class` as a decorator adds the new shell immediately
+     assert "mysh" in click.shell_completion._available_shells
+     assert click.shell_completion._available_shells["mysh"] is MyshComplete
++
++
++def test_file_option_no_resource_warning():
++    """Test that file options don't leave unclosed files during completion."""
++    import warnings
++    import gc
++    
++    cli = Command("cli", params=[Option(["--file"], type=File())])
++    
++    # Capture warnings
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        # Trigger completion which would open the file
++        out = _get_completions(cli, ["--file", "/etc/passwd"], "")
++        
++        # Force garbage collection
++        gc.collect()
++        
++        # Check for ResourceWarnings about unclosed files
++        resource_warnings = [warning for warning in w if issubclass(warning.category, ResourceWarning)]
++        assert len(resource_warnings) == 0, f"Found {len(resource_warnings)} ResourceWarning(s): {[str(w.message) for w in resource_warnings]}"
++
++def test_nested_subcommand_file_option_no_resource_warning():
++    """Test that file options in nested subcommands don't leave unclosed files."""
++    import warnings
++    import gc
++    
++    cli = Group("cli", commands=[Command("subcmd", params=[Option(["--file"], type=File())])])
++    
++    # Capture warnings
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        # Trigger completion for nested subcommand
++        out = _get_completions(cli, ["subcmd", "--file", "/etc/passwd"], "")
++        
++        # Force garbage collection
++        gc.collect()
++        
++        # Check for ResourceWarnings about unclosed files
++        resource_warnings = [warning for warning in w if issubclass(warning.category, ResourceWarning)]
++        assert len(resource_warnings) == 0, f"Found {len(resource_warnings)} ResourceWarning(s): {[str(w.message) for w in resource_warnings]}"
++
++
++def test_chained_command_group_file_option_no_resource_warning():
++    """Test that file options in chained command groups don't leave unclosed files."""
++    import warnings
++    import gc
++    
++    cmd1 = Command("cmd1", params=[Option(["--file"], type=File())])
++    cmd2 = Command("cmd2", params=[Option(["--file2"], type=File())])
++    cli = Group("cli", chain=True, commands=[cmd1, cmd2])
++    
++    # Capture warnings
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        
++        # Trigger completion for chained command
++        out = _get_completions(cli, ["cmd1", "--file", "/etc/passwd"], "")
++        
++        # Force garbage collection
++        gc.collect()
++        
++        # Check for ResourceWarnings about unclosed files
++        resource_warnings = [warning for warning in w if issubclass(warning.category, ResourceWarning)]
++        assert len(resource_warnings) == 0, f"Found {len(resource_warnings)} ResourceWarning(s): {[str(w.message) for w in resource_warnings]}"
++
