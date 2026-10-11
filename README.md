@@ -1,5 +1,8 @@
 # RepoNorm
 
+[HF dataset](https://huggingface.co/datasets/SYSUSELab/RepoNormBench) ·
+[Leaderboard](https://huggingface.co/spaces/SYSUSELab/RepoNormBench-Leaderboard)
+
 RepoNorm acquires repository-specific development norms from a fixed source
 snapshot and its Git history, grounds them in repository evidence, and exports
 static knowledge for coding agents. This repository contains its implementation,
@@ -49,6 +52,11 @@ The public conditions are `raw`, `codewiki`, and `reponorm`. The coding models a
 DeepSeek V4 Flash, Qwen3.5 Flash, and Gemini 3.1 Flash Lite. Exact model aliases,
 provider routes, budgets, and settings are retained with each selected execution;
 new calls to a hosted model are not deterministic replays of the saved results.
+
+New experiments use the corrected default tests, including `JIN1559-F07`.
+The earlier `message-literal` test variant is retained only for historical
+reproduction. Included paper results remain unchanged; the HF leaderboard uses
+the corrected evaluation, so its scores may differ from the paper archive.
 
 ## Repository layout
 

@@ -89,8 +89,7 @@ def plan(model: str, conditions: list[str], selected: list[dict], output: Path, 
             directory.mkdir(parents=True)
             handoff = stage_knowledge(condition, task, directory / "knowledge")
             pool = task_pool(task)
-            if previous["test_variant"] != "default":
-                pool["tests_variant"] = "variants/message-literal-tests.patch"
+            # New experiments use corrected defaults, not historical test variants.
             repository = REPOSITORIES / task["snapshot_id"]
             identity = repository_identity(repository) if repository.exists() else None
             if live and identity is None:

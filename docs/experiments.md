@@ -74,8 +74,12 @@ stages repository history and mounts static Markdown knowledge read-only.
 The coding container cannot see hidden test patches, reference patches, or norm
 labels. Submitted test changes are handled separately from hidden evaluation.
 
-The public runner binds the saved test variant for each selected historical
-model–task configuration. New results are new observations: hosted model aliases
+New coding runs use the corrected default tests for every model and condition,
+including `JIN1559-F07`; they do not inherit historical test variants from saved
+executions. The earlier `message-literal` variant and the paper's recorded results
+remain available for historical reproduction. The HF leaderboard uses corrected
+evaluation results and is separate from that unchanged paper archive.
+New results are new observations: hosted model aliases
 and provider backends cannot guarantee identical weights or responses.
 
 ## Score submitted patches

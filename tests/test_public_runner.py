@@ -7,6 +7,17 @@ import pytest
 from runner import __main__ as controller
 
 
+@pytest.mark.parametrize("model", ["deepseek", "qwen", "gemini"])
+def test_new_plans_do_not_inherit_historical_test_variants(tmp_path, model):
+    selected = controller.tasks(["JIN1559-F07"])
+    specs = controller.plan(model, list(controller.CONDITIONS), selected, tmp_path / "plan")
+    assert len(specs) == 3
+    for path in specs:
+        spec = json.loads(path.read_text())
+        assert "tests_variant" not in spec["pool"]
+        assert spec["pool"] == controller.task_pool(selected[0])
+
+
 @pytest.mark.parametrize("outcome, completed", [
     ("infrastructure_error", False),
     ("knowledge_isolation_error", False),
