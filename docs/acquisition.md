@@ -77,6 +77,34 @@ packages are skipped unless `--rerun` requests a fresh directory. Snapshot
 preparation does not supply benchmark statements, labels, or reference patches
 to acquisition.
 
+## Explore an extracted package
+
+Start the read-only English knowledge explorer after a build. From the repository
+root, run one of the following commands.
+
+```bash
+# Inspect every canonical claim in your build
+repo-memory-v3 visualize outputs/example/package
+
+# Inspect one exported or reviewed consumer view
+repo-memory-v3 visualize outputs/example/package/consumers/accepted_only
+
+# Try the included tiktoken snapshot immediately
+repo-memory-v3 visualize data/knowledge/reponorm/tik-4560a8896f5f.zip
+```
+
+The command opens a local browser tab and prints its URL. Use `--no-open` for a
+terminal-only launch and `--port 8765` to choose a port. Press Ctrl+C to stop.
+The viewer reads the selected package once at startup and works offline.
+
+The overview shows extraction coverage, claim count, and the number of distinct scope patterns. Select **Scope patterns** to see
+which paths have the most claims and narrow the catalog to one scope. Search by rule, claim ID, or path,
+filter by strength or status, and open a row for conditions, exceptions, and
+evidence. A build directory includes accepted, review, and rejected claims. A
+consumer directory or release archive shows the claims exposed by that view.
+For released ZIPs, keep the adjacent release layout to retain snapshot and coverage
+metadata from `data/knowledge/manifest.json`.
+
 ## Validate, export, and review
 
 ```bash

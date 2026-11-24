@@ -42,6 +42,7 @@ input and its provenance.
 
 - [Acquire norms](docs/acquisition.md): analyze a repository, validate a package,
   and export an agent-readable view; includes an offline smoke example.
+- [Explore a knowledge package](docs/acquisition.md#explore-an-extracted-package): browse extracted rules, scopes, and supporting evidence in a local web interface.
 - [Run coding and scoring experiments](docs/experiments.md): prepare frozen
   snapshots and Docker resources, use the released knowledge, generate a
   CodeWiki baseline, and score new patches.

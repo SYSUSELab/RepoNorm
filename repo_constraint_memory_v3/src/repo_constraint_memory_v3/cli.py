@@ -330,6 +330,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Return 1 when the valid source package is truthfully partial.",
     )
 
+    visualize = subparsers.add_parser(
+        "visualize", help="Explore an extracted knowledge package in a local browser.",
+    )
+    visualize.add_argument("package", type=Path, help="Build directory, consumer view, or RepoNorm ZIP archive.")
+    visualize.add_argument("--port", type=int, default=0, help="Local port (default: an available port).")
+    visualize.add_argument("--no-open", action="store_true", help="Print the URL without opening a browser.")
+
     review = subparsers.add_parser(
         "review",
         help="Start an optional local developer review; no model is called.",
@@ -1275,6 +1282,17 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _export_consumer(args)
     if args.command == "validate-consumer":
         return _validate_consumer(args)
+    if args.command == "visualize":
+        from repo_constraint_memory_v3.explorer.server import serve
+
+        try:
+            serve(args.package, args.port, not args.no_open)
+        except (OSError, ValueError) as error:
+            print(f"visualize failed: {error}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            pass
+        return 0
     if args.command == "review":
         return _review(args)
     if args.command == "review-publish":
