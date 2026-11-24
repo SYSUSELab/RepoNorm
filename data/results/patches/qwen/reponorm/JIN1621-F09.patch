@@ -1,0 +1,981 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..ffb6eba 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -4,6 +4,7 @@ sources.
+ import importlib.util
+ import os
+ import sys
++import threading
+ import typing as t
+ import weakref
+ import zipimport
+@@ -97,6 +98,154 @@ class BaseLoader:
+             )
+         raise TemplateNotFound(template)
+ 
++    def _normalize_path(self, path: str) -> str:
++        """Normalize a path to canonical form."""
++        return os.path.normpath(path).replace(os.sep, "/")
++
++    def _get_relative_name(self, abs_path: str) -> t.Optional[str]:
++        """Get the template name from an absolute path."""
++        for searchpath in self.searchpath:
++            if abs_path.startswith(searchpath + os.sep) or abs_path == searchpath:
++                rel = abs_path[len(searchpath):]
++                if rel.startswith(os.sep):
++                    rel = rel[1:]
++                return self._normalize_path(rel)
++        return None
++
++    def _scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and return changed template names."""
++        changed = []
++        new_cache_mtime = {}
++
++        for searchpath in self.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.followlinks):
++                for filename in filenames:
++                    abs_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(abs_path)
++                    except OSError:
++                        continue
++
++                    rel_name = self._get_relative_name(abs_path)
++                    if rel_name is None:
++                        continue
++
++                    new_cache_mtime[rel_name] = mtime
++
++                    if rel_name in self._cache_mtime:
++                        if self._cache_mtime[rel_name] != mtime:
++                            changed.append(rel_name)
++                    else:
++                        changed.append(rel_name)
++
++        # Check for deleted templates
++        for name in list(self._cache_mtime.keys()):
++            if name not in new_cache_mtime:
++                changed.append(name)
++
++        self._cache_mtime = new_cache_mtime
++        return changed
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and invalidate changed entries.
++
++        Returns a list of canonical template names that were changed or added.
++        """
++        if not self.auto_reload:
++            return []
++        return self._scan_once()
++
++    def invalidate_changed(self, paths: t.Sequence[str]) -> t.List[str]:
++        """Invalidate cache entries for the given absolute paths.
++
++        Args:
++            paths: Absolute paths to invalidate. Paths outside search roots are ignored.
++
++        Returns:
++            A list of canonical template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++        invalidated = []
++        with self._lock:
++            for path in paths:
++                rel_name = self._get_relative_name(path)
++                if rel_name is not None and rel_name in self._cache_mtime:
++                    del self._cache_mtime[rel_name]
++                    invalidated.append(rel_name)
++        return invalidated
++
++    def _track_environment(self, environment: "Environment") -> None:
++        """Weakly track an environment bound to this loader."""
++        if not self.auto_reload:
++            return
++        ref = weakref.ref(environment, lambda ref: self._on_env_garbage_collected(ref))
++        with self._lock:
++            self._environments.add(ref)
++
++    def _on_env_garbage_collected(self, ref: weakref.ref) -> None:
++        """Remove environment from tracking when it's garbage collected."""
++        with self._lock:
++            self._environments.discard(ref)
++
++    def _monitor_loop(self) -> None:
++        """Background thread loop that polls for template changes."""
++        while not self._stop_event.is_set():
++            try:
++                changed = self._scan_once()
++                if changed:
++                    self._invalidate_changed(changed)
++            except Exception:
++                # Background errors should not terminate the monitor
++                pass
++            self._stop_event.wait(0.5)
++
++    def _invalidate_changed(self, names: t.List[str]) -> None:
++        """Invalidate cache entries for the given template names."""
++        for env_ref in list(self._environments):
++            env = env_ref()
++            if env is not None and env.cache is not None:
++                for name in names:
++                    cache_key = (env_ref, name)
++                    env.cache.pop(cache_key, None)
++
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return
++            self._stop_event.clear()
++            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            self._thread.start()
++
++    def close(self) -> None:
++        """Stop the monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect.
++        """
++        with self._lock:
++            if self._thread is None or not self._thread.is_alive():
++                return
++            self._stop_event.set()
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring if not already running."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++
+     def list_templates(self) -> t.List[str]:
+         """Iterates over all templates.  If the loader does not support that
+         it should raise a :exc:`TypeError` which is the default behavior.
+@@ -170,6 +319,9 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param auto_reload: If enabled, start a polling monitor that checks
++        for template changes every 0.5 seconds and proactively invalidates
++        the cache when changes are detected.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
+@@ -180,6 +332,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        auto_reload: bool = True,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,9 +340,20 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.auto_reload = auto_reload
++        self._lock = threading.Lock()
++        self._thread: t.Optional[threading.Thread] = None
++        self._stop_event = threading.Event()
++        self._environments: t.Set[weakref.ref] = set()
++        self._cache_mtime: t.Dict[str, float] = {}
+ 
+     def get_source(
+         self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        return self._get_source_impl(environment, template)
++
++    def _get_source_impl(
++        self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+@@ -213,6 +377,154 @@ class FileSystemLoader(BaseLoader):
+             return contents, filename, uptodate
+         raise TemplateNotFound(template)
+ 
++    def _normalize_path(self, path: str) -> str:
++        """Normalize a path to canonical form."""
++        return os.path.normpath(path).replace(os.sep, "/")
++
++    def _get_relative_name(self, abs_path: str) -> t.Optional[str]:
++        """Get the template name from an absolute path."""
++        for searchpath in self.searchpath:
++            if abs_path.startswith(searchpath + os.sep) or abs_path == searchpath:
++                rel = abs_path[len(searchpath):]
++                if rel.startswith(os.sep):
++                    rel = rel[1:]
++                return self._normalize_path(rel)
++        return None
++
++    def _scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and return changed template names."""
++        changed = []
++        new_cache_mtime = {}
++
++        for searchpath in self.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.followlinks):
++                for filename in filenames:
++                    abs_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(abs_path)
++                    except OSError:
++                        continue
++
++                    rel_name = self._get_relative_name(abs_path)
++                    if rel_name is None:
++                        continue
++
++                    new_cache_mtime[rel_name] = mtime
++
++                    if rel_name in self._cache_mtime:
++                        if self._cache_mtime[rel_name] != mtime:
++                            changed.append(rel_name)
++                    else:
++                        changed.append(rel_name)
++
++        # Check for deleted templates
++        for name in list(self._cache_mtime.keys()):
++            if name not in new_cache_mtime:
++                changed.append(name)
++
++        self._cache_mtime = new_cache_mtime
++        return changed
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and invalidate changed entries.
++
++        Returns a list of canonical template names that were changed or added.
++        """
++        if not self.auto_reload:
++            return []
++        return self._scan_once()
++
++    def invalidate_changed(self, paths: t.Sequence[str]) -> t.List[str]:
++        """Invalidate cache entries for the given absolute paths.
++
++        Args:
++            paths: Absolute paths to invalidate. Paths outside search roots are ignored.
++
++        Returns:
++            A list of canonical template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++        invalidated = []
++        with self._lock:
++            for path in paths:
++                rel_name = self._get_relative_name(path)
++                if rel_name is not None and rel_name in self._cache_mtime:
++                    del self._cache_mtime[rel_name]
++                    invalidated.append(rel_name)
++        return invalidated
++
++    def _track_environment(self, environment: "Environment") -> None:
++        """Weakly track an environment bound to this loader."""
++        if not self.auto_reload:
++            return
++        ref = weakref.ref(environment, lambda ref: self._on_env_garbage_collected(ref))
++        with self._lock:
++            self._environments.add(ref)
++
++    def _on_env_garbage_collected(self, ref: weakref.ref) -> None:
++        """Remove environment from tracking when it's garbage collected."""
++        with self._lock:
++            self._environments.discard(ref)
++
++    def _monitor_loop(self) -> None:
++        """Background thread loop that polls for template changes."""
++        while not self._stop_event.is_set():
++            try:
++                changed = self._scan_once()
++                if changed:
++                    self._invalidate_changed(changed)
++            except Exception:
++                # Background errors should not terminate the monitor
++                pass
++            self._stop_event.wait(0.5)
++
++    def _invalidate_changed(self, names: t.List[str]) -> None:
++        """Invalidate cache entries for the given template names."""
++        for env_ref in list(self._environments):
++            env = env_ref()
++            if env is not None and env.cache is not None:
++                for name in names:
++                    cache_key = (env_ref, name)
++                    env.cache.pop(cache_key, None)
++
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return
++            self._stop_event.clear()
++            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            self._thread.start()
++
++    def close(self) -> None:
++        """Stop the monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect.
++        """
++        with self._lock:
++            if self._thread is None or not self._thread.is_alive():
++                return
++            self._stop_event.set()
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring if not already running."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++
+     def list_templates(self) -> t.List[str]:
+         found = set()
+         for searchpath in self.searchpath:
+@@ -356,6 +668,154 @@ class PackageLoader(BaseLoader):
+ 
+         return source.decode(self.encoding), p, up_to_date
+ 
++    def _normalize_path(self, path: str) -> str:
++        """Normalize a path to canonical form."""
++        return os.path.normpath(path).replace(os.sep, "/")
++
++    def _get_relative_name(self, abs_path: str) -> t.Optional[str]:
++        """Get the template name from an absolute path."""
++        for searchpath in self.searchpath:
++            if abs_path.startswith(searchpath + os.sep) or abs_path == searchpath:
++                rel = abs_path[len(searchpath):]
++                if rel.startswith(os.sep):
++                    rel = rel[1:]
++                return self._normalize_path(rel)
++        return None
++
++    def _scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and return changed template names."""
++        changed = []
++        new_cache_mtime = {}
++
++        for searchpath in self.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.followlinks):
++                for filename in filenames:
++                    abs_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(abs_path)
++                    except OSError:
++                        continue
++
++                    rel_name = self._get_relative_name(abs_path)
++                    if rel_name is None:
++                        continue
++
++                    new_cache_mtime[rel_name] = mtime
++
++                    if rel_name in self._cache_mtime:
++                        if self._cache_mtime[rel_name] != mtime:
++                            changed.append(rel_name)
++                    else:
++                        changed.append(rel_name)
++
++        # Check for deleted templates
++        for name in list(self._cache_mtime.keys()):
++            if name not in new_cache_mtime:
++                changed.append(name)
++
++        self._cache_mtime = new_cache_mtime
++        return changed
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and invalidate changed entries.
++
++        Returns a list of canonical template names that were changed or added.
++        """
++        if not self.auto_reload:
++            return []
++        return self._scan_once()
++
++    def invalidate_changed(self, paths: t.Sequence[str]) -> t.List[str]:
++        """Invalidate cache entries for the given absolute paths.
++
++        Args:
++            paths: Absolute paths to invalidate. Paths outside search roots are ignored.
++
++        Returns:
++            A list of canonical template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++        invalidated = []
++        with self._lock:
++            for path in paths:
++                rel_name = self._get_relative_name(path)
++                if rel_name is not None and rel_name in self._cache_mtime:
++                    del self._cache_mtime[rel_name]
++                    invalidated.append(rel_name)
++        return invalidated
++
++    def _track_environment(self, environment: "Environment") -> None:
++        """Weakly track an environment bound to this loader."""
++        if not self.auto_reload:
++            return
++        ref = weakref.ref(environment, lambda ref: self._on_env_garbage_collected(ref))
++        with self._lock:
++            self._environments.add(ref)
++
++    def _on_env_garbage_collected(self, ref: weakref.ref) -> None:
++        """Remove environment from tracking when it's garbage collected."""
++        with self._lock:
++            self._environments.discard(ref)
++
++    def _monitor_loop(self) -> None:
++        """Background thread loop that polls for template changes."""
++        while not self._stop_event.is_set():
++            try:
++                changed = self._scan_once()
++                if changed:
++                    self._invalidate_changed(changed)
++            except Exception:
++                # Background errors should not terminate the monitor
++                pass
++            self._stop_event.wait(0.5)
++
++    def _invalidate_changed(self, names: t.List[str]) -> None:
++        """Invalidate cache entries for the given template names."""
++        for env_ref in list(self._environments):
++            env = env_ref()
++            if env is not None and env.cache is not None:
++                for name in names:
++                    cache_key = (env_ref, name)
++                    env.cache.pop(cache_key, None)
++
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return
++            self._stop_event.clear()
++            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            self._thread.start()
++
++    def close(self) -> None:
++        """Stop the monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect.
++        """
++        with self._lock:
++            if self._thread is None or not self._thread.is_alive():
++                return
++            self._stop_event.set()
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring if not already running."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++
+     def list_templates(self) -> t.List[str]:
+         results: t.List[str] = []
+ 
+@@ -412,6 +872,154 @@ class DictLoader(BaseLoader):
+             return source, None, lambda: source == self.mapping.get(template)
+         raise TemplateNotFound(template)
+ 
++    def _normalize_path(self, path: str) -> str:
++        """Normalize a path to canonical form."""
++        return os.path.normpath(path).replace(os.sep, "/")
++
++    def _get_relative_name(self, abs_path: str) -> t.Optional[str]:
++        """Get the template name from an absolute path."""
++        for searchpath in self.searchpath:
++            if abs_path.startswith(searchpath + os.sep) or abs_path == searchpath:
++                rel = abs_path[len(searchpath):]
++                if rel.startswith(os.sep):
++                    rel = rel[1:]
++                return self._normalize_path(rel)
++        return None
++
++    def _scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and return changed template names."""
++        changed = []
++        new_cache_mtime = {}
++
++        for searchpath in self.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.followlinks):
++                for filename in filenames:
++                    abs_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(abs_path)
++                    except OSError:
++                        continue
++
++                    rel_name = self._get_relative_name(abs_path)
++                    if rel_name is None:
++                        continue
++
++                    new_cache_mtime[rel_name] = mtime
++
++                    if rel_name in self._cache_mtime:
++                        if self._cache_mtime[rel_name] != mtime:
++                            changed.append(rel_name)
++                    else:
++                        changed.append(rel_name)
++
++        # Check for deleted templates
++        for name in list(self._cache_mtime.keys()):
++            if name not in new_cache_mtime:
++                changed.append(name)
++
++        self._cache_mtime = new_cache_mtime
++        return changed
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and invalidate changed entries.
++
++        Returns a list of canonical template names that were changed or added.
++        """
++        if not self.auto_reload:
++            return []
++        return self._scan_once()
++
++    def invalidate_changed(self, paths: t.Sequence[str]) -> t.List[str]:
++        """Invalidate cache entries for the given absolute paths.
++
++        Args:
++            paths: Absolute paths to invalidate. Paths outside search roots are ignored.
++
++        Returns:
++            A list of canonical template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++        invalidated = []
++        with self._lock:
++            for path in paths:
++                rel_name = self._get_relative_name(path)
++                if rel_name is not None and rel_name in self._cache_mtime:
++                    del self._cache_mtime[rel_name]
++                    invalidated.append(rel_name)
++        return invalidated
++
++    def _track_environment(self, environment: "Environment") -> None:
++        """Weakly track an environment bound to this loader."""
++        if not self.auto_reload:
++            return
++        ref = weakref.ref(environment, lambda ref: self._on_env_garbage_collected(ref))
++        with self._lock:
++            self._environments.add(ref)
++
++    def _on_env_garbage_collected(self, ref: weakref.ref) -> None:
++        """Remove environment from tracking when it's garbage collected."""
++        with self._lock:
++            self._environments.discard(ref)
++
++    def _monitor_loop(self) -> None:
++        """Background thread loop that polls for template changes."""
++        while not self._stop_event.is_set():
++            try:
++                changed = self._scan_once()
++                if changed:
++                    self._invalidate_changed(changed)
++            except Exception:
++                # Background errors should not terminate the monitor
++                pass
++            self._stop_event.wait(0.5)
++
++    def _invalidate_changed(self, names: t.List[str]) -> None:
++        """Invalidate cache entries for the given template names."""
++        for env_ref in list(self._environments):
++            env = env_ref()
++            if env is not None and env.cache is not None:
++                for name in names:
++                    cache_key = (env_ref, name)
++                    env.cache.pop(cache_key, None)
++
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return
++            self._stop_event.clear()
++            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            self._thread.start()
++
++    def close(self) -> None:
++        """Stop the monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect.
++        """
++        with self._lock:
++            if self._thread is None or not self._thread.is_alive():
++                return
++            self._stop_event.set()
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring if not already running."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++
+     def list_templates(self) -> t.List[str]:
+         return sorted(self.mapping)
+ 
+@@ -516,6 +1124,154 @@ class PrefixLoader(BaseLoader):
+             # (the one that includes the prefix)
+             raise TemplateNotFound(name) from e
+ 
++    def _normalize_path(self, path: str) -> str:
++        """Normalize a path to canonical form."""
++        return os.path.normpath(path).replace(os.sep, "/")
++
++    def _get_relative_name(self, abs_path: str) -> t.Optional[str]:
++        """Get the template name from an absolute path."""
++        for searchpath in self.searchpath:
++            if abs_path.startswith(searchpath + os.sep) or abs_path == searchpath:
++                rel = abs_path[len(searchpath):]
++                if rel.startswith(os.sep):
++                    rel = rel[1:]
++                return self._normalize_path(rel)
++        return None
++
++    def _scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and return changed template names."""
++        changed = []
++        new_cache_mtime = {}
++
++        for searchpath in self.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.followlinks):
++                for filename in filenames:
++                    abs_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(abs_path)
++                    except OSError:
++                        continue
++
++                    rel_name = self._get_relative_name(abs_path)
++                    if rel_name is None:
++                        continue
++
++                    new_cache_mtime[rel_name] = mtime
++
++                    if rel_name in self._cache_mtime:
++                        if self._cache_mtime[rel_name] != mtime:
++                            changed.append(rel_name)
++                    else:
++                        changed.append(rel_name)
++
++        # Check for deleted templates
++        for name in list(self._cache_mtime.keys()):
++            if name not in new_cache_mtime:
++                changed.append(name)
++
++        self._cache_mtime = new_cache_mtime
++        return changed
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and invalidate changed entries.
++
++        Returns a list of canonical template names that were changed or added.
++        """
++        if not self.auto_reload:
++            return []
++        return self._scan_once()
++
++    def invalidate_changed(self, paths: t.Sequence[str]) -> t.List[str]:
++        """Invalidate cache entries for the given absolute paths.
++
++        Args:
++            paths: Absolute paths to invalidate. Paths outside search roots are ignored.
++
++        Returns:
++            A list of canonical template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++        invalidated = []
++        with self._lock:
++            for path in paths:
++                rel_name = self._get_relative_name(path)
++                if rel_name is not None and rel_name in self._cache_mtime:
++                    del self._cache_mtime[rel_name]
++                    invalidated.append(rel_name)
++        return invalidated
++
++    def _track_environment(self, environment: "Environment") -> None:
++        """Weakly track an environment bound to this loader."""
++        if not self.auto_reload:
++            return
++        ref = weakref.ref(environment, lambda ref: self._on_env_garbage_collected(ref))
++        with self._lock:
++            self._environments.add(ref)
++
++    def _on_env_garbage_collected(self, ref: weakref.ref) -> None:
++        """Remove environment from tracking when it's garbage collected."""
++        with self._lock:
++            self._environments.discard(ref)
++
++    def _monitor_loop(self) -> None:
++        """Background thread loop that polls for template changes."""
++        while not self._stop_event.is_set():
++            try:
++                changed = self._scan_once()
++                if changed:
++                    self._invalidate_changed(changed)
++            except Exception:
++                # Background errors should not terminate the monitor
++                pass
++            self._stop_event.wait(0.5)
++
++    def _invalidate_changed(self, names: t.List[str]) -> None:
++        """Invalidate cache entries for the given template names."""
++        for env_ref in list(self._environments):
++            env = env_ref()
++            if env is not None and env.cache is not None:
++                for name in names:
++                    cache_key = (env_ref, name)
++                    env.cache.pop(cache_key, None)
++
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return
++            self._stop_event.clear()
++            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            self._thread.start()
++
++    def close(self) -> None:
++        """Stop the monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect.
++        """
++        with self._lock:
++            if self._thread is None or not self._thread.is_alive():
++                return
++            self._stop_event.set()
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring if not already running."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++
+     def list_templates(self) -> t.List[str]:
+         result = []
+         for prefix, loader in self.mapping.items():
+@@ -565,6 +1321,154 @@ class ChoiceLoader(BaseLoader):
+                 pass
+         raise TemplateNotFound(name)
+ 
++    def _normalize_path(self, path: str) -> str:
++        """Normalize a path to canonical form."""
++        return os.path.normpath(path).replace(os.sep, "/")
++
++    def _get_relative_name(self, abs_path: str) -> t.Optional[str]:
++        """Get the template name from an absolute path."""
++        for searchpath in self.searchpath:
++            if abs_path.startswith(searchpath + os.sep) or abs_path == searchpath:
++                rel = abs_path[len(searchpath):]
++                if rel.startswith(os.sep):
++                    rel = rel[1:]
++                return self._normalize_path(rel)
++        return None
++
++    def _scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and return changed template names."""
++        changed = []
++        new_cache_mtime = {}
++
++        for searchpath in self.searchpath:
++            for dirpath, _, filenames in os.walk(searchpath, followlinks=self.followlinks):
++                for filename in filenames:
++                    abs_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(abs_path)
++                    except OSError:
++                        continue
++
++                    rel_name = self._get_relative_name(abs_path)
++                    if rel_name is None:
++                        continue
++
++                    new_cache_mtime[rel_name] = mtime
++
++                    if rel_name in self._cache_mtime:
++                        if self._cache_mtime[rel_name] != mtime:
++                            changed.append(rel_name)
++                    else:
++                        changed.append(rel_name)
++
++        # Check for deleted templates
++        for name in list(self._cache_mtime.keys()):
++            if name not in new_cache_mtime:
++                changed.append(name)
++
++        self._cache_mtime = new_cache_mtime
++        return changed
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan and invalidate changed entries.
++
++        Returns a list of canonical template names that were changed or added.
++        """
++        if not self.auto_reload:
++            return []
++        return self._scan_once()
++
++    def invalidate_changed(self, paths: t.Sequence[str]) -> t.List[str]:
++        """Invalidate cache entries for the given absolute paths.
++
++        Args:
++            paths: Absolute paths to invalidate. Paths outside search roots are ignored.
++
++        Returns:
++            A list of canonical template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++        invalidated = []
++        with self._lock:
++            for path in paths:
++                rel_name = self._get_relative_name(path)
++                if rel_name is not None and rel_name in self._cache_mtime:
++                    del self._cache_mtime[rel_name]
++                    invalidated.append(rel_name)
++        return invalidated
++
++    def _track_environment(self, environment: "Environment") -> None:
++        """Weakly track an environment bound to this loader."""
++        if not self.auto_reload:
++            return
++        ref = weakref.ref(environment, lambda ref: self._on_env_garbage_collected(ref))
++        with self._lock:
++            self._environments.add(ref)
++
++    def _on_env_garbage_collected(self, ref: weakref.ref) -> None:
++        """Remove environment from tracking when it's garbage collected."""
++        with self._lock:
++            self._environments.discard(ref)
++
++    def _monitor_loop(self) -> None:
++        """Background thread loop that polls for template changes."""
++        while not self._stop_event.is_set():
++            try:
++                changed = self._scan_once()
++                if changed:
++                    self._invalidate_changed(changed)
++            except Exception:
++                # Background errors should not terminate the monitor
++                pass
++            self._stop_event.wait(0.5)
++
++    def _invalidate_changed(self, names: t.List[str]) -> None:
++        """Invalidate cache entries for the given template names."""
++        for env_ref in list(self._environments):
++            env = env_ref()
++            if env is not None and env.cache is not None:
++                for name in names:
++                    cache_key = (env_ref, name)
++                    env.cache.pop(cache_key, None)
++
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running.
++        """
++        if not self.auto_reload:
++            return
++        with self._lock:
++            if self._thread is not None and self._thread.is_alive():
++                return
++            self._stop_event.clear()
++            self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
++            self._thread.start()
++
++    def close(self) -> None:
++        """Stop the monitoring thread.
++
++        This method is idempotent - calling it multiple times has no effect.
++        """
++        with self._lock:
++            if self._thread is None or not self._thread.is_alive():
++                return
++            self._stop_event.set()
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring if not already running."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++
+     def list_templates(self) -> t.List[str]:
+         found = set()
+         for loader in self.loaders:

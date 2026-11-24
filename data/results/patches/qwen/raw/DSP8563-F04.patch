@@ -1,0 +1,110 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..af88dcf0 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,8 @@
+ import asyncio
++import hashlib
+ import inspect
++import json
++import math
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -16,6 +19,47 @@ if TYPE_CHECKING:
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
+ 
++def _canonicalize_value(value: Any) -> Any:
++    """Convert value to canonical form for fingerprinting.
++    
++    - Trims surrounding whitespace from string values
++    - Treats tuples as lists
++    - Recursively sorts dictionary keys
++    - Preserves numeric/boolean types and list order
++    - Rejects nonfinite numbers and non-JSON values with ValueError
++    
++    Args:
++        value: The value to canonicalize
++        
++    Returns:
++        The canonicalized value
++        
++    Raises:
++        ValueError: If the value contains nonfinite numbers or non-JSON types
++    """
++    if value is None:
++        return None
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, (int, float)):
++        # Reject nonfinite numbers
++        if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
++            raise ValueError(f"Nonfinite number not allowed: {value}")
++        return value
++    if isinstance(value, str):
++        # Trim surrounding whitespace from string values
++        return value.strip()
++    if isinstance(value, tuple):
++        # Treat tuples as lists
++        return [_canonicalize_value(item) for item in value]
++    if isinstance(value, list):
++        return [_canonicalize_value(item) for item in value]
++    if isinstance(value, dict):
++        # Recursively sort dictionary keys
++        return {k: _canonicalize_value(v) for k, v in sorted(value.items())}
++    raise ValueError(f"Non-JSON value type: {type(value)}")
++
++
+ class Tool(Type):
+     """Tool class.
+ 
+@@ -199,7 +243,7 @@ class Tool(Type):
+         Build a DSPy tool from an MCP tool and a ClientSession.
+ 
+         Args:
+-            session: The MCP session to use.
++            session: The MCP client session.
+             tool: The MCP tool to convert.
+ 
+         Returns:
+@@ -259,6 +303,39 @@ class ToolCalls(Type):
+         name: str
+         args: dict[str, Any]
+ 
++        def __init__(self, **data):
++            super().__init__(**data)
++            # Compute fingerprint once at construction
++            self._fingerprint = self._compute_fingerprint()
++            self._id = self._fingerprint[:8]
++
++        def _compute_fingerprint(self) -> str:
++            """Compute SHA-256 fingerprint of tool call.
++            
++            The fingerprint is the 64-character hexadecimal SHA-256 of the UTF-8 canonical JSON
++            object {"name": name, "args": canonical_args}, using sorted keys and compact
++            comma/colon separators with ordinary JSON ASCII escaping.
++            """
++            # Canonicalize args first (converts tuples to lists, trims strings, etc.)
++            canonical_args = _canonicalize_value(self.args)
++            
++            # Create canonical JSON object with sorted keys
++            obj = {"name": self.name, "args": canonical_args}
++            canonical_json = json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
++            
++            # Compute SHA-256
++            return hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()
++
++        @property
++        def fingerprint(self) -> str:
++            """64-character hexadecimal SHA-256 fingerprint of the tool call."""
++            return self._fingerprint
++
++        @property
++        def id(self) -> str:
++            """8-character display abbreviation of the fingerprint."""
++            return self._id
++
+     tool_calls: list[ToolCall]
+ 
+     @classmethod

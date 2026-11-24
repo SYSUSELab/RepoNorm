@@ -1,0 +1,186 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..2d19723 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -170,9 +170,14 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param path_cache_size: Size of the path resolution cache. 0 disables
++        caching (default). Positive integers enable LRU eviction at that
++        capacity. Booleans and negative values are rejected.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionchanged:: NEXT_VERSION
++        Added the ``path_cache_size`` parameter.
+     """
+ 
+     def __init__(
+@@ -180,6 +185,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_cache_size: int = 0,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -188,30 +194,142 @@ class FileSystemLoader(BaseLoader):
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+-    def get_source(
+-        self, environment: "Environment", template: str
+-    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        # Validate path_cache_size
++        if isinstance(path_cache_size, bool):
++            raise TypeError("path_cache_size must be an integer, not a boolean")
++        if path_cache_size < 0:
++            raise ValueError("path_cache_size must be non-negative")
++
++        self._path_cache_size = path_cache_size
++        self._path_cache: t.Optional["LRUCache"] = None
++        if path_cache_size > 0:
++            from .utils import LRUCache
++
++            self._path_cache = LRUCache(path_cache_size)
++
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        """Resolve a template name to a file path using priority-order lookup.
++
++        This method performs the uncached priority-order lookup across all
++        search paths. It is called by get_source when the path cache misses.
++        Subclasses can override this method to customize or observe resolution
++        without depending on the cache's private storage.
++
++        :param template: The template name to resolve.
++        :return: The resolved file path, or None if not found.
++        """
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+-            if f is None:
+-                continue
+-            try:
+-                contents = f.read().decode(self.encoding)
+-            finally:
++            if f is not None:
+                 f.close()
++                return filename
++        return None
+ 
+-            mtime = os.path.getmtime(filename)
++    def clear_path_cache(self) -> None:
++        """Remove all entries from the path cache."""
++        if self._path_cache is not None:
++            self._path_cache.clear()
+ 
+-            def uptodate() -> bool:
+-                try:
+-                    return os.path.getmtime(filename) == mtime
+-                except OSError:
+-                    return False
++    def resize_path_cache(self, capacity: int) -> None:
++        """Change the path cache capacity.
+ 
+-            return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        :param capacity: New capacity. Zero disables and clears the cache.
++            Positive values set the capacity and evict LRU entries as needed.
++        """
++        if isinstance(capacity, bool):
++            raise TypeError("capacity must be an integer, not a boolean")
++        if capacity < 0:
++            raise ValueError("capacity must be non-negative")
++
++        self._path_cache_size = capacity
++
++        if capacity == 0:
++            self._path_cache = None
++        else:
++            from .utils import LRUCache
++
++            if self._path_cache is None:
++                # Cache was disabled, now enable it
++                self._path_cache = LRUCache(capacity)
++            elif capacity != self._path_cache.capacity:
++                # Resize existing cache - preserve entries up to new capacity
++                old_cache = self._path_cache
++                self._path_cache = LRUCache(capacity)
++                # Copy entries in LRU order (most recent last)
++                for key in list(old_cache._queue):
++                    if len(self._path_cache._mapping) < capacity:
++                        self._path_cache[key] = old_cache[key]
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        # Check cache first
++        if self._path_cache is not None:
++            try:
++                cached_filename = self._path_cache[template]
++                # Verify the cached file still exists
++                if os.path.isfile(cached_filename):
++                    return self._read_file(cached_filename, template)
++                # File was removed, remove from cache and re-resolve
++                del self._path_cache[template]
++            except KeyError:
++                pass
++
++        # Resolve the path (may use cache after resolution)
++        filename = self.resolve_template_path(template)
++
++        if filename is None:
++            raise TemplateNotFound(template)
++
++        contents, uptodate = self._read_file_with_mtime(filename)
++
++        # Cache the successful resolution
++        if self._path_cache is not None:
++            self._path_cache[template] = filename
++
++        return contents, filename, uptodate
++
++    def _read_file(self, filename: str, template: str) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        """Read a file and return its contents, filename, and uptodate function."""
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(template)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
++
++        mtime = os.path.getmtime(filename)
++
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        return contents, filename, uptodate
++
++    def _read_file_with_mtime(self, filename: str) -> t.Tuple[str, t.Callable[[], bool]]:
++        """Read a file and return its contents and uptodate function."""
++        f = open_if_exists(filename)
++        if f is None:
++            raise TemplateNotFound(filename)
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
++
++        mtime = os.path.getmtime(filename)
++
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        return contents, uptodate
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()

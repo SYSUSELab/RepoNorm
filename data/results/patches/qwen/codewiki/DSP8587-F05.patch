@@ -1,0 +1,162 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..9bd0aa1a 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,4 +1,5 @@
+ import re
++import logging
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        debug: bool = False,
++        debug_logger: logging.Logger | None = None,
+     ):
+         """
+         Args:
+@@ -36,6 +39,8 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            debug: If True, enable debug logging for trace events. Default is False.
++            debug_logger: The logger to use for debug messages. If None, uses logging.getLogger("dspy.streaming.listener").
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+@@ -47,6 +52,8 @@ class StreamListener:
+         self.stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
++        self.debug = debug
++        self._debug_logger = debug_logger or logging.getLogger("dspy.streaming.listener")
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -66,6 +73,63 @@ class StreamListener:
+             },
+         }
+ 
++    def _should_log_debug(self) -> bool:
++        """Check if we should log debug messages."""
++        return self.debug and self._debug_logger.isEnabledFor(logging.DEBUG)
++
++    def _make_preview(self, content: str) -> str:
++        """Create a preview of content with max 80 characters.
++        
++        Content of length 80 or less is unchanged; longer content uses first 77 chars + '...'.
++        """
++        if len(content) <= 80:
++            return content
++        return content[:77] + "..."
++
++    def _log_start_detection(self, adapter_name: str, buffer_content: str):
++        """Log the start detection event."""
++        if not self._should_log_debug():
++            return
++        preview = self._make_preview(buffer_content)
++        self._debug_logger.debug(
++            f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', "
++            f"stream_start=True, buffer_preview='{preview}'"
++        )
++
++    def _log_rolling_end_check(self, adapter_name: str, reason: str, buffered_size: int):
++        """Log the rolling end check event."""
++        if not self._should_log_debug():
++            return
++        self._debug_logger.debug(
++            f"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', "
++            f"reason='{reason}', buffered_size={buffered_size}"
++        )
++
++    def _log_emit_chunk(self, token_length: int, queue_size: int, is_last_chunk: bool):
++        """Log the emit chunk event."""
++        if not self._should_log_debug():
++            return
++        self._debug_logger.debug(
++            f"Emit chunk: len(token)={token_length}, queue_size={queue_size}, is_last_chunk={is_last_chunk}"
++        )
++
++    def _log_flush(self, adapter_name: str, truncated_length: int):
++        """Log the flush event."""
++        if not self._should_log_debug():
++            return
++        self._debug_logger.debug(
++            f"Flush: adapter={adapter_name}, field='{self.signature_field_name}', "
++            f"truncated_buffer_length={truncated_length}"
++        )
++
++    def _log_state_reset(self):
++        """Log the state reset event."""
++        if not self._should_log_debug():
++            return
++        self._debug_logger.debug(
++            f"State reset for field '{self.signature_field_name}' (allow_reuse={self.allow_reuse})"
++        )
++
+     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
+         for i in range(len(concat_message)):
+             if start_identifier.startswith(concat_message[len(concat_message) - i - 1 :]):
+@@ -91,6 +155,7 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                self._log_state_reset()
+             else:
+                 return
+ 
+@@ -119,6 +184,9 @@ class StreamListener:
+             # ChatAdapter to identify the start of the stream of our target field. Once the start_indicator, i.e., "[["
+             # for ChatAdapter, is found, we start checking the next tokens
+             self.field_start_queue.append(chunk_message)
++            # Log start detection with the current buffer content
++            buffer_content = "".join(self.field_start_queue)
++            self._log_start_detection(adapter_name, buffer_content)
+             return
+ 
+         if len(self.field_start_queue) > 0 and not self.stream_start:
+@@ -161,11 +229,14 @@ class StreamListener:
+             if re.search(end_identifier, concat_message):
+                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
+                 self.stream_end = True
++                self._log_rolling_end_check(adapter_name, "regex_match", len(concat_message))
+                 last_token = self.flush()
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                # Log emit chunk event
++                self._log_emit_chunk(len(token), self.field_end_queue.qsize(), self.stream_end)
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+@@ -183,20 +254,24 @@ class StreamListener:
+                 boundary_index = match.start()
+             else:
+                 boundary_index = len(last_tokens)
+-            return last_tokens[:boundary_index]
++            result = last_tokens[:boundary_index]
+         elif isinstance(settings.adapter, XMLAdapter):
+             boundary_index = last_tokens.find(f"</{self.signature_field_name}>")
+             if boundary_index == -1:
+                 boundary_index = len(last_tokens)
+-            return last_tokens[:boundary_index]
++            result = last_tokens[:boundary_index]
+         elif isinstance(settings.adapter, ChatAdapter) or settings.adapter is None:
+             boundary_index = last_tokens.find("[[")
+-            return last_tokens[:boundary_index]
++            result = last_tokens[:boundary_index]
+         else:
+             raise ValueError(
+                 f"Unsupported adapter for streaming: {settings.adapter}, please use one of the following adapters: "
+                 f"{', '.join([a.__name__ for a in ADAPTER_SUPPORT_STREAMING])}"
+             )
++        
++        # Log flush event
++        self._log_flush(settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter", len(result))
++        return result
+ 
+ 
+ def find_predictor_for_stream_listeners(program: "Module", stream_listeners: list[StreamListener]):

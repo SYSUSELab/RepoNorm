@@ -1,0 +1,142 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..3c3ed0e 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -484,12 +484,13 @@ class Editor:
+         editor: str | None = None,
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+-        extension: str = ".txt",
++        extension: str = ".txt", auto_backup: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.auto_backup = auto_backup
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -509,6 +510,25 @@ class Editor:
+         import subprocess
+ 
+         editor = self.get_editor()
++        if self.auto_backup and os.path.exists(filename):
++            import shutil
++            import datetime
++            
++            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
++            backup_filename = f"{filename}.backup.{timestamp}"
++            
++            # Handle collisions
++            if os.path.exists(backup_filename):
++                counter = 0
++                while os.path.exists(f"{backup_filename}.{counter}"):
++                    counter += 1
++                backup_filename = f"{backup_filename}.{counter}"
++            
++            try:
++                shutil.copy2(filename, backup_filename)
++            except OSError as e:
++                raise ClickException(_("Failed to create backup file: {e}").format(e=e)) from e
++
+         environ: dict[str, str] | None = None
+ 
+         if self.env:
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..d27c95d 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -649,7 +649,7 @@ def edit(
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+     extension: str = ".txt",
+-    filename: str | None = None,
++    filename: str | None = None, auto_backup: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +677,12 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param auto_backup: if this is true, then a backup of the file
++                        will be created before editing.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, auto_backup=auto_backup if filename is not None else False)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_backup.py b/tests/test_backup.py
+new file mode 100644
+index 0000000..55d9691
+--- /dev/null
++++ b/tests/test_backup.py
+@@ -0,0 +1,64 @@
++import os
++import pytest
++import click
++from unittest.mock import patch, MagicMock
++
++def test_edit_auto_backup(tmp_path):
++    filename = tmp_path / "test_file.txt"
++    filename.write_text("initial content")
++    
++    # Mock subprocess.Popen to avoid calling the editor
++    mock_popen = MagicMock()
++    mock_popen.return_value.wait.return_value = 0
++    
++    with patch("subprocess.Popen", side_effect=mock_popen):
++        click.edit(filename=str(filename), auto_backup=True)
++    
++    backups = [f for f in tmp_path.iterdir() if f.name.startswith("test_file.txt.backup.")]
++    assert len(backups) == 1
++    assert backups[0].read_text() == "initial content"
++
++def test_edit_auto_backup_collision(tmp_path):
++    filename = tmp_path / "test_file.txt"
++    filename.write_text("initial content")
++    
++    # Mock subprocess.Popen to avoid calling the editor
++    mock_popen = MagicMock()
++    mock_popen.return_value.wait.return_value = 0
++    
++    with patch("subprocess.Popen", side_effect=mock_popen):
++        click.edit(filename=str(filename), auto_backup=True)
++        click.edit(filename=str(filename), auto_backup=True)
++    
++    backups = [f for f in tmp_path.iterdir() if f.name.startswith("test_file.txt.backup.")]
++    assert len(backups) == 2
++
++def test_edit_auto_backup_failure(tmp_path):
++    filename = tmp_path / "test_file.txt"
++    filename.write_text("initial content")
++    
++    with patch("shutil.copy2", side_effect=OSError("Permission denied")):
++        with pytest.raises(click.ClickException, match="Failed to create backup file"):
++            click.edit(filename=str(filename), auto_backup=True)
++
++def test_edit_no_backup_for_text():
++    # Mock subprocess.Popen to avoid calling the editor
++    mock_popen = MagicMock()
++    mock_popen.return_value.wait.return_value = 0
++    
++    with patch("shutil.copy2") as mock_copy2:
++        with patch("subprocess.Popen", side_effect=mock_popen):
++            click.edit("some text", auto_backup=True)
++            assert not mock_copy2.called
++
++def test_edit_no_backup_for_nonexistent_file():
++    filename = "nonexistent_file.txt"
++    
++    with patch("shutil.copy2") as mock_copy2:
++        # We don't need to mock Popen because it shouldn't reach there if it doesn't exist
++        # Wait, edit_file calls Popen regardless of whether the file exists or not.
++        # Actually, edit_file calls Popen.
++        # Let's mock Popen just in case.
++        with patch("subprocess.Popen", return_value=MagicMock(wait=lambda: 0)):
++            click.edit(filename=filename, auto_backup=True)
++            assert not mock_copy2.called

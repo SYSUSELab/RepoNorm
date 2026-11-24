@@ -1,0 +1,494 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..b25aee1 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1186,6 +1186,59 @@ class Command:
+             self.parse_args(ctx, args)
+         return ctx
+ 
++    def _resolve_dynamic_defaults(self, ctx: Context) -> None:
++        """Resolve all dynamic defaults after parsing is complete.
++        
++        This method is called after all parameters have been parsed and their
++        values are available in ctx.params. It resolves any dynamic defaults
++        whose source is still DEFAULT.
++        """
++        resolving: set[str] = set()
++        
++        for param in self.get_params(ctx):
++            param_name = param.name
++            if param_name is None:
++                continue
++                
++            # Check if this parameter has a dynamic default
++            raw_default = getattr(param, '_dynamic_default', None)
++            if raw_default is None:
++                continue
++            
++            # Skip if already resolved or not a dynamic default
++            if not isinstance(raw_default, dict) or not raw_default:
++                continue
++            
++            # Check if keys start with "--" (dynamic default marker)
++            has_long_option_keys = any(
++                isinstance(k, str) and k.startswith("--") 
++                for k in raw_default.keys()
++            )
++            if not has_long_option_keys:
++                continue
++            
++            # Skip if already being resolved (cycle detection)
++            if param_name in resolving:
++                continue
++            
++            # Resolve this dynamic default
++            try:
++                resolved = param._resolve_dynamic_default(ctx, raw_default, resolving)
++                
++                # Only update if the value came from DEFAULT source
++                # Check if this parameter had a dynamic default that wasn't overridden
++                if hasattr(param, '_dynamic_default') and param._dynamic_default is raw_default:
++                    # Type cast the resolved value through the normal pipeline
++                    resolved = param.type_cast_value(ctx, resolved)
++                    ctx.params[param_name] = resolved
++                    resolving.add(param_name)
++            except (UsageError, TypeError):
++                # Re-raise validation errors
++                raise
++            except Exception:
++                # If resolution fails for other reasons, leave the value as-is
++                pass
++
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:
+         if not args and self.no_args_is_help and not ctx.resilient_parsing:
+             raise NoArgsIsHelpError(ctx)
+@@ -1207,6 +1260,10 @@ class Command:
+ 
+         ctx.args = args
+         ctx._opt_prefixes.update(parser._opt_prefixes)
++        
++        # Resolve dynamic defaults after all parameters are parsed
++        self._resolve_dynamic_defaults(ctx)
++        
+         return args
+ 
+     def invoke(self, ctx: Context) -> t.Any:
+@@ -1779,6 +1836,59 @@ class Group(Command):
+                 with formatter.section(_("Commands")):
+                     formatter.write_dl(rows)
+ 
++    def _resolve_dynamic_defaults(self, ctx: Context) -> None:
++        """Resolve all dynamic defaults after parsing is complete.
++        
++        This method is called after all parameters have been parsed and their
++        values are available in ctx.params. It resolves any dynamic defaults
++        whose source is still DEFAULT.
++        """
++        resolving: set[str] = set()
++        
++        for param in self.get_params(ctx):
++            param_name = param.name
++            if param_name is None:
++                continue
++                
++            # Check if this parameter has a dynamic default
++            raw_default = getattr(param, '_dynamic_default', None)
++            if raw_default is None:
++                continue
++            
++            # Skip if already resolved or not a dynamic default
++            if not isinstance(raw_default, dict) or not raw_default:
++                continue
++            
++            # Check if keys start with "--" (dynamic default marker)
++            has_long_option_keys = any(
++                isinstance(k, str) and k.startswith("--") 
++                for k in raw_default.keys()
++            )
++            if not has_long_option_keys:
++                continue
++            
++            # Skip if already being resolved (cycle detection)
++            if param_name in resolving:
++                continue
++            
++            # Resolve this dynamic default
++            try:
++                resolved = param._resolve_dynamic_default(ctx, raw_default, resolving)
++                
++                # Only update if the value came from DEFAULT source
++                # Check if this parameter had a dynamic default that wasn't overridden
++                if hasattr(param, '_dynamic_default') and param._dynamic_default is raw_default:
++                    # Type cast the resolved value through the normal pipeline
++                    resolved = param.type_cast_value(ctx, resolved)
++                    ctx.params[param_name] = resolved
++                    resolving.add(param_name)
++            except (UsageError, TypeError):
++                # Re-raise validation errors
++                raise
++            except Exception:
++                # If resolution fails for other reasons, leave the value as-is
++                pass
++
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:
+         if not args and self.no_args_is_help and not ctx.resilient_parsing:
+             raise NoArgsIsHelpError(ctx)
+@@ -2265,6 +2375,87 @@ class Parameter:
+     def add_to_parser(self, parser: _OptionParser, ctx: Context) -> None:
+         raise NotImplementedError()
+ 
++    def _resolve_dynamic_default(
++        self, ctx: Context, raw_default: t.Any, resolving: set | None = None
++    ) -> t.Any:
++        """Resolve a dynamic default dictionary to an actual default value.
++        
++        A dynamic default is a non-empty dict whose keys are full long option
++        names (e.g., "--mode") and values are dicts mapping dependency values
++        to target defaults.
++        """
++        if not isinstance(raw_default, dict):
++            return raw_default
++        
++        if not raw_default:
++            return raw_default
++        
++        # Check if this looks like a dynamic default (keys start with --)
++        has_long_option_keys = any(
++            isinstance(k, str) and k.startswith("--") 
++            for k in raw_default.keys()
++        )
++        
++        if not has_long_option_keys:
++            return raw_default
++        
++        # This is a dynamic default - resolve it
++        if resolving is None:
++            resolving = set()
++        
++        resolved = None
++        for dep_opt, value_map in raw_default.items():
++            if not isinstance(value_map, dict):
++                raise TypeError(
++                    f"Dynamic default mapping for {dep_opt!r} must be a dict, "
++                    f"got {type(value_map).__name__}"
++                )
++            
++            # Get the parameter name from the long option
++            param_name = dep_opt[2:]  # Remove "--" prefix
++            
++            # Find the parameter in the command
++            param = None
++            for p in ctx.command.get_params(ctx):
++                if p.name == param_name:
++                    param = p
++                    break
++            
++            if param is None:
++                raise UsageError(
++                    f"Unknown option {dep_opt!r} referenced in dynamic default"
++                )
++            
++            # Cycle detection: check if we're currently resolving this parameter
++            if param_name in resolving:
++                raise UsageError(
++                    f"Dependency cycle detected involving option {dep_opt!r}"
++                )
++            
++            # Get the current value of the dependency parameter
++            dep_value = ctx.params.get(param_name)
++            
++            # Convert boolean values to string for matching
++            if isinstance(dep_value, bool):
++                dep_value_str = "True" if dep_value else "False"
++            else:
++                dep_value_str = str(dep_value) if dep_value is not None else None
++            
++            # Look up the appropriate default value
++            if dep_value_str in value_map:
++                resolved = value_map[dep_value_str]
++            elif dep_value is None and None in value_map:
++                resolved = value_map[None]
++            
++            # Recursively resolve if the resolved value is also a dynamic default
++            if resolved is not None and isinstance(resolved, dict):
++                new_resolving = resolving | {param_name}
++                resolved = self._resolve_dynamic_default(
++                    ctx, resolved, new_resolving
++                )
++        
++        return resolved
++
+     def consume_value(
+         self, ctx: Context, opts: cabc.Mapping[str, t.Any]
+     ) -> tuple[t.Any, ParameterSource]:
+@@ -2282,6 +2473,10 @@ class Parameter:
+         if value is None:
+             value = self.get_default(ctx)
+             source = ParameterSource.DEFAULT
++        
++        # Store raw default for later dynamic resolution if source is DEFAULT
++        if source == ParameterSource.DEFAULT:
++            self._dynamic_default = value
+ 
+         return value, source
+ 
+@@ -2292,6 +2487,14 @@ class Parameter:
+         if value is None:
+             return () if self.multiple or self.nargs == -1 else None
+ 
++        # Skip type casting for unresolved dynamic defaults
++        # (dicts with keys starting with "--")
++        if isinstance(value, dict) and any(
++            isinstance(k, str) and k.startswith("--")
++            for k in value.keys()
++        ):
++            return value
++
+         def check_iter(value: t.Any) -> cabc.Iterator[t.Any]:
+             try:
+                 return _check_iter(value)
+@@ -2868,6 +3071,12 @@ class Option(Parameter):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):
+                 default_string = _("(dynamic)")
++            elif isinstance(default_value, dict) and any(
++                isinstance(k, str) and k.startswith("--") 
++                for k in default_value.keys()
++            ):
++                # Dynamic default dictionary
++                default_string = _("(dynamic)")
+             elif self.is_bool_flag and self.secondary_opts:
+                 # For boolean flags that have distinct True/False opts,
+                 # use the opt without prefix instead of the value.
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000..743801f
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,226 @@
++"""Test edge cases for dynamic defaults."""
++import click
++from click.testing import CliRunner
++import pytest
++
++
++def test_dynamic_default_basic():
++    """Test basic dynamic default resolution."""
++    @click.command()
++    @click.option("--mode", default="debug")
++    @click.option(
++        "--verbose",
++        default={
++            "--mode": {
++                "debug": True,
++                "release": False,
++            }
++        },
++        show_default=True,
++    )
++    def cmd(mode, verbose):
++        print(f"mode={mode}, verbose={verbose}")
++
++    runner = CliRunner()
++    
++    # Test mode=debug -> verbose=True
++    result = runner.invoke(cmd, ["--mode", "debug"])
++    assert result.exit_code == 0
++    assert "mode=debug, verbose=True" in result.output
++    
++    # Test mode=release -> verbose=False
++    result = runner.invoke(cmd, ["--mode", "release"])
++    assert result.exit_code == 0
++    assert "mode=release, verbose=False" in result.output
++
++
++def test_dynamic_default_explicit_wins():
++    """Test that explicit values override dynamic defaults."""
++    @click.command()
++    @click.option("--mode", default="debug")
++    @click.option(
++        "--verbose",
++        default={
++            "--mode": {
++                "debug": True,
++                "release": False,
++            }
++        },
++    )
++    def cmd(mode, verbose):
++        print(f"mode={mode}, verbose={verbose}")
++
++    runner = CliRunner()
++    
++    # Explicit --verbose=True should win
++    result = runner.invoke(cmd, ["--mode", "release", "--verbose", "True"])
++    assert result.exit_code == 0
++    assert "mode=release, verbose=True" in result.output
++
++
++def test_dynamic_default_envvar_wins():
++    """Test that environment variables override dynamic defaults."""
++    @click.command()
++    @click.option("--mode", default="debug")
++    @click.option(
++        "--verbose",
++        envvar="VERBOSE",  # Explicitly set envvar
++        default={
++            "--mode": {
++                "debug": True,
++                "release": False,
++            }
++        },
++    )
++    def cmd(mode, verbose):
++        print(f"mode={mode}, verbose={verbose}")
++
++    runner = CliRunner()
++    
++    # Environment variable should win
++    result = runner.invoke(cmd, ["--mode", "release"], env={"VERBOSE": "True"})
++    assert result.exit_code == 0
++    assert "mode=release, verbose=True" in result.output
++
++
++def test_dynamic_default_type_casting():
++    """Test that resolved values go through type casting pipeline."""
++    @click.command()
++    @click.option("--count", default=1)
++    @click.option(
++        "--multiplier",
++        default={
++            "--count": {
++                "1": 2,
++                "2": 3,
++                "5": 10,
++            }
++        },
++        type=int,
++    )
++    def cmd(count, multiplier):
++        print(f"count={count}, multiplier={multiplier}")
++
++    runner = CliRunner()
++    
++    result = runner.invoke(cmd, ["--count", "5"])
++    assert result.exit_code == 0
++    assert "count=5, multiplier=10" in result.output
++
++
++def test_dynamic_default_none_value():
++    """Test dynamic default with None as a key."""
++    @click.command()
++    @click.option("--flag", is_flag=True, default=False)
++    @click.option(
++        "--value",
++        default={
++            "--flag": {
++                "True": "enabled",
++                "False": "disabled",
++            }
++        },
++    )
++    def cmd(flag, value):
++        print(f"flag={flag}, value={value}")
++
++    runner = CliRunner()
++    
++    result = runner.invoke(cmd, [])
++    assert result.exit_code == 0
++    assert "flag=False, value=disabled" in result.output
++
++
++def test_dynamic_default_help_shows_dynamic():
++    """Test that help shows (dynamic) for dynamic defaults."""
++    @click.command()
++    @click.option("--mode", default="debug")
++    @click.option(
++        "--verbose",
++        default={
++            "--mode": {
++                "debug": True,
++                "release": False,
++            }
++        },
++        show_default=True,
++    )
++    def cmd(mode, verbose):
++        pass
++
++    runner = CliRunner()
++    result = runner.invoke(cmd, ["--help"])
++    assert result.exit_code == 0
++    assert "(dynamic)" in result.output
++
++
++def test_dynamic_default_unknown_option_error():
++    """Test that unknown options in dynamic default raise UsageError."""
++    @click.command()
++    @click.option(
++        "--verbose",
++        default={
++            "--unknown-option": {
++                "true": True,
++            }
++        },
++    )
++    def cmd(verbose):
++        pass
++
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    assert result.exit_code != 0
++    assert "Unknown option" in result.output
++
++
++def test_dynamic_default_cycle_detection():
++    """Test that cycles in dynamic defaults are detected."""
++    @click.command()
++    @click.option(
++        "--a",
++        default={
++            "--b": {
++                "default": "a_val",
++            }
++        },
++    )
++    @click.option(
++        "--b",
++        default={
++            "--a": {
++                "default": "b_val",
++            }
++        },
++    )
++    def cmd(a, b):
++        print(f"a={a}, b={b}")
++
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    # Cycles should raise UsageError
++    assert result.exit_code != 0
++    assert "cycle" in result.output.lower() or "Cycle" in result.output
++
++
++def test_dynamic_default_non_dict_value_error():
++    """Test that non-dict values in dynamic mapping raise TypeError."""
++    @click.command()
++    @click.option(
++        "--verbose",
++        default={
++            "--mode": "not_a_dict",  # Should be a dict
++        },
++    )
++    def cmd(verbose):
++        pass
++
++    runner = CliRunner()
++    result = runner.invoke(cmd, [])
++    assert result.exit_code != 0
++    assert result.exception is not None
++    assert "must be a dict" in str(result.exception)
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])

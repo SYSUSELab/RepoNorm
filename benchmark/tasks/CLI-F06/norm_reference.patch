@@ -1,0 +1,225 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 540bbe2..f8d6681 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   Add transactional ``Context.save_state`` and ``restore_state`` helpers
++    that preserve supported mutable-state graphs without changing resources.
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..69616da 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -229,6 +229,9 @@ class Context:
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
+ 
++    .. versionchanged:: 8.2
++        Added :meth:`save_state` and :meth:`restore_state`.
++
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+         Click 9.0. ``args`` will contain remaining unparsed tokens.
+@@ -832,6 +835,77 @@ class Context:
+         """
+         return self._parameter_source.get(name)
+ 
++    def save_state(self) -> dict[str, t.Any]:
++        """Create a snapshot of the current context state.
++
++        This captures the supported mutable parsing and presentation state,
++        including parameters, options, and command metadata. Open resources,
++        the exit stack, and arbitrary dynamically added attributes are excluded.
++        The snapshot can be used with :meth:`restore_state` to revert the
++        context back to the captured state.
++
++        :return: A dictionary containing the snapshot of the context state.
++
++        .. versionadded:: 8.2
++        """
++        import copy
++
++        return copy.deepcopy({name: getattr(self, name) for name in self._state_fields})
++
++    _state_fields = (
++        "params",
++        "args",
++        "_protected_args",
++        "_opt_prefixes",
++        "obj",
++        "_meta",
++        "default_map",
++        "invoked_subcommand",
++        "terminal_width",
++        "max_content_width",
++        "allow_extra_args",
++        "allow_interspersed_args",
++        "ignore_unknown_options",
++        "help_option_names",
++        "token_normalize_func",
++        "resilient_parsing",
++        "auto_envvar_prefix",
++        "color",
++        "show_default",
++        "_parameter_source",
++    )
++
++    def restore_state(self, snapshot: dict[str, t.Any]) -> None:
++        """Restore the context to a previously saved state.
++
++        This reverts the supported parsing and presentation attributes to
++        the state captured in the provided snapshot. Resource lifecycle state
++        and arbitrary dynamically added attributes are not restored.
++
++        :param snapshot: A snapshot dictionary created by :meth:`save_state`.
++
++        .. versionadded:: 8.2
++        """
++        import copy
++
++        if not isinstance(snapshot, dict):
++            raise TypeError("snapshot must be a dictionary")
++        if any(name not in snapshot for name in self._state_fields):
++            raise ValueError("snapshot is missing supported fields")
++        raw = {name: snapshot[name] for name in self._state_fields}
++        if not isinstance(raw["_meta"], dict):
++            raise TypeError("snapshot metadata must be a dictionary")
++        # Preserve the existing hierarchy-shared metadata root, including
++        # references to that root elsewhere in the copied state graph.
++        memo = {id(raw["_meta"]): self._meta}
++        metadata = copy.deepcopy(dict(raw["_meta"]), memo)
++        restored = copy.deepcopy(raw, memo)
++        self._meta.clear()
++        self._meta.update(metadata)
++        for name, value in restored.items():
++            if name != "_meta":
++                setattr(self, name, value)
++
+ 
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+diff --git a/tests/test_context_state_contribution.py b/tests/test_context_state_contribution.py
+new file mode 100644
+index 0000000..bb26a1b
+--- /dev/null
++++ b/tests/test_context_state_contribution.py
+@@ -0,0 +1,114 @@
++from contextlib import contextmanager
++
++import pytest
++
++import click
++
++
++def test_snapshot_is_independent_and_reusable() -> None:
++    ctx = click.Context(click.Command("cmd"), obj={"items": [1]})
++    ctx.params = {"value": [1]}
++    snapshot = ctx.save_state()
++
++    ctx.params["value"].append(2)
++    ctx.obj["items"].append(2)
++    assert snapshot["params"] == {"value": [1]}
++    assert snapshot["obj"] == {"items": [1]}
++
++    ctx.restore_state(snapshot)
++    ctx.params["value"].append(3)
++    assert snapshot["params"] == {"value": [1]}
++    ctx.restore_state(snapshot)
++    assert ctx.params == {"value": [1]}
++
++
++def test_snapshot_preserves_aliases_and_cycles() -> None:
++    shared = []
++    shared.append(shared)
++    ctx = click.Context(click.Command("cmd"), obj=shared)
++    ctx.params = {"shared": shared}
++    snapshot = ctx.save_state()
++    assert snapshot["obj"] is snapshot["params"]["shared"]
++    assert snapshot["obj"][0] is snapshot["obj"]
++
++    ctx.restore_state(snapshot)
++    assert ctx.obj is ctx.params["shared"]
++    assert ctx.obj[0] is ctx.obj
++    assert ctx.obj is not snapshot["obj"]
++
++
++def test_restore_preserves_parent_child_metadata_identity() -> None:
++    parent = click.Context(click.Command("parent"), obj={"name": "parent"})
++    child = click.Context(click.Command("child"), parent=parent)
++    child.meta["items"] = [1]
++    child.obj = {"metadata": child.meta}
++    snapshot = child.save_state()
++    child.meta["items"].append(2)
++
++    child.restore_state(snapshot)
++    assert child.meta is parent.meta
++    assert child.obj["metadata"] is parent.meta
++    assert child.meta == {"items": [1]}
++    assert child.meta is not snapshot["_meta"]
++
++
++@pytest.mark.parametrize("damage", ["missing", "invalid_meta", "copy_failure"])
++def test_restore_validation_and_copy_failures_are_transactional(damage) -> None:
++    class Uncopyable:
++        def __deepcopy__(self, memo):
++            raise RuntimeError("cannot copy")
++
++    ctx = click.Context(click.Command("cmd"), obj={"before": True})
++    ctx.params = {"before": [1]}
++    snapshot = ctx.save_state()
++    snapshot["unknown"] = "ignored"
++    if damage == "missing":
++        snapshot.pop("args")
++        expected = ValueError
++    elif damage == "invalid_meta":
++        snapshot["_meta"] = []
++        expected = TypeError
++    else:
++        snapshot["obj"] = Uncopyable()
++        expected = RuntimeError
++
++    before_obj = ctx.obj
++    before_params = ctx.params
++    with pytest.raises(expected):
++        ctx.restore_state(snapshot)
++    assert ctx.obj is before_obj
++    assert ctx.params is before_params
++
++
++def test_unknown_keys_are_ignored_and_parameter_sources_restore() -> None:
++    option = click.Option(["--value"])
++    ctx = click.Context(click.Command("cmd", params=[option]))
++    ctx.set_parameter_source("value", click.core.ParameterSource.COMMANDLINE)
++    snapshot = ctx.save_state()
++    snapshot["unknown"] = object()
++    ctx.set_parameter_source("value", click.core.ParameterSource.DEFAULT)
++    ctx.restore_state(snapshot)
++    assert ctx.get_parameter_source("value") is click.core.ParameterSource.COMMANDLINE
++    assert not hasattr(ctx, "unknown")
++
++
++def test_restore_does_not_replace_resource_lifecycle_or_dynamic_attributes() -> None:
++    events = []
++
++    @contextmanager
++    def resource():
++        events.append("enter")
++        try:
++            yield
++        finally:
++            events.append("exit")
++
++    ctx = click.Context(click.Command("cmd"))
++    snapshot = ctx.save_state()
++    ctx.dynamic_value = "keep"
++    ctx.call_on_close(lambda: events.append("callback"))
++    ctx.with_resource(resource())
++    ctx.restore_state(snapshot)
++    assert ctx.dynamic_value == "keep"
++    ctx.close()
++    assert events == ["enter", "exit", "callback"]

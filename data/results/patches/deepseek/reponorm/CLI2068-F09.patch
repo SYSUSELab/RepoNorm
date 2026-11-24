@@ -1,0 +1,165 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..38361e1 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -478,6 +478,15 @@ def _nullpager(
+         stream.write(text)
+ 
+ 
++# Fixed platform-support allowlist for isolated editor environment.
++# Matched case-insensitively.
++_ISOLATE_ENV_ALLOWLIST = frozenset({
++    "PATH", "HOME", "USER", "USERNAME", "LOGNAME", "SHELL",
++    "TERM", "DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "LANG",
++    "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TMPDIR",
++    "TMP", "TEMP", "SYSTEMROOT", "COMSPEC", "PATHEXT",
++})
++
+ class Editor:
+     def __init__(
+         self,
+@@ -485,11 +494,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        isolate_env: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.isolate_env = isolate_env
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,16 +516,30 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
+-        import subprocess
++    def _build_env(self) -> dict[str, str] | None:
++        if self.env is None and not self.isolate_env:
++            return None
+ 
+-        editor = self.get_editor()
+-        environ: dict[str, str] | None = None
++        if self.isolate_env:
++            environ = {
++                key: val
++                for key, val in os.environ.items()
++                if key.upper() in _ISOLATE_ENV_ALLOWLIST
++            }
++        else:
++            environ = os.environ.copy()
+ 
+         if self.env:
+-            environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        return environ
++
++    def edit_file(self, filename: str) -> None:
++        import subprocess
++
++        editor = self.get_editor()
++        environ = self._build_env()
++
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+             exit_code = c.wait()
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..c8311e8 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    isolate_env: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,15 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param isolate_env: if this is true, the editor environment is built
++                        from a fixed allowlist of platform-support
++                        variables instead of inheriting all parent
++                        environment variables.  The caller-supplied
++                        ``env`` mapping is applied afterward.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, isolate_env=isolate_env)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..57fd20e 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -380,6 +380,61 @@ def test_fast_edit(runner):
+     assert result == "aTest\nbTest\n"
+ 
+ 
++def test_edit_isolate_env(runner):
++    """Test the isolate_env parameter of click.edit."""
++    import os
++    from click._termui_impl import Editor
++
++    # Mark a custom variable to test isolation
++    os.environ["_CLICK_TEST_SECRET"] = "should_not_leak"
++
++    try:
++        # --- Test 1: _build_env returns None when no env and not isolated ---
++        ed = Editor()
++        assert ed._build_env() is None
++
++        # --- Test 2: isolate_env=True filters out non-allowlist vars ---
++        ed_iso = Editor(isolate_env=True)
++        env = ed_iso._build_env()
++        assert env is not None, "isolate_env=True should produce non-None env"
++        assert "_CLICK_TEST_SECRET" not in env, (
++            "isolate_env should exclude non-allowlist variables"
++        )
++        # Allowlisted keys present in os.environ should be copied
++        if "PATH" in os.environ:
++            assert env.get("PATH") == os.environ["PATH"]
++
++        # --- Test 3: isolate_env=True with explicit env mapping ---
++        ed_explicit = Editor(isolate_env=True, env={"_CLICK_TEST_SECRET": "explicit"})
++        env2 = ed_explicit._build_env()
++        assert env2 is not None
++        assert env2["_CLICK_TEST_SECRET"] == "explicit", (
++            "Explicit env should be applied after isolation"
++        )
++        # Explicit env can also override allowlisted variables
++        ed_override = Editor(isolate_env=True, env={"PATH": "/overridden"})
++        env3 = ed_override._build_env()
++        assert env3["PATH"] == "/overridden"
++
++        # --- Test 4: isolate_env=False with env inherits all ---
++        ed_inherit = Editor(env={"EDITOR": "vim"})
++        env4 = ed_inherit._build_env()
++        assert env4 is not None
++        assert "_CLICK_TEST_SECRET" in env4, (
++            "Non-isolated mode should inherit all vars including test secret"
++        )
++        assert env4["EDITOR"] == "vim"
++
++        # --- Test 5: Function signature has isolate_env parameter ---
++        import inspect
++        sig = inspect.signature(click.edit)
++        assert "isolate_env" in sig.parameters
++        assert sig.parameters["isolate_env"].default is False
++
++    finally:
++        os.environ.pop("_CLICK_TEST_SECRET", None)
++
++
+ @pytest.mark.parametrize(
+     ("prompt_required", "required", "args", "expect"),
+     [

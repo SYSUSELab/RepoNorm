@@ -1,0 +1,108 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..7659316 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -5,6 +5,8 @@ import enum
+ import errno
+ import inspect
+ import os
++import threading
++import warnings
+ import sys
+ import typing as t
+ from collections import abc
+@@ -280,6 +282,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +430,17 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        #: If set to a positive number, ``close()`` will wait at most
++        #: this many seconds for registered callbacks to complete before
++        #: returning. ``None`` means synchronous cleanup.
++        if cleanup_timeout is not None:
++            if not isinstance(cleanup_timeout, (int, float)) or cleanup_timeout <= 0:
++                raise ValueError(
++                    f"cleanup_timeout must be a positive number, not {cleanup_timeout!r}"
++                )
++        elif parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++        self.cleanup_timeout: float | None = cleanup_timeout
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -606,11 +620,66 @@ class Context:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        If *cleanup_timeout* is set, the method will wait at most
++        that many seconds for cleanup to complete. If cleanup is
++        still running after the timeout, control is returned and a
++        warning is issued. Errors raised after the timeout are
++        reported via warning.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
++        timeout = self.cleanup_timeout
++
++        if timeout is None:
++            # Synchronous cleanup - existing behavior
++            self._exit_stack.close()
++            self._exit_stack = ExitStack()
++            return
++
++        # Timed cleanup: snapshot the current exit stack and
++        # replace it with a fresh one for future registrations.
++        old_stack = self._exit_stack
+         self._exit_stack = ExitStack()
+ 
++        result: list[BaseException | None] = []
++        done = threading.Event()
++
++        def cleanup() -> None:
++            try:
++                old_stack.close()
++                result.append(None)
++            except BaseException as e:
++                result.append(e)
++            finally:
++                done.set()
++
++        t = threading.Thread(target=cleanup, daemon=True)
++        t.start()
++
++        if done.wait(timeout):
++            # Cleanup completed within the deadline.
++            if result and result[0] is not None:
++                raise result[0]  # type: ignore[misc]
++        else:
++            # Timed out -- report and monitor for late errors.
++            warnings.warn(
++                f"Cleanup did not complete within {timeout}s "
++                "(continuing in background).",
++                ResourceWarning,
++                stacklevel=2,
++            )
++
++            def monitor() -> None:
++                done.wait()
++                if result and result[0] is not None:
++                    warnings.warn(
++                        f"Cleanup callback raised after close() "
++                        f"returned: {result[0]}",
++                        RuntimeWarning,
++                        stacklevel=2,
++                    )
++
++            threading.Thread(target=monitor, daemon=True).start()
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``

@@ -1,0 +1,137 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..8cadd71 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,4 +1,7 @@
+ from __future__ import annotations
++import threading
++import warnings
++
+ 
+ import collections.abc as cabc
+ import enum
+@@ -280,6 +283,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -336,6 +340,15 @@ class Context:
+         #: The width of the terminal (None is autodetection).
+         self.terminal_width: int | None = terminal_width
+ 
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be positive")
++
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++
++        #: The timeout for cleanup in seconds.
++        self.cleanup_timeout: float | None = cleanup_timeout
++
+         if max_content_width is None and parent is not None:
+             max_content_width = parent.max_content_width
+ 
+@@ -434,7 +447,6 @@ class Context:
+ 
+     @property
+     def protected_args(self) -> list[str]:
+-        import warnings
+ 
+         warnings.warn(
+             "'protected_args' is deprecated and will be removed in Click 9.0."
+@@ -607,10 +619,27 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
++        if self.cleanup_timeout is None:
++            self._exit_stack.close()
++            self._exit_stack = ExitStack()
++            return
++
++        old_stack = self._exit_stack
+         self._exit_stack = ExitStack()
+ 
++        def run_close():
++            try:
++                old_stack.close()
++            except Exception:
++                warnings.warn("Error during cleanup", stacklevel=2)
++
++        t = threading.Thread(target=run_close)
++        t.start()
++        t.join(timeout=self.cleanup_timeout)
++
++        if t.is_alive():
++            warnings.warn("Cleanup timed out", stacklevel=2)
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+@@ -966,7 +995,6 @@ class Command:
+             params = [*params, help_option]
+ 
+         if __debug__:
+-            import warnings
+ 
+             opts = [opt for param in params for opt in param.opts]
+             opts_counter = Counter(opts)
+@@ -3015,7 +3043,6 @@ class Argument(Parameter):
+ 
+ 
+ def __getattr__(name: str) -> object:
+-    import warnings
+ 
+     if name == "BaseCommand":
+         warnings.warn(
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..0ed2b07 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,42 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++def test_context_cleanup_timeout():
++    import time
++    import warnings
++    
++    @click.command()
++    def cmd():
++        pass
++        
++    # Test that cleanup_timeout is passed correctly
++    ctx = click.Context(cmd, cleanup_timeout=0.5)
++    assert ctx.cleanup_timeout == 0.5
++    
++    # Test that it inherits from parent
++    child_ctx = click.Context(cmd, parent=ctx)
++    assert child_ctx.cleanup_timeout == 0.5
++    
++    # Test that it can be overridden
++    child_ctx_override = click.Context(cmd, parent=ctx, cleanup_timeout=0.2)
++    assert child_ctx_override.cleanup_timeout == 0.2
++    
++    # Test that it raises ValueError for non-positive timeout
++    try:
++        click.Context(cmd, cleanup_timeout=0)
++    except ValueError:
++        pass
++    else:
++        assert False, "Should have raised ValueError"
++
++    # Test that it times out
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        ctx = click.Context(cmd, cleanup_timeout=0.01)
++        @ctx.call_on_close
++        def slow():
++            time.sleep(0.1)
++        ctx.close()
++        assert len(w) > 0
++        assert "Cleanup timed out" in str(w[-1].message)

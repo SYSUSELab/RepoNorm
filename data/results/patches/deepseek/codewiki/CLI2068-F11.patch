@@ -1,0 +1,153 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..d51c890 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -507,6 +509,7 @@ class Editor:
+ 
+     def edit_file(self, filename: str) -> None:
+         import subprocess
++        import warnings
+ 
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+@@ -516,17 +519,87 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
+-            if exit_code != 0:
+-                raise ClickException(
+-                    _("{editor}: Editing failed").format(editor=editor)
+-                )
++            cmd = f'{editor} "{filename}"'
++            c = subprocess.Popen(cmd, env=environ, shell=True)
+         except OSError as e:
+             raise ClickException(
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+ 
++        monitor = self.monitor_process
++        pid = c.pid
++
++        if monitor is not None:
++            def safe_call(event_type: str) -> None:
++                try:
++                    monitor(event_type, pid, cmd, time.time())
++                except Exception as exc:
++                    warnings.warn(
++                        f"Error in monitor_process callback: {exc}",
++                        UserWarning,
++                        stacklevel=2,
++                    )
++
++            safe_call("start")
++
++            if hasattr(os, "WCONTINUED"):
++                # Full monitoring with suspend/resume tracking
++                while True:
++                    try:
++                        wpid, status = os.waitpid(pid, os.WUNTRACED | os.WCONTINUED)
++                    except ChildProcessError:
++                        break
++
++                    if os.WIFEXITED(status):
++                        exit_code = os.WEXITSTATUS(status)
++                        c.returncode = exit_code
++                        safe_call("terminate")
++                        break
++                    elif os.WIFSIGNALED(status):
++                        exit_code = -os.WTERMSIG(status)
++                        c.returncode = exit_code
++                        safe_call("terminate")
++                        break
++                    elif os.WIFSTOPPED(status):
++                        safe_call("suspend")
++                    elif os.WIFCONTINUED(status):
++                        safe_call("resume")
++            else:
++                # Simple monitoring without suspend/resume
++                try:
++                    wpid, status = os.waitpid(pid, 0)
++                except ChildProcessError:
++                    exit_code = -1
++                else:
++                    if os.WIFEXITED(status):
++                        exit_code = os.WEXITSTATUS(status)
++                    elif os.WIFSIGNALED(status):
++                        exit_code = -os.WTERMSIG(status)
++                    else:
++                        exit_code = -1
++
++                c.returncode = exit_code
++                safe_call("terminate")
++        else:
++            try:
++                _pid, status = os.waitpid(pid, 0)
++            except ChildProcessError:
++                exit_code = -1
++            else:
++                if os.WIFEXITED(status):
++                    exit_code = os.WEXITSTATUS(status)
++                elif os.WIFSIGNALED(status):
++                    exit_code = -os.WTERMSIG(status)
++                else:
++                    exit_code = -1
++
++            c.returncode = exit_code
++
++        if exit_code != 0:
++            raise ClickException(
++                _("{editor}: Editing failed").format(editor=editor)
++            )
++
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..7e5da8b 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,19 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param monitor_process: optional callback for monitoring the editor process.
++                            Receives ``(event_type, process_id, editor_command,
++                            timestamp)`` where event is ``"start"``, ``"suspend"``,
++                            ``"resume"``, or ``"terminate"``.
++    :type monitor_process: callable or None
++    :raises TypeError: if the value is not callable or None.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    if monitor_process is not None and not callable(monitor_process):
++        raise TypeError("monitor_process must be a callable or None")
++
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, monitor_process=monitor_process)
+ 
+     if filename is None:
+         return ed.edit(text)

@@ -1,0 +1,367 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..8775fca 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -19,6 +19,7 @@ from .async_utils import auto_to_list
+ from .exceptions import FilterArgumentError
+ from .runtime import Undefined
+ from .utils import htmlsafe_json_dumps
++from .utils import _PassArg
+ from .utils import pass_context
+ from .utils import pass_environment
+ from .utils import pass_eval_context
+@@ -1163,6 +1164,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    key_transform: t.Optional[t.Callable[..., t.Any]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1208,12 +1210,28 @@ def sync_do_groupby(
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
++
++    .. versionadded:: 3.1
++        Added the ``key_transform`` parameter.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++
++    if key_transform is not None:
++        pass_arg = _PassArg.from_obj(key_transform)
++
++        if pass_arg is _PassArg.environment:
++            _key_transform = key_transform
++            key_transform = lambda k: _key_transform(environment, k)
++
++    result = []
++
++    for key, values in groupby(sorted(value, key=expr), expr):
++        if key_transform is not None:
++            key = key_transform(key)
++
++        result.append(_GroupTuple(key, list(values)))
++
++    return result
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1240,28 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    key_transform: t.Optional[t.Callable[..., t.Any]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++
++    if key_transform is not None:
++        pass_arg = _PassArg.from_obj(key_transform)
++
++        if pass_arg is _PassArg.environment:
++            _key_transform = key_transform
++            key_transform = lambda k: _key_transform(environment, k)
++
++    result = []
++
++    for key, values in groupby(
++        sorted(await auto_to_list(value), key=expr), expr
++    ):
++        if key_transform is not None:
++            key = await auto_await(key_transform(key))
++
++        result.append(_GroupTuple(key, await auto_to_list(values)))
++
++    return result
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..e794936 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -94,6 +94,150 @@ def test_groupby_multidot(env_async, articles):
+     ]
+ 
+ 
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "a", "city": "nyc"},
++        {"name": "b", "city": "sf"},
++        {"name": "c", "city": "nyc"},
++    ],
++)
++def test_groupby_key_transform(env_async, items):
++    """Plain callback transforms displayed grouper in async mode."""
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('city', key_transform=kt) %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(items=items, kt=lambda k: k.upper())
++    assert out == "NYC:a,c|SF:b|"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "a", "city": "nyc"},
++        {"name": "b"},
++        {"name": "c", "city": "sf"},
++    ],
++)
++def test_groupby_key_transform_default(env_async, items):
++    """key_transform with default works in async mode."""
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('city', default='nyc', key_transform=kt) %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(items=items, kt=lambda k: k.upper())
++    assert out == "NYC:a,b|SF:c|"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "a", "city": "nyc"},
++        {"name": "b", "city": "sf"},
++    ],
++)
++def test_groupby_key_transform_pass_environment(env_async, items):
++    """@pass_environment callback works in async mode."""
++    from jinja2.utils import pass_environment
++
++    @pass_environment
++    def upper_city(environment, city):
++        return city.upper()
++
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('city', key_transform=upper_city) %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(items=items, upper_city=upper_city)
++    assert out == "NYC:a|SF:b|"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "a", "city": "nyc"},
++        {"name": "b", "city": "sf"},
++    ],
++)
++def test_groupby_key_transform_async_callback(env_async, items):
++    """Async callback (coroutine) is awaited in async mode."""
++    async def async_upper(k):
++        return k.upper()
++
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('city', key_transform=kt) %}"
++        "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(items=items, kt=async_upper)
++    assert out == "NYC:a|SF:b|"
++
++
++@mark_dualiter(
++    "items",
++    lambda: [
++        {"name": "a", "val": 1},
++        {"name": "b", "val": 2},
++    ],
++)
++def test_groupby_key_transform_collision(env_async, items):
++    """Same display key from different groups does not merge them in async mode."""
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('val', key_transform=kt) %}"
++        "{{ grouper }}{% for x in list %}:{{ x.val }}{% endfor %}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(items=items, kt=lambda v: 'same')
++    assert out == "same:1|same:2|"
++
++
++@mark_dualiter("items", lambda: [])
++def test_groupby_key_transform_empty(env_async, items):
++    """Empty input calls no callback in async mode."""
++    called = []
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('val', key_transform=kt) %}"
++        "{{ grouper }}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(items=items, kt=lambda v: called.append(v) or v)
++    assert out == ""
++    assert called == []
++
++
++@mark_dualiter("items", lambda: [{"val": 1}])
++def test_groupby_key_transform_exception(env_async, items):
++    """Exception from callback propagates in async mode."""
++    tmpl = env_async.from_string(
++        "{%- for grouper, list in items()|groupby('val', key_transform=kt) %}"
++        "{{ grouper }}|"
++        "{%- endfor %}"
++    )
++    with pytest.raises(ValueError, match="err"):
++        tmpl.render(
++            items=items,
++            kt=lambda v: (_ for _ in ()).throw(ValueError("err")),
++        )
++
++
++def test_groupby_key_transform_markup(env_async):
++    """Returned Markup is not auto-escaped; plain string is escaped, async mode."""
++    myenv = Environment(enable_async=True, autoescape=True)
++    tmpl = myenv.from_string(
++        "{%- for grouper, list in items|groupby('val', key_transform=kt) %}"
++        "{{ grouper }}|"
++        "{%- endfor %}"
++    )
++    out = tmpl.render(
++        items=[{"val": "safe"}, {"val": "<unsafe>"}],
++        kt=lambda v: Markup(v) if v == "safe" else v,
++    )
++    assert out == "&lt;unsafe&gt;|safe|"
+ @mark_dualiter("int_items", lambda: [1, 2, 3])
+ def test_join_env_int(env_async, int_items):
+     tmpl = env_async.from_string('{{ items()|join("|") }}')
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..d063f76 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -619,8 +619,121 @@ class TestFilter:
+         )
+         assert out == "NY: emma, john\nWA: smith\n"
+ 
++
++    def test_groupby_key_transform(self, env):
++        """key_transform callback transforms displayed grouper."""
++        tmpl = env.from_string(
++            "{%- for grouper, list in items|groupby('city', key_transform=kt) %}"
++            "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++            "{%- endfor %}"
++        )
++        out = tmpl.render(
++            items=[
++                {"name": "a", "city": "nyc"},
++                {"name": "b", "city": "sf"},
++                {"name": "c", "city": "nyc"},
++            ],
++            kt=lambda k: k.upper(),
++        )
++        assert out == "NYC:a,c|SF:b|"
++
++    def test_groupby_key_transform_default(self, env):
++        """key_transform with default parameter."""
++        tmpl = env.from_string(
++            "{%- for grouper, list in items|groupby('city', default='nyc', key_transform=kt) %}"
++            "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++            "{%- endfor %}"
++        )
++        out = tmpl.render(
++            items=[
++                {"name": "a", "city": "nyc"},
++                {"name": "b"},
++                {"name": "c", "city": "sf"},
++            ],
++            kt=lambda k: k.upper(),
++        )
++        assert out == "NYC:a,b|SF:c|"
++
++    def test_groupby_key_transform_pass_environment(self, env):
++        """@pass_environment callback receives env before key."""
++        from jinja2.utils import pass_environment
++
++        @pass_environment
++        def upper_city(environment, city):
++            return city.upper()
++
++        tmpl = env.from_string(
++            "{%- for grouper, list in items|groupby('city', key_transform=upper_city) %}"
++            "{{ grouper }}:{{ list|map(attribute='name')|join(',') }}|"
++            "{%- endfor %}"
++        )
++        out = tmpl.render(
++            items=[
++                {"name": "a", "city": "nyc"},
++                {"name": "b", "city": "sf"},
++            ],
++            upper_city=upper_city,
++        )
++        assert out == "NYC:a|SF:b|"
++
++    def test_groupby_key_transform_collision(self, env):
++        """Same display key from different original groups does not merge them."""
++        tmpl = env.from_string(
++            "{%- for grouper, list in items|groupby('val', key_transform=kt) %}"
++            "{{ grouper }}{% for x in list %}:{{ x.val }}{% endfor %}|"
++            "{%- endfor %}"
++        )
++        out = tmpl.render(
++            items=[
++                {"val": 1},
++                {"val": 2},
++            ],
++            kt=lambda v: 'same',
++        )
++        assert out == "same:1|same:2|"
++
++    def test_groupby_key_transform_empty(self, env):
++        """Empty input calls no callback."""
++        called = []
++        tmpl = env.from_string(
++            "{%- for grouper, list in items|groupby('val', key_transform=kt) %}"
++            "{{ grouper }}|"
++            "{%- endfor %}"
++        )
++        out = tmpl.render(items=[], kt=lambda v: called.append(v) or v)
++        assert out == ""
++        assert called == []
++
++    def test_groupby_key_transform_exception(self, env):
++        """Exception from callback propagates."""
++        tmpl = env.from_string(
++            "{%- for grouper, list in items|groupby('val', key_transform=kt) %}"
++            "{{ grouper }}|"
++            "{%- endfor %}"
++        )
++        with pytest.raises(ValueError, match="err"):
++            tmpl.render(
++                items=[{"val": 1}],
++                kt=lambda v: (_ for _ in ()).throw(ValueError("err")),
++            )
++
++    def test_groupby_key_transform_markup(self, env):
++        """Returned Markup is not auto-escaped; plain string is escaped."""
++        myenv = Environment(autoescape=True)
++        tmpl = myenv.from_string(
++            "{%- for grouper, list in items|groupby('val', key_transform=kt) %}"
++            "{{ grouper }}|"
++            "{%- endfor %}"
++        )
++        out = tmpl.render(
++            items=[{"val": "safe"}, {"val": "<unsafe>"}],
++            kt=lambda v: Markup(v) if v == "safe" else v,
++        )
++        assert out == "&lt;unsafe&gt;|safe|"
++
+     def test_filtertag(self, env):
+         tmpl = env.from_string(
++
+             "{% filter upper|replace('FOO', 'foo') %}foobar{% endfilter %}"
+         )
+         assert tmpl.render() == "fooBAR"

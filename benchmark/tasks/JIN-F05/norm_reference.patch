@@ -1,0 +1,154 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..f840cd0a 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add an ``include_empty`` option to ``groupby`` and define ordering
++    for empty, ``None``, and missing grouping keys.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..09fa80b6 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1163,6 +1163,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = True,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1203,6 +1204,19 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    You can control whether items with empty or falsy attribute values
++    are included in the output using the ``include_empty`` parameter.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", include_empty=false) %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.1
++        Added the ``include_empty`` parameter and defined ordering for
++        empty, ``None``, and missing keys.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+@@ -1210,9 +1224,24 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
++
++    if include_empty:
++        filtered_value = value
++    else:
++        # Filter out items where the grouping attribute is falsy
++        filtered_value = [item for item in value if expr(item)]
++
++    # Create a sort key that handles None values and missing attributes properly
++    def sort_key(item: t.Any) -> t.Tuple[int, t.Any]:
++        val = expr(item)
++        if isinstance(val, Undefined):
++            bool(val)  # Preserve StrictUndefined's error behavior.
++            return (2, "")
++        return (1, "") if val is None else (0, val)
++
+     return [
+         _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
++        for key, values in groupby(sorted(filtered_value, key=sort_key), expr)
+     ]
+ 
+ 
+@@ -1222,11 +1251,28 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = True,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
++    value_list = await auto_to_list(value)
++
++    if include_empty:
++        filtered_value = value_list
++    else:
++        # Filter out items where the grouping attribute is falsy
++        filtered_value = [item for item in value_list if expr(item)]
++
++    # Create a sort key that handles None values and missing attributes properly
++    def sort_key(item: t.Any) -> t.Tuple[int, t.Any]:
++        val = expr(item)
++        if isinstance(val, Undefined):
++            bool(val)  # Preserve StrictUndefined's error behavior.
++            return (2, "")
++        return (1, "") if val is None else (0, val)
++
+     return [
+         _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++        for key, values in groupby(sorted(filtered_value, key=sort_key), expr)
+     ]
+ 
+ 
+diff --git a/tests/test_groupby_empty_contribution.py b/tests/test_groupby_empty_contribution.py
+new file mode 100644
+index 00000000..65b05016
+--- /dev/null
++++ b/tests/test_groupby_empty_contribution.py
+@@ -0,0 +1,46 @@
++import asyncio
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import StrictUndefined
++from jinja2 import Undefined
++from jinja2.exceptions import UndefinedError
++
++
++def test_groupby_retains_distinct_empty_none_and_missing_groups():
++    env = Environment()
++    rows = [{}, {"key": None}, {"key": ""}, {}, {"key": "z"}, {"key": None}]
++    groups = env.call_filter("groupby", rows, ["key"], {"include_empty": True})
++    assert [group.grouper for group in groups[:3]] == ["", "z", None]
++    assert isinstance(groups[3].grouper, Undefined)
++    assert groups[2].list == [rows[1], rows[5]]
++    assert groups[3].list == [rows[0], rows[3]]
++
++
++def test_groupby_filters_after_default_substitution():
++    env = Environment()
++    rows = [{"key": value} for value in [None, "", 0, False, "yes"]] + [{}]
++    groups = env.call_filter(
++        "groupby", rows, ["key"], {"default": "fallback", "include_empty": False}
++    )
++    assert [group.grouper for group in groups] == ["fallback", "yes"]
++
++
++def test_groupby_preserves_strict_undefined_error():
++    env = Environment(undefined=StrictUndefined)
++    with pytest.raises(UndefinedError):
++        env.call_filter("groupby", [{}], ["key"], {"include_empty": True})
++
++
++def test_async_groupby_empty_key_order():
++    env = Environment(enable_async=True)
++
++    async def rows():
++        for value in [None, "", "z"]:
++            yield {"key": value}
++
++    groups = asyncio.run(
++        env.call_filter("groupby", rows(), ["key"], {"include_empty": True})
++    )
++    assert [group.grouper for group in groups] == ["", "z", None]

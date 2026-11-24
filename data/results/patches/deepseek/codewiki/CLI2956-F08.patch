@@ -1,0 +1,135 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..ecc12bc 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -165,6 +165,20 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++class _ParamsDict(dict):
++    """Internal dict subclass that records option history on __setitem__."""
++
++    def __init__(self, *args, ctx=None, **kwargs):
++        self._ctx = ctx
++        super().__init__(*args, **kwargs)
++
++    def __setitem__(self, key, value):
++        super().__setitem__(key, value)
++        if self._ctx is not None and self._ctx._track_changes:
++            if self._ctx._skip_history is not None and key not in self._ctx._skip_history:
++                self._ctx._record_option_history(key, value, None)
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -296,7 +310,7 @@ class Context:
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+-        self.params: dict[str, t.Any] = {}
++        self.params: dict[str, t.Any] = _ParamsDict(ctx=self)
+         #: the leftover arguments.
+         self.args: list[str] = []
+         #: protected arguments.  These are arguments that are prepended
+@@ -438,6 +452,9 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._track_changes: bool = getattr(command, "track_changes", False)
++        self._option_history: dict[str, list[dict]] = {}
++        self._skip_history: set = set()
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -840,6 +857,57 @@ class Context:
+         return self._parameter_source.get(name)
+ 
+ 
++
++    def get_option_history(self, name: str) -> list[dict] | None:
++        """Return the assignment history for an option, or ``None`` if
++        tracking is disabled.
++
++        ``name`` may be an option's Python parameter name, a declared
++        long option such as ``"--count"``, or a declared short option
++        such as ``"-c"``.
++
++        Returns ``None`` when tracking is disabled on the current
++        command.  Returns ``[]`` when tracking is enabled but ``name``
++        does not identify an option on the current command.
++        """
++        if not self._track_changes:
++            return None
++
++        param = None
++        if self.command is not None:
++            for p in self.command.get_params(self):
++                if p.name == name:
++                    param = p
++                    break
++                if isinstance(p, Option):
++                    for opt in p.opts:
++                        if opt == name:
++                            param = p
++                            break
++                    if param is not None:
++                        break
++
++        if param is None:
++            return []
++
++        history = self._option_history.get(param.name)
++        if history is None:
++            return []
++        return [dict(entry) for entry in history]
++
++    def _record_option_history(
++        self, param_name: str, value: t.Any, source: ParameterSource | None
++    ) -> None:
++        """Record an option value assignment."""
++        if param_name not in self._option_history:
++            self._option_history[param_name] = []
++        self._option_history[param_name].append({
++            "value": value,
++            "source": source,
++            "timestamp": __import__("time").time(),
++        })
++
++
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+     Click.  A basic command handles command line parsing and might dispatch
+@@ -916,6 +984,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        track_changes: bool = False,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -945,6 +1014,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -2421,7 +2491,15 @@ class Parameter:
+                 value = None
+ 
+         if self.expose_value:
+-            ctx.params[self.name] = value  # type: ignore
++            # If tracking is enabled, record history with the correct source.
++            if ctx._track_changes:
++                ctx._skip_history.add(self.name)
++                ctx.params[self.name] = value  # type: ignore
++                ctx._skip_history.discard(self.name)
++                if isinstance(self, Option):
++                    ctx._record_option_history(self.name, value, source)
++            else:
++                ctx.params[self.name] = value  # type: ignore
+ 
+         return value, args
+ 

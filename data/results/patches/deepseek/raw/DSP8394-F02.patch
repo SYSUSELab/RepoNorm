@@ -1,0 +1,425 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..c430ece0 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -7,7 +7,7 @@ import litellm
+ from litellm.caching.caching import Cache as LitellmCache
+ 
+ from dspy.clients.base_lm import BaseLM, inspect_history
+-from dspy.clients.cache import Cache
++from dspy.clients.cache import Cache, _set_current_namespace, _validate_namespace
+ from dspy.clients.embedding import Embedder
+ from dspy.clients.lm import LM
+ from dspy.clients.provider import Provider, TrainingJob
+@@ -33,6 +33,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    namespace: Optional[str] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,7 +44,11 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        namespace: Optional namespace for cache isolation. Must be a string or None.
++            If None, uses original (non-namespaced) cache keys.
+     """
++    _validate_namespace(namespace)
++
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+             "Cannot enable both LiteLLM and DSPy on-disk cache, please set at most one of `enable_disk_cache` or "
+@@ -74,6 +79,9 @@ def configure_cache(
+         memory_max_entries,
+     )
+ 
++    # Set the initial namespace for the calling context
++    _set_current_namespace(namespace)
++
+ 
+ litellm.telemetry = False
+ litellm.cache = None  # By default we disable litellm cache and use DSPy on-disk cache.
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..a0f4a1d1 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,7 +1,9 @@
++import contextvars
+ import copy
+ import inspect
+ import logging
+ import threading
++from contextlib import contextmanager
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -14,6 +16,94 @@ from diskcache import FanoutCache
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Namespace state stored in a context variable for thread/async isolation.
++_namespace_var: contextvars.ContextVar = contextvars.ContextVar("cache_namespace", default=None)
++
++
++def _validate_namespace(value):
++    """Validate namespace value. Must be a string (including empty) or None."""
++    if value is not None and not isinstance(value, str):
++        raise ValueError(f"Namespace must be a string or None, got {type(value).__name__}")
++    return value
++
++
++def _namespace_prefix(namespace):
++    """Compute the key prefix for a namespace string.
++
++    Returns None for None namespace, or the first 8 hex chars of SHA-256(namespace) + ':'.
++    """
++    if namespace is None:
++        return None
++    return sha256(namespace.encode("utf-8")).hexdigest()[:8] + ":"
++
++
++def _apply_namespace(key, namespace):
++    """Apply namespace prefix to a cache key."""
++    prefix = _namespace_prefix(namespace)
++    if prefix is None:
++        return key
++    return prefix + key
++
++
++def _get_current_namespace():
++    """Get the current namespace from context variable."""
++    return _namespace_var.get()
++
++
++def _set_current_namespace(value):
++    """Set the current namespace in context variable."""
++    _validate_namespace(value)
++    _namespace_var.set(value)
++
++
++class _NamespaceAccessor:
++    """Descriptor-like accessor for cache namespace.
++
++    Supports:
++        cache.namespace          -> get current namespace
++        cache.namespace = value  -> set current namespace
++        cache.namespace(value)   -> context manager for temporary change
++        cache.namespace == x     -> compare to current value
++        cache.namespace.value    -> current namespace value
++    """
++
++    def __init__(self, cache_instance):
++        self._cache = cache_instance
++
++    @property
++    def value(self):
++        return _get_current_namespace()
++
++    def __eq__(self, other):
++        return self.value == other
++
++    def __ne__(self, other):
++        return self.value != other
++
++    def __repr__(self):
++        return repr(self.value)
++
++    def __str__(self):
++        return str(self.value)
++
++    def __bool__(self):
++        return self.value is not None
++
++    @contextmanager
++    def __call__(self, value):
++        """Context manager for temporary namespace change."""
++        _validate_namespace(value)
++        token = _namespace_var.set(value)
++        try:
++            yield
++        finally:
++            _namespace_var.reset(token)
++
++    def set(self, value):
++        """Set the namespace to the given value."""
++        _validate_namespace(value)
++        _namespace_var.set(value)
++
+ 
+ class Cache:
+     """DSPy Cache
+@@ -58,10 +148,27 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._namespace_accessor = _NamespaceAccessor(self)
++
++    @property
++    def namespace(self):
++        """Accessor for the current cache namespace."""
++        return self._namespace_accessor
++
++    @namespace.setter
++    def namespace(self, value):
++        """Set the current cache namespace."""
++        self._namespace_accessor.set(value)
++
++    def set_namespace(self, value):
++        """Set the current cache namespace."""
++        self._namespace_accessor.set(value)
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+-        return key in self.memory_cache or key in self.disk_cache
++        ns = _get_current_namespace()
++        ns_key = _apply_namespace(key, ns)
++        return ns_key in self.memory_cache or ns_key in self.disk_cache
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+@@ -96,6 +203,17 @@ class Cache:
+         params = {k: transform_value(v) for k, v in request.items() if k not in ignored_args_for_cache_key}
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
++    def _namespaced_key(self, key, namespace=None):
++        """Apply namespace prefix to a key.
++
++        Args:
++            key: The base cache key.
++            namespace: The namespace to use. If None, uses the current context namespace.
++        """
++        if namespace is None:
++            namespace = _get_current_namespace()
++        return _apply_namespace(key, namespace)
++
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+@@ -103,15 +221,17 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
+-        if self.enable_memory_cache and key in self.memory_cache:
++        ns_key = self._namespaced_key(key)
++
++        if self.enable_memory_cache and ns_key in self.memory_cache:
+             with self._lock:
+-                response = self.memory_cache[key]
+-        elif self.enable_disk_cache and key in self.disk_cache:
++                response = self.memory_cache[ns_key]
++        elif self.enable_disk_cache and ns_key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
++            response = self.disk_cache[ns_key]
+             if self.enable_memory_cache:
+                 with self._lock:
+-                    self.memory_cache[key] = response
++                    self.memory_cache[ns_key] = response
+         else:
+             return None
+ 
+@@ -134,13 +254,15 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return
+ 
++        ns_key = self._namespaced_key(key)
++
+         if self.enable_memory_cache and enable_memory_cache:
+             with self._lock:
+-                self.memory_cache[key] = value
++                self.memory_cache[ns_key] = value
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                self.disk_cache[ns_key] = value
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+@@ -175,6 +297,7 @@ def request_cache(
+     enable_memory_cache: bool = True,
+     *,  # everything after this is keyword-only
+     maxsize: Optional[int] = None,  # legacy / no-op
++    namespace: Optional[str] = None,  # namespace override for the decorated call
+ ):
+     """
+     Decorator for applying caching to a function based on the request argument.
+@@ -185,7 +308,12 @@ def request_cache(
+         ignored_args_for_cache_key: A list of arguments to ignore when computing the cache key from the request.
+         enable_memory_cache: Whether to enable in-memory cache at call time. If False, the memory cache will not be
+             written to on new data.
++        namespace: Optional namespace override for this decorated function. If provided, this namespace is used
++            temporarily for the cache lookup and writeback during the call.
+     """
++    if namespace is not None:
++        _validate_namespace(namespace)
++
+     ignored_args_for_cache_key = ignored_args_for_cache_key or ["api_key", "api_base", "base_url"]
+     # Deprecation notice
+     if maxsize is not None:
+@@ -223,18 +351,26 @@ def request_cache(
+             cache = dspy.cache
+             modified_request = process_request(args, kwargs)
+ 
+-            # Retrieve from cache if available
+-            cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+-
+-            if cached_result is not None:
+-                return cached_result
+-
+-            # Otherwise, compute and store the result
+-            result = fn(*args, **kwargs)
+-            # `enable_memory_cache` can be provided at call time to avoid indefinite growth.
+-            cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+-
+-            return result
++            if namespace is not None:
++                # Temporarily override namespace for this call
++                token = _namespace_var.set(namespace)
++                try:
++                    cached_result = cache.get(modified_request, ignored_args_for_cache_key)
++                    if cached_result is not None:
++                        return cached_result
++                    result = fn(*args, **kwargs)
++                    cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                    return result
++                finally:
++                    _namespace_var.reset(token)
++            else:
++                # Use the caller's active namespace
++                cached_result = cache.get(modified_request, ignored_args_for_cache_key)
++                if cached_result is not None:
++                    return cached_result
++                result = fn(*args, **kwargs)
++                cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                return result
+ 
+         @wraps(fn)
+         async def async_wrapper(*args, **kwargs):
+@@ -243,16 +379,26 @@ def request_cache(
+             cache = dspy.cache
+             modified_request = process_request(args, kwargs)
+ 
+-            # Retrieve from cache if available
+-            cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+-            if cached_result is not None:
+-                return cached_result
+-
+-            # Otherwise, compute and store the result
+-            result = await fn(*args, **kwargs)
+-            cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+-
+-            return result
++            if namespace is not None:
++                # Temporarily override namespace for this async call
++                token = _namespace_var.set(namespace)
++                try:
++                    cached_result = cache.get(modified_request, ignored_args_for_cache_key)
++                    if cached_result is not None:
++                        return cached_result
++                    result = await fn(*args, **kwargs)
++                    cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                    return result
++                finally:
++                    _namespace_var.reset(token)
++            else:
++                # Use the caller's active namespace
++                cached_result = cache.get(modified_request, ignored_args_for_cache_key)
++                if cached_result is not None:
++                    return cached_result
++                result = await fn(*args, **kwargs)
++                cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                return result
+ 
+         if inspect.iscoroutinefunction(fn):
+             return async_wrapper
+diff --git a/dspy/utils/asyncify.py b/dspy/utils/asyncify.py
+index 5ca9cdf3..c9ab8bf0 100644
+--- a/dspy/utils/asyncify.py
++++ b/dspy/utils/asyncify.py
+@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
+ import asyncer
+ from anyio import CapacityLimiter
+ 
++from dspy.clients.cache import _get_current_namespace, _set_current_namespace
++
+ if TYPE_CHECKING:
+     from dspy.primitives.program import Module
+ 
+@@ -47,6 +49,8 @@ def asyncify(program: "Module") -> Callable[[Any, Any], Awaitable[Any]]:
+         from dspy.dsp.utils.settings import thread_local_overrides
+ 
+         parent_overrides = thread_local_overrides.get().copy()
++        # Capture the current cache namespace at call-time
++        parent_namespace = _get_current_namespace()
+ 
+         def wrapped_program(*a, **kw):
+             from dspy.dsp.utils.settings import thread_local_overrides
+@@ -54,6 +58,8 @@ def asyncify(program: "Module") -> Callable[[Any, Any], Awaitable[Any]]:
+             original_overrides = thread_local_overrides.get()
+             token = thread_local_overrides.set({**original_overrides, **parent_overrides.copy()})
+             try:
++                # Set the cache namespace from the parent context
++                _set_current_namespace(parent_namespace)
+                 return program(*a, **kw)
+             finally:
+                 thread_local_overrides.reset(token)
+diff --git a/dspy/utils/parallelizer.py b/dspy/utils/parallelizer.py
+index d45df534..d460e484 100644
+--- a/dspy/utils/parallelizer.py
++++ b/dspy/utils/parallelizer.py
+@@ -10,6 +10,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+ 
+ import tqdm
+ 
++from dspy.clients.cache import _get_current_namespace, _set_current_namespace
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -76,7 +78,7 @@ class ParallelExecutor:
+         resubmitted = set()
+ 
+         # This is the worker function each thread will run.
+-        def worker(parent_overrides, submission_id, index, item):
++        def worker(parent_overrides, submission_id, index, item, parent_namespace):
+             if self.cancel_jobs.is_set():
+                 return index, job_cancelled
+             # Record actual start time
+@@ -92,6 +94,9 @@ class ParallelExecutor:
+                 # Usage tracker needs to be deep copied across threads so that each thread tracks its own usage
+                 thread_local_overrides.overrides["usage_tracker"] = copy.deepcopy(parent_overrides["usage_tracker"])
+ 
++            # Set the cache namespace from the parent context
++            _set_current_namespace(parent_namespace)
++
+             try:
+                 return index, function(item)
+             finally:
+@@ -122,13 +127,15 @@ class ParallelExecutor:
+                 from dspy.dsp.utils.settings import thread_local_overrides
+ 
+                 parent_overrides = thread_local_overrides.get().copy()
++                # Capture the current cache namespace for propagation to worker threads
++                parent_namespace = _get_current_namespace()
+ 
+                 futures_map = {}
+                 futures_set = set()
+                 submission_counter = 0
+ 
+                 for idx, item in enumerate(data):
+-                    f = executor.submit(worker, parent_overrides, submission_counter, idx, item)
++                    f = executor.submit(worker, parent_overrides, submission_counter, idx, item, parent_namespace)
+                     futures_map[f] = (submission_counter, idx, item)
+                     futures_set.add(f)
+                     submission_counter += 1
+@@ -187,6 +194,7 @@ class ParallelExecutor:
+                                         submission_counter,
+                                         idx,
+                                         item,
++                                        parent_namespace,
+                                     )
+                                     futures_map[nf] = (submission_counter, idx, item)
+                                     futures_set.add(nf)

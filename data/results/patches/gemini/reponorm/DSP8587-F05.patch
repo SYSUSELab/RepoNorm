@@ -1,0 +1,460 @@
+diff --git a/apply_changes.py b/apply_changes.py
+new file mode 100644
+index 00000000..3edf686e
+--- /dev/null
++++ b/apply_changes.py
+@@ -0,0 +1,91 @@
++import sys
++
++file_path = 'dspy/streaming/streaming_listener.py'
++with open(file_path, 'r') as f:
++    content = f.read()
++
++# Update __init__
++old_init = """    def __init__(
++        self,
++        signature_field_name: str,
++        predict: Any = None,
++        predict_name: str | None = None,
++        allow_reuse: bool = False,
++    ):
++        \"\"\"
++        Args:
++            signature_field_name: The name of the field to listen to.
++            predict: The predictor to listen to. If None, when calling `streamify()` it will automatically look for
++                the predictor that has the `signature_field_name` in its signature.
++            predict_name: The name of the predictor to listen to. If None, when calling `streamify()` it will
++                automatically look for the predictor that has the `signature_field_name` in its signature.
++            allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
++                hurt the performance because the same stream chunk is sent to multiple listeners.
++        \"\"\"
++        self.signature_field_name = signature_field_name
++        self.predict = predict
++        self.predict_name = predict_name
++
++        self.field_start_queue = []
++        self.field_end_queue = Queue()
++        self.stream_start = False
++        self.stream_end = False
++        self.cache_hit = False
++        self.allow_reuse = allow_reuse"""
++
++new_init = """    def __init__(
++        self,
++        signature_field_name: str,
++        predict: Any = None,
++        predict_name: str | None = None,
++        allow_reuse: bool = False,
++        debug: bool = False,
++        debug_logger: logging.Logger | None = None,
++    ):
++        \"\"\"
++        Args:
++            signature_field_name: The name of the field to listen to.
++            predict: The predictor to listen to. If None, when calling `streamify()` it will automatically look for
++                the predictor that has the `signature_field_name` in its signature.
++            predict_name: The name of the predictor to listen to. If None, when calling `streamify()` it will
++                automatically look for the predictor that has the `signature_field_name` in its signature.
++            allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
++                hurt the performance because the same stream chunk is sent to multiple listeners.
++            debug: If True, enable debug logging.
++            debug_logger: The logger to use for debug logging. If None, use `dspy.streaming.listener`.
++        \"\"\"
++        self.signature_field_name = signature_field_name
++        self.predict = predict
++        self.predict_name = predict_name
++
++        self.field_start_queue = []
++        self.field_end_queue = Queue()
++        self.stream_start = False
++        self.stream_end = False
++        self.cache_hit = False
++        self.allow_reuse = allow_reuse
++        self.debug = debug
++        self.debug_logger = debug_logger or logging.getLogger("dspy.streaming.listener")"""
++
++content = content.replace(old_init, new_init)
++
++# Add import logging
++content = "import logging\n" + content
++
++# Add _log_debug method
++log_method = """
++    def _log_debug(self, message: str):
++        if self.debug and self.debug_logger.isEnabledFor(logging.DEBUG):
++            self.debug_logger.debug(message)
++
++    def _preview(self, text: str) -> str:
++        if len(text) <= 80:
++            return text
++        return text[:77] + "..."
++"""
++
++# Insert _log_debug before receive
++content = content.replace("    def receive(self, chunk: ModelResponseStream):", log_method + "\n    def receive(self, chunk: ModelResponseStream):")
++
++with open(file_path, 'w') as f:
++    f.write(content)
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..c3205c7e 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,3 +1,4 @@
++import logging
+ import re
+ from collections import defaultdict
+ from queue import Queue
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        debug: bool = False,
++        debug_logger: logging.Logger | None = None,
+     ):
+         """
+         Args:
+@@ -36,6 +39,8 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            debug: If True, enable debug logging.
++            debug_logger: The logger to use for debug logging. If None, use `dspy.streaming.listener`.
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+@@ -47,6 +52,8 @@ class StreamListener:
+         self.stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
++        self.debug = debug
++        self.debug_logger = debug_logger or logging.getLogger("dspy.streaming.listener")
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -72,6 +79,16 @@ class StreamListener:
+                 return True
+         return False
+ 
++
++    def _log_debug(self, message: str):
++        if self.debug and self.debug_logger.isEnabledFor(logging.DEBUG):
++            self.debug_logger.debug(message)
++
++    def _preview(self, text: str) -> str:
++        if len(text) <= 80:
++            return text
++        return text[:77] + "..."
++
+     def receive(self, chunk: ModelResponseStream):
+         adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
+         if adapter_name not in self.adapter_identifiers:
+@@ -91,6 +108,7 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                self._log_debug(f"State reset for field '{self.signature_field_name}' (allow_reuse={self.allow_reuse})")
+             else:
+                 return
+ 
+@@ -112,6 +130,7 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
++                self._log_debug(f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(chunk_message)}'")
+                 return
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+@@ -131,6 +150,7 @@ class StreamListener:
+                 # We have a full identifier, we can start the stream.
+                 self.stream_start = True
+                 self.field_start_queue = []
++                self._log_debug(f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(concat_message)}'")
+                 # Keep the part after the start_identifier from the concat_message, we need to write it to the buffer.
+                 value_start_index = concat_message.find(start_identifier) + len(start_identifier)
+                 chunk_message = concat_message[value_start_index:].lstrip()
+@@ -160,12 +180,14 @@ class StreamListener:
+             concat_message = "".join(self.field_end_queue.queue).strip()
+             if re.search(end_identifier, concat_message):
+                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
++                self._log_debug(f"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', reason='regex_match', buffered_size={len(concat_message)}")
+                 self.stream_end = True
+                 last_token = self.flush()
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                self._log_debug(f"Emit chunk: len(token)={len(token)}, queue_size={self.field_end_queue.qsize()}, is_last_chunk={self.stream_end}")
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+@@ -176,6 +198,8 @@ class StreamListener:
+         with the purpose to not yield the end_identifier tokens, e.g., "[[ ## ... ## ]]" for ChatAdapter.
+         """
+         last_tokens = "".join(self.field_end_queue.queue)
++        adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
++        self._log_debug(f"Flush: adapter={adapter_name}, field='{self.signature_field_name}', truncated_buffer_length={len(last_tokens)}")
+         self.field_end_queue = Queue()
+         if isinstance(settings.adapter, JSONAdapter):
+             match = re.search(r'",|"\s*}', last_tokens)
+diff --git a/test_logging.py b/test_logging.py
+new file mode 100644
+index 00000000..0e546eda
+--- /dev/null
++++ b/test_logging.py
+@@ -0,0 +1,15 @@
++import logging
++from dspy.streaming.streaming_listener import StreamListener
++
++def test_logging_initialization():
++    logger = logging.getLogger("test_logger")
++    listener = StreamListener(signature_field_name="answer", debug=True, debug_logger=logger)
++    assert listener.debug is True
++    assert listener.debug_logger == logger
++
++if __name__ == "__main__":
++    try:
++        test_logging_initialization()
++        print("Test passed!")
++    except Exception as e:
++        print(f"Test failed: {e}")
+diff --git a/test_logging_v2.py b/test_logging_v2.py
+new file mode 100644
+index 00000000..eaccedb4
+--- /dev/null
++++ b/test_logging_v2.py
+@@ -0,0 +1,23 @@
++import logging
++from dspy.streaming.streaming_listener import StreamListener
++from unittest.mock import MagicMock
++
++def test_logging_initialization():
++    logger = MagicMock(spec=logging.Logger)
++    logger.isEnabledFor.return_value = True
++    listener = StreamListener(signature_field_name="answer", debug=True, debug_logger=logger)
++    assert listener.debug is True
++    assert listener.debug_logger == logger
++    
++    # Test _log_debug
++    listener._log_debug("test message")
++    logger.debug.assert_called_with("test message")
++
++if __name__ == "__main__":
++    try:
++        test_logging_initialization()
++        print("Test passed!")
++    except Exception as e:
++        import traceback
++        traceback.print_exc()
++        print(f"Test failed: {e}")
+diff --git a/update_logging.py b/update_logging.py
+new file mode 100644
+index 00000000..ff729a67
+--- /dev/null
++++ b/update_logging.py
+@@ -0,0 +1,37 @@
++import sys
++
++file_path = 'dspy/streaming/streaming_listener.py'
++with open(file_path, 'r') as f:
++    content = f.read()
++
++# 1. Start detection
++# "Start detection: adapter=ChatAdapter, field='answer', stream_start=True, buffer_preview='...'"
++# I need to find where stream_start becomes True.
++# It happens in two places:
++# 1. When cache_hit is True (in the first if block)
++# 2. When start_identifier is found in concat_message (in the second if block)
++
++# Let's add logging to both.
++
++# 2. Rolling end check
++# "Rolling end check: adapter=ChatAdapter, field='answer', reason='regex_match', buffered_size=25"
++# This happens when re.search(end_identifier, concat_message) is true.
++
++# 3. Emit chunk
++# "Emit chunk: len(token)=12, queue_size=3, is_last_chunk=False"
++# This happens when returning StreamResponse.
++
++# 4. Flush
++# "Flush: adapter=ChatAdapter, field='answer', truncated_buffer_length=15"
++# This happens in flush().
++
++# 5. State reset
++# "State reset for field 'answer' (allow_reuse=True)"
++# This happens when resetting state.
++
++# Let's start by modifying receive() and flush().
++
++# I will use a more robust way to replace the code.
++# I'll read the file and use string replacement.
++
++# Actually, I'll just rewrite the file with the logging calls.
+diff --git a/update_logging_v2.py b/update_logging_v2.py
+new file mode 100644
+index 00000000..2399710a
+--- /dev/null
++++ b/update_logging_v2.py
+@@ -0,0 +1,42 @@
++import re
++
++file_path = 'dspy/streaming/streaming_listener.py'
++with open(file_path, 'r') as f:
++    content = f.read()
++
++# Helper to get adapter name
++adapter_name_code = 'adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"'
++
++# 1. Start detection
++# In the first block (cache hit)
++# In the second block (start_identifier found)
++
++# Let's add a helper to get the log message for start detection
++# "Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(concat_message)}'"
++
++# I'll just manually edit the file content string.
++
++# Let's find the lines to replace.
++# I'll use a more surgical approach.
++
++# Actually, I'll just use `sed` or `python` to replace the whole file content.
++# Since I have the content in memory, I can just do it.
++
++# Let's define the logging calls.
++# Start detection:
++# self._log_debug(f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(chunk_message)}'")
++
++# Rolling end check:
++# self._log_debug(f"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', reason='regex_match', buffered_size={len(concat_message)}")
++
++# Emit chunk:
++# self._log_debug(f"Emit chunk: len(token)={len(token)}, queue_size={self.field_end_queue.qsize()}, is_last_chunk={self.stream_end}")
++
++# Flush:
++# self._log_debug(f"Flush: adapter={adapter_name}, field='{self.signature_field_name}', truncated_buffer_length={len(last_tokens)}")
++
++# State reset:
++# self._log_debug(f"State reset for field '{self.signature_field_name}' (allow_reuse={self.allow_reuse})")
++
++# This seems correct. Now I need to insert them.
++
+diff --git a/update_logging_v3.py b/update_logging_v3.py
+new file mode 100644
+index 00000000..0409e120
+--- /dev/null
++++ b/update_logging_v3.py
+@@ -0,0 +1,115 @@
++import re
++
++file_path = 'dspy/streaming/streaming_listener.py'
++with open(file_path, 'r') as f:
++    content = f.read()
++
++# 1. State reset
++# Find:
++#                 self.field_start_queue = []
++#                 self.field_end_queue = Queue()
++#                 self.stream_start = False
++# Replace with:
++#                 self.field_start_queue = []
++#                 self.field_end_queue = Queue()
++#                 self.stream_start = False
++#                 self._log_debug(f"State reset for field '{self.signature_field_name}' (allow_reuse={self.allow_reuse})")
++
++content = content.replace(
++    "                self.stream_start = False",
++    "                self.stream_start = False\n                self._log_debug(f\"State reset for field '{self.signature_field_name}' (allow_reuse={self.allow_reuse})\")"
++)
++
++# 2. Start detection (cache hit)
++# Find:
++#             if re.search(end_identifier, message_after_start_identifier):
++#                 self.cache_hit = True
++#                 self.stream_start = True
++#                 self.stream_end = True
++#                 return
++# Replace with:
++#             if re.search(end_identifier, message_after_start_identifier):
++#                 self.cache_hit = True
++#                 self.stream_start = True
++#                 self.stream_end = True
++#                 self._log_debug(f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(chunk_message)}'")
++#                 return
++
++# Wait, I need to make sure adapter_name is defined. It is defined at the beginning of receive().
++# Yes, it is.
++
++content = content.replace(
++    "                self.stream_end = True\n                return",
++    "                self.stream_end = True\n                self._log_debug(f\"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(chunk_message)}'\")\n                return"
++)
++
++# 3. Start detection (normal)
++# Find:
++#             if start_identifier in concat_message:
++#                 # We have a full identifier, we can start the stream.
++#                 self.stream_start = True
++#                 self.field_start_queue = []
++# Replace with:
++#             if start_identifier in concat_message:
++#                 # We have a full identifier, we can start the stream.
++#                 self.stream_start = True
++#                 self.field_start_queue = []
++#                 self._log_debug(f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(concat_message)}'")
++
++content = content.replace(
++    "                self.field_start_queue = []",
++    "                self.field_start_queue = []\n                self._log_debug(f\"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{self._preview(concat_message)}'\")"
++)
++
++# 4. Rolling end check
++# Find:
++#             if re.search(end_identifier, concat_message):
++#                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
++#                 self.stream_end = True
++#                 last_token = self.flush()
++# Replace with:
++#             if re.search(end_identifier, concat_message):
++#                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
++#                 self._log_debug(f"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', reason='regex_match', buffered_size={len(concat_message)}")
++#                 self.stream_end = True
++#                 last_token = self.flush()
++
++content = content.replace(
++    "                self.stream_end = True\n                last_token = self.flush()",
++    "                self._log_debug(f\"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', reason='regex_match', buffered_size={len(concat_message)}\")\n                self.stream_end = True\n                last_token = self.flush()"
++)
++
++# 5. Emit chunk
++# Find:
++#             if token:
++#                 return StreamResponse(self.predict_name, self.signature_field_name, token)
++# Replace with:
++#             if token:
++#                 self._log_debug(f"Emit chunk: len(token)={len(token)}, queue_size={self.field_end_queue.qsize()}, is_last_chunk={self.stream_end}")
++#                 return StreamResponse(self.predict_name, self.signature_field_name, token)
++
++content = content.replace(
++    "            if token:\n                return StreamResponse(self.predict_name, self.signature_field_name, token)",
++    "            if token:\n                self._log_debug(f\"Emit chunk: len(token)={len(token)}, queue_size={self.field_end_queue.qsize()}, is_last_chunk={self.stream_end}\")\n                return StreamResponse(self.predict_name, self.signature_field_name, token)"
++)
++
++# 6. Flush
++# Find:
++#         last_tokens = "".join(self.field_end_queue.queue)
++#         self.field_end_queue = Queue()
++# Replace with:
++#         last_tokens = "".join(self.field_end_queue.queue)
++#         self._log_debug(f"Flush: adapter={adapter_name}, field='{self.signature_field_name}', truncated_buffer_length={len(last_tokens)}")
++#         self.field_end_queue = Queue()
++
++# Wait, I need to define adapter_name in flush() too.
++# It is not defined in flush(). I should define it.
++# Or I can just use settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
++
++content = content.replace(
++    "        last_tokens = \"\".join(self.field_end_queue.queue)\n        self.field_end_queue = Queue()",
++    "        last_tokens = \"\".join(self.field_end_queue.queue)\n        adapter_name = settings.adapter.__class__.__name__ if settings.adapter else \"ChatAdapter\"\n        self._log_debug(f\"Flush: adapter={adapter_name}, field='{self.signature_field_name}', truncated_buffer_length={len(last_tokens)}\")\n        self.field_end_queue = Queue()"
++)
++
++with open(file_path, 'w') as f:
++    f.write(content)

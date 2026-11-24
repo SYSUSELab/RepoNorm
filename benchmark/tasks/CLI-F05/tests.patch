@@ -1,0 +1,279 @@
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..42b97cf 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,166 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++def test_retry_cleanup_explicit_zero_disables_parent_policy():
++    attempts = []
++    parent = click.Context(click.Command("parent"), retry_cleanup=3)
++    child = click.Context(click.Command("child"), parent=parent, retry_cleanup=0)
++
++    def failure():
++        attempts.append(1)
++        raise ValueError("once")
++
++    child.call_on_close(failure)
++    with pytest.raises(ValueError, match="once"):
++        child.close()
++    assert len(attempts) == 1
++    parent.close()
++
++
++def test_retry_cleanup_independent_callbacks_and_last_exception():
++    events = []
++    attempts = []
++    ctx = click.Context(click.Command("cmd"), retry_cleanup=2)
++
++    def succeeds():
++        events.append("success")
++
++    def exhausted():
++        error = ValueError(str(len(attempts)))
++        attempts.append(error)
++        raise error
++
++    assert ctx.call_on_close(succeeds) is succeeds
++    assert ctx.call_on_close(exhausted) is exhausted
++    with pytest.raises(ValueError) as caught:
++        ctx.close()
++    assert caught.value is attempts[-1]
++    assert len(attempts) == 3
++    assert events == ["success"]
++    ctx.close()
++    assert events == ["success"]
++
++
++def test_retry_cleanup_each_callback_has_own_budget():
++    calls = {"a": 0, "b": 0}
++    ctx = click.Context(click.Command("cmd"), retry_cleanup=2)
++
++    def operation(name, needed):
++        def close():
++            calls[name] += 1
++            if calls[name] < needed:
++                raise ValueError(name)
++
++        return close
++
++    ctx.call_on_close(operation("a", 3))
++    ctx.call_on_close(operation("b", 2))
++    ctx.close()
++    assert calls == {"a": 3, "b": 2}
++
++
++def test_retry_cleanup_does_not_reenter_context_manager():
++    calls = []
++
++    @contextmanager
++    def manager():
++        try:
++            yield
++        finally:
++            calls.append("exit")
++            raise ValueError("manager")
++
++    ctx = click.Context(click.Command("cmd"), retry_cleanup=2)
++    ctx.with_resource(manager())
++    with pytest.raises(ValueError, match="manager"):
++        ctx.close()
++    assert calls == ["exit"]
++
++
++@pytest.mark.parametrize("failure", [KeyboardInterrupt, SystemExit])
++def test_retry_cleanup_does_not_retry_base_exceptions(failure):
++    calls = []
++    ctx = click.Context(click.Command("cmd"), retry_cleanup=2)
++
++    def callback():
++        calls.append("call")
++        raise failure()
++
++    ctx.call_on_close(callback)
++    with pytest.raises(failure):
++        ctx.close()
++    assert calls == ["call"]
++
++
++@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "0.1"])
++def test_retry_backoff_rejects_invalid_configuration(value):
++    with pytest.raises(ValueError):
++        click.Context(click.Command("cmd"), retry_cleanup_backoff=value)
++
++
++def test_retry_backoff_defaults_inheritance_and_override():
++    root = click.Context(click.Command("root"))
++    assert root.retry_cleanup_backoff == 0.1
++    parent = click.Context(click.Command("parent"), retry_cleanup_backoff=1)
++    inherited = click.Context(click.Command("child"), parent=parent)
++    explicit_none = click.Context(
++        click.Command("child"), parent=parent, retry_cleanup_backoff=None
++    )
++    override = click.Context(
++        click.Command("child"), parent=parent, retry_cleanup_backoff=0.2
++    )
++    assert inherited.retry_cleanup_backoff == explicit_none.retry_cleanup_backoff == 1
++    assert override.retry_cleanup_backoff == 0.2
++
++
++@pytest.mark.parametrize("exhausted", [False, True])
++def test_retry_backoff_observable_schedule(exhausted):
++    # Observe callback timestamps, not a specific sleep implementation.
++    # 150 ms scheduling tolerance is large relative to callback execution,
++    # while still distinguishing no wait, constant wait and factor-three wait.
++    import time
++
++    calls = []
++    ctx = click.Context(
++        click.Command("cmd"), retry_cleanup=3, retry_cleanup_backoff=0.2
++    )
++
++    def callback():
++        calls.append(time.monotonic())
++        if exhausted or len(calls) < 4:
++            raise ValueError("transient")
++
++    ctx.call_on_close(callback)
++    started = time.monotonic()
++    if exhausted:
++        with pytest.raises(ValueError, match="transient"):
++            ctx.close()
++    else:
++        ctx.close()
++    finished = time.monotonic()
++    assert len(calls) == 4
++    assert calls[0] - started < 0.15
++    for previous, following, expected in zip(calls, calls[1:], (0.2, 0.4, 0.8)):
++        assert expected * 0.95 <= following - previous <= expected + 0.15
++    assert finished - calls[-1] < 0.15
++
++
++def test_retry_backoff_resets_for_each_callback():
++    import time
++
++    calls = {"a": [], "b": []}
++    ctx = click.Context(
++        click.Command("cmd"), retry_cleanup=2, retry_cleanup_backoff=0.2
++    )
++
++    def callback(name):
++        calls[name].append(time.monotonic())
++        if len(calls[name]) < 2:
++            raise ValueError(name)
++
++    ctx.call_on_close(lambda: callback("a"))
++    ctx.call_on_close(lambda: callback("b"))
++    ctx.close()
++    for timestamps in calls.values():
++        assert len(timestamps) == 2
++        assert 0.19 <= timestamps[1] - timestamps[0] <= 0.35
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index 3e7a2bd..f0dc08a 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -3,6 +3,7 @@ import pytest
+ import click.shell_completion
+ from click.core import Argument
+ from click.core import Command
++from click.core import Context
+ from click.core import Group
+ from click.core import Option
+ from click.shell_completion import add_completion_class
+@@ -414,3 +415,95 @@ def test_add_completion_class_decorator():
+     # Using `add_completion_class` as a decorator adds the new shell immediately
+     assert "mysh" in click.shell_completion._available_shells
+     assert click.shell_completion._available_shells["mysh"] is MyshComplete
++
++
++def test_context_retry_cleanup_basic():
++    """Test basic retry_cleanup functionality with successful cleanup."""
++    cleanup_count = 0
++
++    def cleanup_func():
++        nonlocal cleanup_count
++        cleanup_count += 1
++
++    ctx = Context(Command("test"), retry_cleanup=3)
++    ctx.call_on_close(cleanup_func)
++    ctx.close()
++
++    assert cleanup_count == 1
++
++
++def test_context_retry_cleanup_with_failure():
++    """Test retry_cleanup with failing cleanup operations."""
++    cleanup_attempts = 0
++
++    def failing_cleanup():
++        nonlocal cleanup_attempts
++        cleanup_attempts += 1
++        if cleanup_attempts < 3:
++            raise OSError("Simulated cleanup failure")
++
++    ctx = Context(Command("test"), retry_cleanup=3)
++    ctx.call_on_close(failing_cleanup)
++
++    ctx.close()
++
++    assert cleanup_attempts == 3
++    # Configurable timing is checked separately; this checks the lifecycle.
++
++
++def test_context_retry_cleanup_exhausted():
++    """Test retry_cleanup when all retries are exhausted."""
++    cleanup_attempts = 0
++
++    def always_failing_cleanup():
++        nonlocal cleanup_attempts
++        cleanup_attempts += 1
++        raise ValueError("Always fails")
++
++    ctx = Context(Command("test"), retry_cleanup=2)
++    ctx.call_on_close(always_failing_cleanup)
++
++    with pytest.raises(ValueError, match="Always fails"):
++        ctx.close()
++
++    assert cleanup_attempts == 3  # Initial attempt + 2 retries
++
++
++def test_context_retry_cleanup_inheritance():
++    """Test that retry_cleanup is inherited from parent context."""
++    parent_ctx = Context(Command("parent"), retry_cleanup=5)
++    child_ctx = Context(Command("child"), parent=parent_ctx)
++
++    assert child_ctx.retry_cleanup == 5
++
++
++def test_context_retry_cleanup_explicit_override():
++    """Test that explicit retry_cleanup overrides parent value."""
++    parent_ctx = Context(Command("parent"), retry_cleanup=5)
++    child_ctx = Context(Command("child"), parent=parent_ctx, retry_cleanup=2)
++
++    assert child_ctx.retry_cleanup == 2
++
++
++def test_context_retry_cleanup_zero_default():
++    """Test that retry_cleanup defaults to 0 (no retries)."""
++    ctx = Context(Command("test"))
++    assert ctx.retry_cleanup == 0
++
++
++def test_context_retry_cleanup_no_retry_path():
++    """Test cleanup without retry (retry_cleanup=0) for edge case."""
++    cleanup_attempts = 0
++
++    def failing_cleanup():
++        nonlocal cleanup_attempts
++        cleanup_attempts += 1
++        raise RuntimeError("Should not retry")
++
++    ctx = Context(Command("test"), retry_cleanup=0)
++    ctx.call_on_close(failing_cleanup)
++
++    with pytest.raises(RuntimeError, match="Should not retry"):
++        ctx.close()
++
++    assert cleanup_attempts == 1  # No retries

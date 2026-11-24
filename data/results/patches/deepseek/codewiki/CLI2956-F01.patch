@@ -1,0 +1,261 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..29f658d 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2549,6 +2549,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        auto_complete: bool | str = False,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2662,6 +2663,25 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++        # Validate auto_complete
++        if not isinstance(auto_complete, (bool, str)):
++            raise TypeError(
++                f"auto_complete must be a bool or str, not {auto_complete.__class__.__name__!r}."
++            )
++
++        if isinstance(auto_complete, str):
++            _valid_auto_complete_strategies = {
++                "user", "branch", "environment", "file", "directory"
++            }
++            if auto_complete not in _valid_auto_complete_strategies:
++                raise ValueError(
++                    f"auto_complete string must be one of"
++                    f" {sorted(_valid_auto_complete_strategies)},"
++                    f" not {auto_complete!r}."
++                )
++
++        self.auto_complete = auto_complete
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+@@ -3033,6 +3053,222 @@ class Option(Parameter):
+         return value, source
+ 
+ 
++    def shell_complete(
++        self, ctx: Context, incomplete: str
++    ) -> list[CompletionItem]:
++        """Return a list of completions for the incomplete value.
++
++        If a ``shell_complete`` function was given during init, it is
++        used.  Otherwise, if :attr:`auto_complete` is enabled, a
++        built-in strategy is selected based on the option's name or
++        the explicit strategy string.  Otherwise, the :attr:`type`
++        :meth:`~click.types.ParamType.shell_complete` function is used.
++
++        :param ctx: Invocation context for this command.
++        :param incomplete: Value being completed. May be empty.
++
++        .. versionadded:: 8.2
++        """
++        # Explicit custom callback always takes precedence
++        if self._custom_shell_complete is not None:
++            results = self._custom_shell_complete(ctx, self, incomplete)
++
++            if results and isinstance(results[0], str):
++                from click.shell_completion import CompletionItem
++
++                results = [CompletionItem(c) for c in results]
++
++            return t.cast("list[CompletionItem]", results)
++
++        # Determine the strategy
++        strategy: str | None = None
++
++        if self.auto_complete is False:
++            return self.type.shell_complete(ctx, self, incomplete)
++
++        if isinstance(self.auto_complete, str):
++            strategy = self.auto_complete
++        else:
++            # Infer strategy from the normalized name
++            strategy = _infer_auto_complete_strategy(self)
++
++        if strategy is None:
++            return self.type.shell_complete(ctx, self, incomplete)
++
++        # Execute the chosen strategy
++        return _execute_auto_complete_strategy(strategy, ctx, self, incomplete)
++
++
++def _infer_auto_complete_strategy(param: Parameter) -> str | None:
++    """Infer the auto-complete strategy from the parameter's name."""
++    if param.name is None:
++        return None
++
++    # Normalize: lowercase and split on underscores
++    tokens = param.name.lower().split("_")
++    token_set = set(tokens)
++
++    # User/username/owner/author names
++    if token_set & {"user", "username", "owner", "author"}:
++        return "user"
++
++    # Branch/ref/revision names
++    if token_set & {"branch", "ref", "revision"}:
++        return "branch"
++
++    # Env/environment/var names
++    if token_set & {"env", "environment", "var"}:
++        return "environment"
++
++    # File/path/input/output names
++    if token_set & {"file", "path", "input", "output"}:
++        return "file"
++
++    # Dir/directory names
++    if token_set & {"dir", "directory"}:
++        return "directory"
++
++    return None
++
++
++def _execute_auto_complete_strategy(
++    strategy: str, ctx: Context, param: Parameter, incomplete: str
++) -> list[CompletionItem]:
++    """Execute a named auto-complete strategy and return results."""
++    from click.shell_completion import CompletionItem
++
++    if strategy == "file":
++        return [
++            CompletionItem(value, type="file")
++            for value in _complete_file(incomplete)
++        ]
++
++    if strategy == "directory":
++        return [
++            CompletionItem(value, type="dir")
++            for value in _complete_directory(incomplete)
++        ]
++
++    if strategy == "user":
++        return [
++            CompletionItem(value)
++            for value in _complete_user(incomplete)
++        ]
++
++    if strategy == "branch":
++        return [
++            CompletionItem(value)
++            for value in _complete_branch(incomplete)
++        ]
++
++    if strategy == "environment":
++        return [
++            CompletionItem(value)
++            for value in _complete_environment(incomplete)
++        ]
++
++    # Fallback to type completion
++    return param.type.shell_complete(ctx, param, incomplete)
++
++
++def _complete_file(incomplete: str) -> list[str]:
++    """Complete file paths (non-directory only)."""
++    import glob
++
++    results: list[str] = []
++    # Use glob to find matching paths
++    pattern = incomplete + "*" if incomplete else "*"
++    matches = sorted(set(glob.glob(pattern)))
++    for m in matches:
++        if os.path.isfile(m) or os.path.islink(m):
++            results.append(m)
++    return results
++
++
++def _complete_directory(incomplete: str) -> list[str]:
++    """Complete directory paths."""
++    import glob
++
++    results: list[str] = []
++    pattern = incomplete + "*" if incomplete else "*"
++    matches = sorted(set(glob.glob(pattern)))
++    for m in matches:
++        if os.path.isdir(m):
++            results.append(m)
++
++    # Also ensure we can complete partial directory names
++    # e.g., /usr/lo -> /usr/local
++    if incomplete and os.path.isdir(incomplete):
++        results.append(incomplete + "/")
++
++    return results
++
++
++def _complete_user(incomplete: str) -> list[str]:
++    """Complete system usernames."""
++    try:
++        import pwd
++    except ImportError:
++        return []
++
++    try:
++        results: list[str] = []
++        for user in pwd.getpwall():
++            name = user.pw_name
++            if not name.startswith("_"):
++                if name.startswith(incomplete):
++                    results.append(name)
++        results.sort()
++        return results[:20]
++    except Exception:
++        return []
++
++
++def _complete_branch(incomplete: str) -> list[str]:
++    """Complete git branch/ref names."""
++    import subprocess
++
++    try:
++        # Get all branches (local and remote)
++        result = subprocess.run(
++            ["git", "branch", "--list", "--all"],
++            capture_output=True,
++            text=True,
++            timeout=10,
++        )
++        if result.returncode != 0:
++            return []
++
++        branches: list[str] = []
++        for line in result.stdout.splitlines():
++            line = line.strip()
++            # Remove leading "* " for current branch, "remotes/" prefix
++            if line.startswith("* "):
++                line = line[2:]
++            if line.startswith("remotes/"):
++                line = line[len("remotes/"):]
++            # Skip detached HEAD
++            if line and line != "HEAD" and not line.startswith("("):
++                if line.startswith(incomplete):
++                    if line not in branches:
++                        branches.append(line)
++
++        branches.sort()
++        return branches[:20]
++    except (FileNotFoundError, subprocess.SubprocessError, OSError):
++        return []
++
++
++def _complete_environment(incomplete: str) -> list[str]:
++    """Complete environment variable names only (not values)."""
++    results: list[str] = [
++        key for key in os.environ.keys()
++        if key.startswith(incomplete)
++    ]
++    results.sort()
++    return results[:20]
++
++
+ class Argument(Parameter):
+     """Arguments are positional parameters to a command.  They generally
+     provide fewer features than options but can have infinite ``nargs``

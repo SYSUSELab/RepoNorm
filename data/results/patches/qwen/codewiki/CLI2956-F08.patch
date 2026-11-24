@@ -1,0 +1,161 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..7c33611 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -165,6 +165,40 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++class _ParamDict(dict):
++    """A dictionary wrapper that tracks parameter assignments when
++    option history tracking is enabled."""
++
++    def __init__(self, ctx: Context) -> None:
++        super().__init__()
++        self._ctx = ctx
++
++    def __setitem__(self, key: str, value: t.Any) -> None:
++        # Track manual assignments - append when there's already history
++        if getattr(self._ctx.command, "track_changes", False):
++            history = self._ctx._option_history.get(key)
++            if history:
++                # Always append for manual assignments
++                import time
++                entry = {
++                    "value": value,
++                    "source": None,  # Manual assignment has no source
++                    "timestamp": time.time(),
++                }
++                self._ctx._option_history[key].append(entry)
++            else:
++                # No history yet - this is during normal parsing, record with source=None
++                # Source will be set later by handle_parse_result
++                import time
++                entry = {
++                    "value": value,
++                    "source": None,  # Placeholder, will be updated
++                    "timestamp": time.time(),
++                }
++                self._ctx._option_history[key] = [entry]
++        super().__setitem__(key, value)
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -296,7 +330,7 @@ class Context:
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+-        self.params: dict[str, t.Any] = {}
++        self.params: dict[str, t.Any] = _ParamDict(self)
+         #: the leftover arguments.
+         self.args: list[str] = []
+         #: protected arguments.  These are arguments that are prepended
+@@ -321,7 +355,11 @@ class Context:
+             and parent is not None
+             and parent.default_map is not None
+         ):
++            # First try to get a nested default_map for this command
+             default_map = parent.default_map.get(info_name)
++            # If no nested entry, fall back to parent's default_map directly
++            if default_map is None:
++                default_map = parent.default_map
+ 
+         self.default_map: cabc.MutableMapping[str, t.Any] | None = default_map
+ 
+@@ -437,6 +475,8 @@ class Context:
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
++        #: History of option value assignments when track_changes is enabled.
++        self._option_history: dict[str, list[dict[str, t.Any]]] = {}
+         self._exit_stack = ExitStack()
+ 
+     @property
+@@ -821,6 +861,54 @@ class Context:
+         """
+         self._parameter_source[name] = source
+ 
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        """Get the history of option value assignments for a given option.
++
++        This returns a list of dictionaries, each containing information about
++        an assignment to the option. Each dictionary has the following keys:
++
++        - ``value``: The assigned value.
++        - ``source``: The :class:`ParameterSource` indicating where the value came from,
++          or ``None`` if it was manually assigned via ``ctx.params[name]``.
++        - ``timestamp``: A floating-point Unix timestamp of when the assignment occurred.
++
++        When tracking is disabled on the current command, this method returns ``None``.
++        When tracking is enabled but ``name`` does not identify an option on the
++        current command, it returns an empty list.
++
++        Positional arguments are not included in option history entries.
++
++        .. versionadded:: 8.3
++
++        :param name: The name of the option (Python parameter name, long option like
++                     ``"--count"``, or short option like ``"-c"``).
++        :returns: A list of assignment records, ``None`` if tracking is disabled,
++                  or an empty list if the option is not found.
++        """
++        # Check if tracking is enabled for this context's command
++        if not getattr(self.command, "track_changes", False):
++            return None
++
++        # First try direct lookup by name
++        history = self._option_history.get(name)
++        if history is not None:
++            # Return a shallow copy to prevent mutation of internal state
++            return list(history)
++
++        # If not found, try to match by option names (--opt, -o)
++        for param in self.command.params:
++            if hasattr(param, 'opts'):
++                for opt in param.opts:
++                    if opt == name:
++                        # Found matching option, return its history
++                        hist = self._option_history.get(param.name)
++                        if hist is not None:
++                            return list(hist)
++                        return []
++
++        # No matching option found
++        return []
++
+     def get_parameter_source(self, name: str) -> ParameterSource | None:
+         """Get the source of a parameter. This indicates the location
+         from which the value of the parameter was obtained.
+@@ -916,6 +1004,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        track_changes: bool = False,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -945,6 +1034,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -2423,6 +2513,14 @@ class Parameter:
+         if self.expose_value:
+             ctx.params[self.name] = value  # type: ignore
+ 
++            # Update source in history if tracking is enabled
++            if getattr(ctx.command, "track_changes", False):
++                history = ctx._option_history.get(self.name)
++                if history and history[0].get("source") is None:
++                    import time
++                    history[0]["source"] = source
++                    history[0]["timestamp"] = time.time()
++
+         return value, args
+ 
+     def get_help_record(self, ctx: Context) -> tuple[str, str] | None:

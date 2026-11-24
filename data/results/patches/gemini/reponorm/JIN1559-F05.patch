@@ -1,0 +1,91 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..e0299f4 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -379,10 +379,24 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            if token.value in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++                parser.fail(
++                    f"variable {token.value!r} conflicts with translation function names",
++                    token.lineno,
++                    exc=TemplateSyntaxError,
++                )
++
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                if not _validate_expression(var):
++                    parser.fail(
++                        f"invalid expression {var!r} for translatable variable {token.value!r}",
++                        token.lineno,
++                        exc=TemplateSyntaxError,
++                    )
++                variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+@@ -852,3 +866,20 @@ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+ loopcontrols = LoopControlExtension
+ debug = DebugExtension
++
++def _validate_expression(expr: nodes.Expr) -> bool:
++    if isinstance(expr, (nodes.Const, nodes.Name)):
++        return True
++    if isinstance(expr, nodes.Getattr):
++        return _validate_expression(expr.node)
++    if isinstance(expr, nodes.Filter):
++        return _validate_expression(expr.node) and all(_validate_expression(arg) for arg in expr.args)
++    if isinstance(expr, nodes.Test):
++        return _validate_expression(expr.node) and all(_validate_expression(arg) for arg in expr.args)
++    if isinstance(expr, nodes.Call):
++        if not isinstance(expr.node, nodes.Name):
++            return False
++        if expr.dyn_args is not None or expr.dyn_kwargs is not None:
++            return False
++        return all(_validate_expression(arg) for arg in expr.args) and                all(_validate_expression(kw.value) for kw in expr.kwargs)
++    return False
+diff --git a/tests/test_trans_validation.py b/tests/test_trans_validation.py
+new file mode 100644
+index 0000000..e065a42
+--- /dev/null
++++ b/tests/test_trans_validation.py
+@@ -0,0 +1,34 @@
++import pytest
++from jinja2 import Environment
++from jinja2.ext import InternationalizationExtension
++from jinja2.exceptions import TemplateSyntaxError
++
++def test_reserved_names():
++    env = Environment(extensions=[InternationalizationExtension])
++    for name in ['gettext', 'ngettext', 'pgettext', 'npgettext', '_']:
++        with pytest.raises(TemplateSyntaxError, match=f"conflicts with translation function names"):
++            env.from_string("{% trans " + name + "=1 %}{% endtrans %}")
++
++def test_invalid_expression():
++    env = Environment(extensions=[InternationalizationExtension])
++    # Item access is not allowed
++    with pytest.raises(TemplateSyntaxError):
++        env.from_string("{% trans x=y['a'] %}{% endtrans %}")
++    # Arithmetic is not allowed
++    with pytest.raises(TemplateSyntaxError):
++        env.from_string("{% trans x=1+1 %}{% endtrans %}")
++    # Conditional is not allowed
++    with pytest.raises(TemplateSyntaxError):
++        env.from_string("{% trans x=1 if True else 2 %}{% endtrans %}")
++
++def test_valid_expression():
++    env = Environment(extensions=[InternationalizationExtension])
++    # Constants, names, attribute access, filters, tests, calls
++    env.from_string("{% trans x=1, y=z, a=b.c, f=d|e, t=g is defined, c=i() %}{% endtrans %}")
++
++def test_invalid_dynamic_args():
++    env = Environment(extensions=[InternationalizationExtension])
++    with pytest.raises(TemplateSyntaxError):
++        env.from_string("{% trans x=f(*args) %}{% endtrans %}")
++    with pytest.raises(TemplateSyntaxError):
++        env.from_string("{% trans x=f(**kwargs) %}{% endtrans %}")

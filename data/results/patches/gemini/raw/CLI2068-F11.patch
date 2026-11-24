@@ -1,0 +1,150 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..3c40442 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -17,7 +17,7 @@ from gettext import gettext as _
+ from io import StringIO
+ from types import TracebackType
+ 
+-from ._compat import _default_text_stdout
++from ._compat import WIN, _default_text_stdout
+ from ._compat import CYGWIN
+ from ._compat import get_best_encoding
+ from ._compat import isatty
+@@ -484,13 +484,16 @@ class Editor:
+         editor: str | None = None,
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+-        extension: str = ".txt",
++        extension: str = '.txt',
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
+-
++        if monitor_process is not None and not callable(monitor_process):
++            raise TypeError('monitor_process must be a callable')
++        self.monitor_process = monitor_process
+     def get_editor(self) -> str:
+         if self.editor is not None:
+             return self.editor
+@@ -507,6 +510,10 @@ class Editor:
+ 
+     def edit_file(self, filename: str) -> None:
+         import subprocess
++        import time
++        import warnings
++        import shlex
++        import os
+ 
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+@@ -515,9 +522,42 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        def _emit(event_type, pid, cmd):
++            if self.monitor_process:
++                try:
++                    self.monitor_process(event_type, pid, cmd, time.time())
++                except Exception as e:
++                    warnings.warn(f'monitor_process callback failed: {e}', UserWarning)
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            args = shlex.split(editor) + [filename]
++            c = subprocess.Popen(args, env=environ)
++            _emit('start', c.pid, editor)
++
++            if not WIN:
++                while True:
++                    try:
++                        pid, status = os.waitpid(c.pid, os.WUNTRACED | os.WCONTINUED | os.WNOHANG)
++                    except ChildProcessError:
++                        # Process already exited
++                        break
++
++                    if pid == 0:
++                        time.sleep(0.1)
++                        continue
++
++                    if os.WIFEXITED(status) or os.WIFSIGNALED(status):
++                        _emit('terminate', c.pid, editor)
++                        break
++                    elif os.WIFSTOPPED(status):
++                        _emit('suspend', c.pid, editor)
++                    elif os.WIFCONTINUED(status):
++                        _emit('resume', c.pid, editor)
++                exit_code = c.wait()
++            else:
++                exit_code = c.wait()
++                _emit('terminate', c.pid, editor)
++
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+@@ -526,7 +566,6 @@ class Editor:
+             raise ClickException(
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+-
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..da50511 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -648,8 +648,9 @@ def edit(
+     editor: str | None = None,
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+-    extension: str = ".txt",
++    extension: str = '.txt',
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -680,7 +681,7 @@ def edit(
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, monitor_process=monitor_process)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_monitor_process.py b/tests/test_monitor_process.py
+new file mode 100644
+index 0000000..288e95d
+--- /dev/null
++++ b/tests/test_monitor_process.py
+@@ -0,0 +1,24 @@
++import click
++import pytest
++import os
++import sys
++import time
++
++def test_monitor_process_callback():
++    events = []
++    def monitor_callback(event_type, process_id, editor_command, timestamp):
++        events.append((event_type, process_id, editor_command, timestamp))
++
++    # Use a simple command that exits immediately
++    os.environ["EDITOR"] = "true"
++    
++    click.edit("hello", monitor_process=monitor_callback)
++    
++    assert len(events) >= 2
++    assert events[0][0] == 'start'
++    assert events[-1][0] == 'terminate'
++    assert events[0][1] == events[-1][1]
++
++def test_monitor_process_invalid_callback():
++    with pytest.raises(TypeError):
++        click.edit("hello", monitor_process="not a callable")

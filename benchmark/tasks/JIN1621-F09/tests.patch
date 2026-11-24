@@ -1,0 +1,111 @@
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..492e1f4 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,106 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++def test_monitor_automatic_modify_delete_and_add(tmp_path):
++    import threading
++    path = tmp_path / "a.html"; path.write_text("one")
++    class ObservableLoader(loaders.FileSystemLoader):
++        def __init__(self, *args, **kwargs):
++            self.changed = threading.Event(); super().__init__(*args, **kwargs)
++        def scan_once(self):
++            names = super().scan_once()
++            if names: self.changed.set()
++            return names
++    loader = ObservableLoader(tmp_path)
++    env = Environment(loader=loader, auto_reload=False)
++    first = env.get_template("a.html")
++    path.write_text("two changed")
++    assert loader.changed.wait(2.0)
++    second = env.get_template("a.html")
++    assert second is not first and second.render() == "two changed"
++    loader.changed.clear(); path.unlink(); assert loader.changed.wait(2.0)
++    with pytest.raises(TemplateNotFound): env.get_template("a.html")
++    loader.changed.clear(); (tmp_path / "new.html").write_text("new")
++    assert loader.changed.wait(2.0)
++    assert env.get_template("new.html").render() == "new"
++    loader.close()
++
++
++def test_monitor_public_close_restart_and_context_manager(tmp_path):
++    import threading
++    (tmp_path / "a").write_text("A")
++    class ObservableLoader(loaders.FileSystemLoader):
++        def __init__(self, *args, **kwargs):
++            self.scanned = threading.Event(); super().__init__(*args, **kwargs)
++        def scan_once(self):
++            names = super().scan_once(); self.scanned.set(); return names
++    loader = ObservableLoader(tmp_path)
++    env = Environment(loader=loader); env.get_template("a")
++    assert loader.scanned.wait(2.0)
++    loader.close()
++    loader.scanned.clear()
++    assert not loader.scanned.wait(0.7)
++    loader.start_monitoring()
++    assert loader.scanned.wait(2.0)
++    loader.close()
++    with ObservableLoader(tmp_path) as managed:
++        Environment(loader=managed).get_template("a")
++        assert managed.scanned.wait(2.0)
++    managed.scanned.clear()
++    assert not managed.scanned.wait(0.7)
++
++
++def test_monitor_disabled_never_scans(tmp_path):
++    import threading
++    class ObservableLoader(loaders.FileSystemLoader):
++        def __init__(self, *args, **kwargs):
++            self.scanned = threading.Event(); super().__init__(*args, **kwargs)
++        def scan_once(self):
++            self.scanned.set(); return super().scan_once()
++    loader = ObservableLoader(tmp_path, auto_reload=False)
++    env = Environment(loader=loader)
++    with pytest.raises(TemplateNotFound): env.get_template("missing")
++    loader.start_monitoring()
++    assert not loader.scanned.wait(0.7)
++    loader.close()
++
++
++def test_monitor_public_scan_and_manual_invalidation(tmp_path):
++    path = tmp_path / ".hidden"; path.write_text("one")
++    loader = loaders.FileSystemLoader(tmp_path)
++    env = Environment(loader=loader, auto_reload=False)
++    first = env.get_template(".hidden")
++    path.write_text("two")
++    assert loader.invalidate_changed([str(path), str(tmp_path.parent / "outside")]) == {".hidden"}
++    assert env.get_template(".hidden") is not first
++    path.write_text("three")
++    assert loader.scan_once() == {".hidden"}
++    assert env.get_template(".hidden").render() == "three"
++    loader.close()
++
++
++def test_monitor_environment_is_weakly_tracked(tmp_path):
++    import gc, weakref
++    (tmp_path / "a").write_text("A")
++    loader = loaders.FileSystemLoader(tmp_path)
++    env = Environment(loader=loader); env.get_template("a")
++    ref = weakref.ref(env); del env; gc.collect()
++    assert ref() is None
++    loader.close()
++
++
++def test_monitor_survives_background_filesystem_error(tmp_path):
++    import threading
++    class FlakyLoader(loaders.FileSystemLoader):
++        def __init__(self, *args, **kwargs):
++            self.calls = 0; self.recovered = threading.Event(); super().__init__(*args, **kwargs)
++        def scan_once(self):
++            self.calls += 1
++            if self.calls == 1: raise OSError("temporary")
++            self.recovered.set(); return super().scan_once()
++    (tmp_path / "a").write_text("A")
++    loader = FlakyLoader(tmp_path); Environment(loader=loader).get_template("a")
++    assert loader.recovered.wait(2.0)
++    loader.close()

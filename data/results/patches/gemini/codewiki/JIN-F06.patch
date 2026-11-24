@@ -1,0 +1,202 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..c52501a 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -21,6 +21,7 @@ from .runtime import Undefined
+ from .utils import htmlsafe_json_dumps
+ from .utils import pass_context
+ from .utils import pass_environment
++from .utils import _PassArg
+ from .utils import pass_eval_context
+ from .utils import pformat
+ from .utils import url_quote
+@@ -1163,6 +1164,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    key_transform: t.Optional[t.Callable[[t.Any], t.Any]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,10 +1212,23 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    pass_arg = _PassArg.from_obj(key_transform)
++    groups = []
++
++    for key, values in groupby(sorted(value, key=expr), expr):
++        items = list(values)
++        
++        if key_transform is not None:
++            if pass_arg is _PassArg.environment:
++                display_key = key_transform(environment, key)
++            else:
++                display_key = key_transform(key)
++        else:
++            display_key = key
++            
++        groups.append(_GroupTuple(display_key, items))
++        
++    return groups
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1237,29 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    key_transform: t.Optional[t.Callable[[t.Any], t.Any]] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    pass_arg = _PassArg.from_obj(key_transform)
++    groups = []
++    
++    for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr):
++        items = await auto_to_list(values)
++        
++        if key_transform is not None:
++            if pass_arg is _PassArg.environment:
++                display_key = key_transform(environment, key)
++            else:
++                display_key = key_transform(key)
++            
++            display_key = await auto_await(display_key)
++        else:
++            display_key = key
++            
++        groups.append(_GroupTuple(display_key, items))
++        
++    return groups
++
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_async.py b/tests/test_async.py
+index c9ba70c..a2f3561 100644
+--- a/tests/test_async.py
++++ b/tests/test_async.py
+@@ -658,3 +658,32 @@ def test_getitem_after_call():
+     t = env.from_string("{{ add_each(a, 2)[1:] }}")
+     out = t.render(a=range(3))
+     assert out == "[3, 4]"
++
++import asyncio
++from jinja2.filters import do_groupby
++from jinja2 import Environment
++
++def test_groupby_key_transform_async():
++    async def run():
++        env = Environment(enable_async=True)
++        users = [
++            {"name": "Alice", "city": "NY"},
++            {"name": "Bob", "city": "LA"},
++            {"name": "Charlie", "city": "ny"},
++        ]
++        
++        async def transform(key):
++            await asyncio.sleep(0.01)
++            return key.upper()
++        
++        result = await do_groupby(env, users, "city", key_transform=transform)
++        
++        assert len(result) == 3
++        assert result[0].grouper == "LA"
++        assert result[1].grouper == "NY"
++        assert result[2].grouper == "NY"
++        assert result[0].list[0]["name"] == "Bob"
++        assert result[1].list[0]["name"] == "Alice"
++        assert result[2].list[0]["name"] == "Charlie"
++    
++    asyncio.run(run())
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..15d270a 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -251,3 +251,31 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++import pytest
++import asyncio
++from jinja2 import Environment
++from jinja2.filters import do_groupby
++
++@pytest.mark.asyncio
++async def test_groupby_key_transform_async():
++    env = Environment(enable_async=True)
++    users = [
++        {"name": "Alice", "city": "NY"},
++        {"name": "Bob", "city": "LA"},
++        {"name": "Charlie", "city": "ny"},
++    ]
++    
++    async def transform(key):
++        await asyncio.sleep(0.01)
++        return key.upper()
++    
++    result = await do_groupby(env, users, "city", key_transform=transform)
++    
++    assert len(result) == 3
++    assert result[0].grouper == "LA"
++    assert result[1].grouper == "NY"
++    assert result[2].grouper == "NY"
++    assert result[0].list[0]["name"] == "Bob"
++    assert result[1].list[0]["name"] == "Alice"
++    assert result[2].list[0]["name"] == "Charlie"
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..a429553 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -852,3 +852,42 @@ class TestFilter:
+         with pytest.raises(TemplateRuntimeError, match="No filter named 'f'"):
+             t1.render(x=42)
+             t2.render(x=42)
++
++def test_groupby_key_transform():
++    from jinja2 import Environment
++    from jinja2.filters import do_groupby
++    env = Environment()
++    users = [
++        {"name": "Alice", "city": "NY"},
++        {"name": "Bob", "city": "LA"},
++        {"name": "Charlie", "city": "ny"},
++    ]
++    
++    def transform(key):
++        return key.upper()
++    
++    result = do_groupby(env, users, "city", key_transform=transform)
++    
++    assert len(result) == 3
++    assert result[0].grouper == "LA"
++    assert result[1].grouper == "NY"
++    assert result[2].grouper == "NY"
++    assert result[0].list[0]["name"] == "Bob"
++    assert result[1].list[0]["name"] == "Alice"
++    assert result[2].list[0]["name"] == "Charlie"
++
++def test_groupby_key_transform_pass_env():
++    from jinja2 import Environment
++    from jinja2.filters import do_groupby, pass_environment
++    env = Environment()
++    env.name = "TEST"
++    users = [
++        {"name": "Alice", "city": "NY"},
++    ]
++    
++    @pass_environment
++    def transform(env, key):
++        return f"{env.name}: {key}"
++    
++    result = do_groupby(env, users, "city", key_transform=transform)
++    assert result[0].grouper == "TEST: NY"

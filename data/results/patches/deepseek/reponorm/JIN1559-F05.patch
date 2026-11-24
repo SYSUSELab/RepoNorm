@@ -1,0 +1,317 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..cb49c10 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -247,6 +247,9 @@ class InternationalizationExtension(Extension):
+ 
+     tags = {"trans"}
+ 
++    #: Reserved names that conflict with translation function names.
++    TRANSLATION_NAMES = frozenset(("gettext", "ngettext", "pgettext", "npgettext", "_"))
++
+     # TODO: the i18n extension is currently reevaluating values in a few
+     # situations.  Take this example:
+     #   {% trans count=something() %}{{ count }} foo{% pluralize
+@@ -379,10 +382,19 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            if token.value in self.TRANSLATION_NAMES:
++                parser.fail(
++                    f"the name {token.value!r} conflicts with translation"
++                    f" function names",
++                    token.lineno,
++                )
++
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                self._validate_trans_expr(var, token.value, token.lineno, parser)
++                variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+@@ -409,10 +421,17 @@ class InternationalizationExtension(Extension):
+         # now parse until endtrans or pluralize
+         singular_names, singular = self._parse_block(parser, True)
+         if singular_names:
+-            referenced.update(singular_names)
++            for name, name_lineno in singular_names:
++                if name in self.TRANSLATION_NAMES:
++                    parser.fail(
++                        f"the name {name!r} conflicts with translation function"
++                        f" names",
++                        name_lineno,
++                    )
++                referenced.add(name)
+             if plural_expr is None:
+-                plural_expr = nodes.Name(singular_names[0], "load")
+-                num_called_num = singular_names[0] == "num"
++                plural_expr = nodes.Name(singular_names[0][0], "load")
++                num_called_num = singular_names[0][0] == "num"
+ 
+         # if we have a pluralize block, we parse that too
+         if parser.stream.current.test("name:pluralize"):
+@@ -431,7 +450,14 @@ class InternationalizationExtension(Extension):
+             parser.stream.expect("block_end")
+             plural_names, plural = self._parse_block(parser, False)
+             next(parser.stream)
+-            referenced.update(plural_names)
++            for name, name_lineno in plural_names:
++                if name in self.TRANSLATION_NAMES:
++                    parser.fail(
++                        f"the name {name!r} conflicts with translation function"
++                        f" names",
++                        name_lineno,
++                    )
++                referenced.add(name)
+         else:
+             next(parser.stream)
+ 
+@@ -466,14 +492,94 @@ class InternationalizationExtension(Extension):
+         else:
+             return node
+ 
++
++    @staticmethod
++    def _validate_trans_expr(
++        expr: nodes.Expr, var_name: str, lineno: int, parser: "Parser"
++    ) -> None:
++        """Validate that *expr* uses only node types allowed in ``trans``
++        variable assignments.  Raises ``TemplateSyntaxError`` if not.
++        """
++        # Reject dynamic *args / **kwargs on the top-level expression
++        if isinstance(expr, (nodes.Call, nodes.Filter, nodes.Test)):
++            if expr.dyn_args is not None or expr.dyn_kwargs is not None:
++                parser.fail(
++                    f'expression "{var_name}" includes *args or **kwargs,'
++                    f" which are not allowed in template data or translation"
++                    f" contexts",
++                    lineno,
++                )
++            # For Call, the callee (node) must be a simple Name
++            if isinstance(expr, nodes.Call) and not isinstance(
++                expr.node, nodes.Name
++            ):
++                parser.fail(
++                    f'expression "{var_name}" includes a method call or'
++                    f" complex callable that is not allowed in template data"
++                    f" or translation contexts",
++                    lineno,
++                )
++
++        # Check the node type
++        if isinstance(expr, nodes.Const):
++            return  # leaf node
++        elif isinstance(expr, nodes.Name):
++            return  # leaf node
++        elif isinstance(expr, nodes.Getattr):
++            InternationalizationExtension._validate_trans_expr(
++                expr.node, var_name, lineno, parser
++            )
++        elif isinstance(expr, nodes.Filter):
++            InternationalizationExtension._validate_trans_expr(
++                expr.node, var_name, lineno, parser
++            )
++            for arg in expr.args:
++                InternationalizationExtension._validate_trans_expr(
++                    arg, var_name, lineno, parser
++                )
++            for kw in expr.kwargs:
++                InternationalizationExtension._validate_trans_expr(
++                    kw.value, var_name, lineno, parser
++                )
++        elif isinstance(expr, nodes.Test):
++            InternationalizationExtension._validate_trans_expr(
++                expr.node, var_name, lineno, parser
++            )
++            for arg in expr.args:
++                InternationalizationExtension._validate_trans_expr(
++                    arg, var_name, lineno, parser
++                )
++            for kw in expr.kwargs:
++                InternationalizationExtension._validate_trans_expr(
++                    kw.value, var_name, lineno, parser
++                )
++        elif isinstance(expr, nodes.Call):
++            InternationalizationExtension._validate_trans_expr(
++                expr.node, var_name, lineno, parser
++            )
++            for arg in expr.args:
++                InternationalizationExtension._validate_trans_expr(
++                    arg, var_name, lineno, parser
++                )
++            for kw in expr.kwargs:
++                InternationalizationExtension._validate_trans_expr(
++                    kw.value, var_name, lineno, parser
++                )
++        else:
++            parser.fail(
++                f'expression "{var_name}" includes a construct that is not'
++                f" allowed in template data or translation contexts",
++                lineno,
++            )
++
+     def _trim_whitespace(self, string: str, _ws_re: t.Pattern[str] = _ws_re) -> str:
+         return _ws_re.sub(" ", string.strip())
+ 
+     def _parse_block(
+         self, parser: "Parser", allow_pluralize: bool
+-    ) -> t.Tuple[t.List[str], str]:
++    ) -> t.Tuple[t.List[t.Tuple[str, int]], str]:
+         """Parse until the next block tag with a given name."""
+-        referenced = []
++        referenced: t.List[t.Tuple[str, int]] = []
+         buf = []
+ 
+         while True:
+@@ -482,9 +588,9 @@ class InternationalizationExtension(Extension):
+                 next(parser.stream)
+             elif parser.stream.current.type == "variable_begin":
+                 next(parser.stream)
+-                name = parser.stream.expect("name").value
+-                referenced.append(name)
+-                buf.append(f"%({name})s")
++                token = parser.stream.expect("name")
++                referenced.append((token.value, token.lineno))
++                buf.append(f"%({token.value})s")
+                 parser.stream.expect("variable_end")
+             elif parser.stream.current.type == "block_begin":
+                 next(parser.stream)
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..c703bb3 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -465,6 +465,130 @@ class TestInternationalization:
+             (3, "npgettext", ("babel", "%(users)s user", "%(users)s users", None), []),
+         ]
+ 
++    def test_trans_reserved_variable_names(self):
++        """Reserved translation function names cannot be declared in trans header."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        for name in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++            with pytest.raises(TemplateSyntaxError) as exc:
++                i18n_env.from_string(
++                    f"{{% trans {name}='hello' %}}foo{{% endtrans %}}"
++                )
++            assert "conflicts with translation function names" in str(exc.value.message)
++
++    def test_trans_reserved_body_references(self):
++        """Reserved translation function names cannot be referenced in trans body."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        for name in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++            with pytest.raises(TemplateSyntaxError) as exc:
++                i18n_env.from_string(
++                    "{% trans %}{{" + name + "}}{% endtrans %}"
++                )
++            assert "conflicts with translation function names" in str(exc.value.message)
++
++    def test_trans_reserved_body_plural(self):
++        """Reserved names in plural body also raise."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        for name in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++            with pytest.raises(TemplateSyntaxError) as exc:
++                i18n_env.from_string(
++                    "{% trans count=1 %}hello{% pluralize %}{{"
++                    + name
++                    + "}}{% endtrans %}"
++                )
++            assert "conflicts with translation function names" in str(exc.value.message)
++
++    def test_trans_valid_expressions(self):
++        """Valid expression types in trans assignments."""
++        i18n_env.from_string("{% trans x=42 %}hello{% endtrans %}")
++        i18n_env.from_string("{% trans x=y %}hello{% endtrans %}")
++        i18n_env.from_string("{% trans x=foo.bar %}hello{% endtrans %}")
++        i18n_env.from_string("{% trans x=foo|lower %}hello{% endtrans %}")
++        i18n_env.from_string("{% trans x=foo is defined %}hello{% endtrans %}")
++        i18n_env.from_string("{% trans x=foo(1, 2) %}hello{% endtrans %}")
++
++    def test_trans_invalid_expressions(self):
++        """Invalid expression types raise TemplateSyntaxError with proper messages."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        cases = [
++            ("{% trans x=foo[0] %}hello{% endtrans %}", "getitem"),
++            ("{% trans x=foo + 1 %}hello{% endtrans %}", "arithmetic"),
++            ("{% trans x=foo if bar else baz %}hello{% endtrans %}", "conditional"),
++            ("{% trans x=foo.bar() %}hello{% endtrans %}", "method call"),
++            ("{% trans x=foo(*args) %}hello{% endtrans %}", "*args"),
++            ("{% trans x=foo(**kwargs) %}hello{% endtrans %}", "**kwargs"),
++        ]
++
++        for tmpl, desc in cases:
++            with pytest.raises(TemplateSyntaxError) as exc:
++                i18n_env.from_string(tmpl)
++            msg = str(exc.value.message)
++            assert "template data" in msg, f"{desc}: missing 'template data' in {msg}"
++            assert "translation contexts" in msg, f"{desc}: missing 'translation contexts' in {msg}"
++
++    def test_trans_duplicate_variable(self):
++        """Duplicate-variable errors still raise TemplateAssertionError."""
++        from jinja2.exceptions import TemplateAssertionError
++
++        with pytest.raises(TemplateAssertionError):
++            i18n_env.from_string("{% trans x=1, x=2 %}hello{% endtrans %}")
++
++    def test_trans_trimmed_notrimmed_with_validation(self):
++        """trimmed/notrimmed do not interfere with expression validation."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        # trimmed with valid expression
++        i18n_env.from_string("{% trans trimmed x=42 %}hello {{ x }}{% endtrans %}")
++
++        # notrimmed with valid expression
++        i18n_env.from_string("{% trans notrimmed x=foo|lower %}hello{% endtrans %}")
++
++        # trimmed with invalid expression
++        with pytest.raises(TemplateSyntaxError):
++            i18n_env.from_string(
++                "{% trans trimmed x=foo[0] %}hello{% endtrans %}"
++            )
++
++    def test_trans_plural_validation(self):
++        """Plural block assignment validation works."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        # valid plural template
++        i18n_env.from_string(
++            "{% trans x=1 %}hello{% pluralize x %}bye{% endtrans %}"
++        )
++
++        # invalid expression in singular assignment with plural block
++        with pytest.raises(TemplateSyntaxError) as exc:
++            i18n_env.from_string(
++                "{% trans x=foo+1 %}hello{% pluralize x %}bye{% endtrans %}"
++            )
++        assert "template data" in str(exc.value.message)
++        assert "translation contexts" in str(exc.value.message)
++
++    def test_trans_reserved_names_with_plural(self):
++        """Reserved name checks work with plural blocks."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        # reserved name in singular body with plural block
++        with pytest.raises(TemplateSyntaxError) as exc:
++            i18n_env.from_string(
++                "{% trans x=1 %}hello{% pluralize x %}bye {{ gettext }}{% endtrans %}"
++            )
++        assert "conflicts with translation function names" in str(exc.value.message)
++
++        # reserved name referenced from plural body
++        with pytest.raises(TemplateSyntaxError) as exc:
++            i18n_env.from_string(
++                "{% trans x=1 %}hello{% pluralize x %}bye {{_}}{% endtrans %}"
++            )
++        assert "conflicts with translation function names" in str(exc.value.message)
++
++
++
+ 
+ class TestScope:
+     def test_basic_scope_behavior(self):

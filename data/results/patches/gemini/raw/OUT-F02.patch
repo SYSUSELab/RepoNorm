@@ -1,0 +1,183 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..244b962 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,8 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Optional, Dict, Any
++from collections import OrderedDict
++import threading
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -22,11 +24,11 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: Any):
+         """
+         Parameters
+         ----------
+-        compiled_grammar: str
++        compiled_grammar: Any
+             The compiled grammar to use to create the logits processor.
+ 
+         """
+@@ -53,12 +55,21 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self,
++        model: SteerableModel,
++        cache_compiled_grammars: bool = False,
++        max_cached_grammars: Optional[int] = None,
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        cache_compiled_grammars
++            Whether to cache compiled grammars.
++        max_cached_grammars
++            The maximum number of grammars to cache.
+ 
+         """
+         import xgrammar as xgr
+@@ -69,6 +80,18 @@ class XGrammarBackend(BaseBackend):
+                 "The xgrammar backend only supports Transformers models"
+             )
+ 
++        if max_cached_grammars is not None and (
++            not isinstance(max_cached_grammars, int) or max_cached_grammars <= 0
++        ):
++            raise ValueError("max_cached_grammars must be a positive integer")
++
++        self.cache_compiled_grammars = cache_compiled_grammars
++        self.max_cached_grammars = max_cached_grammars
++        self.cache: OrderedDict[tuple, Any] = OrderedDict()
++        self.cache_lock = threading.Lock()
++        self.compilation_locks: Dict[tuple, threading.Lock] = {}
++        self.compilation_locks_lock = threading.Lock()
++
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+@@ -78,57 +101,69 @@ class XGrammarBackend(BaseBackend):
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+-    def get_json_schema_logits_processor(
+-        self, json_schema: str
+-    ) -> "LogitsProcessor":
+-        """Create a logits processor from a JSON schema.
++    def _get_compiled_grammar(self, kind: str, source: str, compile_func) -> Any:
++        if not self.cache_compiled_grammars:
++            return compile_func()
+ 
+-        Parameters
+-        ----------
+-        json_schema: str
+-            The JSON schema to create a logits processor from.
++        key = (kind, source)
+ 
+-        Returns
+-        -------
+-        LogitsProcessor
+-            The logits processor to use to constrain the generation.
++        with self.cache_lock:
++            if key in self.cache:
++                self.cache.move_to_end(key)
++                return self.cache[key]
+ 
+-        """
+-        compiled_grammar = self.grammar_compiler.compile_json_schema(
+-            json_schema
+-        )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        with self.compilation_locks_lock:
++            if key not in self.compilation_locks:
++                self.compilation_locks[key] = threading.Lock()
++            lock = self.compilation_locks[key]
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
+-        """Create a logits processor from a regex.
++        with lock:
++            # Double-check cache after acquiring lock
++            with self.cache_lock:
++                if key in self.cache:
++                    self.cache.move_to_end(key)
++                    return self.cache[key]
+ 
+-        Parameters
+-        ----------
+-        regex: str
+-            The regex to create a logits processor from.
+-
+-        Returns
+-        -------
+-        LogitsProcessor
+-            The logits processor to use to constrain the generation.
++            # Compile
++            compiled_grammar = compile_func()
+ 
+-        """
+-        compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++            # Cache
++            with self.cache_lock:
++                self.cache[key] = compiled_grammar
++                self.cache.move_to_end(key)
++                if (
++                    self.max_cached_grammars is not None
++                    and len(self.cache) > self.max_cached_grammars
++                ):
++                    self.cache.popitem(last=False)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+-        """Create a logits processor from a context-free grammar.
++            return compiled_grammar
+ 
+-        Parameters
+-        ----------
+-        grammar: str
+-            The context-free grammar to create a logits processor from.
++    def get_json_schema_logits_processor(
++        self, json_schema: str
++    ) -> "LogitsProcessor":
++        """Create a logits processor from a JSON schema."""
++        compiled_grammar = self._get_compiled_grammar(
++            "json_schema",
++            json_schema,
++            lambda: self.grammar_compiler.compile_json_schema(json_schema),
++        )
++        return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-        Returns
+-        -------
+-        LogitsProcessor
+-            The logits processor to use to constrain the generation.
++    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++        """Create a logits processor from a regex."""
++        compiled_grammar = self._get_compiled_grammar(
++            "regex",
++            regex,
++            lambda: self.grammar_compiler.compile_regex(regex),
++        )
++        return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-        """
+-        compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
++    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++        """Create a logits processor from a context-free grammar."""
++        compiled_grammar = self._get_compiled_grammar(
++            "cfg",
++            grammar,
++            lambda: self.grammar_compiler.compile_grammar(grammar),
++        )
+         return XGrammarLogitsProcessor(compiled_grammar)

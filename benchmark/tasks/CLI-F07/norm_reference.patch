@@ -1,0 +1,210 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 540bbe2..b208aa0 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   Add optional nested ``Context`` lifetime validation across public context
++    creation paths, including recovery after invalid close order.
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..16596a1 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,11 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param validate_nesting: Refuse to close a context while it has open
++        descendants. Enabled validation is inherited by child contexts.
++
++    .. versionchanged:: 8.2
++        Added the ``validate_nesting`` parameter.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +285,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool = False,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -431,6 +437,12 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self.validate_nesting: bool = validate_nesting or (
++            parent is not None and parent.validate_nesting
++        )
++        self._open_children: set[Context] = set()
++        if parent is not None:
++            parent._open_children.add(self)
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -466,6 +478,8 @@ class Context:
+         }
+ 
+     def __enter__(self) -> Context:
++        if self.parent is not None:
++            self.parent._open_children.add(self)
+         self._depth += 1
+         push_context(self)
+         return self
+@@ -477,9 +491,11 @@ class Context:
+         tb: TracebackType | None,
+     ) -> None:
+         self._depth -= 1
+-        if self._depth == 0:
+-            self.close()
+-        pop_context()
++        try:
++            if self._depth == 0:
++                self.close()
++        finally:
++            pop_context()
+ 
+     @contextmanager
+     def scope(self, cleanup: bool = True) -> cabc.Iterator[Context]:
+@@ -607,9 +623,19 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self._open_children:
++            names = [
++                child.info_name or child.command.name or "unknown"
++                for child in self._open_children
++            ]
++            raise RuntimeError(
++                f"Cannot close context with open children: {', '.join(names)}"
++            )
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
++        if self.parent is not None:
++            self.parent._open_children.discard(self)
+ 
+     @property
+     def command_path(self) -> str:
+@@ -1151,8 +1177,12 @@ class Command:
+ 
+         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
+ 
+-        with ctx.scope(cleanup=False):
+-            self.parse_args(ctx, args)
++        try:
++            with ctx.scope(cleanup=False):
++                self.parse_args(ctx, args)
++        except BaseException:
++            ctx.close()
++            raise
+         return ctx
+ 
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:
+diff --git a/tests/test_nesting_validation_contribution.py b/tests/test_nesting_validation_contribution.py
+new file mode 100644
+index 0000000..b3d4abb
+--- /dev/null
++++ b/tests/test_nesting_validation_contribution.py
+@@ -0,0 +1,95 @@
++from contextlib import contextmanager
++
++import pytest
++
++import click
++from click.testing import CliRunner
++
++
++@pytest.mark.parametrize("factory", ["constructor", "make_context"])
++def test_parent_rejects_open_child_and_recovers(factory) -> None:
++    events = []
++    parent = click.Context(click.Command("parent"), validate_nesting=True)
++    parent.call_on_close(lambda: events.append("parent-close"))
++    if factory == "constructor":
++        child = click.Context(click.Command("child"), parent=parent)
++    else:
++        child = click.Command("child").make_context("child", [], parent=parent)
++
++    with pytest.raises(RuntimeError, match="child"):
++        parent.close()
++    assert events == []
++    child.close()
++    parent.close()
++    assert events == ["parent-close"]
++
++
++def test_closed_child_is_tracked_again_when_reentered() -> None:
++    parent = click.Context(click.Command("parent"), validate_nesting=True)
++    child = click.Context(click.Command("child"), parent=parent)
++    child.close()
++    with child:
++        with pytest.raises(RuntimeError, match="child"):
++            parent.close()
++    parent.close()
++
++
++def test_failed_parent_exit_restores_current_context_stack() -> None:
++    parent = click.Context(click.Command("parent"), validate_nesting=True)
++    child = click.Context(click.Command("child"), parent=parent)
++    with pytest.raises(RuntimeError, match="child"):
++        with parent:
++            assert click.get_current_context() is parent
++    assert click.get_current_context(silent=True) is None
++    child.close()
++    parent.close()
++
++
++def test_failed_child_parse_does_not_leave_phantom_child() -> None:
++    parent = click.Context(click.Command("parent"), validate_nesting=True)
++    child = click.Command("child", params=[click.Option(["--required"], required=True)])
++    with pytest.raises(click.MissingParameter):
++        child.make_context("child", [], parent=parent)
++    parent.close()
++
++
++def test_validation_disabled_keeps_legacy_close_behavior() -> None:
++    parent = click.Context(click.Command("parent"))
++    child = click.Context(click.Command("child"), parent=parent)
++    parent.close()
++    child.close()
++
++
++def test_resources_survive_rejected_close_and_keep_lifo() -> None:
++    events = []
++
++    @contextmanager
++    def resource():
++        events.append("enter")
++        try:
++            yield
++        finally:
++            events.append("resource-exit")
++
++    parent = click.Context(click.Command("parent"), validate_nesting=True)
++    parent.call_on_close(lambda: events.append("first"))
++    parent.with_resource(resource())
++    parent.call_on_close(lambda: events.append("last"))
++    child = click.Context(click.Command("child"), parent=parent)
++    with pytest.raises(RuntimeError):
++        parent.close()
++    assert events == ["enter"]
++    child.close()
++    parent.close()
++    assert events == ["enter", "last", "resource-exit", "first"]
++
++
++@pytest.mark.parametrize("chain", [False, True])
++def test_normal_cli_execution_with_validation(chain) -> None:
++    group = click.Group(
++        "root", chain=chain, context_settings={"validate_nesting": True}
++    )
++    group.add_command(click.Command("sub", callback=lambda: click.echo("ok")))
++    result = CliRunner().invoke(group, ["sub"])
++    assert result.exit_code == 0
++    assert result.output == "ok\n"

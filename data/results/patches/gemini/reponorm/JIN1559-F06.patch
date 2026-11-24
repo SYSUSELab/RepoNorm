@@ -1,0 +1,185 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..0b0d555 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -363,8 +363,23 @@ class Environment:
+         self.extensions = load_extensions(self, extensions)
+ 
+         self.is_async = enable_async
++        self._translation_cache = None
+         _environment_config_check(self)
+ 
++
++    def set_translation_cache_partition(self, value: t.Any) -> None:
++        if self._translation_cache is not None:
++            self._translation_cache.partition = value
++            self._translation_cache.clear()
++
++    def clear_translation_cache(self) -> None:
++        if self._translation_cache is not None:
++            self._translation_cache.clear()
++
++    def resize_translation_cache(self, capacity: int) -> None:
++        if self._translation_cache is not None:
++            self._translation_cache.resize(capacity)
++
+     def add_extension(self, extension: t.Union[str, t.Type["Extension"]]) -> None:
+         """Adds an extension after the environment was created.
+ 
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..9ccccae 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -1,6 +1,7 @@
+ """Extension API for adding custom tags and behavior."""
+ import pprint
+ import re
++from collections import OrderedDict
+ import typing as t
+ 
+ from markupsafe import Markup
+@@ -161,6 +162,41 @@ class Extension:
+ 
+ 
+ @pass_context
++
++class _TranslationCache:
++    def __init__(self, capacity: int) -> None:
++        self.capacity = capacity
++        self.cache: t.OrderedDict[t.Any, t.Any] = OrderedDict()
++        self.partition: t.Any = None
++
++    def get(self, key: t.Any) -> t.Any:
++        if self.capacity <= 0:
++            return None
++        if key not in self.cache:
++            return None
++        self.cache.move_to_end(key)
++        return self.cache[key]
++
++    def set(self, key: t.Any, value: t.Any) -> None:
++        if self.capacity <= 0:
++            return
++        if key in self.cache:
++            self.cache.move_to_end(key)
++        self.cache[key] = value
++        if len(self.cache) > self.capacity:
++            self.cache.popitem(last=False)
++
++    def clear(self) -> None:
++        self.cache.clear()
++
++    def resize(self, capacity: int) -> None:
++        if capacity < 0:
++            raise ValueError("Capacity must be non-negative")
++        self.capacity = capacity
++        while len(self.cache) > self.capacity:
++            self.cache.popitem(last=False)
++
++
+ def _gettext_alias(
+     __context: Context, *args: t.Any, **kwargs: t.Any
+ ) -> t.Union[t.Any, Undefined]:
+@@ -264,6 +300,7 @@ class InternationalizationExtension(Extension):
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
++            _translation_cache=None,
+         )
+ 
+     def _install(
+@@ -312,6 +349,7 @@ class InternationalizationExtension(Extension):
+             npgettext=npgettext,
+         )
+ 
++
+     def _install_callables(
+         self,
+         gettext: t.Callable[[str], str],
+@@ -319,23 +357,79 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Any = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
++        
++        self.environment._translation_cache = _TranslationCache(cache_size)
++        self.environment._translation_cache.partition = cache_partition
++
++        def gettext_wrapper(message: str) -> str:
++            cache = self.environment._translation_cache
++            if cache.capacity <= 0:
++                return gettext(message)
++            key = ("gettext", cache.partition, message)
++            res = cache.get(key)
++            if res is None:
++                res = gettext(message)
++                cache.set(key, res)
++            return res
++
++        def ngettext_wrapper(singular: str, plural: str, n: int) -> str:
++            cache = self.environment._translation_cache
++            if cache.capacity <= 0:
++                return ngettext(singular, plural, n)
++            key = ("ngettext", cache.partition, singular, plural, n)
++            res = cache.get(key)
++            if res is None:
++                res = ngettext(singular, plural, n)
++                cache.set(key, res)
++            return res
++
++        def pgettext_wrapper(context: str, message: str) -> str:
++            cache = self.environment._translation_cache
++            if cache.capacity <= 0:
++                return pgettext(context, message)  # type: ignore
++            key = ("pgettext", cache.partition, context, message)
++            res = cache.get(key)
++            if res is None:
++                res = pgettext(context, message)  # type: ignore
++                cache.set(key, res)
++            return res
++
++        def npgettext_wrapper(context: str, singular: str, plural: str, n: int) -> str:
++            cache = self.environment._translation_cache
++            if cache.capacity <= 0:
++                return npgettext(context, singular, plural, n)  # type: ignore
++            key = ("npgettext", cache.partition, context, singular, plural, n)
++            res = cache.get(key)
++            if res is None:
++                res = npgettext(context, singular, plural, n)  # type: ignore
++                cache.set(key, res)
++            return res
++
++        gettext_func = gettext_wrapper
++        ngettext_func = ngettext_wrapper
++        pgettext_func = pgettext_wrapper if pgettext is not None else None
++        npgettext_func = npgettext_wrapper if npgettext is not None else None
++
+         if self.environment.newstyle_gettext:  # type: ignore
+-            gettext = _make_new_gettext(gettext)
+-            ngettext = _make_new_ngettext(ngettext)
++            gettext_func = _make_new_gettext(gettext_func)
++            ngettext_func = _make_new_ngettext(ngettext_func)
+ 
+-            if pgettext is not None:
+-                pgettext = _make_new_pgettext(pgettext)
++            if pgettext_func is not None:
++                pgettext_func = _make_new_pgettext(pgettext_func)
+ 
+-            if npgettext is not None:
+-                npgettext = _make_new_npgettext(npgettext)
++            if npgettext_func is not None:
++                npgettext_func = _make_new_npgettext(npgettext_func)
+ 
+         self.environment.globals.update(
+-            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
++            gettext=gettext_func, ngettext=ngettext_func, pgettext=pgettext_func, npgettext=npgettext_func
+         )
+ 
++
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)

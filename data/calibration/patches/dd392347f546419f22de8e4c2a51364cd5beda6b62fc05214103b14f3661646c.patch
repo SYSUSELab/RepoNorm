@@ -1,0 +1,251 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..0a219d0 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,12 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add ordered post-callback validators to ``Option``.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..866398c 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2463,70 +2463,6 @@ class Parameter:
+ 
+ 
+ class Option(Parameter):
+-    """Options are usually optional values on the command line and
+-    have some extra features that arguments don't have.
+-
+-    All other parameters are passed onwards to the parameter constructor.
+-
+-    :param show_default: Show the default value for this option in its
+-        help text. Values are not shown by default, unless
+-        :attr:`Context.show_default` is ``True``. If this value is a
+-        string, it shows that string in parentheses instead of the
+-        actual value. This is particularly useful for dynamic options.
+-        For single option boolean flags, the default remains hidden if
+-        its value is ``False``.
+-    :param show_envvar: Controls if an environment variable should be
+-        shown on the help page and error messages.
+-        Normally, environment variables are not shown.
+-    :param prompt: If set to ``True`` or a non empty string then the
+-        user will be prompted for input. If set to ``True`` the prompt
+-        will be the option name capitalized. A deprecated option cannot be
+-        prompted.
+-    :param confirmation_prompt: Prompt a second time to confirm the
+-        value if it was prompted for. Can be set to a string instead of
+-        ``True`` to customize the message.
+-    :param prompt_required: If set to ``False``, the user will be
+-        prompted for input only when the option was specified as a flag
+-        without a value.
+-    :param hide_input: If this is ``True`` then the input on the prompt
+-        will be hidden from the user. This is useful for password input.
+-    :param is_flag: forces this option to act as a flag.  The default is
+-                    auto detection.
+-    :param flag_value: which value should be used for this flag if it's
+-                       enabled.  This is set to a boolean automatically if
+-                       the option string contains a slash to mark two options.
+-    :param multiple: if this is set to `True` then the argument is accepted
+-                     multiple times and recorded.  This is similar to ``nargs``
+-                     in how it works but supports arbitrary number of
+-                     arguments.
+-    :param count: this flag makes an option increment an integer.
+-    :param allow_from_autoenv: if this is enabled then the value of this
+-                               parameter will be pulled from an environment
+-                               variable in case a prefix is defined on the
+-                               context.
+-    :param help: the help string.
+-    :param hidden: hide this option from help outputs.
+-    :param attrs: Other command arguments described in :class:`Parameter`.
+-
+-    .. versionchanged:: 8.2
+-        ``envvar`` used with ``flag_value`` will always use the ``flag_value``,
+-        previously it would use the value of the environment variable.
+-
+-    .. versionchanged:: 8.1
+-        Help text indentation is cleaned here instead of only in the
+-        ``@option`` decorator.
+-
+-    .. versionchanged:: 8.1
+-        The ``show_default`` parameter overrides
+-        ``Context.show_default``.
+-
+-    .. versionchanged:: 8.1
+-        The default of a single option boolean flag is not shown if the
+-        default value is ``False``.
+-
+-    .. versionchanged:: 8.0.1
+-        ``type`` is detected from ``flag_value`` if given.
+-    """
+ 
+     param_type_name = "option"
+ 
+@@ -2549,6 +2485,9 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        validators: (
++            cabc.Sequence[t.Callable[[Context, Parameter, t.Any], t.Any]] | None
++        ) = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2636,6 +2575,15 @@ class Option(Parameter):
+         self.show_default = show_default
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
++        self.validators: tuple[t.Callable[[Context, Parameter, t.Any], t.Any], ...]
++        if validators is None:
++            self.validators = ()
++        elif isinstance(validators, (str, bytes)) or not all(
++            callable(validator) for validator in validators
++        ):
++            raise TypeError("validators must be a sequence of callables")
++        else:
++            self.validators = tuple(validators)
+ 
+         if __debug__:
+             if deprecated and prompt:
+@@ -2925,7 +2873,7 @@ class Option(Parameter):
+ 
+         return super().get_default(ctx, call=call)
+ 
+-    def prompt_for_value(self, ctx: Context) -> t.Any:
++    def _base_prompt_for_value(self, ctx: Context) -> t.Any:
+         """This is an alternative flow that can be activated in the full
+         value processing if a value does not exist.  It will prompt the
+         user until a valid value exists and then returns the processed
+@@ -3032,6 +2980,30 @@ class Option(Parameter):
+ 
+         return value, source
+ 
++    def prompt_for_value(self, ctx: Context) -> t.Any:
++        key = f"click.validators.prompt.{id(self)}"
++        ctx.meta[key] = "processing"
++        try:
++            return self._base_prompt_for_value(ctx)
++        finally:
++            if ctx.meta.get(key) == "processing":
++                ctx.meta.pop(key, None)
++
++    def process_value(self, ctx: Context, value: t.Any) -> t.Any:
++        key = f"click.validators.prompt.{id(self)}"
++        prompt_state = ctx.meta.get(key)
++        if prompt_state == "processed":
++            ctx.meta.pop(key, None)
++            return value
++
++        value = super().process_value(ctx, value)
++        for validator in self.validators:
++            value = validator(ctx, self, value)
++
++        if prompt_state == "processing":
++            ctx.meta[key] = "processed"
++        return value
++
+ 
+ class Argument(Parameter):
+     """Arguments are positional parameters to a command.  They generally
+diff --git a/tests/test_n4c_author_option_validators.py b/tests/test_n4c_author_option_validators.py
+new file mode 100644
+index 0000000..bb7e1c7
+--- /dev/null
++++ b/tests/test_n4c_author_option_validators.py
+@@ -0,0 +1,87 @@
++import pytest
++
++import click
++
++
++def test_validators_run_after_callback_and_transform_in_order(runner):
++    events = []
++
++    def callback(ctx, param, value):
++        events.append(("callback", value))
++        return value + 1
++
++    def double(ctx, param, value):
++        events.append(("double", value))
++        return value * 2
++
++    @click.command()
++    @click.option("--number", type=int, callback=callback, validators=[double])
++    def cli(number):
++        click.echo(number)
++
++    result = runner.invoke(cli, ["--number", "3"])
++    assert result.exit_code == 0
++    assert result.output == "8\n"
++    assert events == [("callback", 3), ("double", 4)]
++
++
++def test_multiple_value_is_validated_once_as_a_tuple(runner):
++    seen = []
++
++    def join(ctx, param, value):
++        seen.append(value)
++        return ":".join(value)
++
++    @click.command()
++    @click.option("--item", multiple=True, validators=[join])
++    def cli(item):
++        click.echo(item)
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b"])
++    assert result.exit_code == 0
++    assert result.output == "a:b\n"
++    assert seen == [("a", "b")]
++
++
++def test_bad_parameter_retries_prompt_without_double_validation(runner):
++    seen = []
++
++    def positive(ctx, param, value):
++        seen.append(value)
++        if value <= 0:
++            raise click.BadParameter("must be positive")
++        return value
++
++    @click.command()
++    @click.option("--number", type=int, prompt=True, validators=[positive])
++    def cli(number):
++        click.echo(number)
++
++    result = runner.invoke(cli, input="-1\n2\n")
++    assert result.exit_code == 0
++    assert result.output.endswith("2\n")
++    assert seen == [-1, 2]
++
++
++def test_invalid_validator_inputs_are_rejected_at_construction():
++    for value in ("validator", [lambda c, p, v: v, None], [object()]):
++        with pytest.raises(TypeError, match="sequence of callables"):
++            click.Option(["--value"], validators=value)
++
++
++def test_none_and_empty_sequences_preserve_existing_callback(runner):
++    for validators in (None, []):
++
++        @click.command()
++        @click.option(
++            "--value",
++            type=int,
++            callback=lambda ctx, param, value: value * 2,
++            validators=validators,
++        )
++        def cli(value):
++            click.echo(value)
++
++        result = runner.invoke(cli, ["--value", "4"])
++        assert result.exit_code == 0
++        assert result.output == "8\n"

@@ -1,0 +1,243 @@
+"""Redis-based mailbox messaging between agents.
+
+Provides simple send/receive messaging via Redis lists. Each agent has an inbox
+that other agents can push messages to.
+
+Example:
+    connector = MessagingConnector(
+        agent_id="agent1",
+        agents=["agent1", "agent2"],
+        url="redis://localhost:6379#run:abc123"
+    )
+
+    # Send to specific agent
+    connector.send("agent2", "I found a bug in auth.py")
+
+    # Receive pending messages
+    messages = connector.receive()
+
+    # Broadcast to all
+    connector.broadcast("I'm starting on the API changes")
+"""
+
+import json
+import time
+from datetime import datetime
+from typing import Any
+
+import redis
+
+# Long enough to outlast a slow step -- a single agent turn can run minutes on a long prompt
+# plus a test run, and a heartbeat that expires mid-step would declare a working agent dead.
+ALIVE_TTL = 600
+
+
+class MessagingConnector:
+    """Redis-based mailbox messaging between agents."""
+
+    def __init__(self, agent_id: str, agents: list[str], url: str = "redis://localhost:6379"):
+        """Initialize messaging connector.
+
+        Args:
+            agent_id: This agent's unique identifier (e.g., "agent1")
+            agents: List of all agent IDs in the collaboration
+            url: Redis URL. Supports namespacing via #prefix (e.g., "redis://host:6379#run:abc")
+        """
+        self.agent_id = agent_id
+        self.agents = agents
+
+        # Parse optional namespace prefix from URL (format: url#prefix)
+        if "#" in url:
+            url, self._prefix = url.split("#", 1)
+            self._prefix += ":"
+        else:
+            self._prefix = ""
+
+        self._client = redis.from_url(url)
+        self._inbox_key = f"{self._prefix}{agent_id}:inbox"
+        self._seen_alive: set[str] = set()
+
+        # Clear stale messages from previous runs
+        self._client.delete(self._inbox_key)
+        self._client.delete(self._exited_key(agent_id))
+        self.heartbeat()
+
+    def _exited_key(self, agent_id: str) -> str:
+        return f"{self._prefix}{agent_id}:exited"
+
+    def _alive_key(self, agent_id: str) -> str:
+        return f"{self._prefix}{agent_id}:alive"
+
+    def heartbeat(self) -> None:
+        """Refresh this agent's liveness key.
+
+        `mark_exited` is self-reported, so it cannot fire when the sandbox is reclaimed --
+        the process is killed outright and no `finally` runs. The peer then waits forever on
+        someone who is already gone. A key that must be refreshed inverts that: silence is
+        the signal, so death needs no cooperation from the dead.
+        """
+        try:
+            self._client.setex(self._alive_key(self.agent_id), ALIVE_TTL, "1")
+        except redis.RedisError:  # never let bookkeeping take down a run
+            pass
+
+    def mark_exited(self, published: bool = False) -> None:
+        """Record that this agent has finished, so peers stop waiting on it.
+
+        Without this a peer's ``send`` silently succeeds into an inbox nobody will ever
+        read again, and ``send_and_wait`` blocks for its full timeout on a reply that
+        cannot come.
+
+        ``published`` records whether this agent's submitted patch actually reached the
+        shared remote.  Peers are told to go read that branch, so they must only be told
+        that when it is true — publication is best-effort and can fail.
+        """
+        try:
+            self._client.set(self._exited_key(self.agent_id), "published" if published else "1")
+        except redis.RedisError:  # never let bookkeeping take down a run
+            pass
+
+    def has_exited(self, agent_id: str) -> bool:
+        """True when ``agent_id`` is gone -- whether it said so or simply stopped.
+
+        Only report a lapsed heartbeat for an agent we have actually seen alive, so a peer
+        that has not started yet is never mistaken for one that has died.
+        """
+        try:
+            if self._client.exists(self._exited_key(agent_id)):
+                return True
+            if self._client.exists(self._alive_key(agent_id)):
+                self._seen_alive.add(agent_id)
+                return False
+            return agent_id in self._seen_alive
+        except redis.RedisError:
+            return False
+
+    def is_unreachable(self, agent_id: str) -> bool:
+        """Gone WITHOUT announcing it, i.e. killed rather than finished."""
+        try:
+            if self._client.exists(self._exited_key(agent_id)):
+                return False
+            return agent_id in self._seen_alive and not self._client.exists(self._alive_key(agent_id))
+        except redis.RedisError:
+            return False
+
+    def has_published(self, agent_id: str) -> bool:
+        """True when ``agent_id``'s submitted patch is actually on the shared remote."""
+        try:
+            raw = self._client.get(self._exited_key(agent_id))
+        except redis.RedisError:
+            return False
+        if raw is None:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        return raw == "published"
+
+    def setup(self, env: Any) -> None:
+        """Configure the agent's sandbox for messaging.
+
+        Messaging doesn't require sandbox configuration (it's pure Redis),
+        but this method exists for interface consistency with other connectors.
+
+        Args:
+            env: The agent's environment (unused for messaging)
+        """
+        pass
+
+    def send(self, recipient: str, content: str) -> bool:
+        """Send a message to another agent's inbox.
+
+        Args:
+            recipient: Target agent's ID
+            content: Message content
+
+        Returns:
+            ``True`` if the message was queued, ``False`` if the recipient has already
+            finished and left — in which case nothing will ever read it.  Callers must
+            surface that to the agent instead of reporting success.
+        """
+        if self.has_exited(recipient):
+            return False
+        message = {
+            "from": self.agent_id,
+            "to": recipient,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._client.rpush(f"{self._prefix}{recipient}:inbox", json.dumps(message))
+        return True
+
+    def receive(self) -> list[dict]:
+        """Get all pending messages from inbox (empties the inbox).
+
+        Returns:
+            List of message dicts with from, to, content, timestamp
+        """
+        messages = []
+        while True:
+            msg = self._client.lpop(self._inbox_key)
+            if msg is None:
+                break
+            messages.append(json.loads(msg))
+        return messages
+
+    def send_and_wait(self, recipient: str, content: str, timeout: int = 60) -> tuple[bool, list[dict]]:
+        """Send, then block until the recipient replies, they exit, or ``timeout``.
+
+        Returns ``(delivered, replies)``.  ``delivered`` is False when the recipient had
+        already finished before the send.  The wait also ends the moment the recipient
+        exits, so an agent never burns the full timeout on a reply that cannot arrive.
+        """
+        if not self.send(recipient, content):
+            return False, []
+
+        # Publish that we are blocked on this recipient, so their delivery can say so. A peer
+        # that knows someone is stalled on it answers; measured over 62 timeouts, the peer had
+        # the message in hand within ~10s and then took a median of 7 more actions without
+        # replying, so the failure is salience, not delivery. TTL means a crashed waiter
+        # cannot leave the flag set.
+        self._client.setex(self._blocked_key(recipient), max(1, int(timeout)), self.agent_id)
+        deadline = time.monotonic() + timeout
+        replies: list[dict] = []
+        try:
+            while time.monotonic() < deadline:
+                got = self.receive()
+                if got:
+                    replies.extend(got)
+                    break
+                if self.has_exited(recipient):
+                    break
+                time.sleep(1.0)
+        finally:
+            self._client.delete(self._blocked_key(recipient))
+        return True, replies
+
+    def _blocked_key(self, recipient: str) -> str:
+        """Key set while WE are blocked waiting on `recipient` to reply."""
+        return f"{self._prefix}{recipient}:awaited_by"
+
+    def is_awaited_by(self, sender: str) -> bool:
+        """Whether `sender` is currently blocked in send_and_wait on us."""
+        try:
+            return self._client.get(self._blocked_key(self.agent_id)) == sender.encode()
+        except redis.RedisError:  # bookkeeping must never take down a run
+            return False
+
+    def broadcast(self, content: str) -> None:
+        """Send a message to all other agents.
+
+        Args:
+            content: Message content
+        """
+        for agent in self.agents:
+            if agent != self.agent_id:
+                self.send(agent, content)
+
+    def peek(self) -> int:
+        """Check how many messages are waiting without consuming them.
+
+        Returns:
+            Number of pending messages
+        """
+        return self._client.llen(self._inbox_key)

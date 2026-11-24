@@ -1,0 +1,208 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..4a48d14 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -12,6 +12,58 @@ import jinja2
+ import pydantic
+ 
+ 
++def _select_condition(
++    conditional_filters: Optional[Dict[str, Dict[str, Callable]]],
++) -> Optional[str]:
++    """Determine which condition is active based on environment variables.
++
++    Rules:
++    1. OUTLINES_DEBUG=true activates 'debug'
++    2. ENVIRONMENT=production activates 'production'
++    3. ENV=testing, OUTLINES_TESTING=true, or TESTING_MODE=on activates 'testing'
++
++    Priority: debug > production > testing.
++    If none of the standard conditions match, select the alphabetically first
++    supplied condition key. None and empty mapping return None.
++
++    Environment names and values are compared with ASCII case-insensitive equality.
++    """
++    if not conditional_filters:
++        return None
++
++    # Determine which standard conditions are active
++    active_conditions = set()
++
++    # Check environment variables (case-insensitive)
++    env = {k.upper(): v.upper() for k, v in os.environ.items()}
++
++    # 1. OUTLINES_DEBUG=true activates 'debug'
++    if env.get("OUTLINES_DEBUG") == "TRUE":
++        active_conditions.add("debug")
++
++    # 2. ENVIRONMENT=production activates 'production'
++    if env.get("ENVIRONMENT") == "PRODUCTION":
++        active_conditions.add("production")
++
++    # 3. ENV=testing, OUTLINES_TESTING=true, or TESTING_MODE=on activates 'testing'
++    if env.get("ENV") == "TESTING" or env.get("OUTLINES_TESTING") == "TRUE" or env.get("TESTING_MODE") == "ON":
++        active_conditions.add("testing")
++
++    # Check in priority order
++    priority = ["debug", "production", "testing"]
++    for condition in priority:
++        if condition in active_conditions and condition in conditional_filters:
++            return condition
++
++    # If any standard condition is active but not in the mapping, skip and
++    # fall through to the alphabetical fallback.
++    # If no standard condition is active, pick alphabetically first supplied key.
++    if conditional_filters:
++        return sorted(conditional_filters.keys())[0]
++
++    return None
++
++
+ @dataclass
+ class Prompt:
+     """Represents a prompt function.
+@@ -40,7 +92,11 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(
++        cls,
++        content: str,
++        conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None,
++    ):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -48,15 +104,22 @@ class Prompt:
+         ----------
+         content : str
+             The string content to be converted into a template.
++        conditional_filters : dict of str to dict of str to callable, optional
++            A mapping of condition names to Jinja filter dictionaries.
++            The active condition's filters are installed during template compilation.
+ 
+         Returns
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(cls._template_from_str(content, conditional_filters), None)
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(
++        cls,
++        path: Path,
++        conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None,
++    ):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -67,6 +130,9 @@ class Prompt:
+         ----------
+         path : Path
+             The path to the file containing the Jinja template.
++        conditional_filters : dict of str to dict of str to callable, optional
++            A mapping of condition names to Jinja filter dictionaries.
++            The active condition's filters are installed during template compilation.
+ 
+         Returns
+         -------
+@@ -75,10 +141,14 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(cls._template_from_file(path, conditional_filters), None)
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(
++        _,
++        content: str,
++        conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None,
++    ) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -106,10 +176,20 @@ class Prompt:
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
+ 
++        # Apply conditional filters if a condition is active
++        condition = _select_condition(conditional_filters)
++        if condition is not None and conditional_filters is not None:
++            selected_filters = conditional_filters.get(condition, {})
++            env.filters.update(selected_filters)
++
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(
++        _,
++        path: Path,
++        conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None,
++    ) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,10 +198,21 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++
++        # Apply conditional filters if a condition is active
++        condition = _select_condition(conditional_filters)
++        if condition is not None and conditional_filters is not None:
++            selected_filters = conditional_filters.get(condition, {})
++            env.filters.update(selected_filters)
++
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++def prompt(
++    fn: Optional[Callable] = None,
++    *,
++    conditional_filters: Optional[Dict[str, Dict[str, Callable]]] = None,
++) -> Prompt:
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -152,12 +243,25 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Parameters
++    ----------
++    fn : callable, optional
++        The function to decorate. If None, the decorator can be called with
++        keyword arguments.
++    conditional_filters : dict of str to dict of str to callable, optional
++        A mapping of condition names to Jinja filter dictionaries.
++        The active condition's filters are installed during template compilation.
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
+ 
++    # Handle the case where the decorator is used with arguments
++    if fn is None:
++        return functools.partial(prompt, conditional_filters=conditional_filters)
++
+     signature = inspect.signature(fn)
+ 
+     # The docstring contains the template that will be rendered to be used
+@@ -166,7 +270,7 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(cast(str, docstring), conditional_filters)
+ 
+     return Prompt(template, signature)
+ 

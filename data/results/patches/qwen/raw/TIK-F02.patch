@@ -1,0 +1,218 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 64dc6a1..5f65411 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -287,6 +287,119 @@ impl CoreBPE {
+         (ret, last_piece_token_len)
+     }
+ 
++    // Helper function to convert byte offset to character index
++    fn byte_offset_to_char_index(text: &str, byte_offset: usize) -> usize {
++        // Find the character at the given byte offset
++        // This handles multi-byte UTF-8 characters correctly
++        text.char_indices()
++            .find(|(i, _)| *i == byte_offset)
++            .map(|(i, _)| i)
++            .unwrap_or_else(|| text.len())
++    }
++
++    pub fn encode_with_positions(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<Rank>, Vec<usize>) {
++        let special_regex = self._get_tl_special_regex();
++        let regex = self._get_tl_regex();
++        let mut ret = vec![];
++        let mut positions = vec![];
++
++        let mut start = 0;
++        loop {
++            let mut next_special;
++            let mut start_find = start;
++            loop {
++                // Find the next allowed special token, if any
++                next_special = special_regex.find_from_pos(text, start_find).unwrap();
++                match next_special {
++                    Some(m) => {
++                        if allowed_special.contains(&text[m.start()..m.end()]) {
++                            break;
++                        }
++                        start_find = m.start() + 1;
++                    }
++                    None => break,
++                }
++            }
++            let end = next_special.map_or(text.len(), |m| m.start());
++
++            // Process regular text pieces
++            for mat in regex.find_iter(&text[start..end]) {
++                let mat = mat.unwrap();
++                let piece = mat.as_str().as_bytes();
++                let piece_start_byte = start + mat.start();
++                
++                if let Some(token) = self.encoder.get(piece) {
++                    // Direct match - use the character index of the start of the piece
++                    let char_idx = Self::byte_offset_to_char_index(text, piece_start_byte);
++                    ret.push(*token);
++                    positions.push(char_idx);
++                    continue;
++                }
++                
++                // BPE encode the piece
++                let merged = _byte_pair_merge(&self.encoder, piece);
++                for (i, &(start_byte, _)) in merged[..merged.len() - 1].iter().enumerate() {
++                    let end_byte = merged[i + 1].0;
++                    let token = self.encoder[&piece[start_byte..end_byte]];
++                    
++                    // Convert byte offset to character index
++                    let char_idx = Self::byte_offset_to_char_index(text, piece_start_byte + start_byte);
++                    ret.push(token);
++                    positions.push(char_idx);
++                }
++            }
++
++            match next_special {
++                // Handle special tokens
++                Some(m) => {
++                    let piece = m.as_str();
++                    let token = self.special_tokens_encoder[piece];
++                    let char_idx = Self::byte_offset_to_char_index(text, m.start());
++                    ret.push(token);
++                    positions.push(char_idx);
++                    start = m.end();
++                }
++                None => break,
++            }
++        }
++
++        (ret, positions)
++    }
++    
++    pub fn encode_ordinary_with_positions(&self, text: &str) -> (Vec<Rank>, Vec<usize>) {
++        let regex = self._get_tl_regex();
++        let mut ret = vec![];
++        let mut positions = vec![];
++
++        for mat in regex.find_iter(text) {
++            let mat = mat.unwrap();
++            let piece = mat.as_str().as_bytes();
++            let piece_start_byte = mat.start();
++            
++            if let Some(token) = self.encoder.get(piece) {
++                // Direct match - use the character index of the start of the piece
++                let char_idx = Self::byte_offset_to_char_index(text, piece_start_byte);
++                ret.push(*token);
++                positions.push(char_idx);
++                continue;
++            }
++            
++            // BPE encode the piece
++            let merged = _byte_pair_merge(&self.encoder, piece);
++            for (i, &(start_byte, _)) in merged[..merged.len() - 1].iter().enumerate() {
++                let end_byte = merged[i + 1].0;
++                let token = self.encoder[&piece[start_byte..end_byte]];
++                
++                // Convert byte offset to character index
++                let char_idx = Self::byte_offset_to_char_index(text, piece_start_byte + start_byte);
++                ret.push(token);
++                positions.push(char_idx);
++            }
++        }
++
++        (ret, positions)
++    }
++
+     fn _increase_last_piece_token_len(
+         &self,
+         tokens: Vec<Rank>,
+diff --git a/src/py.rs b/src/py.rs
+index ed107b4..5af3de1 100644
+--- a/src/py.rs
++++ b/src/py.rs
+@@ -50,6 +50,25 @@ impl CoreBPE {
+         })
+     }
+ 
++    #[pyo3(name = "encode_with_positions")]
++    fn py_encode_with_positions(
++        &self,
++        py: Python,
++        text: &str,
++        allowed_special: HashSet<PyBackedStr>,
++    ) -> (Vec<Rank>, Vec<usize>) {
++        py.allow_threads(|| {
++            let allowed_special: HashSet<&str> =
++                allowed_special.iter().map(|s| s.as_ref()).collect();
++            self.encode_with_positions(text, &allowed_special)
++        })
++    }
++
++    #[pyo3(name = "encode_ordinary_with_positions")]
++    fn py_encode_ordinary_with_positions(&self, py: Python, text: &str) -> (Vec<Rank>, Vec<usize>) {
++        py.allow_threads(|| self.encode_ordinary_with_positions(text))
++    }
++
+     fn encode_to_tiktoken_buffer(
+         &self,
+         py: Python,
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..8bc8119 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,8 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        return_positions: bool = False,
++    ) -> list[int] | tuple[list[int], list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -120,6 +121,8 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if return_positions:
++            return self._core_bpe.encode_with_positions(text, allowed_special)
+         try:
+             return self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+@@ -179,7 +182,8 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[list[int]]:
++        return_positions: bool = False,
++    ) -> list[list[int]] | list[tuple[list[int], list[int]]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+@@ -196,11 +200,25 @@ class Encoding:
+         if not isinstance(disallowed_special, frozenset):
+             disallowed_special = frozenset(disallowed_special)
+ 
+-        encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
+-        )
+-        with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++        # Apply disallowed special token check to all text items
++        if disallowed_special:
++            regex = _special_token_regex(disallowed_special)
++            for t in text:
++                if match := regex.search(t):
++                    raise_disallowed_special_token(match.group())
++
++        if return_positions:
++            def encode_with_pos(text_item):
++                return self._core_bpe.encode_with_positions(text_item, allowed_special)
++            with ThreadPoolExecutor(num_threads) as e:
++                results = list(e.map(encode_with_pos, text))
++                return results
++        else:
++            encoder = functools.partial(
++                self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            )
++            with ThreadPoolExecutor(num_threads) as e:
++                return list(e.map(encoder, text))
+ 
+     def encode_with_unstable(
+         self,

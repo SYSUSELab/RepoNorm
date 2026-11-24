@@ -1,0 +1,526 @@
+diff --git a/debug_fingerprint.py b/debug_fingerprint.py
+new file mode 100644
+index 00000000..e81aba68
+--- /dev/null
++++ b/debug_fingerprint.py
+@@ -0,0 +1,24 @@
++import json
++import hashlib
++from typing import Any
++
++def _compute_fingerprint(name: str, args: dict[str, Any]) -> str:
++    def prepare_args(args: Any) -> Any:
++        if isinstance(args, dict):
++            return {k: prepare_args(v) for k, v in sorted(args.items())}
++        elif isinstance(args, (list, tuple)):
++            return [prepare_args(i) for i in args]
++        elif isinstance(args, str):
++            return args.strip()
++        return args
++
++    canonical_args = prepare_args(args)
++    obj_to_hash = {"args": canonical_args, "name": name}
++    json_str = json.dumps(obj_to_hash, sort_keys=True, separators=(',', ':'))
++    print(f"DEBUG: name={name}, args={args}, canonical_args={canonical_args}, json_str={json_str}")
++    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
++
++f1 = _compute_fingerprint("my_tool", {"a": 1, "b": "  hello  "})
++f2 = _compute_fingerprint("my_tool", {"a": 1, "b": "hello"})
++print(f"f1={f1}")
++print(f"f2={f2}")
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..4d98eb14 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,13 @@
+ import asyncio
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
++import json
++import hashlib
++from pydantic import PrivateAttr
++
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, model_validator
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -15,6 +19,39 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++def _validate_json_value(value: Any):
++    if isinstance(value, (str, int, float, bool, type(None))):
++        if isinstance(value, float) and not (float('-inf') < value < float('inf')):
++            raise ValueError("Non-finite number")
++        return
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            _validate_json_value(item)
++        return
++    if isinstance(value, dict):
++        for k, v in value.items():
++            if not isinstance(k, str):
++                raise ValueError("Dictionary keys must be strings")
++            _validate_json_value(v)
++        return
++    raise ValueError(f"Unsupported type: {type(value)}")
++
++def _compute_fingerprint(name: str, args: dict[str, Any]) -> str:
++    def prepare_args(args: Any) -> Any:
++        if isinstance(args, dict):
++            return {k: prepare_args(v) for k, v in sorted(args.items())}
++        elif isinstance(args, (list, tuple)):
++            return [prepare_args(i) for i in args]
++        elif isinstance(args, str):
++            return args.strip()
++        return args
++
++    canonical_args = prepare_args(args)
++    obj_to_hash = {"args": canonical_args, "name": name}
++    json_str = json.dumps(obj_to_hash, sort_keys=True, separators=(',', ':'))
++    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
++
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -258,6 +295,25 @@ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
++        _fingerprint: str = PrivateAttr()
++        _id: str = PrivateAttr()
++
++        @model_validator(mode='after')
++        def _validate_and_fingerprint(self) -> 'ToolCall':
++            _validate_json_value(self.args)
++            self._fingerprint = _compute_fingerprint(self.name, self.args)
++            self._id = self._fingerprint[:8]
++            return self
++
++        @property
++        def fingerprint(self) -> str:
++            return self._fingerprint
++
++        @property
++        def id(self) -> str:
++            return self._id
++
++
+ 
+     tool_calls: list[ToolCall]
+ 
+diff --git a/edit_tool.py b/edit_tool.py
+new file mode 100644
+index 00000000..e1e25548
+--- /dev/null
++++ b/edit_tool.py
+@@ -0,0 +1,76 @@
++import re
++
++with open('dspy/adapters/types/tool.py', 'r') as f:
++    content = f.read()
++
++# Add imports
++new_imports = """import json
++import hashlib
++from pydantic import PrivateAttr
++"""
++content = re.sub(r'from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints', 
++                 r'from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints\n' + new_imports, content)
++
++# Add helper functions
++helper_functions = """
++def _validate_json_value(value: Any):
++    if isinstance(value, (str, int, float, bool, type(None))):
++        if isinstance(value, float) and not (float('-inf') < value < float('inf')):
++            raise ValueError("Non-finite number")
++        return
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            _validate_json_value(item)
++        return
++    if isinstance(value, dict):
++        for k, v in value.items():
++            if not isinstance(k, str):
++                raise ValueError("Dictionary keys must be strings")
++            _validate_json_value(v)
++        return
++    raise ValueError(f"Unsupported type: {type(value)}")
++
++def _compute_fingerprint(name: str, args: dict[str, Any]) -> str:
++    def prepare_args(args: Any) -> Any:
++        if isinstance(args, dict):
++            return {k: prepare_args(v) for k, v in sorted(args.items())}
++        elif isinstance(args, (list, tuple)):
++            return [prepare_args(i) for i in args]
++        elif isinstance(args, str):
++            return args.strip()
++        return args
++
++    canonical_args = prepare_args(args)
++    obj_to_hash = {"args": canonical_args, "name": name}
++    json_str = json.dumps(obj_to_hash, sort_keys=True, separators=(',', ':'))
++    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
++"""
++content = re.sub(r'_TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}',
++                 r'_TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}\n' + helper_functions, content)
++
++# Modify ToolCall class
++tool_call_replacement = """    class ToolCall(BaseModel):
++        name: str
++        args: dict[str, Any]
++        _fingerprint: str = PrivateAttr()
++        _id: str = PrivateAttr()
++
++        def __init__(self, **data):
++            super().__init__(**data)
++            _validate_json_value(self.args)
++            self._fingerprint = _compute_fingerprint(self.name, self.args)
++            self._id = self._fingerprint[:8]
++
++        @property
++        def fingerprint(self) -> str:
++            return self._fingerprint
++
++        @property
++        def id(self) -> str:
++            return self._id
++"""
++content = re.sub(r'    class ToolCall\(BaseModel\):\n        name: str\n        args: dict\[str, Any\]',
++                 tool_call_replacement, content)
++
++with open('dspy/adapters/types/tool.py', 'w') as f:
++    f.write(content)
+diff --git a/edit_tool_v2.py b/edit_tool_v2.py
+new file mode 100644
+index 00000000..260400b1
+--- /dev/null
++++ b/edit_tool_v2.py
+@@ -0,0 +1,45 @@
++import re
++
++with open('dspy/adapters/types/tool.py', 'r') as f:
++    content = f.read()
++
++# Replace the __init__ method with a Pydantic validator
++# I need to remove the __init__ method and add a field_validator for 'args'
++# Actually, I can keep the __init__ but it's better to use Pydantic's validator.
++
++# Let's remove the __init__ and add the validator.
++# Wait, I need to keep the _fingerprint and _id initialization.
++# I can use model_post_init.
++
++new_tool_call = """    class ToolCall(BaseModel):
++        name: str
++        args: dict[str, Any]
++        _fingerprint: str = PrivateAttr()
++        _id: str = PrivateAttr()
++
++        @model_validator(mode='after')
++        def _validate_and_fingerprint(self) -> 'ToolCall':
++            _validate_json_value(self.args)
++            self._fingerprint = _compute_fingerprint(self.name, self.args)
++            self._id = self._fingerprint[:8]
++            return self
++
++        @property
++        def fingerprint(self) -> str:
++            return self._fingerprint
++
++        @property
++        def id(self) -> str:
++            return self._id
++"""
++
++# I need to import model_validator
++content = re.sub(r'from pydantic import BaseModel, TypeAdapter, create_model',
++                 r'from pydantic import BaseModel, TypeAdapter, create_model, model_validator', content)
++
++# Replace the old ToolCall definition
++content = re.sub(r'    class ToolCall\(BaseModel\):\n        name: str\n        args: dict\[str, Any\]\n        _fingerprint: str = PrivateAttr\(\)\n        _id: str = PrivateAttr\(\)\n\n        def __init__\(self, \*\*data\):\n            super\(\).__init__\(\*\*data\)\n            _validate_json_value\(self.args\)\n            self._fingerprint = _compute_fingerprint\(self.name, self.args\)\n            self._id = self._fingerprint\[:8\]\n\n        @property\n        def fingerprint\(self\) -> str:\n            return self._fingerprint\n\n        @property\n        def id\(self\) -> str:\n            return self._id',
++                 new_tool_call, content)
++
++with open('dspy/adapters/types/tool.py', 'w') as f:
++    f.write(content)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..7bb1ba64
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,30 @@
++import json
++from dspy.adapters.types.tool import ToolCalls
++from pydantic import BaseModel
++
++def test_fingerprint():
++    # Test case 1: Basic ToolCall
++    tool_call_dict = {"name": "test_tool", "args": {"a": 1, "b": "hello"}}
++    tool_calls = ToolCalls.from_dict_list([tool_call_dict])
++    
++    # Check if fingerprint and id exist
++    try:
++        print(f"Fingerprint: {tool_calls.tool_calls[0].fingerprint}")
++        print(f"ID: {tool_calls.tool_calls[0].id}")
++    except AttributeError:
++        print("Fingerprint or ID not found")
++
++    # Test case 2: Check immutability
++    tool_call = tool_calls.tool_calls[0]
++    original_fingerprint = tool_call.fingerprint
++    
++    # Try to modify args
++    tool_call.args = {"a": 2}
++    
++    if tool_call.fingerprint == original_fingerprint:
++        print("Fingerprint is immutable")
++    else:
++        print("Fingerprint changed!")
++
++if __name__ == "__main__":
++    test_fingerprint()
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..ffa8dc8e
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,33 @@
++import pytest
++from dspy.adapters.types.tool import ToolCalls
++
++def test_edge_cases():
++    # Test tuple as list
++    tool_call_dict = {"name": "test_tool", "args": {"a": (1, 2)}}
++    tool_calls = ToolCalls.from_dict_list([tool_call_dict])
++    f1 = tool_calls.tool_calls[0].fingerprint
++    
++    # Test list
++    tool_call_dict2 = {"name": "test_tool", "args": {"a": [1, 2]}}
++    tool_calls2 = ToolCalls.from_dict_list([tool_call_dict2])
++    f2 = tool_calls2.tool_calls[0].fingerprint
++    
++    assert f1 == f2
++    print("Tuple/List equivalence passed")
++
++    # Test non-finite number
++    try:
++        ToolCalls.from_dict_list([{"name": "test", "args": {"a": float('inf')}}])
++        assert False, "Should have raised ValueError"
++    except ValueError:
++        print("Non-finite number check passed")
++
++    # Test non-string key
++    try:
++        ToolCalls.from_dict_list([{"name": "test", "args": {1: "a"}}])
++        assert False, "Should have raised ValueError"
++    except ValueError:
++        print("Non-string key check passed")
++
++if __name__ == "__main__":
++    test_edge_cases()
+diff --git a/test_fingerprint.py b/test_fingerprint.py
+new file mode 100644
+index 00000000..fa0353ef
+--- /dev/null
++++ b/test_fingerprint.py
+@@ -0,0 +1,21 @@
++from dspy.adapters.types.tool import ToolCalls
++
++def test_fingerprint():
++    # The requirement says: "In arguments, recursively sort dictionary keys, treat tuples as lists and trim surrounding whitespace from string values."
++    # So {"a": 1, "b": "  hello  "} should be the same as {"a": 1, "b": "hello"}
++    
++    tool_call1 = ToolCalls.ToolCall(name="my_tool", args={"a": 1, "b": "  hello  "})
++    tool_call2 = ToolCalls.ToolCall(name="my_tool", args={"a": 1, "b": "hello"})
++    
++    # They SHOULD be the same
++    assert tool_call1.fingerprint == tool_call2.fingerprint
++    
++    # Now let's test something that SHOULD be different
++    tool_call3 = ToolCalls.ToolCall(name="my_tool", args={"a": 1, "b": "hello"})
++    tool_call4 = ToolCalls.ToolCall(name="my_tool", args={"a": 2, "b": "hello"})
++    assert tool_call3.fingerprint != tool_call4.fingerprint
++    
++    print("All tests passed!")
++
++if __name__ == "__main__":
++    test_fingerprint()
+diff --git a/test_fingerprint_logic.py b/test_fingerprint_logic.py
+new file mode 100644
+index 00000000..4f6e9df3
+--- /dev/null
++++ b/test_fingerprint_logic.py
+@@ -0,0 +1,51 @@
++import json
++import hashlib
++from typing import Any
++
++def canonical_json(obj: Any) -> str:
++    def sort_dict(d: Any) -> Any:
++        if isinstance(d, dict):
++            return {k: sort_dict(v) for k, v in sorted(d.items())}
++        elif isinstance(d, list):
++            return [sort_dict(i) for i in d]
++        elif isinstance(d, tuple):
++            return [sort_dict(i) for i in d]
++        elif isinstance(d, str):
++            return d.strip()
++        return d
++
++    # The requirement says:
++    # "The fingerprint is the 64-character hexadecimal SHA-256 of the UTF-8 canonical JSON object
++    # {"name": name, "args": canonical_args}, using sorted keys and compact comma/colon separators
++    # with ordinary JSON ASCII escaping."
++    
++    # "In arguments, recursively sort dictionary keys, treat tuples as lists and trim surrounding
++    # whitespace from string values."
++    
++    # "Do not trim dictionary keys or the tool name."
++    
++    # Let's implement this.
++    
++    def prepare_args(args: Any) -> Any:
++        if isinstance(args, dict):
++            return {k: prepare_args(v) for k, v in sorted(args.items())}
++        elif isinstance(args, (list, tuple)):
++            return [prepare_args(i) for i in args]
++        elif isinstance(args, str):
++            return args.strip()
++        return args
++
++    canonical_args = prepare_args(obj["args"])
++    
++    # The object to hash is {"name": name, "args": canonical_args}
++    # Keys must be sorted.
++    obj_to_hash = {"args": canonical_args, "name": obj["name"]}
++    
++    # Compact JSON
++    json_str = json.dumps(obj_to_hash, sort_keys=True, separators=(',', ':'))
++    
++    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
++
++# Test
++tool_call = {"name": "test_tool", "args": {"b": " hello ", "a": 1}}
++print(canonical_json(tool_call))
+diff --git a/test_fingerprint_logic_v2.py b/test_fingerprint_logic_v2.py
+new file mode 100644
+index 00000000..bd516fac
+--- /dev/null
++++ b/test_fingerprint_logic_v2.py
+@@ -0,0 +1,31 @@
++import json
++import hashlib
++from typing import Any
++
++def get_fingerprint(name: str, args: dict[str, Any]) -> str:
++    def prepare_args(args: Any) -> Any:
++        if isinstance(args, dict):
++            return {k: prepare_args(v) for k, v in sorted(args.items())}
++        elif isinstance(args, (list, tuple)):
++            return [prepare_args(i) for i in args]
++        elif isinstance(args, str):
++            return args.strip()
++        return args
++
++    canonical_args = prepare_args(args)
++    
++    # The object to hash is {"name": name, "args": canonical_args}
++    # Keys must be sorted.
++    obj_to_hash = {"args": canonical_args, "name": name}
++    
++    # Compact JSON
++    json_str = json.dumps(obj_to_hash, sort_keys=True, separators=(',', ':'))
++    
++    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
++
++# Test
++name = "test_tool"
++args = {"b": " hello ", "a": 1}
++fingerprint = get_fingerprint(name, args)
++print(f"Fingerprint: {fingerprint}")
++print(f"ID: {fingerprint[:8]}")
+diff --git a/test_json_validation.py b/test_json_validation.py
+new file mode 100644
+index 00000000..02e4c98c
+--- /dev/null
++++ b/test_json_validation.py
+@@ -0,0 +1,32 @@
++import json
++from typing import Any
++
++def validate_json_value(value: Any):
++    if isinstance(value, (str, int, float, bool, type(None))):
++        if isinstance(value, float) and not (float('-inf') < value < float('inf')):
++            raise ValueError("Non-finite number")
++        return
++    if isinstance(value, (list, tuple)):
++        for item in value:
++            validate_json_value(item)
++        return
++    if isinstance(value, dict):
++        for k, v in value.items():
++            if not isinstance(k, str):
++                raise ValueError("Dictionary keys must be strings")
++            validate_json_value(v)
++        return
++    raise ValueError(f"Unsupported type: {type(value)}")
++
++# Test
++try:
++    validate_json_value({"a": 1, "b": [1, 2], "c": {"d": "e"}})
++    print("Valid")
++    validate_json_value({"a": float('inf')})
++except ValueError as e:
++    print(f"Caught expected error: {e}")
++
++try:
++    validate_json_value({1: "a"})
++except ValueError as e:
++    print(f"Caught expected error: {e}")
+diff --git a/test_pydantic_validation.py b/test_pydantic_validation.py
+new file mode 100644
+index 00000000..19319cd8
+--- /dev/null
++++ b/test_pydantic_validation.py
+@@ -0,0 +1,11 @@
++from pydantic import BaseModel, ValidationError
++from typing import Any
++
++class Model(BaseModel):
++    args: dict[str, Any]
++
++try:
++    Model(args={"a": float('inf')})
++    print("Pydantic allowed inf")
++except ValidationError as e:
++    print(f"Pydantic caught inf: {e}")
+diff --git a/test_validation.py b/test_validation.py
+new file mode 100644
+index 00000000..334a1c35
+--- /dev/null
++++ b/test_validation.py
+@@ -0,0 +1,21 @@
++import pytest
++from dspy.adapters.types.tool import ToolCalls
++from pydantic import ValidationError
++
++def test_validation():
++    # Test non-finite number
++    with pytest.raises(ValueError, match="Non-finite number"):
++        ToolCalls.ToolCall(name="my_tool", args={"a": float('inf')})
++    
++    # Test non-string dictionary key (Pydantic will catch this first)
++    with pytest.raises(ValidationError):
++        ToolCalls.ToolCall(name="my_tool", args={1: "value"})
++        
++    # Test unsupported type
++    with pytest.raises(ValueError, match="Unsupported type"):
++        ToolCalls.ToolCall(name="my_tool", args={"a": set([1, 2])})
++
++    print("Validation tests passed!")
++
++if __name__ == "__main__":
++    test_validation()

@@ -1,0 +1,169 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..a7917cf0 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -5,6 +5,7 @@ from dspy.propose.dataset_summary_generator import create_dataset_summary
+ from dspy.propose.propose_base import Proposer
+ from dspy.propose.utils import (
+     create_example_string,
++    truncate_description,
+     create_predictor_level_history_string,
+     get_dspy_source_code,
+     strip_prefix,
+@@ -142,6 +143,7 @@ class GenerateModuleInstruction(dspy.Module):
+         use_task_demos=True,
+         use_instruct_history=True,
+         use_tip=True,
++        max_description_chars=2000,
+         verbose=False,
+     ):
+         super().__init__()
+@@ -150,6 +152,11 @@ class GenerateModuleInstruction(dspy.Module):
+         self.use_task_demos = use_task_demos
+         self.use_instruct_history = use_instruct_history
+         self.use_tip = use_tip
++        self.max_description_chars = max_description_chars
++        if max_description_chars is not None:
++            if not isinstance(max_description_chars, int) or isinstance(max_description_chars, bool) or max_description_chars <= 0:
++                raise ValueError("max_description_chars must be a positive integer or None")
++
+         self.verbose = verbose
+ 
+         self.program_code_string = program_code_string
+@@ -217,6 +224,7 @@ class GenerateModuleInstruction(dspy.Module):
+                         program_code=self.program_code_string, program_example=task_demos,
+                     ).program_description,
+                 )
++                program_description = truncate_description(program_description, self.max_description_chars)
+                 if self.verbose:
+                     print(f"PROGRAM DESCRIPTION: {program_description}")
+ 
+@@ -241,6 +249,7 @@ class GenerateModuleInstruction(dspy.Module):
+                     module=module_code,
+                     max_depth=10,
+                 ).module_description
++                module_description = truncate_description(module_description, self.max_description_chars)
+             except Exception as e:
+                 if self.verbose:
+                     print(f"Error getting program description. Running without program aware proposer. Error: {e}")
+@@ -284,6 +293,7 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
++        max_description_chars=2000,
+         rng=None
+     ):
+         super().__init__()
+@@ -296,6 +306,11 @@ class GroundedProposer(Proposer):
+         self.set_tip_randomly=set_tip_randomly
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
++        self.max_description_chars = max_description_chars
++        if max_description_chars is not None:
++            if not isinstance(max_description_chars, int) or isinstance(max_description_chars, bool) or max_description_chars <= 0:
++                raise ValueError("max_description_chars must be a positive integer or None")
++
+         self.rng = rng or random
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+@@ -406,6 +421,7 @@ class GroundedProposer(Proposer):
+         # Create our instruction generator class (given specific criteria for this round of proposal)
+         instruction_generator = GenerateModuleInstruction(
+             program_code_string=self.program_code_string,
++            max_description_chars=self.max_description_chars,
+             use_dataset_summary=self.use_dataset_summary,
+             program_aware=self.program_aware,
+             use_task_demos=self.use_task_demos and demo_candidates,
+diff --git a/dspy/propose/utils.py b/dspy/propose/utils.py
+index 8bd720a2..3a13ed24 100644
+--- a/dspy/propose/utils.py
++++ b/dspy/propose/utils.py
+@@ -187,3 +187,45 @@ def get_dspy_source_code(module):
+             completed_set.add(item)
+ 
+     return "\n\n".join(header) + "\n\n" + base_code
++
++def truncate_description(text, cap):
++    if cap is None:
++        return text
++    if not isinstance(cap, int) or cap <= 0:
++        raise ValueError("cap must be a positive integer or None")
++    
++    if len(text) <= cap:
++        return text
++    
++    if cap == 1:
++        return "…"
++    
++    # The requirement: "retain the last complete sentence ending (. ! or ?, followed by whitespace or the end) that fits."
++    # "that fits" means the length of the retained part + 1 (for ellipsis) <= cap.
++    # Actually, the ellipsis is 1 character. So the retained part must be <= cap-1.
++    
++    # Let's find all sentence endings.
++    # A sentence ends with [.!?] followed by whitespace or end of string.
++    # The regex [\.!\?](?:\s+|$) matches . ! or ? followed by whitespace or end.
++    
++    # We want the last match where the end of the match is <= cap-1.
++    
++    # Let's find all matches.
++    matches = list(re.finditer(r'[.!?](?:\s+|$)', text))
++    
++    # We want the last match whose end position is <= cap-1.
++    
++    best_match = None
++    for match in matches:
++        if match.end() <= cap - 1:
++            best_match = match
++        else:
++            break
++            
++    if best_match:
++        # "Remove trailing whitespace from that prefix and append …"
++        return text[:best_match.end()].rstrip() + "…"
++    
++    # If no sentence fits, take a hard prefix of cap-1 characters.
++    # "Remove trailing whitespace from that prefix and append …"
++    return text[:cap-1].rstrip() + "…"
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..215e45d1 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -52,3 +52,18 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         tip=None,
+     )
+     assert result == "instruction"
++
++def test_grounded_proposer_max_description_chars():
++    prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++    program = Predict("question -> answer")
++    
++    # Test valid max_description_chars
++    proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], max_description_chars=100)
++    assert proposer.max_description_chars == 100
++    
++    # Test invalid max_description_chars
++    with pytest.raises(ValueError):
++        GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], max_description_chars=-1)
++    
++    with pytest.raises(ValueError):
++        GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], max_description_chars="invalid")
+diff --git a/tests/propose/test_propose_utils.py b/tests/propose/test_propose_utils.py
+new file mode 100644
+index 00000000..0390c99a
+--- /dev/null
++++ b/tests/propose/test_propose_utils.py
+@@ -0,0 +1,14 @@
++import pytest
++from dspy.propose.utils import truncate_description
++
++def test_truncate_description():
++    assert truncate_description("Hello world. This is a test.", 20) == "Hello world.…"
++    assert truncate_description("Hello world. This is a test.", 10) == "Hello wor…"
++    assert truncate_description("Hello world. This is a test.", 1) == "…"
++    assert truncate_description("A" * 20, 10) == "AAAAAAAAA…"
++    assert truncate_description("Hello world", 10) == "Hello wor…"
++    assert truncate_description("Hello world", None) == "Hello world"
++    with pytest.raises(ValueError):
++        truncate_description("Hello world", -1)
++    with pytest.raises(ValueError):
++        truncate_description("Hello world", "invalid")

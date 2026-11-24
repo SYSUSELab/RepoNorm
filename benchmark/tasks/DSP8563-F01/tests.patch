@@ -1,0 +1,118 @@
+diff --git a/tests/adapters/test_chat_adapter.py b/tests/adapters/test_chat_adapter.py
+index 98e892e..854c2ab 100644
+--- a/tests/adapters/test_chat_adapter.py
++++ b/tests/adapters/test_chat_adapter.py
+@@ -531,3 +531,18 @@ def test_chat_adapter_toolcalls_native_function_calling():
+         )
+         assert result[0]["answer"] == "Paris"
+         assert result[0]["tool_calls"] is None
++
++
++@pytest.mark.parametrize('body', [
++    '{"name":"search","args":{"query":"hello"}}',
++    '[{"name":"search","args":{"query":"hello"}}]',
++    '{"tool_calls":[{"name":"search","args":{"query":"hello"}}]}',
++])
++def test_chat_adapter_flexible_tool_calls_output(body):
++    class Calls(dspy.Signature):
++        question: str = dspy.InputField()
++        calls: dspy.ToolCalls = dspy.OutputField()
++    completion = '[[ ## calls ## ]]\n' + body + '\n[[ ## completed ## ]]'
++    result = dspy.ChatAdapter().parse(Calls, completion)
++    assert [item.model_dump() for item in result['calls'].tool_calls] == [
++        {'name': 'search', 'args': {'query': 'hello'}}]
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 1857145..2540e8a 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,90 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++@pytest.mark.parametrize('shape', ['single', 'list', 'canonical'])
++@pytest.mark.parametrize('as_text', [False, True])
++def test_flexible_tool_calls_containers(shape, as_text):
++    import copy
++    import json
++    from dspy import ToolCalls
++    call = {'name': 'search', 'args': {'query': '雪', 'nested': [1, None, {'ok': True}]}}
++    value = {'single': call, 'list': [call], 'canonical': {'tool_calls': [call]}}[shape]
++    before = copy.deepcopy(value)
++    supplied = json.dumps(value) if as_text else value
++    parsed = ToolCalls.model_validate(supplied)
++    assert [item.model_dump() for item in parsed.tool_calls] == [call]
++    assert ToolCalls.model_validate_json(json.dumps(value)) == parsed
++    assert value == before
++    helper = ToolCalls.validate_input(supplied)
++    assert not isinstance(helper, ToolCalls)
++    assert ToolCalls.model_validate(helper) == parsed
++
++
++def test_flexible_empty_order_and_existing_model():
++    from dspy import ToolCalls
++    assert ToolCalls.model_validate([]).tool_calls == []
++    values = [{'name': 'second', 'args': {'n': 2}}, {'name': 'first', 'args': {'n': 1}}]
++    parsed = ToolCalls.model_validate(values)
++    assert [call.name for call in parsed.tool_calls] == ['second', 'first']
++    assert ToolCalls.model_validate(parsed) == parsed
++    assert ToolCalls.from_dict_list(values) == parsed
++    assert parsed.format() == [{'type': 'tool_calls', 'tool_calls': [
++        {'type': 'function', 'function': {'name': item['name'], 'arguments': item['args']}}
++        for item in values]}]
++
++
++@pytest.mark.parametrize('value', [None, 3, {}, [1], [{'name': 'missing'}],
++    {'name': 'bad', 'args': []}, {'tool_calls': 'bad'}, 'not JSON',
++    '{"tool_calls": [}', "__import__('os').getcwd()"])
++def test_flexible_inputs_still_validate_fields(value):
++    from dspy import ToolCalls
++    with pytest.raises(ValueError):
++        ToolCalls.model_validate(value)
++
++
++def test_normalization_helper_does_not_execute(tmp_path):
++    from dspy import ToolCalls
++    marker = tmp_path / 'must-not-exist'
++    text = "__import__('pathlib').Path(%r).touch()" % str(marker)
++    assert ToolCalls.validate_input(text) == text
++    with pytest.raises(ValueError):
++        ToolCalls.model_validate(text)
++    assert not marker.exists()
++
++
++@pytest.mark.parametrize("adapter_name", ["ChatAdapter", "JSONAdapter", "XMLAdapter"])
++@pytest.mark.parametrize("shape", ["single", "list", "canonical"])
++def test_flexible_toolcalls_nested_signature_adapters(adapter_name, shape):
++    import json
++    import dspy
++    from pydantic import BaseModel
++    from dspy.utils.exceptions import AdapterParseError
++
++    class Batch(BaseModel):
++        calls: dspy.ToolCalls
++
++    class Result(dspy.Signature):
++        question: str = dspy.InputField()
++        batch: Batch = dspy.OutputField()
++
++    call = {"name": "search", "args": {"query": "snow", "limit": 2}}
++    value = {"single": call, "list": [call], "canonical": {"tool_calls": [call]}}[shape]
++    adapter = getattr(dspy, adapter_name)()
++
++    def completion(body):
++        payload = json.dumps({"calls": body})
++        if adapter_name == "JSONAdapter":
++            return '{"batch":' + payload + '}'
++        if adapter_name == "XMLAdapter":
++            return "<batch>" + payload + "</batch><completed/>"
++        return "[[ ## batch ## ]]\n" + payload + "\n[[ ## completed ## ]]"
++
++    for supplied in (value, json.dumps(value)):
++        result = adapter.parse(Result, completion(supplied))["batch"]
++        assert isinstance(result, Batch)
++        assert isinstance(result.calls, dspy.ToolCalls)
++        assert [item.model_dump() for item in result.calls.tool_calls] == [call]
++    with pytest.raises((ValueError, AdapterParseError)):
++        adapter.parse(Result, completion({"tool_calls": [{"name": "missing-args"}]}))

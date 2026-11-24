@@ -1,0 +1,85 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..fbb6c3be 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,4 +1,5 @@
+ import copy
++import contextvars
+ import inspect
+ import logging
+ import threading
+@@ -15,6 +16,29 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++
++class _CacheBypass:
++    """Context manager returned by Cache.bypass().
++
++    Within the context, reads behave as cache misses even when a value is stored.
++    Writes remain enabled according to the existing memory/disk configuration.
++    After the context ends, newly written values can be read normally.
++    """
++
++    def __init__(self, cache: "Cache") -> None:
++        self._cache = cache
++        self._token: Optional[contextvars.Token] = None
++
++    def __enter__(self) -> "Cache":
++        cache = self._cache
++        current = cache._bypass_depth.get()
++        self._token = cache._bypass_depth.set(current + 1)
++        return cache
++
++    def __exit__(self, *args) -> None:
++        if self._token is not None:
++            self._cache._bypass_depth.reset(self._token)
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -58,6 +82,7 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._bypass_depth: contextvars.ContextVar[int] = contextvars.ContextVar(f"cache_bypass_{id(self)}", default=0)
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -97,6 +122,8 @@ class Cache:
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
++        if self._bypass_depth.get() > 0:
++            return None
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+@@ -168,6 +195,27 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    def bypass(self):
++        """Return a context manager that bypasses cache reads.
++
++        Within the context, :meth:`get` always returns ``None`` (cache miss)
++        so that every lookup recomputes the value.  Writes via :meth:`put`
++        continue to work normally; after the context exits, newly written
++        values can be read again.
++
++        Nested contexts are supported: the bypass stays active until the
++        outermost context exits.  The state is local to the current thread
++        or asynchronous execution context and to this :class:`Cache` instance.
++
++        Example::
++
++            with dspy.cache.bypass():
++                result = lm(...)         # always recomputed, then stored
++            result = lm(...)              # reads the freshly stored value
++        """
++        return _CacheBypass(self)
++
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,

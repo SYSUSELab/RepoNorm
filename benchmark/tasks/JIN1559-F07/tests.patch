@@ -1,0 +1,289 @@
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..9a445fe 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -499,6 +499,284 @@ class TestScope:
+         assert tmpl.render(b=3, e=4) == "1|2|2|4|5"
+ 
+ 
++class TestFallbackInternationalization:
++    @staticmethod
++    def install(env, *, newstyle, gettext=None, ngettext=None, **kwargs):
++        if gettext is None:
++            gettext = lambda message: message
++        if ngettext is None:
++            ngettext = lambda singular, plural, n: singular if n == 1 else plural
++        env.install_gettext_callables_with_fallback(
++            gettext, ngettext, newstyle=newstyle, **kwargs
++        )
++
++    @pytest.mark.parametrize("newstyle", [False, True])
++    def test_gettext_chain_and_trans_variables(self, newstyle):
++        calls = []
++
++        def primary(message):
++            calls.append(("primary", message))
++            return {"Known": "Primary"}.get(message, message)
++
++        def first(message):
++            calls.append(("first", message))
++            return message
++
++        def second(message):
++            calls.append(("second", message))
++            return {"Hello %(name)s": "Welcome %(name)s"}.get(message, message)
++
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=newstyle,
++            gettext=primary,
++            fallback_gettext_funcs=[first, second],
++        )
++
++        assert env.from_string("{% trans %}Known{% endtrans %}").render() == "Primary"
++        assert calls == [("primary", "Known")]
++        calls.clear()
++
++        template = env.from_string(
++            "{% trans name=user %}Hello {{ name }}{% endtrans %}"
++        )
++        assert template.render(user="Ada") == "Welcome Ada"
++        assert calls == [
++            ("primary", "Hello %(name)s"),
++            ("first", "Hello %(name)s"),
++            ("second", "Hello %(name)s"),
++        ]
++
++    @pytest.mark.parametrize("newstyle", [False, True])
++    @pytest.mark.parametrize(
++        ("count", "expected", "expected_source"),
++        [(1, "un livre", "%(count)s book"), (2, "2 livres", "%(count)s books")],
++    )
++    def test_ngettext_chain_with_trans(
++        self, newstyle, count, expected, expected_source
++    ):
++        calls = []
++
++        def fallback(singular, plural, n):
++            calls.append((singular, plural, n))
++            if singular == "%(count)s book":
++                return "un livre" if n == 1 else "%(count)s livres"
++            return singular if n == 1 else plural
++
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=newstyle,
++            fallback_ngettext_funcs=[fallback],
++        )
++        template = env.from_string(
++            "{% trans count=n %}{{ count }} book{% pluralize %}"
++            "{{ count }} books{% endtrans %}"
++        )
++
++        assert template.render(n=count) == expected
++        assert calls == [("%(count)s book", "%(count)s books", count)]
++        assert expected_source in calls[0][:2]
++
++    @pytest.mark.parametrize("newstyle", [False, True])
++    def test_direct_calls_and_all_miss(self, newstyle):
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=newstyle,
++            fallback_gettext_funcs=[lambda message: message],
++            fallback_ngettext_funcs=[
++                lambda singular, plural, n: singular if n == 1 else plural
++            ],
++        )
++
++        assert env.from_string('{{ gettext("missing") }}').render() == "missing"
++        assert (
++            env.from_string('{{ ngettext("one", "many", n) }}').render(n=3)
++            == "many"
++        )
++
++    def test_newstyle_autoescape_applies_after_fallback(self):
++        env = Environment(autoescape=True, extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=True,
++            fallback_gettext_funcs=[
++                lambda message: "<strong>%(name)s</strong>"
++            ],
++        )
++
++        template = env.from_string('{{ gettext("Hello %(name)s", name=value) }}')
++        assert template.render(value="<em>Ada</em>") == (
++            "<strong>&lt;em&gt;Ada&lt;/em&gt;</strong>"
++        )
++
++    @pytest.mark.parametrize("fallbacks", [None, []])
++    def test_none_and_empty_match_normal_install(self, fallbacks):
++        def primary(message):
++            return "translated"
++
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=False,
++            gettext=primary,
++            fallback_gettext_funcs=fallbacks,
++        )
++
++        assert env.from_string('{{ gettext("source") }}').render() == "translated"
++
++    def test_provider_exception_propagates_and_stops_chain(self):
++        called = []
++
++        def broken(message):
++            raise LookupError("catalog unavailable")
++
++        def later(message):
++            called.append(message)
++            return "unexpected"
++
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=True,
++            fallback_gettext_funcs=[broken, later],
++        )
++
++        with pytest.raises(LookupError, match="catalog unavailable"):
++            env.from_string('{{ gettext("missing") }}').render()
++
++        assert called == []
++
++    def test_reinstall_replaces_fallback_chain(self):
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=False,
++            fallback_gettext_funcs=[lambda message: "first"],
++        )
++        template = env.from_string('{{ gettext("missing") }}')
++        assert template.render() == "first"
++
++        self.install(
++            env,
++            newstyle=False,
++            fallback_gettext_funcs=[lambda message: "second"],
++        )
++        assert template.render() == "second"
++
++    def test_context_callables_keep_existing_behavior(self):
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=True,
++            fallback_gettext_funcs=[lambda message: "fallback"],
++            pgettext=lambda context, message: f"{context}:{message}",
++            npgettext=lambda context, singular, plural, n: (
++                f"{context}:{singular if n == 1 else plural}"
++            ),
++        )
++
++        assert env.from_string('{{ pgettext("menu", "Open") }}').render() == (
++            "menu:Open"
++        )
++        assert (
++            env.from_string(
++                '{{ npgettext("menu", "%(num)s item", "%(num)s items", n) }}'
++            ).render(n=2)
++            == "menu:2 items"
++        )
++
++
++    @pytest.mark.parametrize("newstyle", [False, True])
++    def test_context_gettext_fallback_chain(self, newstyle):
++        calls = []
++
++        def primary(context, message):
++            calls.append(("primary", context, message))
++            return message
++
++        def first(context, message):
++            calls.append(("first", context, message))
++            return message
++
++        def second(context, message):
++            calls.append(("second", context, message))
++            return "Ouvrir" if context == "menu" else message
++
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=newstyle,
++            pgettext=primary,
++            fallback_pgettext_funcs=[first, second],
++        )
++
++        assert env.from_string('{{ pgettext("menu", "Open") }}').render() == (
++            "Ouvrir"
++        )
++        assert calls == [
++            ("primary", "menu", "Open"),
++            ("first", "menu", "Open"),
++            ("second", "menu", "Open"),
++        ]
++
++    @pytest.mark.parametrize("newstyle", [False, True])
++    @pytest.mark.parametrize(("count", "expected"), [(1, "un fichier"), (3, "fichiers")])
++    def test_context_plural_fallback_chain(self, newstyle, count, expected):
++        def fallback(context, singular, plural, n):
++            assert context == "files"
++            return "un fichier" if n == 1 else "fichiers"
++
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=newstyle,
++            npgettext=lambda context, singular, plural, n: (
++                singular if n == 1 else plural
++            ),
++            fallback_npgettext_funcs=[fallback],
++        )
++        template = env.from_string(
++            '{{ npgettext("files", "one file", "many files", n) }}'
++        )
++        assert template.render(n=count) == expected
++
++    def test_context_fallback_newstyle_formats_and_escapes(self):
++        env = Environment(autoescape=True, extensions=["jinja2.ext.i18n"])
++        self.install(
++            env,
++            newstyle=True,
++            pgettext=lambda context, message: message,
++            fallback_pgettext_funcs=[
++                lambda context, message: "<b>%(name)s</b>"
++            ],
++        )
++        template = env.from_string(
++            '{{ pgettext("menu", "Open %(name)s", name=value) }}'
++        )
++        assert template.render(value="<em>Ada</em>") == (
++            "<b>&lt;em&gt;Ada&lt;/em&gt;</b>"
++        )
++
++    @pytest.mark.parametrize(
++        ("keyword", "primary"),
++        [
++            ("fallback_pgettext_funcs", "pgettext"),
++            ("fallback_npgettext_funcs", "npgettext"),
++        ],
++    )
++    def test_context_fallback_requires_primary(self, keyword, primary):
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        with pytest.raises(ValueError) as exc_info:
++            self.install(env, newstyle=False, **{keyword: [lambda *args: "value"]})
++
++        message = str(exc_info.value)
++        assert keyword in message
++        assert primary in message.replace(keyword, "")
++
++
+ class TestNewstyleInternationalization:
+     def test_trans(self):
+         tmpl = newstyle_i18n_env.get_template("child.html")

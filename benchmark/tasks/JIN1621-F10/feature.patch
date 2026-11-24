@@ -1,0 +1,195 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..7b783e2 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -71,6 +71,52 @@ class BaseLoader:
+     #: .. versionadded:: 2.4
+     has_source_access = True
+ 
++    def __init__(self, aliases: t.Optional[t.Mapping[str, str]] = None) -> None:
++        self.aliases: t.Dict[str, str] = dict(aliases or ())
++        self._alias_environments: weakref.WeakSet[Environment] = weakref.WeakSet()
++
++    def _invalidate_alias(self, alias: str) -> None:
++        for environment in list(self._alias_environments):
++            cache = environment.cache
++            if cache is None:
++                continue
++            for key in list(cache):
++                loader_ref, name = key
++                if loader_ref() is self and name == alias:
++                    del cache[key]
++
++    def add_alias(self, alias: str, target: str) -> None:
++        """Add a template path alias.
++ 
++        :param alias: The alias name for the template
++        :param target: The actual template path
++        """
++        if not isinstance(alias, str) or not isinstance(target, str):
++            raise TypeError("alias and target must be strings")
++        self.aliases[alias] = target
++        self._invalidate_alias(alias)
++
++    def remove_alias(self, alias: str) -> None:
++        """Remove a template path alias.
++ 
++        :param alias: The alias name to remove
++        """
++        self.aliases.pop(alias, None)
++        self._invalidate_alias(alias)
++
++    def resolve_template_name(self, template: str) -> str:
++        """Resolve template name through aliases.
++ 
++        :param template: The template name (possibly an alias)
++        :return: The actual template path
++        """
++        return self.aliases.get(template, template)
++
++    def _listed_with_aliases(self, names: t.Iterable[str]) -> t.List[str]:
++        result = set(names)
++        result.update(alias for alias, target in self.aliases.items() if target in result)
++        return sorted(result)
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+@@ -116,6 +162,8 @@ class BaseLoader:
+         loaders (such as :class:`PrefixLoader` or :class:`ChoiceLoader`)
+         will not call this method but `get_source` directly.
+         """
++        self._alias_environments.add(environment)
++        name = self.resolve_template_name(name)
+         code = None
+         if globals is None:
+             globals = {}
+@@ -181,6 +229,7 @@ class FileSystemLoader(BaseLoader):
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
++        super().__init__()
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+@@ -228,7 +277,7 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        return self._listed_with_aliases(found)
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -270,6 +319,7 @@ class PackageLoader(BaseLoader):
+         package_path: "str" = "templates",
+         encoding: str = "utf-8",
+     ) -> None:
++        super().__init__()
+         package_path = os.path.normpath(package_path).rstrip(os.path.sep)
+ 
+         # normpath preserves ".", which isn't valid in zip paths.
+@@ -402,6 +452,7 @@ class DictLoader(BaseLoader):
+     """
+ 
+     def __init__(self, mapping: t.Mapping[str, str]) -> None:
++        super().__init__()
+         self.mapping = mapping
+ 
+     def get_source(
+@@ -413,7 +464,7 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        return self._listed_with_aliases(self.mapping)
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -445,6 +496,7 @@ class FunctionLoader(BaseLoader):
+             ],
+         ],
+     ) -> None:
++        super().__init__()
+         self.load_func = load_func
+ 
+     def get_source(
+@@ -479,10 +531,12 @@ class PrefixLoader(BaseLoader):
+     def __init__(
+         self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
+     ) -> None:
++        super().__init__()
+         self.mapping = mapping
+         self.delimiter = delimiter
+ 
+     def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        template = self.resolve_template_name(template)
+         try:
+             prefix, name = template.split(self.delimiter, 1)
+             loader = self.mapping[prefix]
+@@ -508,6 +562,7 @@ class PrefixLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        self._alias_environments.add(environment)
+         loader, local_name = self.get_loader(name)
+         try:
+             return loader.load(environment, local_name, globals)
+@@ -521,7 +576,7 @@ class PrefixLoader(BaseLoader):
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
+-        return result
++        return self._listed_with_aliases(result)
+ 
+ 
+ class ChoiceLoader(BaseLoader):
+@@ -539,11 +594,13 @@ class ChoiceLoader(BaseLoader):
+     """
+ 
+     def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        super().__init__()
+         self.loaders = loaders
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        template = self.resolve_template_name(template)
+         for loader in self.loaders:
+             try:
+                 return loader.get_source(environment, template)
+@@ -558,6 +615,8 @@ class ChoiceLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        self._alias_environments.add(environment)
++        name = self.resolve_template_name(name)
+         for loader in self.loaders:
+             try:
+                 return loader.load(environment, name, globals)
+@@ -569,7 +628,7 @@ class ChoiceLoader(BaseLoader):
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
+-        return sorted(found)
++        return self._listed_with_aliases(found)
+ 
+ 
+ class _TemplateModule(ModuleType):
+@@ -594,6 +653,7 @@ class ModuleLoader(BaseLoader):
+     def __init__(
+         self, path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
+     ) -> None:
++        super().__init__()
+         package_name = f"_jinja2_module_templates_{id(self):x}"
+ 
+         # create a fake module that looks for the templates in the
+@@ -630,6 +690,8 @@ class ModuleLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        self._alias_environments.add(environment)
++        name = self.resolve_template_name(name)
+         key = self.get_template_key(name)
+         module = f"{self.package_name}.{key}"
+         mod = getattr(self.module, module, None)

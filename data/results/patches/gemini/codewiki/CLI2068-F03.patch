@@ -1,0 +1,127 @@
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..395ac17 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -5,13 +5,14 @@ import inspect
+ import io
+ import itertools
+ import sys
++import os
+ import typing as t
+ from contextlib import AbstractContextManager
+ from gettext import gettext as _
+ 
+ from ._compat import isatty
+ from ._compat import strip_ansi
+-from .exceptions import Abort
++from .exceptions import Abort, ClickException
+ from .exceptions import UsageError
+ from .globals import resolve_color_default
+ from .types import Choice
+@@ -650,6 +651,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    auto_backup: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,9 +679,29 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param auto_backup: if enabled, this will create a backup of the file
++                        before opening the editor.
+     """
+     from ._termui_impl import Editor
+ 
++    if auto_backup and filename is not None and os.path.exists(filename):
++        import shutil
++        from datetime import datetime
++
++        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++        backup_name = f"{filename}.backup.{timestamp}"
++        
++        # Handle collisions
++        counter = 1
++        while os.path.exists(backup_name):
++            backup_name = f"{filename}.backup.{timestamp}.{counter}"
++            counter += 1
++        
++        try:
++            shutil.copy2(filename, backup_name)
++        except OSError as e:
++            raise ClickException(f"Failed to create backup file: {e}") from e
++
+     ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
+ 
+     if filename is None:
+@@ -687,8 +709,6 @@ def edit(
+ 
+     ed.edit_file(filename)
+     return None
+-
+-
+ def launch(url: str, wait: bool = False, locate: bool = False) -> int:
+     """This function launches the given URL (or filename) in the default
+     viewer application for this file type.  If this is an executable, it
+diff --git a/tests/test_edit_backup.py b/tests/test_edit_backup.py
+new file mode 100644
+index 0000000..6e98591
+--- /dev/null
++++ b/tests/test_edit_backup.py
+@@ -0,0 +1,54 @@
++import os
++import pytest
++import click
++from unittest.mock import patch
++
++def test_edit_auto_backup(tmp_path):
++    filename = tmp_path / "test.txt"
++    filename.write_text("hello")
++    
++    with patch("click._termui_impl.Editor.edit_file") as mock_edit:
++        click.edit(filename=str(filename), auto_backup=True)
++        
++        # Check if backup exists
++        backups = [f for f in os.listdir(tmp_path) if f.startswith("test.txt.backup.")]
++        assert len(backups) == 1
++        
++        # Check content
++        backup_path = tmp_path / backups[0]
++        assert backup_path.read_text() == "hello"
++
++def test_edit_no_auto_backup(tmp_path):
++    filename = tmp_path / "test.txt"
++    filename.write_text("hello")
++    
++    with patch("click._termui_impl.Editor.edit_file") as mock_edit:
++        click.edit(filename=str(filename), auto_backup=False)
++        
++        # Check if backup exists
++        backups = [f for f in os.listdir(tmp_path) if f.startswith("test.txt.backup.")]
++        assert len(backups) == 0
++
++def test_edit_auto_backup_non_existent_file(tmp_path):
++    filename = tmp_path / "non_existent.txt"
++    
++    with patch("click._termui_impl.Editor.edit_file") as mock_edit:
++        click.edit(filename=str(filename), auto_backup=True)
++        
++        # Check if backup exists
++        backups = [f for f in os.listdir(tmp_path) if f.startswith("non_existent.txt.backup.")]
++        assert len(backups) == 0
++
++def test_edit_auto_backup_failure(tmp_path):
++    filename = tmp_path / "test.txt"
++    filename.write_text("hello")
++    
++    # Make the file read-only to force OSError during copy
++    os.chmod(filename, 0o444)
++    
++    with patch("shutil.copy2", side_effect=OSError("Permission denied")):
++        with pytest.raises(click.ClickException, match="Failed to create backup file"):
++            click.edit(filename=str(filename), auto_backup=True)
++    
++    # Cleanup
++    os.chmod(filename, 0o644)

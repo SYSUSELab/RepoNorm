@@ -1,0 +1,93 @@
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff148..31c43b0 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -280,3 +280,88 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++
++@pytest.mark.parametrize('codec,selector', [('gzip', 1), ('zlib', 2)])
++def test_disk_compression_format_roundtrip_and_switch(tmp_path, codec, selector):
++    import gzip
++    import pickle
++    import zlib
++    cache = Cache(True, True, str(tmp_path), compress=codec)
++    request = {'key': 'structured'}
++    value = DummyResponse('answer' * 1000, {'tokens': 9})
++    cache.put(request, value)
++    stored = cache.disk_cache[cache.cache_key(request)]
++    assert isinstance(stored, bytes)
++    assert stored[:5] == b'DSPC' + bytes([selector])
++    payload = gzip.decompress(stored[5:]) if codec == 'gzip' else zlib.decompress(stored[5:])
++    assert pickle.loads(payload) == value
++    cache.set_compression(None)
++    cache.reset_memory_cache()
++    result = cache.get(request)
++    assert isinstance(result, DummyResponse)
++    assert result.message == value.message
++    assert result.usage == {}
++    assert value.usage == {'tokens': 9}
++    result.message = 'changed by caller'
++    assert cache.get(request).message == value.message
++    reopened = Cache(True, False, str(tmp_path), compress='zlib' if codec == 'gzip' else 'gzip')
++    assert reopened.get(request).message == value.message
++
++
++def test_real_legacy_values_and_codec_zero(tmp_path):
++    import pickle
++    import subprocess
++    namespace = {'__name__': 'baseline_cache_fixture'}
++    source = subprocess.run(['git', 'show', 'HEAD:dspy/clients/cache.py'],
++                            check=True, capture_output=True, text=True).stdout
++    exec(compile(source, '<frozen-baseline-cache>', 'exec'), namespace)
++    baseline = namespace['Cache'](True, False, str(tmp_path))
++    values = [{'nested': [1, None, True]}, b'ordinary bytes', pickle.dumps({'still': 'bytes'})]
++    for i, value in enumerate(values):
++        baseline.put({'key': i}, value)
++    reader = Cache(True, False, str(tmp_path), compress='gzip')
++    for i, value in enumerate(values):
++        assert reader.get({'key': i}) == value
++        assert type(reader.get({'key': i})) is type(value)
++    key = reader.cache_key({'key': 'codec-zero'})
++    reader.disk_cache[key] = b'DSPC\x00' + pickle.dumps({'plain': 3})
++    assert reader.get({'key': 'codec-zero'}) == {'plain': 3}
++    reader.disk_cache[key] = b'DSPC\xffinvalid'
++    with pytest.raises(ValueError):
++        reader.get({'key': 'codec-zero'})
++
++
++@pytest.mark.parametrize('codec', ['gzip', 'zlib'])
++def test_compressible_payload_is_smaller_on_disk(tmp_path, codec):
++    plain = Cache(True, False, str(tmp_path / 'plain'), disk_size_limit_bytes=32 * 1024 * 1024)
++    compressed = Cache(True, False, str(tmp_path / 'compressed'),
++                       disk_size_limit_bytes=32 * 1024 * 1024, compress=codec)
++    payload = {'text': 'repeatable response ' * 100000}
++    request = {'key': 1}
++    plain.put(request, payload)
++    compressed.put(request, payload)
++    assert plain.get(request) == compressed.get(request) == payload
++    assert compressed.disk_cache.volume() < plain.disk_cache.volume()
++
++
++def test_compression_configuration_and_disabled_layers(tmp_path, monkeypatch):
++    import dspy
++    from dspy.clients import configure_cache
++    monkeypatch.setattr(dspy, 'cache', None)
++    configure_cache(disk_cache_dir=str(tmp_path), compress='gzip',
++                    cull_limit=7, eviction_policy='least-recently-used')
++    assert dspy.cache.disk_cache.cull_limit == 7
++    assert dspy.cache.disk_cache.eviction_policy == 'least-recently-used'
++    request = {'key': 'configuration'}
++    dspy.cache.put(request, {'answer': 3})
++    with pytest.raises(ValueError):
++        dspy.cache.set_compression('unknown')
++    dspy.cache.reset_memory_cache()
++    assert dspy.cache.get(request) == {'answer': 3}
++    with pytest.raises(ValueError):
++        Cache(False, True, '', compress='unknown')
++    for memory in [True, False]:
++        cache = Cache(False, memory, '', compress='zlib')
++        cache.put(request, {'answer': 3})
++        assert cache.get(request) == ({'answer': 3} if memory else None)

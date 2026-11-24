@@ -1,0 +1,152 @@
+diff --git a/dspy/adapters/__init__.py b/dspy/adapters/__init__.py
+index 1dea6da4..80e7b90e 100644
+--- a/dspy/adapters/__init__.py
++++ b/dspy/adapters/__init__.py
+@@ -2,7 +2,7 @@ from dspy.adapters.base import Adapter
+ from dspy.adapters.chat_adapter import ChatAdapter
+ from dspy.adapters.json_adapter import JSONAdapter
+ from dspy.adapters.two_step_adapter import TwoStepAdapter
+-from dspy.adapters.types import Audio, Code, History, Image, Tool, ToolCalls, Type
++from dspy.adapters.types import Audio, Code, History, Image, Tool, ToolCalls, Type, parse_python_calls
+ from dspy.adapters.xml_adapter import XMLAdapter
+ 
+ __all__ = [
+@@ -17,5 +17,5 @@ __all__ = [
+     "XMLAdapter",
+     "TwoStepAdapter",
+     "Tool",
+-    "ToolCalls",
++    "ToolCalls", "parse_python_calls",
+ ]
+diff --git a/dspy/adapters/types/__init__.py b/dspy/adapters/types/__init__.py
+index 11b9faee..60695f7f 100644
+--- a/dspy/adapters/types/__init__.py
++++ b/dspy/adapters/types/__init__.py
+@@ -3,6 +3,6 @@ from dspy.adapters.types.base_type import Type
+ from dspy.adapters.types.code import Code
+ from dspy.adapters.types.history import History
+ from dspy.adapters.types.image import Image
+-from dspy.adapters.types.tool import Tool, ToolCalls
++from dspy.adapters.types.tool import Tool, ToolCalls, parse_python_calls
+ 
+-__all__ = ["History", "Image", "Audio", "Type", "Tool", "ToolCalls", "Code"]
++__all__ = ["History", "Image", "Audio", "Type", "Tool", "ToolCalls", "Code", "parse_python_calls"]
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..8d82d2c8 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,6 +1,7 @@
++import ast
+ import asyncio
+ import inspect
+-from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
++from typing import TYPE_CHECKING, Any, Callable, Type as TypingType, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+ from pydantic import BaseModel, TypeAdapter, create_model
+@@ -15,6 +16,78 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++def parse_python_calls(text: str) -> dict:
++    if not text.strip():
++        raise ValueError("Empty input")
++    
++    try:
++        tree = ast.parse(text)
++    except SyntaxError as e:
++        raise ValueError(f"Malformed syntax: {e}")
++        
++    tool_calls = []
++    
++    for node in tree.body:
++        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
++            raise ValueError("Only calls are allowed")
++        
++        call = node.value
++        
++        def get_name(node):
++            if isinstance(node, ast.Name):
++                return node.id
++            elif isinstance(node, ast.Attribute):
++                return f"{get_name(node.value)}.{node.attr}"
++            else:
++                raise ValueError("Invalid function name")
++        
++        name = get_name(call.func)
++        
++        if call.args:
++            raise ValueError("Positional arguments are not allowed")
++        
++        args = {}
++        for keyword in call.keywords:
++            if keyword.arg in args:
++                raise ValueError(f"Duplicate keyword argument: {keyword.arg}")
++            args[keyword.arg] = _parse_value(keyword.value)
++            
++        tool_calls.append({"name": name, "args": args})
++        
++    return {"tool_calls": tool_calls}
++
++def _parse_value(node: ast.AST) -> Any:
++    if isinstance(node, ast.Constant):
++        if isinstance(node.value, (str, int, float, bool)) or node.value is None:
++            if isinstance(node.value, float) and not (float('-inf') < node.value < float('inf')):
++                raise ValueError("Non-finite numbers are not allowed")
++            return node.value
++        else:
++            raise ValueError(f"Unsupported constant type: {type(node.value)}")
++    elif isinstance(node, ast.List):
++        return [_parse_value(elt) for elt in node.elts]
++    elif isinstance(node, ast.Tuple):
++        return [_parse_value(elt) for elt in node.elts]
++    elif isinstance(node, ast.Dict):
++        keys = []
++        for k in node.keys:
++            if not isinstance(k, ast.Constant) or not isinstance(k.value, str):
++                raise ValueError("Dictionary keys must be strings")
++            if k.value in keys:
++                raise ValueError(f"Duplicate dictionary key: {k.value}")
++            keys.append(k.value)
++        return {k.value: _parse_value(v) for k, v in zip(node.keys, node.values)}
++    elif isinstance(node, ast.UnaryOp):
++        if isinstance(node.op, (ast.UAdd, ast.USub)):
++            if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)):
++                val = node.operand.value
++                return +val if isinstance(node.op, ast.UAdd) else -val
++            else:
++                raise ValueError("Unary operators only permitted on numbers")
++        else:
++            raise ValueError("Unsupported unary operator")
++    else:
++        raise ValueError(f"Unsupported node type: {type(node)}")
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -261,6 +334,18 @@ class ToolCalls(Type):
+ 
+     tool_calls: list[ToolCall]
+ 
++    @classmethod
++    def validate_input(cls, value: Any) -> Any:
++        if isinstance(value, str):
++            return cls.from_dict_list(parse_python_calls(value)["tool_calls"])
++        return super().validate_input(value)
++
++    @classmethod
++    def model_validate(cls, obj: Any, **kwargs) -> "ToolCalls":
++        if isinstance(obj, str):
++            return cls.from_dict_list(parse_python_calls(obj)["tool_calls"])
++        return super().model_validate(obj, **kwargs)
++
+     @classmethod
+     def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+@@ -309,7 +394,6 @@ class ToolCalls(Type):
+             }
+         ]
+ 
+-
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+ 

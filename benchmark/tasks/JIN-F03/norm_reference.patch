@@ -1,0 +1,225 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..2ed83e4d 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,10 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add a ``separator`` argument to ``groupby`` and attribute-mode
++    ``map``. A custom delimiter leaves dots literal and preserves
++    environment lookup rules, defaults, and async support.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..232f55b6 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -57,13 +57,14 @@ def make_attrgetter(
+     attribute: t.Optional[t.Union[str, int]],
+     postprocess: t.Optional[t.Callable[[t.Any], t.Any]] = None,
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> t.Callable[[t.Any], t.Any]:
+     """Returns a callable that looks up the given attribute from a
+-    passed object with the rules of the environment.  Dots are allowed
+-    to access attributes of attributes.  Integer parts in paths are
+-    looked up as integers.
++    passed object with the rules of the environment. The nonempty
++    ``separator`` delimits nested attributes and defaults to a dot.
++    Integer parts in paths are looked up as integers.
+     """
+-    parts = _prepare_attribute_parts(attribute)
++    parts = _prepare_attribute_parts(attribute, separator)
+ 
+     def attrgetter(item: t.Any) -> t.Any:
+         for part in parts:
+@@ -84,10 +85,12 @@ def make_multi_attrgetter(
+     environment: "Environment",
+     attribute: t.Optional[t.Union[str, int]],
+     postprocess: t.Optional[t.Callable[[t.Any], t.Any]] = None,
++    separator: str = ".",
+ ) -> t.Callable[[t.Any], t.List[t.Any]]:
+     """Returns a callable that looks up the given comma separated
+     attributes from a passed object with the rules of the environment.
+-    Dots are allowed to access attributes of each attribute.  Integer
++    The nonempty ``separator`` delimits nested attributes and defaults
++    to a dot. Commas still separate the requested attributes. Integer
+     parts in paths are looked up as integers.
+ 
+     The value returned by the returned callable is a list of extracted
+@@ -100,7 +103,7 @@ def make_multi_attrgetter(
+     else:
+         split = [attribute]
+ 
+-    parts = [_prepare_attribute_parts(item) for item in split]
++    parts = [_prepare_attribute_parts(item, separator) for item in split]
+ 
+     def attrgetter(item: t.Any) -> t.List[t.Any]:
+         items = [None] * len(parts)
+@@ -122,13 +125,15 @@ def make_multi_attrgetter(
+ 
+ 
+ def _prepare_attribute_parts(
+-    attr: t.Optional[t.Union[str, int]]
++    attr: t.Optional[t.Union[str, int]], separator: str = "."
+ ) -> t.List[t.Union[str, int]]:
++    if not separator:
++        raise FilterArgumentError("separator must not be empty")
+     if attr is None:
+         return []
+ 
+     if isinstance(attr, str):
+-        return [int(x) if x.isdigit() else x for x in attr.split(".")]
++        return [int(x) if x.isdigit() else x for x in attr.split(separator)]
+ 
+     return [attr]
+ 
+@@ -1163,6 +1168,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1203,13 +1209,29 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    A nonempty ``separator`` replaces the dot delimiter for this call.
++    Dots then become literal characters in field names. Numeric path
++    components still select integer indices. An empty delimiter raises
++    :exc:`FilterArgumentError` when the path is evaluated.
++
++    For example, to use double underscores:
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("profile__city", separator="__") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.1
++        Added the ``separator`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
++    expr = make_attrgetter(environment, attribute, default=default, separator=separator)
+     return [
+         _GroupTuple(key, list(values))
+         for key, values in groupby(sorted(value, key=expr), expr)
+@@ -1222,8 +1244,9 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
++    expr = make_attrgetter(environment, attribute, default=default, separator=separator)
+     return [
+         _GroupTuple(key, await auto_to_list(values))
+         for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+@@ -1376,6 +1399,7 @@ def sync_do_map(
+     *,
+     attribute: str = ...,
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> t.Iterable:
+     ...
+ 
+@@ -1402,6 +1426,15 @@ def sync_do_map(
+ 
+         {{ users|map(attribute="username", default="Anonymous")|join(", ") }}
+ 
++    In attribute mode, ``separator`` replaces the dot delimiter. For
++    example, ``map(attribute="profile__name", separator="__")`` resolves
++    the nested name while ordinary dots remain literal. An empty
++    separator raises :exc:`FilterArgumentError` when evaluating a path;
++    an empty input remains lazy and does not evaluate a path.
++
++    In filter-name mode, all keyword arguments, including ``separator``,
++    are forwarded to the named filter.
++
+     Alternatively you can let it invoke a filter by passing the name of the
+     filter and the arguments afterwards.  A good example would be applying a
+     text conversion filter on a sequence:
+@@ -1418,6 +1451,9 @@ def sync_do_map(
+         (getattr(u, "username", "Anonymous") for u in users)
+         (do_lower(x) for x in titles)
+ 
++    .. versionchanged:: 3.1
++        Added the ``separator`` parameter in attribute mode.
++
+     .. versionchanged:: 2.11.0
+         Added the ``default`` parameter.
+ 
+@@ -1448,6 +1484,7 @@ def do_map(
+     *,
+     attribute: str = ...,
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> t.Iterable:
+     ...
+ 
+@@ -1656,13 +1693,16 @@ def prepare_map(
+     if not args and "attribute" in kwargs:
+         attribute = kwargs.pop("attribute")
+         default = kwargs.pop("default", None)
++        separator = kwargs.pop("separator", ".")
+ 
+         if kwargs:
+             raise FilterArgumentError(
+                 f"Unexpected keyword argument {next(iter(kwargs))!r}"
+             )
+ 
+-        func = make_attrgetter(context.environment, attribute, default=default)
++        func = make_attrgetter(
++            context.environment, attribute, default=default, separator=separator
++        )
+     else:
+         try:
+             name = args[0]
+diff --git a/tests/test_separator_contribution.py b/tests/test_separator_contribution.py
+new file mode 100644
+index 00000000..2968a2d0
+--- /dev/null
++++ b/tests/test_separator_contribution.py
+@@ -0,0 +1,30 @@
++import asyncio
++
++import pytest
++
++from jinja2 import Environment
++from jinja2.exceptions import FilterArgumentError
++
++
++@pytest.mark.parametrize("asynchronous", [False, True])
++def test_separator_map_and_groupby(asynchronous):
++    env = Environment(enable_async=asynchronous)
++    template = env.from_string(
++        "{% for g in xs|groupby('data__0__literal.key', separator='__') %}"
++        "{{ g.grouper }}:{{ g.list|map(attribute='data__0__literal.key', "
++        "separator='__')|join(',') }};{% endfor %}"
++    )
++    values = iter([{"data": [{"literal.key": "b"}]}, {"data": [{"literal.key": "a"}]}])
++    if asynchronous:
++        result = asyncio.run(template.render_async(xs=values))
++    else:
++        result = template.render(xs=values)
++    assert result == "a:a;b:b;"
++
++
++def test_separator_empty_path_evaluation():
++    env = Environment()
++    template = env.from_string("{{ xs|map(attribute='name', separator='')|list }}")
++    assert template.render(xs=[]) == "[]"
++    with pytest.raises(FilterArgumentError):
++        template.render(xs=[{"name": "a"}])

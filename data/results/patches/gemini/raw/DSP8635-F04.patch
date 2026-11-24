@@ -1,0 +1,461 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..9404ca83 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -7,7 +7,7 @@ from dspy.propose.utils import (
+     create_example_string,
+     create_predictor_level_history_string,
+     get_dspy_source_code,
+-    strip_prefix,
++    strip_prefix, truncate_description,
+ )
+ from dspy.teleprompt.utils import get_prompt_model, get_signature
+ 
+@@ -142,7 +142,7 @@ class GenerateModuleInstruction(dspy.Module):
+         use_task_demos=True,
+         use_instruct_history=True,
+         use_tip=True,
+-        verbose=False,
++        verbose=False, max_description_chars=2000,
+     ):
+         super().__init__()
+         self.use_dataset_summary = use_dataset_summary
+@@ -150,7 +150,9 @@ class GenerateModuleInstruction(dspy.Module):
+         self.use_task_demos = use_task_demos
+         self.use_instruct_history = use_instruct_history
+         self.use_tip = use_tip
++        self.set_tip_randomly=set_tip_randomly
+         self.verbose = verbose
++        self.max_description_chars = max_description_chars
+ 
+         self.program_code_string = program_code_string
+         self.describe_program = dspy.Predict(DescribeProgram)
+@@ -217,6 +219,8 @@ class GenerateModuleInstruction(dspy.Module):
+                         program_code=self.program_code_string, program_example=task_demos,
+                     ).program_description,
+                 )
++                if self.max_description_chars:
++                    program_description = truncate_description(program_description, self.max_description_chars)
+                 if self.verbose:
+                     print(f"PROGRAM DESCRIPTION: {program_description}")
+ 
+@@ -241,6 +245,8 @@ class GenerateModuleInstruction(dspy.Module):
+                     module=module_code,
+                     max_depth=10,
+                 ).module_description
++                if self.max_description_chars:
++                    module_description = truncate_description(module_description, self.max_description_chars)
+             except Exception as e:
+                 if self.verbose:
+                     print(f"Error getting program description. Running without program aware proposer. Error: {e}")
+@@ -281,8 +287,8 @@ class GroundedProposer(Proposer):
+         num_demos_in_context = 3,
+         use_instruct_history=True,
+         use_tip=True,
+-        set_tip_randomly=True,
+-        set_history_randomly=True,
++        set_history_randomly=True, set_tip_randomly=True,
++        max_description_chars=2000,
+         verbose=False,
+         rng=None
+     ):
+@@ -294,9 +300,19 @@ class GroundedProposer(Proposer):
+         self.use_instruct_history = use_instruct_history
+         self.use_tip = use_tip
+         self.set_tip_randomly=set_tip_randomly
++        self.set_tip_randomly=set_tip_randomly
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
++        self.max_description_chars = max_description_chars
+         self.rng = rng or random
++        if max_description_chars is not None:
++            if not isinstance(max_description_chars, int) or isinstance(max_description_chars, bool) or max_description_chars <= 0:
++                raise ValueError("max_description_chars must be a positive, non-boolean integer or None.")
++        self.max_description_chars = max_description_chars
++        if max_description_chars is not None:
++            if not isinstance(max_description_chars, int) or isinstance(max_description_chars, bool) or max_description_chars <= 0:
++                raise ValueError("max_description_chars must be a positive, non-boolean integer or None.")
++        self.max_description_chars = max_description_chars
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -411,7 +427,7 @@ class GroundedProposer(Proposer):
+             use_task_demos=self.use_task_demos and demo_candidates,
+             use_instruct_history=self.use_instruct_history and instruction_history,
+             use_tip=self.use_tip,
+-            verbose=self.verbose
++            verbose=self.verbose, max_description_chars=self.max_description_chars
+         )
+ 
+         # Generate a new instruction for our predictor, using the temperature specified for this round
+diff --git a/dspy/propose/utils.py b/dspy/propose/utils.py
+index 8bd720a2..b2dc71f6 100644
+--- a/dspy/propose/utils.py
++++ b/dspy/propose/utils.py
+@@ -187,3 +187,21 @@ def get_dspy_source_code(module):
+             completed_set.add(item)
+ 
+     return "\n\n".join(header) + "\n\n" + base_code
++
++def truncate_description(text, cap):
++    if cap is None or len(text) <= cap:
++        return text
++    
++    if cap == 1:
++        return "…"
++    
++    # Find all sentence endings
++    matches = list(re.finditer(r'[.!?](\s|$)', text))
++    
++    # We want the last match that fits in cap-1 characters
++    for match in reversed(matches):
++        if match.end() <= cap - 1:
++            return text[:match.end()].rstrip() + "…"
++            
++    # If no sentence fits, take a hard prefix of cap-1 characters
++    return text[:cap-1].rstrip() + "…"
+diff --git a/edit_grounded_proposer.py b/edit_grounded_proposer.py
+new file mode 100644
+index 00000000..e43b9767
+--- /dev/null
++++ b/edit_grounded_proposer.py
+@@ -0,0 +1,17 @@
++import re
++
++with open('dspy/propose/grounded_proposer.py', 'r') as f:
++    content = f.read()
++
++# Apply to program_description
++pattern = r'(program_description = strip_prefix\(\s*self\.describe_program\(\s*program_code=self\.program_code_string,\s*program_example=task_demos,\s*\)\.program_description,\s*\))'
++replacement = r'\1\n                if self.max_description_chars:\n                    program_description = truncate_description(program_description, self.max_description_chars)'
++content = re.sub(pattern, replacement, content)
++
++# Apply to module_description
++pattern = r'(module_description = self\.describe_module\(\s*program_code=self\.program_code_string,\s*program_description=program_description,\s*program_example=task_demos,\s*module=module_code,\s*max_depth=10,\s*\)\.module_description)'
++replacement = r'\1\n                if self.max_description_chars:\n                    module_description = truncate_description(module_description, self.max_description_chars)'
++content = re.sub(pattern, replacement, content)
++
++with open('dspy/propose/grounded_proposer.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_file.py b/fix_file.py
+new file mode 100644
+index 00000000..cc13d758
+--- /dev/null
++++ b/fix_file.py
+@@ -0,0 +1,41 @@
++import re
++
++with open('dspy/propose/grounded_proposer.py', 'r') as f:
++    content = f.read()
++
++# Fix GenerateModuleInstruction.__init__
++pattern = r'class GenerateModuleInstruction\(dspy\.Module\):\n    def __init__\(\n        self,\n        program_code_string=None,\n        use_dataset_summary=True,\n        program_aware=False,\n        use_task_demos=True,\n        use_instruct_history=True,\n        use_tip=True,\n        verbose=False, max_description_chars=2000,\n        self\.max_description_chars = max_description_chars\n        self\.max_description_chars = max_description_chars\n    \):'
++replacement = r'class GenerateModuleInstruction(dspy.Module):\n    def __init__(\n        self,\n        program_code_string=None,\n        use_dataset_summary=True,\n        program_aware=False,\n        use_task_demos=True,\n        use_instruct_history=True,\n        use_tip=True,\n        verbose=False,\n        max_description_chars=2000,\n    ):\n        super().__init__()\n        self.use_dataset_summary = use_dataset_summary\n        self.program_aware = program_aware\n        self.use_task_demos = use_task_demos\n        self.use_instruct_history = use_instruct_history\n        self.use_tip = use_tip\n        self.verbose = verbose\n        self.max_description_chars = max_description_chars'
++
++# The pattern might be too specific. Let's use a more robust way.
++# Let's just find the line "class GenerateModuleInstruction(dspy.Module):" and replace the next few lines.
++
++lines = content.splitlines()
++for i, line in enumerate(lines):
++    if 'class GenerateModuleInstruction(dspy.Module):' in line:
++        # Replace the next 15 lines
++        lines[i+1:i+16] = [
++            '    def __init__(',
++            '        self,',
++            '        program_code_string=None,',
++            '        use_dataset_summary=True,',
++            '        program_aware=False,',
++            '        use_task_demos=True,',
++            '        use_instruct_history=True,',
++            '        use_tip=True,',
++            '        verbose=False,',
++            '        max_description_chars=2000,',
++            '    ):',
++            '        super().__init__()',
++            '        self.use_dataset_summary = use_dataset_summary',
++            '        self.program_aware = program_aware',
++            '        self.use_task_demos = use_task_demos',
++            '        self.use_instruct_history = use_instruct_history',
++            '        self.use_tip = use_tip',
++            '        self.verbose = verbose',
++            '        self.max_description_chars = max_description_chars'
++        ]
++        break
++
++with open('dspy/propose/grounded_proposer.py', 'w') as f:
++    f.write('\n'.join(lines))
+diff --git a/fix_file_v2.py b/fix_file_v2.py
+new file mode 100644
+index 00000000..37d66138
+--- /dev/null
++++ b/fix_file_v2.py
+@@ -0,0 +1,43 @@
++with open('dspy/propose/grounded_proposer.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the line "class GenerateModuleInstruction(dspy.Module):"
++for i, line in enumerate(lines):
++    if 'class GenerateModuleInstruction(dspy.Module):' in line:
++        # Replace the next 25 lines
++        lines[i+1:i+26] = [
++            '    def __init__(',
++            '        self,',
++            '        program_code_string=None,',
++            '        use_dataset_summary=True,',
++            '        program_aware=False,',
++            '        use_task_demos=True,',
++            '        use_instruct_history=True,',
++            '        use_tip=True,',
++            '        verbose=False,',
++            '        max_description_chars=2000,',
++            '    ):',
++            '        super().__init__()',
++            '        self.use_dataset_summary = use_dataset_summary',
++            '        self.program_aware = program_aware',
++            '        self.use_task_demos = use_task_demos',
++            '        self.use_instruct_history = use_instruct_history',
++            '        self.use_tip = use_tip',
++            '        self.verbose = verbose',
++            '        self.max_description_chars = max_description_chars',
++            '',
++            '        self.program_code_string = program_code_string',
++            '        self.describe_program = dspy.Predict(DescribeProgram)',
++            '        self.describe_module = dspy.Predict(DescribeModule)',
++            '        self.generate_module_instruction = generate_instruction_class(',
++            '            use_dataset_summary=use_dataset_summary,',
++            '            program_aware=program_aware,',
++            '            use_task_demos=use_task_demos,',
++            '            use_instruct_history=use_instruct_history,',
++            '            use_tip=use_tip,',
++            '        )'
++        ]
++        break
++
++with open('dspy/propose/grounded_proposer.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/fix_grounded_proposer_init.py b/fix_grounded_proposer_init.py
+new file mode 100644
+index 00000000..bd63bd72
+--- /dev/null
++++ b/fix_grounded_proposer_init.py
+@@ -0,0 +1,17 @@
++with open('dspy/propose/grounded_proposer.py', 'r') as f:
++    lines = f.readlines()
++
++for i, line in enumerate(lines):
++    if 'class GroundedProposer(Proposer):' in line:
++        # Find the __init__ method
++        for j in range(i, i+20):
++            if 'def __init__(' in lines[j]:
++                # Replace the arguments
++                lines[j+12] = '        set_history_randomly=True,\n'
++                lines[j+13] = '        max_description_chars=2000,\n'
++                lines[j+14] = '        verbose=False,\n'
++                break
++        break
++
++with open('dspy/propose/grounded_proposer.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/fix_init.py b/fix_init.py
+new file mode 100644
+index 00000000..6269ccd2
+--- /dev/null
++++ b/fix_init.py
+@@ -0,0 +1,53 @@
++with open('dspy/propose/grounded_proposer.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the line with def __init__
++for i, line in enumerate(lines):
++    if 'def __init__(' in line and 'GenerateModuleInstruction' in lines[i-1]:
++        # This is the GenerateModuleInstruction.__init__
++        # Let's rewrite it
++        lines[i+1] = '        self,\n'
++        lines[i+2] = '        program_code_string=None,\n'
++        lines[i+3] = '        use_dataset_summary=True,\n'
++        lines[i+4] = '        program_aware=False,\n'
++        lines[i+5] = '        use_task_demos=True,\n'
++        lines[i+6] = '        use_instruct_history=True,\n'
++        lines[i+7] = '        use_tip=True,\n'
++        lines[i+8] = '        verbose=False,\n'
++        lines[i+9] = '        max_description_chars=2000,\n'
++        lines[i+10] = '    ):\n'
++        lines[i+11] = '        super().__init__()\n'
++        lines[i+12] = '        self.use_dataset_summary = use_dataset_summary\n'
++        lines[i+13] = '        self.program_aware = program_aware\n'
++        lines[i+14] = '        self.use_task_demos = use_task_demos\n'
++        lines[i+15] = '        self.use_instruct_history = use_instruct_history\n'
++        lines[i+16] = '        self.use_tip = use_tip\n'
++        lines[i+17] = '        self.verbose = verbose\n'
++        lines[i+18] = '        self.max_description_chars = max_description_chars\n'
++        # Remove the rest of the lines until the next method
++        # Actually, I should just replace the lines.
++        # Let's just delete the lines I don't need.
++        # The original lines were:
++        # 137:    def __init__(
++        # 138:        self,
++        # 139:        program_code_string=None,
++        # 140:        use_dataset_summary=True,
++        # 141:        program_aware=False,
++        # 142:        use_task_demos=True,
++        # 143:        use_instruct_history=True,
++        # 144:        use_tip=True,
++        # 145:        verbose=False, max_description_chars=2000,
++        # 146:        self.max_description_chars = max_description_chars
++        # 147:        self.max_description_chars = max_description_chars
++        # 148:    ):
++        # 149:        super().__init__()
++        # 150:        self.use_dataset_summary = use_dataset_summary
++        # 151:        self.program_aware = program_aware
++        
++        # I will just replace the lines 137 to 151.
++        
++        # Let's just rewrite the whole file to be safe.
++        break
++
++with open('dspy/propose/grounded_proposer.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/test_description_limit.py b/test_description_limit.py
+new file mode 100644
+index 00000000..388244a4
+--- /dev/null
++++ b/test_description_limit.py
+@@ -0,0 +1,29 @@
++import unittest
++from dspy.propose.grounded_proposer import GroundedProposer
++from dspy.propose.utils import truncate_description
++
++class TestDescriptionLimit(unittest.TestCase):
++    def test_invalid_limit(self):
++        with self.assertRaises(ValueError):
++            GroundedProposer(prompt_model=None, program=None, trainset=None, max_description_chars="invalid")
++        with self.assertRaises(ValueError):
++            GroundedProposer(prompt_model=None, program=None, trainset=None, max_description_chars=-1)
++        with self.assertRaises(ValueError):
++            GroundedProposer(prompt_model=None, program=None, trainset=None, max_description_chars=0)
++        with self.assertRaises(ValueError):
++            GroundedProposer(prompt_model=None, program=None, trainset=None, max_description_chars=True)
++
++    def test_valid_limit(self):
++        # Should not raise
++        GroundedProposer(prompt_model=None, program=None, trainset=None, max_description_chars=2000)
++        GroundedProposer(prompt_model=None, program=None, trainset=None, max_description_chars=None)
++
++    def test_truncate_description(self):
++        self.assertEqual(truncate_description("This is a sentence. This is another sentence.", 30), "This is a sentence.…")
++        self.assertEqual(truncate_description("This is a sentence. This is another sentence.", 20), "This is a sentence.…")
++        self.assertEqual(truncate_description("This is a sentence. This is another sentence.", 5), "This…")
++        self.assertEqual(truncate_description("Short.", 10), "Short.")
++        self.assertEqual(truncate_description("A" * 20, 10), "AAAAAAAAA…")
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/truncate_description.py b/truncate_description.py
+new file mode 100644
+index 00000000..9a3d3492
+--- /dev/null
++++ b/truncate_description.py
+@@ -0,0 +1,103 @@
++import re
++
++def truncate_description(text, cap):
++    if cap is None or len(text) <= cap:
++        return text
++    
++    if cap == 1:
++        return "…"
++    
++    # The requirement: "retain the last complete sentence ending (. ! or ?, followed by whitespace or the end) that fits."
++    # "If none fits, take a hard prefix of cap-1 characters."
++    # "Remove trailing whitespace from that prefix and append …."
++    
++    # Let's find all sentence endings.
++    # A sentence ending is [.!?] followed by whitespace or end of string.
++    
++    # Let's find all matches of [.!?](\s|$)
++    # We need to be careful about the whitespace.
++    
++    # Let's find all matches of [.!?]
++    
++    # Let's try this:
++    # Find all positions of [.!?]
++    
++    # Let's use re.finditer(r'[.!?](\s|$)', text)
++    
++    # Wait, the requirement says: "retain the last complete sentence ending (. ! or ?, followed by whitespace or the end) that fits."
++    # This means we should include the sentence ending character and the whitespace.
++    
++    # Let's find all matches of [.!?]
++    
++    # Let's try this:
++    # Find all positions of [.!?]
++    
++    # Let's use re.finditer(r'[.!?](\s|$)', text)
++    
++    # Let's test with "This is a sentence. This is another sentence."
++    # Matches:
++    # 1. "e." at index 18 (match.end() is 19)
++    # 2. "e." at index 44 (match.end() is 45)
++    
++    # If cap is 30:
++    # 1. match.end() is 19. 19 <= 29. This fits.
++    # 2. match.end() is 45. 45 > 29. This does not fit.
++    
++    # So we should return text[:19].rstrip() + "…"
++    # "This is a sentence. …"
++    
++    # Let's check the output of my previous script:
++    # 'This is a sentence.…'
++    # It seems it's already doing that.
++    
++    # Let's check the output of my previous script again:
++    # 'This is a sentence.…'
++    # Wait, the output was 'This is a sentence.…'
++    # Let's check the length of 'This is a sentence.'
++    # 'This is a sentence.' is 19 characters.
++    # So text[:19] is 'This is a sentence.'
++    # Then rstrip() is 'This is a sentence.'
++    # Then + "…" is 'This is a sentence.…'
++    
++    # This looks correct.
++    
++    # Let's check the case where the sentence ending is followed by whitespace.
++    # "This is a sentence.  This is another sentence."
++    # The match for the first sentence is "e. "
++    # match.end() is 20.
++    # text[:20] is 'This is a sentence. '
++    # rstrip() is 'This is a sentence.'
++    # + "…" is 'This is a sentence.…'
++    
++    # This also looks correct.
++    
++    # What if the sentence ending is at the very end?
++    # "This is a sentence."
++    # match.end() is 19.
++    # text[:19] is 'This is a sentence.'
++    # rstrip() is 'This is a sentence.'
++    # + "…" is 'This is a sentence.…'
++    
++    # Wait, if the text is already within the cap, we should return it as is.
++    # My function does that:
++    # if cap is None or len(text) <= cap:
++    #     return text
++    
++    # So if the text is "This is a sentence." and cap is 20, it returns "This is a sentence."
++    # This is correct.
++    
++    # What if the text is "This is a sentence." and cap is 10?
++    # len(text) is 19. 19 > 10.
++    # matches:
++    # 1. "e." at index 18 (match.end() is 19)
++    # 19 > 9.
++    # So it goes to the hard prefix part.
++    # text[:9] is 'This is a'
++    # rstrip() is 'This is a'
++    # + "…" is 'This is a…'
++    
++    # This seems correct.
++    
++    return "Correct"
++
++print(truncate_description('This is a sentence. This is another sentence.', 30))

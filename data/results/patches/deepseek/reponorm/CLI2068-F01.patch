@@ -1,0 +1,287 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..61825ba 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -505,10 +505,26 @@ class Editor:
+                 return editor
+         return "vi"
+ 
+-    def edit_file(self, filename: str) -> None:
++    def edit_file(self, filename: str | t.Iterable[str]) -> None:
++        import shlex
+         import subprocess
+ 
+         editor = self.get_editor()
++
++        if isinstance(filename, str):
++            filenames: list[str] = [filename]
++        else:
++            filenames = list(filename)
++            if not filenames:
++                raise ValueError(
++                    _("filename is an empty iterable")
++                )
++            for fn in filenames:
++                if not isinstance(fn, str):
++                    raise TypeError(
++                        _("filename iterable contains non-string item: {fn!r}").format(fn=fn)
++                    )
++
+         environ: dict[str, str] | None = None
+ 
+         if self.env:
+@@ -516,7 +532,8 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            cmd = [*shlex.split(editor), *filenames]
++            c = subprocess.Popen(cmd, env=environ)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..8563d95 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -649,7 +649,7 @@ def edit(
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+     extension: str = ".txt",
+-    filename: str | None = None,
++    filename: str | t.Iterable[str] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -676,7 +676,9 @@ def edit(
+                       highlighting.
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+-                     file as an indirection in that case.
++                     file as an indirection in that case.  Can be a string
++                     or an iterable of strings to edit multiple files in
++                     one editor session.
+     """
+     from ._termui_impl import Editor
+ 
+diff --git a/tests/test_edit.py b/tests/test_edit.py
+new file mode 100644
+index 0000000..feded08
+--- /dev/null
++++ b/tests/test_edit.py
+@@ -0,0 +1,215 @@
++"""Tests for click.edit and click._termui_impl.Editor.edit_file."""
++
++import subprocess
++import sys
++
++import pytest
++
++import click
++from click._termui_impl import Editor
++from click.exceptions import ClickException
++
++
++def _make_mock_popen(recorded_cmd=None, exit_code=0):
++    """Create a mock Popen that records the command and returns given exit code."""
++    container = {"cmd": recorded_cmd, "exit_code": exit_code}
++
++    class MockProcess:
++        def __init__(self, cmd, *args, **kwargs):
++            container["cmd"] = cmd
++            self.args = args
++            self.kwargs = kwargs
++
++        def wait(self):
++            return container["exit_code"]
++
++    return container, MockProcess
++
++
++class TestEditFile:
++    """Tests for Editor.edit_file with the new multi-filename support."""
++
++    def test_single_filename_string(self, monkeypatch):
++        """A single string filename is treated as one file."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="cat")
++        ed.edit_file("single_file.txt")
++        assert container["cmd"] == ["cat", "single_file.txt"]
++
++    def test_multiple_filenames_list(self, monkeypatch):
++        """A list of filenames is passed as distinct arguments."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="cat")
++        ed.edit_file(["file1.txt", "file2.txt", "file3.txt"])
++        assert container["cmd"] == ["cat", "file1.txt", "file2.txt", "file3.txt"]
++
++    def test_multiple_filenames_tuple(self, monkeypatch):
++        """A tuple of filenames is passed as distinct arguments."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="cat")
++        ed.edit_file(("a.txt", "b.txt"))
++        assert container["cmd"] == ["cat", "a.txt", "b.txt"]
++
++    def test_string_not_iterated_as_characters(self, monkeypatch):
++        """A single string must not be treated as an iterable of characters."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="cat")
++        ed.edit_file("filename.txt")
++        # If iterated as characters, would be ["cat", "f", "i", "l", "e", ...]
++        assert container["cmd"] == ["cat", "filename.txt"]
++
++    def test_empty_iterable_raises_value_error(self):
++        """An empty iterable must raise ValueError."""
++        ed = Editor(editor="cat")
++        with pytest.raises(ValueError, match="empty"):
++            ed.edit_file([])
++        with pytest.raises(ValueError, match="empty"):
++            ed.edit_file(())
++
++    def test_generator_empty_raises_value_error(self):
++        """An empty generator raises ValueError."""
++        ed = Editor(editor="cat")
++
++        def empty_gen():
++            yield from []
++
++        with pytest.raises(ValueError, match="empty"):
++            ed.edit_file(empty_gen())
++
++    def test_non_string_item_raises_type_error(self):
++        """A non-string item in the iterable must raise TypeError."""
++        ed = Editor(editor="cat")
++        with pytest.raises(TypeError, match="non-string"):
++            ed.edit_file(["good.txt", 42])
++        with pytest.raises(TypeError, match="non-string"):
++            ed.edit_file(["good.txt", None])
++
++    def test_oneshot_iterable_consumed_once(self, monkeypatch):
++        """A one-shot iterable (generator) is consumed correctly."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        def gen():
++            yield "a.txt"
++            yield "b.txt"
++
++        ed = Editor(editor="cat")
++        ed.edit_file(gen())
++        assert container["cmd"] == ["cat", "a.txt", "b.txt"]
++
++    def test_filenames_with_spaces(self, monkeypatch):
++        """Filenames with spaces must retain their exact boundaries."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="cat")
++        ed.edit_file("file with spaces.txt")
++        assert container["cmd"] == ["cat", "file with spaces.txt"]
++
++    def test_filenames_with_special_chars(self, monkeypatch):
++        """Filenames with quotes, semicolons, etc. must be passed literally."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="cat")
++
++        ed.edit_file('file"quote.txt')
++        assert container["cmd"] == ["cat", 'file"quote.txt']
++
++        ed.edit_file("file's quote.txt")
++        assert container["cmd"] == ["cat", "file's quote.txt"]
++
++    def test_editor_with_arguments_preserved(self, monkeypatch):
++        """An editor string that already contains arguments must work."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        ed = Editor(editor="sed -i~")
++        ed.edit_file("test.txt")
++        assert container["cmd"] == ["sed", "-i~", "test.txt"]
++
++    def test_env_forwarded(self, monkeypatch):
++        """Custom environment must be forwarded to subprocess."""
++        captured = {}
++
++        class MockProcess:
++            def __init__(self, cmd, *args, **kwargs):
++                captured["env"] = kwargs.get("env")
++                captured["cmd"] = cmd
++
++            def wait(self):
++                return 0
++
++        monkeypatch.setattr(subprocess, "Popen", MockProcess)
++
++        ed = Editor(editor="cat", env={"EDITOR_TEST": "1"})
++        ed.edit_file("test.txt")
++        assert captured["env"] is not None
++        assert captured["env"].get("EDITOR_TEST") == "1"
++
++    def test_nonzero_exit_raises(self, monkeypatch):
++        """Nonzero exit code must raise ClickException."""
++
++        class MockProcess:
++            def __init__(self, cmd, *args, **kwargs):
++                pass
++
++            def wait(self):
++                return 1
++
++        monkeypatch.setattr(subprocess, "Popen", MockProcess)
++
++        ed = Editor(editor="cat")
++        with pytest.raises(ClickException, match="Editing failed"):
++            ed.edit_file("test.txt")
++
++    def test_edit_function_single_filename(self, monkeypatch):
++        """click.edit with a single filename string still works."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        result = click.edit(filename="myfile.txt")
++        assert result is None
++        assert container["cmd"] is not None
++        assert container["cmd"][-1] == "myfile.txt"
++
++    def test_edit_function_multiple_filenames(self, monkeypatch):
++        """click.edit with multiple filenames via iterable."""
++        container, MockProc = _make_mock_popen()
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        result = click.edit(filename=["a.txt", "b.txt"])
++        assert result is None
++        assert container["cmd"][-2:] == ["a.txt", "b.txt"]
++
++    def test_edit_text_still_works(self, monkeypatch):
++        """Editing text (without filename) still uses a temp file and works."""
++        container, MockProc = _make_mock_popen(exit_code=0)
++        monkeypatch.setattr(subprocess, "Popen", MockProc)
++
++        # "cat" doesn't modify the file, so require_save returns None
++        result = click.edit("hello", editor="cat")
++        # The file wasn't modified, so result is None
++        assert result is None
++        # The command should include editor and a temp file
++        assert container["cmd"] is not None
++        assert container["cmd"][0] == "cat"
++        assert "editor-" in container["cmd"][-1]
++
++    def test_fast_edit_preserved(self, monkeypatch):
++        """The existing fast_edit test case must still work."""
++        # Skip if no sed available
++        import shutil
++        if shutil.which("sed") is None:
++            pytest.skip("sed not available")
++
++        result = click.edit("a\nb", editor="sed -i~ 's/$/Test/'")
++        assert result == "aTest\nbTest\n"

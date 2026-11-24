@@ -1,0 +1,276 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..4a9e8c3 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1161,8 +1161,9 @@ class _GroupTuple(t.NamedTuple):
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, "t.List[t.Union[str, int]]"],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1208,8 +1209,74 @@ def sync_do_groupby(
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
++
++    .. versionchanged:: 3.4
++        Added the ``levels`` parameter for hierarchical grouping.
++        When ``levels`` is a positive integer, ``attribute`` can be a
++        list or comma-separated string of attribute names, with one
++        attribute for each level.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
++    if levels is not None:
++        if isinstance(levels, bool) or not isinstance(levels, int):
++            raise FilterArgumentError(
++                "levels must be a positive integer or None"
++            )
++        if levels < 1:
++            raise FilterArgumentError(
++                "levels must be a positive integer"
++            )
++
++        # Parse attribute list
++        if isinstance(attribute, str):
++            attrs = [x.strip() for x in attribute.split(",")]
++        elif isinstance(attribute, list):
++            attrs = attribute
++        else:
++            attrs = [attribute]
++
++        if len(attrs) != levels:
++            raise FilterArgumentError(
++                f"number of attributes ({len(attrs)}) must match levels ({levels})"
++            )
++
++        # Create attrgetter for each level
++        exprs = [
++            make_attrgetter(environment, attr, default=default)
++            for attr in attrs
++        ]
++
++        # Sort by tuple of all attribute values for consistent ordering
++        def sort_key(item):
++            return tuple(expr(item) for expr in exprs)
++
++        sorted_items = sorted(value, key=sort_key)
++
++        # Recursively group
++        def _group(items, level):
++            if level == levels:
++                return list(items)
++            expr = exprs[level]
++            result = []
++            for key, group in groupby(items, expr):
++                children = _group(list(group), level + 1)
++                result.append(_GroupTuple(key, children))
++            return result
++
++        return _group(sorted_items, 0)
++
++    # Original single-attribute behavior
++    # Accept a one-element attribute list or pass-through
++    if isinstance(attribute, list):
++        if len(attribute) == 1:
++            attr = attribute[0]
++        else:
++            raise FilterArgumentError(
++                f"attribute list has {len(attribute)} elements, "
++                "use levels to specify hierarchical grouping"
++            )
++    else:
++        attr = attribute
++    expr = make_attrgetter(environment, attr, default=default)
+     return [
+         _GroupTuple(key, list(values))
+         for key, values in groupby(sorted(value, key=expr), expr)
+@@ -1220,10 +1287,72 @@ def sync_do_groupby(
+ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, "t.List[t.Union[str, int]]"],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
++    if levels is not None:
++        if isinstance(levels, bool) or not isinstance(levels, int):
++            raise FilterArgumentError(
++                "levels must be a positive integer or None"
++            )
++        if levels < 1:
++            raise FilterArgumentError(
++                "levels must be a positive integer"
++            )
++
++        # Parse attribute list
++        if isinstance(attribute, str):
++            attrs = [x.strip() for x in attribute.split(",")]
++        elif isinstance(attribute, list):
++            attrs = attribute
++        else:
++            attrs = [attribute]
++
++        if len(attrs) != levels:
++            raise FilterArgumentError(
++                f"number of attributes ({len(attrs)}) must match levels ({levels})"
++            )
++
++        # Create attrgetter for each level
++        exprs = [
++            make_attrgetter(environment, attr, default=default)
++            for attr in attrs
++        ]
++
++        # Sort by tuple of all attribute values for consistent ordering
++        def sort_key(item):
++            return tuple(expr(item) for expr in exprs)
++
++        value_list = await auto_to_list(value)
++        sorted_items = sorted(value_list, key=sort_key)
++
++        # Recursively group
++        def _group(items, level):
++            if level == levels:
++                return list(items)
++            expr = exprs[level]
++            result = []
++            for key, group in groupby(items, expr):
++                children = _group(list(group), level + 1)
++                result.append(_GroupTuple(key, children))
++            return result
++
++        return _group(sorted_items, 0)
++
++    # Original single-attribute behavior
++    # Accept a one-element attribute list or pass-through
++    if isinstance(attribute, list):
++        if len(attribute) == 1:
++            attr = attribute[0]
++        else:
++            raise FilterArgumentError(
++                f"attribute list has {len(attribute)} elements, "
++                "use levels to specify hierarchical grouping"
++            )
++    else:
++        attr = attribute
++    expr = make_attrgetter(environment, attr, default=default)
+     return [
+         _GroupTuple(key, await auto_to_list(values))
+         for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..7c4eaeb 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -8,7 +8,7 @@ from jinja2 import Environment
+ from jinja2 import StrictUndefined
+ from jinja2 import TemplateRuntimeError
+ from jinja2 import UndefinedError
+-from jinja2.exceptions import TemplateAssertionError
++from jinja2.exceptions import FilterArgumentError, TemplateAssertionError
+ 
+ 
+ class Magic:
+@@ -618,6 +618,96 @@ class TestFilter:
+             ]
+         )
+         assert out == "NY: emma, john\nWA: smith\n"
++    def test_groupby_hierarchical(self, env):
++        """Test hierarchical groupby with levels parameter."""
++        tmpl = env.from_string(
++            '{% for dep, role_groups in items|groupby([\'department\', \'role\'], levels=2) %}'
++            '{{ dep }}:'
++            '{% for role, users in role_groups %}'
++            '{{ role }}({{ users|map(attribute=\'name\')|join(\',\') }})'
++            '{% endfor %}|'
++            '{% endfor %}'
++        )
++        out = tmpl.render(
++            items=[
++                {"name": "alice", "department": "eng", "role": "dev"},
++                {"name": "bob", "department": "eng", "role": "dev"},
++                {"name": "charlie", "department": "eng", "role": "manager"},
++                {"name": "dave", "department": "sales", "role": "lead"},
++            ]
++        )
++        assert out == "eng:dev(alice,bob)manager(charlie)|sales:lead(dave)|"
++
++    def test_groupby_hierarchical_comma(self, env):
++        """Test hierarchical groupby with comma-separated string."""
++        tmpl = env.from_string(
++            '{% for dep, role_groups in items|groupby(\'department , role\', levels=2) %}'
++            '{{ dep }}:'
++            '{% for role, users in role_groups %}'
++            '{{ role }}({{ users|map(attribute=\'name\')|join(\',\') }})'
++            '{% endfor %}|'
++            '{% endfor %}'
++        )
++        out = tmpl.render(
++            items=[
++                {"name": "alice", "department": "eng", "role": "dev"},
++                {"name": "bob", "department": "eng", "role": "dev"},
++                {"name": "charlie", "department": "eng", "role": "manager"},
++                {"name": "dave", "department": "sales", "role": "lead"},
++            ]
++        )
++        assert out == "eng:dev(alice,bob)manager(charlie)|sales:lead(dave)|"
++
++    def test_groupby_one_element_list(self, env):
++        """Test one-element attribute list without levels."""
++        tmpl = env.from_string(
++            '{% for city, items in users|groupby([\'city\']) %}'
++            '{{ city }}:{{ items|map(attribute=\'name\')|join(\',\') }}|'
++            '{% endfor %}'
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "alice", "city": "NY"},
++                {"name": "bob", "city": "NY"},
++                {"name": "charlie", "city": "LA"},
++            ]
++        )
++        assert out == "LA:charlie|NY:alice,bob|"
++
++    def test_groupby_levels_mismatch(self, env):
++        """Test mismatched attribute count with levels raises error."""
++        with pytest.raises(FilterArgumentError):
++            env.from_string(
++                '{% for dep, items in items|groupby([\'a\', \'b\', \'c\'], levels=2) %}'
++                '{% endfor %}'
++            ).render(items=[])
++
++    def test_groupby_levels_bad_value(self, env):
++        """Test non-positive/non-integer/boolean levels raises error."""
++        with pytest.raises(FilterArgumentError):
++            env.from_string(
++                '{% for dep, items in items|groupby([\'a\'], levels=true) %}'
++                '{% endfor %}'
++            ).render(items=[])
++        with pytest.raises(FilterArgumentError):
++            env.from_string(
++                '{% for dep, items in items|groupby([\'a\'], levels=0) %}'
++                '{% endfor %}'
++            ).render(items=[])
++        with pytest.raises(FilterArgumentError):
++            env.from_string(
++                '{% for dep, items in items|groupby([\'a\'], levels=-1) %}'
++                '{% endfor %}'
++            ).render(items=[])
++
++    def test_groupby_multiple_attrs_no_levels(self, env):
++        """Test multiple attributes without levels raises error."""
++        with pytest.raises(FilterArgumentError):
++            env.from_string(
++                '{% for dep, items in items|groupby([\'a\', \'b\']) %}'
++                '{% endfor %}'
++            ).render(items=[])
++
+ 
+     def test_filtertag(self, env):
+         tmpl = env.from_string(

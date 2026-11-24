@@ -1,0 +1,174 @@
+diff --git a/tests/test_validators_contribution.py b/tests/test_validators_contribution.py
+new file mode 100644
+index 0000000..ddaaaaa
+--- /dev/null
++++ b/tests/test_validators_contribution.py
+@@ -0,0 +1,69 @@
++import pytest
++
++import tiktoken
++
++
++@pytest.fixture(scope="module")
++def encoding():
++    return tiktoken.get_encoding("cl100k_base")
++
++
++def test_each_validator_gets_an_independent_copy(encoding) -> None:
++    expected = encoding.encode("hello hello")
++    seen = []
++
++    def mutate(tokens):
++        tokens.clear()
++
++    def observe(tokens):
++        seen.append(tokens)
++        return True
++
++    assert encoding.encode("hello hello", validators=(mutate, observe)) == expected
++    assert seen == [expected]
++
++
++def test_false_rejects_but_none_and_true_accept(encoding) -> None:
++    expected = encoding.encode("hello")
++    assert encoding.encode("hello", validators=[lambda tokens: None]) == expected
++    assert encoding.encode("hello", validators=[lambda tokens: True]) == expected
++    with pytest.raises(ValueError, match="index 0"):
++        encoding.encode("hello", validators=[lambda tokens: False])
++
++
++def test_failure_short_circuits_and_preserves_exception_identity(encoding) -> None:
++    called = []
++    error = RuntimeError("original")
++
++    def fail(tokens):
++        raise error
++
++    def later(tokens):
++        called.append(tokens)
++
++    with pytest.raises(RuntimeError) as info:
++        encoding.encode("hello", validators=[fail, later])
++    assert info.value is error
++    assert called == []
++
++
++def test_special_policy_and_surrogate_recovery_precede_validation(encoding) -> None:
++    special = "<|endoftext|>"
++    with pytest.raises(ValueError, match="disallowed special token"):
++        encoding.encode(special, validators=[lambda tokens: True])
++    text = "before \ud800 after"
++    assert encoding.encode(text, validators=[lambda tokens: True]) == encoding.encode(text)
++
++
++def test_batch_validates_each_document_and_preserves_order(encoding) -> None:
++    texts = ["b", "", "a", "b"]
++    expected = [encoding.encode(text) for text in texts]
++    seen = []
++
++    def observe(tokens):
++        seen.append(tokens)
++        return True
++
++    assert encoding.encode_batch(texts, validators=[observe], num_threads=1) == expected
++    assert seen == expected
++    assert encoding.encode_batch([], validators=[lambda tokens: False]) == []
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..a4582fe 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
++from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Literal, NoReturn, Sequence
+ 
+ import regex
+ 
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        validators: Sequence[Callable[[list[int]], bool | None]] | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -97,6 +98,11 @@ class Encoding:
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
+ 
++        `validators` is a list or tuple of callbacks applied in order after encoding.
++        Each callback receives its own copy of the token list. Returning False rejects
++        the result with ValueError; None and True accept it. Callback exceptions
++        propagate unchanged.
++
+         ```
+         >>> enc.encode("hello world")
+         [31373, 995]
+@@ -108,6 +114,10 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> def no_repeats(tokens):
++        ...     return len(tokens) == len(set(tokens))  # Returns False if duplicates exist
++        >>> enc.encode("hello hello", validators=[no_repeats])
++        # Raises ValueError
+         ```
+         """
+         if allowed_special == "all":
+@@ -121,7 +131,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +140,15 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if validators:
++            for i, validator in enumerate(validators):
++                result = validator(list(tokens))
++                if result is False:
++                    raise ValueError(f"Token validation failed for validator at index {i}")
++
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -177,12 +195,16 @@ class Encoding:
+         text: list[str],
+         *,
+         num_threads: int = 8,
++        validators: Sequence[Callable[[list[int]], bool | None]] | None = None,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
++        `validators` follows the same semantics for each document independently;
++        returned token lists remain in input order. A validation failure raises instead
++        of returning a partial batch.
+ 
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+@@ -197,7 +219,10 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode,
++            allowed_special=allowed_special,
++            disallowed_special=disallowed_special,
++            validators=validators,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

@@ -1,0 +1,691 @@
+diff --git a/apply_changes.py b/apply_changes.py
+new file mode 100644
+index 0000000..73b11c2
+--- /dev/null
++++ b/apply_changes.py
+@@ -0,0 +1,75 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# Add imports
++content = content.replace(
++    'import fnmatch', '', 1 # Just in case it was already there, but it's not
++)
++content = re.sub(
++    r'import os',
++    'import os\nimport fnmatch\nfrom contextlib import contextmanager',
++    content
++)
++
++# Add BaseLoader methods
++base_loader_methods = """
++    def add_filter(self, filter_pattern: t.Union[str, t.Pattern, t.Callable[[str], bool]]) -> None:
++        if not hasattr(self, "_filters"):
++            self._filters = []
++        self._filters.append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        if hasattr(self, "_filters"):
++            self._filters = []
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Union[str, t.Pattern, t.Callable[[str], bool]]):
++        if not hasattr(self, "_filters"):
++            self._filters = []
++        old_filters = list(self._filters)
++        for p in patterns:
++            self.add_filter(p)
++        try:
++            yield
++        finally:
++            self._filters = old_filters
++
++    def _is_filtered(self, name: str) -> bool:
++        if not hasattr(self, "_filters"):
++            return False
++        for f in self._filters:
++            if isinstance(f, str):
++                if fnmatch.fnmatch(name, f):
++                    return True
++            elif hasattr(f, "search"):
++                if f.search(name):
++                    return True
++            elif callable(f):
++                if f(name):
++                    return True
++            else:
++                raise TypeError(f"Unsupported filter type: {type(f)}")
++        return False
++"""
++
++# Insert methods into BaseLoader
++content = re.sub(
++    r'(class BaseLoader:.*?)(\n\s+def get_source)',
++    r'\1' + base_loader_methods + r'\2',
++    content,
++    flags=re.DOTALL
++)
++
++# Update list_templates in BaseLoader (it currently raises TypeError)
++# Actually, the task says: "The feature applies to loaders that already implement list_templates"
++# So I should probably not change BaseLoader.list_templates to return [], but keep it raising TypeError.
++# Wait, the task says: "A registered filter excludes a canonical /-separated template name from list_templates when any filter matches."
++# This implies that if a loader implements list_templates, it should use the filters.
++
++# Let's look at FileSystemLoader or other loaders that implement list_templates.
++# I need to find where list_templates is implemented and add the filtering logic.
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_loaders.py b/fix_loaders.py
+new file mode 100644
+index 0000000..e844ab6
+--- /dev/null
++++ b/fix_loaders.py
+@@ -0,0 +1,39 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# Extract the methods I added
++methods = re.findall(r'(    def (?:add_filter|clear_filters|filter_scope|_is_filtered).*?return False\n        return False\n        )', content, re.DOTALL)
++# Wait, that regex is not quite right.
++
++# Let's just read the file and manually fix it.
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the end of the docstring
++docstring_end = 0
++for i, line in enumerate(lines):
++    if '"""' in line and i > 30:
++        docstring_end = i
++        break
++
++# Extract the methods
++methods = []
++i = docstring_end + 1
++while i < len(lines):
++    if lines[i].startswith('    def add_filter'):
++        start = i
++        while i < len(lines) and (lines[i].startswith('    ') or lines[i].strip() == ''):
++            i += 1
++        methods = lines[start:i]
++        lines[start:i] = []
++        break
++    i += 1
++
++# Insert the methods after the docstring
++lines.insert(docstring_end + 1, '\n')
++lines[docstring_end+1:docstring_end+1] = methods
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/methods.py b/methods.py
+new file mode 100644
+index 0000000..2a014fc
+--- /dev/null
++++ b/methods.py
+@@ -0,0 +1,37 @@
++    def add_filter(self, filter_pattern: t.Union[str, t.Pattern, t.Callable[[str], bool]]) -> None:
++        if not hasattr(self, "_filters") or self._filters is None:
++            self._filters = []
++        self._filters.append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        if hasattr(self, "_filters"):
++            self._filters = []
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Union[str, t.Pattern, t.Callable[[str], bool]]):
++        if not hasattr(self, "_filters") or self._filters is None:
++            self._filters = []
++        old_filters = list(self._filters)
++        for p in patterns:
++            self.add_filter(p)
++        try:
++            yield
++        finally:
++            self._filters = old_filters
++
++    def _is_filtered(self, name: str) -> bool:
++        if not hasattr(self, "_filters") or self._filters is None:
++            return False
++        for f in self._filters:
++            if isinstance(f, str):
++                if fnmatch.fnmatch(name, f):
++                    return True
++            elif hasattr(f, "search"):
++                if f.search(name):
++                    return True
++            elif callable(f):
++                if f(name):
++                    return True
++            else:
++                raise TypeError(f"Unsupported filter type: {type(f)}")
++        return False
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..7dc9b0a 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -1,3 +1,5 @@
++import fnmatch
++from contextlib import contextmanager
+ """API and implementations for loading templates from different data
+ sources.
+ """
+@@ -64,6 +66,43 @@ class BaseLoader:
+                     source = f.read()
+                 return source, path, lambda: mtime == getmtime(path)
+     """
++    def add_filter(self, filter_pattern: t.Union[str, t.Pattern, t.Callable[[str], bool]]) -> None:
++        if not hasattr(self, "_filters") or self._filters is None:
++            self._filters = []
++        self._filters.append(filter_pattern)
++
++    def clear_filters(self) -> None:
++        if hasattr(self, "_filters"):
++            self._filters = []
++
++    @contextmanager
++    def filter_scope(self, *patterns: t.Union[str, t.Pattern, t.Callable[[str], bool]]):
++        if not hasattr(self, "_filters") or self._filters is None:
++            self._filters = []
++        old_filters = list(self._filters)
++        for p in patterns:
++            self.add_filter(p)
++        try:
++            yield
++        finally:
++            self._filters = old_filters
++
++    def _is_filtered(self, name: str) -> bool:
++        if not hasattr(self, "_filters") or self._filters is None:
++            return False
++        for f in self._filters:
++            if isinstance(f, str):
++                if fnmatch.fnmatch(name, f):
++                    return True
++            elif hasattr(f, "search"):
++                if f.search(name):
++                    return True
++            elif callable(f):
++                if f(name):
++                    return True
++            else:
++                raise TypeError(f"Unsupported filter type: {type(f)}")
++        return False
+ 
+     #: if set to `False` it indicates that the loader cannot provide access
+     #: to the source of templates.
+@@ -228,7 +267,7 @@ class FileSystemLoader(BaseLoader):
+                         template = template[2:]
+                     if template not in found:
+                         found.add(template)
+-        return sorted(found)
++        return sorted(t for t in found if not self._is_filtered(t))
+ 
+ 
+ class PackageLoader(BaseLoader):
+@@ -389,7 +428,7 @@ class PackageLoader(BaseLoader):
+                     results.append(name[offset:].replace(os.path.sep, "/"))
+ 
+         results.sort()
+-        return results
++        return [t for t in results if not self._is_filtered(t)]
+ 
+ 
+ class DictLoader(BaseLoader):
+@@ -413,7 +452,7 @@ class DictLoader(BaseLoader):
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+-        return sorted(self.mapping)
++        return sorted(t for t in self.mapping if not self._is_filtered(t))
+ 
+ 
+ class FunctionLoader(BaseLoader):
+@@ -521,7 +560,7 @@ class PrefixLoader(BaseLoader):
+         for prefix, loader in self.mapping.items():
+             for template in loader.list_templates():
+                 result.append(prefix + self.delimiter + template)
+-        return result
++        return [t for t in result if not self._is_filtered(t)]
+ 
+ 
+ class ChoiceLoader(BaseLoader):
+@@ -569,7 +608,7 @@ class ChoiceLoader(BaseLoader):
+         found = set()
+         for loader in self.loaders:
+             found.update(loader.list_templates())
+-        return sorted(found)
++        return sorted(t for t in found if not self._is_filtered(t))
+ 
+ 
+ class _TemplateModule(ModuleType):
+diff --git a/test_filter_feature.py b/test_filter_feature.py
+new file mode 100644
+index 0000000..b0c9875
+--- /dev/null
++++ b/test_filter_feature.py
+@@ -0,0 +1,49 @@
++import unittest
++import fnmatch
++import re
++from jinja2 import BaseLoader, TemplateNotFound
++
++class FilteredLoader(BaseLoader):
++    def __init__(self, templates):
++        self.templates = templates
++        self.filters = []
++
++    def list_templates(self):
++        templates = self.templates
++        for f in self.filters:
++            if isinstance(f, str):
++                templates = [t for t in templates if not fnmatch.fnmatch(t, f)]
++            elif hasattr(f, 'search'):
++                templates = [t for t in templates if not f.search(t)]
++            elif callable(f):
++                templates = [t for t in templates if not f(t)]
++            else:
++                raise TypeError(f"Unsupported filter type: {type(f)}")
++        return templates
++
++    def add_filter(self, filter_pattern):
++        self.filters.append(filter_pattern)
++
++    def clear_filters(self):
++        self.filters = []
++
++class TestLoaderFilters(unittest.TestCase):
++    def test_filter_persistence(self):
++        loader = FilteredLoader(["a.html", "b.html", "c.txt"])
++        loader.add_filter("*.txt")
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++        loader.clear_filters()
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html", "c.txt"])
++
++    def test_regex_filter(self):
++        loader = FilteredLoader(["a.html", "b.html", "c.txt"])
++        loader.add_filter(re.compile(r"\.html$"))
++        self.assertEqual(loader.list_templates(), ["c.txt"])
++
++    def test_callable_filter(self):
++        loader = FilteredLoader(["a.html", "b.html", "c.txt"])
++        loader.add_filter(lambda t: t.startswith("a"))
++        self.assertEqual(loader.list_templates(), ["b.html", "c.txt"])
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test_scope_feature.py b/test_scope_feature.py
+new file mode 100644
+index 0000000..721c064
+--- /dev/null
++++ b/test_scope_feature.py
+@@ -0,0 +1,47 @@
++import unittest
++import fnmatch
++from jinja2 import BaseLoader
++from contextlib import contextmanager
++
++class FilteredLoader(BaseLoader):
++    def __init__(self, templates):
++        self.templates = templates
++        self.filters = []
++
++    def list_templates(self):
++        templates = self.templates
++        for f in self.filters:
++            if isinstance(f, str):
++                templates = [t for t in templates if not fnmatch.fnmatch(t, f)]
++            else:
++                raise TypeError("Unsupported filter")
++        return templates
++
++    def add_filter(self, filter_pattern):
++        self.filters.append(filter_pattern)
++
++    def clear_filters(self):
++        self.filters = []
++
++    @contextmanager
++    def filter_scope(self, *patterns):
++        old_filters = list(self.filters)
++        for p in patterns:
++            self.add_filter(p)
++        try:
++            yield
++        finally:
++            self.filters = old_filters
++
++class TestLoaderScope(unittest.TestCase):
++    def test_filter_scope(self):
++        loader = FilteredLoader(["a.html", "b.html", "c.txt"])
++        with loader.filter_scope("*.txt"):
++            self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++            with loader.filter_scope("*.html"):
++                self.assertEqual(loader.list_templates(), [])
++            self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html", "c.txt"])
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_loader_filters.py b/tests/test_loader_filters.py
+new file mode 100644
+index 0000000..c119f59
+--- /dev/null
++++ b/tests/test_loader_filters.py
+@@ -0,0 +1,42 @@
++import unittest
++import re
++from jinja2 import FileSystemLoader, ChoiceLoader, DictLoader
++from jinja2.loaders import BaseLoader
++
++class TestLoaderFilters(unittest.TestCase):
++    def test_filter_persistence(self):
++        loader = DictLoader({"a.html": "a", "b.html": "b", "c.txt": "c"})
++        loader.add_filter("*.txt")
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++        loader.clear_filters()
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html", "c.txt"])
++
++    def test_regex_filter(self):
++        loader = DictLoader({"a.html": "a", "b.html": "b", "c.txt": "c"})
++        loader.add_filter(re.compile(r"\.html$"))
++        self.assertEqual(loader.list_templates(), ["c.txt"])
++
++    def test_callable_filter(self):
++        loader = DictLoader({"a.html": "a", "b.html": "b", "c.txt": "c"})
++        loader.add_filter(lambda t: t.startswith("a"))
++        self.assertEqual(loader.list_templates(), ["b.html", "c.txt"])
++
++    def test_filter_scope(self):
++        loader = DictLoader({"a.html": "a", "b.html": "b", "c.txt": "c"})
++        with loader.filter_scope("*.txt"):
++            self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++            with loader.filter_scope("*.html"):
++                self.assertEqual(loader.list_templates(), [])
++            self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html", "c.txt"])
++
++    def test_choice_loader_filters(self):
++        loader = ChoiceLoader([
++            DictLoader({"a.html": "a"}),
++            DictLoader({"b.html": "b", "c.txt": "c"})
++        ])
++        loader.add_filter("*.txt")
++        self.assertEqual(loader.list_templates(), ["a.html", "b.html"])
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/update_loaders.py b/update_loaders.py
+new file mode 100644
+index 0000000..2473270
+--- /dev/null
++++ b/update_loaders.py
+@@ -0,0 +1,64 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# Helper to add filtering to list_templates
++# The logic is:
++# templates = [t for t in templates if not self._is_filtered(t)]
++
++# 1. FileSystemLoader (around line 256)
++# It's a bit complex, let's find the end of the loop.
++# The loop is:
++#            for dirpath, _, filenames in walk_dir:
++#                for filename in filenames:
++#                    template = (
++#                        os.path.join(dirpath, filename)[offset:]
++#                        .replace(os.path.sep, "/")
++#                        .lstrip("/")
++#                    )
++#                    found.add(template)
++#        return sorted(found)
++
++# We need to change it to:
++#        found = set()
++#        ...
++#        return sorted(t for t in found if not self._is_filtered(t))
++
++# Let's do this with regex.
++
++# FileSystemLoader
++content = re.sub(
++    r'(found\.add\(template\)\n\s+return sorted\(found\))',
++    r'\1.replace(r"return sorted\(found\)", r"return sorted(t for t in found if not self._is_filtered(t))")',
++    content
++)
++# Wait, that regex is wrong.
++
++# Let's try a simpler approach:
++# Find the return statement in list_templates and replace it.
++
++# Actually, I can just replace `return sorted(found)` with `return sorted(t for t in found if not self._is_filtered(t))`
++# But I need to be careful to only do it for FileSystemLoader.
++
++# Let's look at the code again.
++# FileSystemLoader.list_templates:
++# ...
++#                    found.add(template)
++#        return sorted(found)
++
++# PackageLoader.list_templates:
++# ...
++#        return sorted(results)
++
++# PrefixLoader.list_templates:
++# ...
++#        return result
++
++# ChoiceLoader.list_templates:
++# ...
++#        return sorted(found)
++
++# This is tricky because they all return different things.
++
++# Let's just manually edit the file for each loader.
+diff --git a/update_loaders_safe.py b/update_loaders_safe.py
+new file mode 100644
+index 0000000..dddf114
+--- /dev/null
++++ b/update_loaders_safe.py
+@@ -0,0 +1,40 @@
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# FileSystemLoader
++content = content.replace(
++    '        return sorted(found)',
++    '        return sorted(t for t in found if not self._is_filtered(t))'
++)
++
++# PackageLoader
++content = content.replace(
++    '        return results',
++    '        return [t for t in results if not self._is_filtered(t)]'
++)
++
++# DictLoader
++content = content.replace(
++    '    def list_templates(self) -> t.List[str]:\n        return sorted(self.mapping)',
++    '    def list_templates(self) -> t.List[str]:\n        return sorted(t for t in self.mapping if not self._is_filtered(t))'
++)
++
++# PrefixLoader
++content = content.replace(
++    '        return result',
++    '        return [t for t in result if not self._is_filtered(t)]'
++)
++
++# ChoiceLoader
++# Wait, ChoiceLoader also uses "return sorted(found)".
++# Let's check if the replacement for FileSystemLoader also affected ChoiceLoader.
++# Yes, it did. Let's check if that's correct.
++# ChoiceLoader:
++#        found = set()
++#        for loader in self.loaders:
++#            found.update(loader.list_templates())
++#        return sorted(t for t in found if not self._is_filtered(t))
++# This is correct!
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.write(content)
+diff --git a/update_loaders_v2.py b/update_loaders_v2.py
+new file mode 100644
+index 0000000..abe67ba
+--- /dev/null
++++ b/update_loaders_v2.py
+@@ -0,0 +1,32 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    lines = f.readlines()
++
++new_lines = []
++i = 0
++while i < len(lines):
++    line = lines[i]
++    
++    # FileSystemLoader.list_templates
++    if "return sorted(found)" in line and "FileSystemLoader" in "".join(lines[i-20:i]):
++        new_lines.append(line.replace("return sorted(found)", "return sorted(t for t in found if not self._is_filtered(t))"))
++    
++    # PackageLoader.list_templates
++    elif "return sorted(results)" in line and "PackageLoader" in "".join(lines[i-20:i]):
++        new_lines.append(line.replace("return sorted(results)", "return sorted(t for t in results if not self._is_filtered(t))"))
++        
++    # PrefixLoader.list_templates
++    elif "return result" in line and "PrefixLoader" in "".join(lines[i-10:i]):
++        new_lines.append(line.replace("return result", "return [t for t in result if not self._is_filtered(t)]"))
++        
++    # ChoiceLoader.list_templates
++    elif "return sorted(found)" in line and "ChoiceLoader" in "".join(lines[i-10:i]):
++        new_lines.append(line.replace("return sorted(found)", "return sorted(t for t in found if not self._is_filtered(t))"))
++        
++    else:
++        new_lines.append(line)
++    i += 1
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/update_loaders_v3.py b/update_loaders_v3.py
+new file mode 100644
+index 0000000..031a34c
+--- /dev/null
++++ b/update_loaders_v3.py
+@@ -0,0 +1,17 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# FileSystemLoader
++content = content.replace(
++    '        return sorted(found)',
++    '        return sorted(t for t in found if not self._is_filtered(t))'
++)
++
++# PackageLoader
++# It doesn't have a simple return sorted(found) at the end.
++# Let's look at it again.
++# It seems I need to find where it returns.
++# Ah, I see it doesn't have a return statement in the snippet I saw.
++# Let me check PackageLoader.list_templates again.
+diff --git a/update_loaders_v4.py b/update_loaders_v4.py
+new file mode 100644
+index 0000000..116c855
+--- /dev/null
++++ b/update_loaders_v4.py
+@@ -0,0 +1,51 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# FileSystemLoader
++# The previous replacement was too broad because it replaced all "return sorted(found)"
++# Let's be more specific.
++# I will use a function to replace only the ones I want.
++
++def replace_list_templates(match):
++    # This is not going to work with simple replace.
++    # I will use re.sub with a callback.
++    pass
++
++# Let's just use specific string replacements that are unique enough.
++
++# FileSystemLoader
++content = content.replace(
++    '        return sorted(found)',
++    '        return sorted(t for t in found if not self._is_filtered(t))'
++)
++# Wait, this will also replace ChoiceLoader's return sorted(found).
++# Let's check if that's okay.
++# ChoiceLoader:
++#        found = set()
++#        for loader in self.loaders:
++#            found.update(loader.list_templates())
++#        return sorted(found)
++# Yes, this is also correct for ChoiceLoader!
++
++# PackageLoader
++content = content.replace(
++    '        return results',
++    '        return [t for t in results if not self._is_filtered(t)]'
++)
++
++# DictLoader
++content = content.replace(
++    '    def list_templates(self) -> t.List[str]:\n        return sorted(self.mapping)',
++    '    def list_templates(self) -> t.List[str]:\n        return sorted(t for t in self.mapping if not self._is_filtered(t))'
++)
++
++# PrefixLoader
++content = content.replace(
++    '        return result',
++    '        return [t for t in result if not self._is_filtered(t)]'
++)
++
++with open('src/jinja2/loaders.py', 'w') as f:
++    f.write(content)
+diff --git a/update_loaders_v5.py b/update_loaders_v5.py
+new file mode 100644
+index 0000000..e3726f9
+--- /dev/null
++++ b/update_loaders_v5.py
+@@ -0,0 +1,27 @@
++import re
++
++with open('src/jinja2/loaders.py', 'r') as f:
++    content = f.read()
++
++# Update _is_filtered to be more robust
++content = content.replace(
++    '    def _is_filtered(self, name: str) -> bool:\n        if not hasattr(self, "_filters"):\n            return False',
++    '    def _is_filtered(self, name: str) -> bool:\n        if not hasattr(self, "_filters") or self._filters is None:\n            return False'
++)
++
++# Wait, I also need to make sure that when I call add_filter, it initializes _filters.
++# My previous implementation of add_filter already does that:
++#    def add_filter(self, filter_pattern: t.Union[str, t.Pattern, t.Callable[[str], bool]]) -> None:
++#        if not hasattr(self, "_filters"):
++#            self._filters = []
++#        self._filters.append(filter_pattern)
++
++# The problem is that the existing loaders (like FileSystemLoader) don't call BaseLoader.__init__?
++# Let's check if they do.
++# FileSystemLoader does not have an __init__ that calls super().__init__().
++# Ah, that's the problem.
++
++# I should add `self._filters = []` to BaseLoader.__init__ if it exists, or just initialize it in _is_filtered.
++# Actually, I can just initialize it in _is_filtered if it's missing.
++
++# Let's modify _is_filtered again.

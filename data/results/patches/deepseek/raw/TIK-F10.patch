@@ -1,0 +1,82 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..2193626 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,5 +1,8 @@
+ from __future__ import annotations
+ 
++import threading
++from collections import OrderedDict
++
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+ from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
+@@ -52,6 +55,8 @@ class Encoding:
+             assert self.max_token_value == explicit_n_vocab - 1
+ 
+         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
++        self._cache = OrderedDict()
++        self._cache_lock = threading.Lock()
+ 
+     def __repr__(self) -> str:
+         return f"<Encoding {self.name!r}>"
+@@ -82,6 +87,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -120,8 +126,15 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if use_cache:
++            cache_key = (text, frozenset(allowed_special))
++            with self._cache_lock:
++                if cache_key in self._cache:
++                    self._cache.move_to_end(cache_key)
++                    return list(self._cache[cache_key])
++
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +143,15 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
++
++        if use_cache:
++            with self._cache_lock:
++                self._cache[cache_key] = result
++                if len(self._cache) > 128:
++                    self._cache.popitem(last=False)
++
++        return list(result)
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,6 +200,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -197,7 +219,8 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special,
++            use_cache=use_cache,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

@@ -1,0 +1,181 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..d627786 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
++from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Literal, NoReturn, Sequence
+ 
+ import regex
+ 
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        validators: Sequence[Callable[[list[int]], bool | None]] | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -93,10 +94,16 @@ class Encoding:
+         to a special token. This can be controlled on a per-token level using the `allowed_special`
+         and `disallowed_special` parameters. In particular:
+         - Setting `disallowed_special` to () will prevent this function from raising errors and
+-          cause all text corresponding to special tokens to be encoded as natural text.
++          cause all text corresponding to special tokens to be encoded as normal text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
+ 
++        Validators are optional callbacks that receive the encoded tokens after encoding.
++        Each validator receives an independent copy of the tokens. If a validator returns False,
++        a ValueError is raised. If a validator returns None or True, the tokens are accepted.
++        Validator exceptions propagate unchanged. On failure, later validators for that document
++        are not called.
++
+         ```
+         >>> enc.encode("hello world")
+         [31373, 995]
+@@ -121,7 +128,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +137,18 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        # Apply validators
++        if validators:
++            for validator in validators:
++                # Create an independent copy for each validator
++                tokens_copy = list(tokens)
++                result = validator(tokens_copy)
++                if result is False:
++                    raise ValueError("Validator rejected the tokens")
++
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,11 +197,18 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        validators: Sequence[Callable[[list[int]], bool | None]] | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+ 
++        Validators are optional callbacks that receive the encoded tokens after encoding.
++        Each validator receives an independent copy of the tokens. If a validator returns False,
++        a ValueError is raised. If a validator returns None or True, the tokens are accepted.
++        Validator exceptions propagate unchanged. On failure, later validators for that document
++        are not called. A batch returns no partial result if any validation fails.
++
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
+@@ -197,7 +222,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, validators=validators
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+@@ -260,53 +285,28 @@ class Encoding:
+     # ====================
+ 
+     def decode_bytes(self, tokens: Sequence[int]) -> bytes:
+-        """Decodes a list of tokens into bytes.
+-
+-        ```
+-        >>> enc.decode_bytes([31373, 995])
+-        b'hello world'
+-        ```
+-        """
++        """Decodes a list of tokens into raw bytes."""
+         return self._core_bpe.decode_bytes(tokens)
+ 
+-    def decode(self, tokens: Sequence[int], errors: str = "replace") -> str:
++    def decode(self, tokens: Sequence[int], *, errors: str = "strict") -> str:
+         """Decodes a list of tokens into a string.
+ 
+-        WARNING: the default behaviour of this function is lossy, since decoded bytes are not
+-        guaranteed to be valid UTF-8. You can control this behaviour using the `errors` parameter,
+-        for instance, setting `errors=strict`.
++        This will currently raise if given tokens that decode to invalid UTF-8; this behaviour may
++        change in the future to be more permissive.
+ 
+-        ```
+         >>> enc.decode([31373, 995])
+         'hello world'
+-        ```
+         """
+-        return self._core_bpe.decode_bytes(tokens).decode("utf-8", errors=errors)
+-
+-    def decode_single_token_bytes(self, token: int) -> bytes:
+-        """Decodes a token into bytes.
+-
+-        NOTE: this will decode all special tokens.
+-
+-        Raises `KeyError` if the token is not in the vocabulary.
+-
+-        ```
+-        >>> enc.decode_single_token_bytes(31373)
+-        b'hello'
+-        ```
+-        """
+-        return self._core_bpe.decode_single_token_bytes(token)
++        token_bytes = self.decode_tokens_bytes(tokens)
++        return b"".join(token_bytes).decode("utf-8", errors=errors)
+ 
+     def decode_tokens_bytes(self, tokens: Sequence[int]) -> list[bytes]:
+-        """Decodes a list of tokens into a list of bytes.
+-
+-        Useful for visualising tokenisation.
+-        >>> enc.decode_tokens_bytes([31373, 995])
+-        [b'hello', b' world']
+-        """
+-        return [self.decode_single_token_bytes(token) for token in tokens]
++        """Decodes a list of tokens into a list of byte sequences."""
++        return self._core_bpe.decode_tokens_bytes(tokens)
+ 
+-    def decode_with_offsets(self, tokens: Sequence[int]) -> tuple[str, list[int]]:
++    def decode_with_offsets(
++        self, tokens: Sequence[int], *, errors: str = "strict"
++    ) -> tuple[str, list[int]]:
+         """Decodes a list of tokens into a string and a list of offsets.
+ 
+         Each offset is the index into text corresponding to the start of each token.
+@@ -328,7 +328,7 @@ class Encoding:
+             text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
+ 
+         # TODO: assess correctness for errors="ignore" and errors="replace"
+-        text = b"".join(token_bytes).decode("utf-8", errors="strict")
++        text = b"".join(token_bytes).decode("utf-8", errors=errors)
+         return text, offsets
+ 
+     def decode_batch(
+@@ -362,6 +362,10 @@ class Encoding:
+     def special_tokens_set(self) -> set[str]:
+         return set(self._special_tokens.keys())
+ 
++    @functools.cached_property
++    def _special_token_values(self) -> set[int]:
++        return set(self._special_tokens.values())
++
+     def is_special_token(self, token: int) -> bool:
+         assert isinstance(token, int)
+         return token in self._special_token_values

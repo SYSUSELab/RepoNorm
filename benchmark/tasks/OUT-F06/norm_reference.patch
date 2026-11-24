@@ -1,0 +1,246 @@
+diff --git a/docs/features/advanced/backends.md b/docs/features/advanced/backends.md
+index 84e222e1..6c3957ae 100644
+--- a/docs/features/advanced/backends.md
++++ b/docs/features/advanced/backends.md
+@@ -52,3 +52,12 @@ As mentioned previously, selecting the structured generation backend is only app
+ | JSON Schema | ✅ | ✅ | ✅ |
+ | Regex | ✅ | ✅ | ✅ |
+ | Grammar | ❌ | ✅ | ✅ |
++
++### Validating XGrammar sources
++
++`XGrammarBackend` accepts a default `validate_grammar` callback. Each processor
++factory inherits it when the argument is omitted, can replace it for one
++request, or can disable validation with explicit `None`. The selected callback
++receives the original source before compilation. Any normal return value is
++accepted; a raised exception is propagated without compiling and does not make
++later requests unusable.
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672d..cc5375fa 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,15 +1,18 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import Any, Callable, Optional, TYPE_CHECKING
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+ from outlines.models.transformers import Transformers
+ from outlines.processors.base_logits_processor import (
+     OutlinesLogitsProcessor,
+-    TensorType
++    TensorType,
+ )
+ 
++_INHERIT_VALIDATOR = object()
++Validator = Optional[Callable[[str], object]]
++
+ if TYPE_CHECKING:
+     from xgrammar.contrib.hf import LogitsProcessor
+ 
+@@ -47,39 +50,42 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self, model: SteerableModel, validate_grammar: Validator = None
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        validate_grammar
++            Default callback before compilation. Factory calls may override
++            this policy or disable it for one request with explicit None.
+ 
+         """
+         import xgrammar as xgr
+         from transformers import AutoConfig
+ 
+         if not isinstance(model, Transformers):
+-            raise ValueError(
+-                "The xgrammar backend only supports Transformers models"
+-            )
++            raise ValueError("The xgrammar backend only supports Transformers models")
+ 
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+-            model.hf_tokenizer,
+-            vocab_size=vocab_size
++            model.hf_tokenizer, vocab_size=vocab_size
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
++        self._default_validator = validate_grammar
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self, json_schema: str, validate_grammar: Any = _INHERIT_VALIDATOR
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +93,9 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        validate_grammar
++            Per-request callback. Omitting it inherits the backend default;
++            explicit ``None`` disables validation for this request.
+ 
+         Returns
+         -------
+@@ -94,18 +103,26 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_json_schema(
+-            json_schema
+-        )
++        if validate_grammar is _INHERIT_VALIDATOR:
++            validate_grammar = self._default_validator
++        if validate_grammar is not None:
++            validate_grammar(json_schema)
++
++        compiled_grammar = self.grammar_compiler.compile_json_schema(json_schema)
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self, regex: str, validate_grammar: Any = _INHERIT_VALIDATOR
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        validate_grammar
++            Per-request callback. Omitting it inherits the backend default;
++            explicit ``None`` disables validation for this request.
+ 
+         Returns
+         -------
+@@ -113,16 +130,26 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        if validate_grammar is _INHERIT_VALIDATOR:
++            validate_grammar = self._default_validator
++        if validate_grammar is not None:
++            validate_grammar(regex)
++
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self, grammar: str, validate_grammar: Any = _INHERIT_VALIDATOR
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        validate_grammar
++            Per-request callback. Omitting it inherits the backend default;
++            explicit ``None`` disables validation for this request.
+ 
+         Returns
+         -------
+@@ -130,5 +157,10 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        if validate_grammar is _INHERIT_VALIDATOR:
++            validate_grammar = self._default_validator
++        if validate_grammar is not None:
++            validate_grammar(grammar)
++
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+         return XGrammarLogitsProcessor(compiled_grammar)
+diff --git a/tests/backends/test_xgrammar_contribution.py b/tests/backends/test_xgrammar_contribution.py
+new file mode 100644
+index 00000000..28db4850
+--- /dev/null
++++ b/tests/backends/test_xgrammar_contribution.py
+@@ -0,0 +1,67 @@
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import xgrammar as xgr
++
++from outlines.backends.xgrammar import XGrammarBackend
++from outlines.models.transformers import Transformers
++
++
++@pytest.fixture
++def model(monkeypatch):
++    model = Mock(spec=Transformers)
++    model.model = SimpleNamespace(config=SimpleNamespace(_name_or_path="local"))
++    model.hf_tokenizer = object()
++    monkeypatch.setattr(
++        "transformers.AutoConfig.from_pretrained",
++        lambda *args, **kwargs: SimpleNamespace(vocab_size=5),
++    )
++    info = xgr.TokenizerInfo(
++        ["a", "b", "c", "d", "<eos>"], stop_token_ids=[4]
++    )
++    monkeypatch.setattr(
++        xgr.TokenizerInfo,
++        "from_huggingface",
++        lambda *args, **kwargs: info,
++    )
++    return model
++
++
++@pytest.mark.parametrize(
++    "factory,compile_method",
++    [
++        ("get_json_schema_logits_processor", "compile_json_schema"),
++        ("get_regex_logits_processor", "compile_regex"),
++        ("get_cfg_logits_processor", "compile_grammar"),
++    ],
++)
++def test_validator_inheritance_override_and_disable(model, factory, compile_method):
++    events = []
++    default = Mock(side_effect=lambda value: events.append(("default", value)))
++    override = Mock(side_effect=lambda value: events.append(("override", value)))
++    backend = XGrammarBackend(model, validate_grammar=default)
++    compiler = Mock(side_effect=lambda value: events.append(("compile", value)))
++    backend.grammar_compiler = Mock(**{compile_method: compiler})
++    method = getattr(backend, factory)
++    source = "  original source\n"
++
++    method(source)
++    assert events == [("default", source), ("compile", source)]
++    events.clear()
++    method(source, validate_grammar=override)
++    assert events == [("override", source), ("compile", source)]
++    events.clear()
++    method(source, validate_grammar=None)
++    assert events == [("compile", source)]
++
++    error = RuntimeError("rejected")
++    before = compiler.call_count
++    with pytest.raises(RuntimeError) as caught:
++        method(source, validate_grammar=Mock(side_effect=error))
++    assert caught.value is error
++    assert compiler.call_count == before
++
++    events.clear()
++    method(source)
++    assert events == [("default", source), ("compile", source)]

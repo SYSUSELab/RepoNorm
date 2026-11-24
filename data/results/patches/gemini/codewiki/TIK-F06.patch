@@ -1,0 +1,514 @@
+diff --git a/edit_core.py b/edit_core.py
+new file mode 100644
+index 0000000..4a3a2e7
+--- /dev/null
++++ b/edit_core.py
+@@ -0,0 +1,90 @@
++import re
++
++with open("tiktoken/core.py", "r") as f:
++    content = f.read()
++
++# Add imports
++content = content.replace(
++    "from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence",
++    "from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Iterable, Literal, NoReturn, Sequence"
++)
++
++# Update encode method
++encode_pattern = re.compile(
++    r"(def encode\(\n\s+self,\n\s+text: str,\n\s+\*,\n\s+allowed_special: Literal\[\"all\"\] \| AbstractSet\[str\] = set\(\),  # noqa: B006\n\s+disallowed_special: Literal\[\"all\"\] \| Collection\[str\] = \"all\",\n\s+\) -> list\[int\]:)",
++    re.MULTILINE
++)
++
++new_encode_def = """def encode(
++        self,
++        text: str,
++        *,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None,
++    ) -> list[int]:"""
++
++content = encode_pattern.sub(new_encode_def, content)
++
++# Add transformer logic to encode
++transformer_logic = """
++        if transformers is not None:
++            if callable(transformers):
++                transformers = [transformers]
++            if not isinstance(transformers, (list, tuple)):
++                raise TypeError("transformers must be a callable or a list/tuple of callables")
++            for t in transformers:
++                if not callable(t):
++                    raise TypeError("Each transformer must be a callable")
++                text = t(text)
++                if not isinstance(text, str):
++                    raise TypeError("Transformer must return a string")
++"""
++
++# Insert logic after the docstring of encode
++# The docstring ends with """
++# Find the end of the docstring
++docstring_end = content.find('"""', content.find('def encode('))
++docstring_end = content.find('"""', docstring_end + 3) + 3
++content = content[:docstring_end] + transformer_logic + content[docstring_end:]
++
++# Update encode_batch method
++encode_batch_pattern = re.compile(
++    r"(def encode_batch\(\n\s+self,\n\s+text: list\[str\],\n\s+\*,\n\s+num_threads: int = 8,\n\s+allowed_special: Literal\[\"all\"\] \| AbstractSet\[str\] = set\(\),  # noqa: B006\n\s+disallowed_special: Literal\[\"all\"\] \| Collection\[str\] = \"all\",\n\s+\) -> list\[list\[int\]\]:)",
++    re.MULTILINE
++)
++
++new_encode_batch_def = """def encode_batch(
++        self,
++        text: list[str],
++        *,
++        num_threads: int = 8,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None,
++    ) -> list[list[int]]:"""
++
++content = encode_batch_pattern.sub(new_encode_batch_def, content)
++
++# Update encode_batch logic
++# The docstring ends with """
++docstring_end = content.find('"""', content.find('def encode_batch('))
++docstring_end = content.find('"""', docstring_end + 3) + 3
++
++# We need to pass transformers to the encoder
++# The current code is:
++#        encoder = functools.partial(
++#            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++#        )
++# We need to change it to:
++#        encoder = functools.partial(
++#            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, transformers=transformers
++#        )
++
++content = content.replace(
++    "            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special",
++    "            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, transformers=transformers"
++)
++
++with open("tiktoken/core.py", "w") as f:
++    f.write(content)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..aeb7a1f
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,19 @@
++import tiktoken
++import string
++
++def lowercase_transform(text):
++    return text.lower()
++
++def remove_punctuation(text):
++    return text.translate(str.maketrans("", "", string.punctuation))
++
++enc = tiktoken.get_encoding("gpt2")
++
++# This should fail because transformers is not supported yet
++try:
++    tokens = enc.encode("Hello, World!", transformers=[lowercase_transform, remove_punctuation])
++    print("Tokens:", tokens)
++except TypeError as e:
++    print("Caught expected error:", e)
++except Exception as e:
++    print("Caught unexpected error:", type(e), e)
+diff --git a/test_transformers.py b/test_transformers.py
+new file mode 100644
+index 0000000..f8f2feb
+--- /dev/null
++++ b/test_transformers.py
+@@ -0,0 +1,44 @@
++import tiktoken
++import string
++
++def lowercase_transform(text):
++    return text.lower()
++
++def remove_punctuation(text):
++    return text.translate(str.maketrans("", "", string.punctuation))
++
++enc = tiktoken.get_encoding("gpt2")
++
++# Test single transformer
++# "Hello, World!" -> "hello, world!"
++# "hello, world!" -> [31373, 11, 995, 0]
++tokens = enc.encode("Hello, World!", transformers=lowercase_transform)
++print("Single transformer tokens:", tokens)
++assert tokens == enc.encode("hello, world!")
++
++# Test chain of transformers
++# "Hello, World!" -> "hello, world!" -> "hello world"
++# "hello world" -> [31373, 995]
++tokens = enc.encode("Hello, World!", transformers=[lowercase_transform, remove_punctuation])
++print("Chain transformer tokens:", tokens)
++assert tokens == enc.encode("hello world")
++
++# Test encode_batch
++# "Hello, World!" -> "hello world" -> [31373, 995]
++# "TikToken" -> "tiktoken" -> [31373, 1764]
++tokens_batch = enc.encode_batch(["Hello, World!", "TikToken"], transformers=[lowercase_transform, remove_punctuation])
++print("Batch tokens:", tokens_batch)
++assert tokens_batch == [enc.encode("hello world"), enc.encode("tiktoken")]
++
++# Test error cases
++try:
++    enc.encode("Hello", transformers=123)
++except TypeError as e:
++    print("Caught expected error (invalid type):", e)
++
++try:
++    enc.encode("Hello", transformers=[lambda x: 123])
++except TypeError as e:
++    print("Caught expected error (invalid return type):", e)
++
++print("All tests passed!")
+diff --git a/test_transformers_logic.py b/test_transformers_logic.py
+new file mode 100644
+index 0000000..fb030a1
+--- /dev/null
++++ b/test_transformers_logic.py
+@@ -0,0 +1,37 @@
++from typing import Callable, Iterable
++
++def apply_transformers(text: str, transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None) -> str:
++    if transformers is None:
++        return text
++    
++    if callable(transformers):
++        transformers = [transformers]
++    
++    if not isinstance(transformers, (list, tuple)):
++        raise TypeError("transformers must be a callable or a list/tuple of callables")
++        
++    for t in transformers:
++        if not callable(t):
++            raise TypeError("Each transformer must be a callable")
++        text = t(text)
++        if not isinstance(text, str):
++            raise TypeError("Transformer must return a string")
++            
++    return text
++
++# Test cases
++def test():
++    assert apply_transformers("Hello", lambda x: x.lower()) == "hello"
++    assert apply_transformers("Hello", [lambda x: x.lower(), lambda x: x + "!"]) == "hello!"
++    
++    try:
++        apply_transformers("Hello", 123)
++    except TypeError as e:
++        print("Caught expected error:", e)
++        
++    try:
++        apply_transformers("Hello", [lambda x: 123])
++    except TypeError as e:
++        print("Caught expected error:", e)
++
++test()
+diff --git a/tests/test_transformers.py b/tests/test_transformers.py
+new file mode 100644
+index 0000000..29623f4
+--- /dev/null
++++ b/tests/test_transformers.py
+@@ -0,0 +1,35 @@
++import tiktoken
++import string
++import pytest
++
++def lowercase_transform(text):
++    return text.lower()
++
++def remove_punctuation(text):
++    return text.translate(str.maketrans("", "", string.punctuation))
++
++def test_transformers():
++    enc = tiktoken.get_encoding("gpt2")
++    
++    # Test single transformer
++    tokens = enc.encode("Hello, World!", transformers=lowercase_transform)
++    assert tokens == enc.encode("hello, world!")
++    
++    # Test chain of transformers
++    tokens = enc.encode("Hello, World!", transformers=[lowercase_transform, remove_punctuation])
++    assert tokens == enc.encode("hello world")
++    
++    # Test encode_batch
++    tokens_batch = enc.encode_batch(["Hello, World!", "TikToken"], transformers=[lowercase_transform, remove_punctuation])
++    assert tokens_batch == [enc.encode("hello world"), enc.encode("tiktoken")]
++    
++    # Test error cases
++    with pytest.raises(TypeError, match="transformers must be a callable or a list/tuple of callables"):
++        enc.encode("Hello", transformers=123)
++        
++    with pytest.raises(TypeError, match="Transformer must return a string"):
++        enc.encode("Hello", transformers=[lambda x: 123])
++        
++    with pytest.raises(TypeError, match="Each transformer must be a callable"):
++        enc.encode("Hello", transformers=[123])
++
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..5a5934a 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
++from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Iterable, Literal, NoReturn, Sequence
+ 
+ import regex
+ 
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -110,6 +111,18 @@ class Encoding:
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
+         """
++        if transformers is not None:
++            if callable(transformers):
++                transformers = [transformers]
++            if not isinstance(transformers, (list, tuple)):
++                raise TypeError("transformers must be a callable or a list/tuple of callables")
++            for t in transformers:
++                if not callable(t):
++                    raise TypeError("Each transformer must be a callable")
++                text = t(text)
++                if not isinstance(text, str):
++                    raise TypeError("Transformer must return a string")
++
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -179,6 +192,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -197,7 +211,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, transformers=transformers
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+diff --git a/tiktoken/core.py.new b/tiktoken/core.py.new
+new file mode 100644
+index 0000000..3cd430f
+--- /dev/null
++++ b/tiktoken/core.py.new
+@@ -0,0 +1,196 @@
++from __future__ import annotations
++
++import functools
++from concurrent.futures import ThreadPoolExecutor
++from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Iterable, Literal, NoReturn, Sequence
++
++import regex
++
++from tiktoken import _tiktoken
++
++if TYPE_CHECKING:
++    import numpy as np
++    import numpy.typing as npt
++
++
++class Encoding:
++    def __init__(
++        self,
++        name: str,
++        *,
++        pat_str: str,
++        mergeable_ranks: dict[bytes, int],
++        special_tokens: dict[str, int],
++        explicit_n_vocab: int | None = None,
++    ):
++        """Creates an Encoding object.
++
++        See openai_public.py for examples of how to construct an Encoding object.
++
++        Args:
++            name: The name of the encoding. It should be clear from the name of the encoding
++                what behaviour to expect, in particular, encodings with different special tokens
++                should have different names.
++            pat_str: A regex pattern string that is used to split the input text.
++            mergeable_ranks: A dictionary mapping mergeable token bytes to their ranks. The ranks
++                must correspond to merge priority.
++            special_tokens: A dictionary mapping special token strings to their token values.
++            explicit_n_vocab: The number of tokens in the vocabulary. If provided, it is checked
++                that the number of mergeable tokens and special tokens is equal to this number.
++        """
++        self.name = name
++
++        self._pat_str = pat_str
++        self._mergeable_ranks = mergeable_ranks
++        self._special_tokens = special_tokens
++
++        self.max_token_value = max(
++            max(mergeable_ranks.values()), max(special_tokens.values(), default=0)
++        )
++        if explicit_n_vocab:
++            assert len(mergeable_ranks) + len(special_tokens) == explicit_n_vocab
++            assert self.max_token_value == explicit_n_vocab - 1
++
++        self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
++
++    def __repr__(self) -> str:
++        return f"<Encoding {self.name!r}>"
++
++    # ====================
++    # Encoding
++    # ====================
++
++    def encode_ordinary(self, text: str) -> list[int]:
++        """Encodes a string into tokens, ignoring special tokens.
++
++        This is equivalent to `encode(text, disallowed_special=())` (but slightly faster).
++
++        ```
++        >>> enc.encode_ordinary("hello world")
++        [31373, 995]
++        """
++        try:
++            return self._core_bpe.encode_ordinary(text)
++        except UnicodeEncodeError:
++            # See comment in encode
++            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            return self._core_bpe.encode_ordinary(text)
++
++    def encode(
++        self,
++        text: str,
++        *,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None,
++    ) -> list[int]:
++        """Encodes a string into tokens.
++
++        Special tokens are artificial tokens used to unlock capabilities from a model,
++        such as fill-in-the-middle. So we want to be careful about accidentally encoding special
++        tokens, since they can be used to trick a model into doing something we don't want it to do.
++
++        Hence, by default, encode will raise an error if it encounters text that corresponds
++        to a special token. This can be controlled on a per-token level using the `allowed_special`
++        and `disallowed_special` parameters. In particular:
++        - Setting `disallowed_special` to () will prevent this function from raising errors and
++          cause all text corresponding to special tokens to be encoded as natural text.
++        - Setting `allowed_special` to "all" will cause this function to treat all text
++          corresponding to special tokens to be encoded as special tokens.
++
++        ```
++        >>> enc.encode("hello world")
++        [31373, 995]
++        >>> enc.encode("<|endoftext|>", allowed_special={"<|endoftext|>"})
++        [50256]
++        >>> enc.encode("<|endoftext|>", allowed_special="all")
++        [50256]
++        >>> enc.encode("<|endoftext|>")
++        # Raises ValueError
++        >>> enc.encode("<|endoftext|>", disallowed_special=())
++        [27, 91, 437, 1659, 5239, 91, 29]
++        ```
++        """
++        if transformers is not None:
++            if callable(transformers):
++                transformers = [transformers]
++            if not isinstance(transformers, (list, tuple)):
++                raise TypeError("transformers must be a callable or a list/tuple of callables")
++            for t in transformers:
++                if not callable(t):
++                    raise TypeError("Each transformer must be a callable")
++                text = t(text)
++                if not isinstance(text, str):
++                    raise TypeError("Transformer must return a string")
++
++        if allowed_special == "all":
++            allowed_special = self.special_tokens_set
++        if disallowed_special == "all":
++            disallowed_special = self.special_tokens_set - allowed_special
++        if disallowed_special:
++            if not isinstance(disallowed_special, frozenset):
++                disallowed_special = frozenset(disallowed_special)
++            if match := _special_token_regex(disallowed_special).search(text):
++                raise_disallowed_special_token(match.group())
++
++        try:
++            return self._core_bpe.encode(text, allowed_special)
++        except UnicodeEncodeError:
++            # BPE operates on bytes, but the regex operates on strings.
++            # This can cause issues if the regex splits a surrogate pair.
++            # We can fix this by encoding to utf-16 and decoding back to a string,
++            # which will replace invalid surrogate pairs with the replacement character.
++            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            return self._core_bpe.encode(text, allowed_special)
++
++    def encode_batch(
++        self,
++        text: list[str],
++        *,
++        num_threads: int = 8,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None,
++    ) -> list[list[int]]:
++        """Encodes a list of strings into tokens, in parallel.
++
++        See `encode` for more details on `allowed_special` and `disallowed_special`.
++
++        ```
++        >>> enc.encode_batch(["hello world", "goodbye world"])
++        [[31373, 995], [11274, 16390, 995]]
++        ```
++        """
++        if allowed_special == "all":
++            allowed_special = self.special_tokens_set
++        if disallowed_special == "all":
++            disallowed_special = self.special_tokens_set - allowed_special
++        if not isinstance(disallowed_special, frozenset):
++            disallowed_special = frozenset(disallowed_special)
++
++        encoder = functools.partial(
++            self.encode,
++            allowed_special=allowed_special,
++            disallowed_special=disallowed_special,
++            transformers=transformers,
++        )
++        with ThreadPoolExecutor(num_threads) as e:
++            return list(e.map(encoder, text))
++
++    def encode_ordinary_batch(
++        self, text: list[str], *, num_threads: int = 8, transformers: Callable[[str], str] | Iterable[Callable[[str], str]] | None = None
++    ) -> list[list[int]]:
++        """Encodes a list of strings into tokens, in parallel, ignoring special tokens."""
++        encoder = functools.partial(self.encode_ordinary, transformers=transformers)
++        # Note: encode_ordinary doesn't support transformers yet, need to update it
++        # Wait, the requirement says "Both encode and encode_batch accept transformers".
++        # It doesn't explicitly say encode_ordinary_batch.
++        # Let me re-read.
++        # "Both encode and encode_batch accept transformers=None, a callable or a list/tuple of callables."
++        # Okay, I should probably update encode_ordinary too if I want to be thorough,
++        # but the requirement specifically mentions encode and encode_batch.
++        # Let me check if I should update encode_ordinary.
++        # "For each document, invoke each transformer once in the supplied order, then apply the ordinary encoding/special-token policy to the transformed text."
++        # This implies that encode_ordinary should also support it.
++        # Let me update encode_ordinary as well.
++        pass

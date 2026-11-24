@@ -1,0 +1,357 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..b277140 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1157,12 +1157,78 @@ class _GroupTuple(t.NamedTuple):
+         return tuple.__str__(self)
+ 
+ 
++def _groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int],
++    default: t.Optional[t.Any] = None,
++    case_sensitive: bool = False,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    """Helper function for groupby that handles case sensitivity."""
++    expr = make_attrgetter(environment, attribute, default=default)
++    
++    if case_sensitive:
++        # Case-sensitive grouping - use current behavior
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value, key=expr), expr)
++        ]
++    
++    # Case-insensitive grouping for strings
++    # Group by lowercase key but keep original spelling of first encountered key
++    groups: dict[t.Any, tuple[t.Any, list[V]]] = {}
++    
++    for item in sorted(value, key=expr):
++        key = expr(item)
++        
++        if isinstance(key, str):
++            # Use lowercase as the grouping key
++            lower_key = key.lower()
++            
++            if lower_key not in groups:
++                # First time seeing this key (case-insensitively)
++                # Store the original key and start a new group
++                groups[lower_key] = (key, [])
++            
++            # Append to the group with the stored original key
++            orig_key, group_items = groups[lower_key]
++            group_items.append(item)
++            groups[lower_key] = (orig_key, group_items)
++        else:
++            # Non-string keys - use them directly
++            if key not in groups:
++                groups[key] = (key, [])
++            groups[key][1].append(item)
++    
++    # Return groups in order of first appearance (sorted by original key)
++    result = []
++    seen_lower_keys: set[t.Any] = set()
++    
++    for item in sorted(value, key=expr):
++        key = expr(item)
++        
++        if isinstance(key, str):
++            lower_key = key.lower()
++            if lower_key not in seen_lower_keys:
++                seen_lower_keys.add(lower_key)
++                orig_key, group_items = groups[lower_key]
++                result.append(_GroupTuple(orig_key, group_items))
++        else:
++            if key not in seen_lower_keys:
++                seen_lower_keys.add(key)
++                orig_key, group_items = groups[key]
++                result.append(_GroupTuple(orig_key, group_items))
++    
++    return result
++
++
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    case_sensitive: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1203,17 +1269,25 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    By default, string keys differing only by lowercasing belong to one
++    group, retaining the spelling of the first encountered key and the
++    input order of its members. Set ``case_sensitive=True`` to keep
++    differently cased keys separate. Non-string comparable keys retain
++    normal grouping behavior. Unicode handling follows lowercasing, not
++    casefolding.
++
++    .. versionchanged:: 3.1
++        Added the ``case_sensitive`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    return _groupby(
++        environment, value, attribute, default=default, case_sensitive=case_sensitive
++    )
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1296,134 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    case_sensitive: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    """Group a sequence of objects by an attribute using Python's
++    :func:`itertools.groupby`. The attribute can use dot notation for
++    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
++    the values are sorted first so only one group is returned for each
++    unique value.
++
++    For example, a list of ``User`` objects with a ``city`` attribute
++    can be rendered in groups. In this example, ``grouper`` refers to
++    the ``city`` value of the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items in users|groupby("city") %}
++          <li>{{ city }}
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    ``groupby`` yields namedtuples of ``(grouper, list)``, which
++    can be used instead of the tuple unpacking above. ``grouper`` is the
++    value of the attribute, and ``list`` is the items with that value.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for group in users|groupby("city") %}
++          <li>{{ group.grouper }}: {{ group.list|join(", ") }}
++        {% endfor %}</ul>
++
++    You can specify a ``default`` value to use if an object in the list
++    does not have the given attribute.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", default="NY") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    By default, string keys differing only by lowercasing belong to one
++    group, retaining the spelling of the first encountered key and the
++    input order of its members. Set ``case_sensitive=True`` to keep
++    differently cased keys separate. Non-string comparable keys retain
++    normal grouping behavior. Unicode handling follows lowercasing, not
++    casefolding.
++
++    .. versionchanged:: 3.1
++        Added the ``case_sensitive`` parameter.
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
++    .. versionchanged:: 2.6
++        The attribute supports dot notation for nested access.
++    """
++    return await _groupby_async(
++        environment, value, attribute, default=default, case_sensitive=case_sensitive
++    )
++
++
++async def _groupby_async(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int],
++    default: t.Optional[t.Any] = None,
++    case_sensitive: bool = False,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    """Async helper function for groupby that handles case sensitivity."""
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    
++    # Convert to list once to avoid consuming async iterators multiple times
++    items = await auto_to_list(value)
++    
++    if case_sensitive:
++        # Case-sensitive grouping - use current behavior
++        return [
++            _GroupTuple(key, await auto_to_list(values))
++            for key, values in groupby(sorted(items, key=expr), expr)
++        ]
++    
++    # Case-insensitive grouping for strings
++    # Group by lowercase key but keep original spelling of first encountered key
++    groups: dict[t.Any, tuple[t.Any, list[V]]] = {}
++    
++    for item in sorted(items, key=expr):
++        key = expr(item)
++        
++        if isinstance(key, str):
++            # Use lowercase as the grouping key
++            lower_key = key.lower()
++            
++            if lower_key not in groups:
++                # First time seeing this key (case-insensitively)
++                # Store the original key and start a new group
++                groups[lower_key] = (key, [])
++            
++            # Append to the group with the stored original key
++            orig_key, group_items = groups[lower_key]
++            group_items.append(item)
++            groups[lower_key] = (orig_key, group_items)
++        else:
++            # Non-string keys - use them directly
++            if key not in groups:
++                groups[key] = (key, [])
++            groups[key][1].append(item)
++    
++    # Return groups in order of first appearance (sorted by original key)
++    result = []
++    seen_lower_keys: set[t.Any] = set()
++    
++    for item in sorted(items, key=expr):
++        key = expr(item)
++        
++        if isinstance(key, str):
++            lower_key = key.lower()
++            if lower_key not in seen_lower_keys:
++                seen_lower_keys.add(lower_key)
++                orig_key, group_items = groups[lower_key]
++                result.append(_GroupTuple(orig_key, group_items))
++        else:
++            if key not in seen_lower_keys:
++                seen_lower_keys.add(key)
++                orig_key, group_items = groups[key]
++                result.append(_GroupTuple(orig_key, group_items))
++    
++    return result
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..dd45d28 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -251,3 +251,50 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++@mark_dualiter("items", lambda: [{'name': 'NY'}, {'name': 'NYC'}, {'name': 'ny'}, {'name': 'nyc'}])
++def test_groupby_case_sensitive(env_async, items):
++    """Test case-sensitive grouping with case_sensitive=True."""
++    tmpl = env_async.from_string(
++        """
++    {%- for grouper, list in items()|groupby('name', case_sensitive=true) -%}
++        {{ grouper }}|
++    {%- endfor %}"""
++    )
++    # Each different casing should be a separate group
++    result = tmpl.render(items=items)
++    assert result.split("|") == ["NY", "NYC", "ny", "nyc", ""]
++
++
++@mark_dualiter("items", lambda: [{'name': 'NY'}, {'name': 'NYC'}, {'name': 'ny'}, {'name': 'nyc'}])
++def test_groupby_case_insensitive(env_async, items):
++    """Test case-insensitive grouping with case_sensitive=False (default)."""
++    tmpl = env_async.from_string(
++        """
++    {%- for grouper, list in items()|groupby('name') -%}
++        {{ grouper }}:{{ list|length }}|
++    {%- endfor %}"""
++    )
++    # Case-insensitive grouping - NY groups with ny, NYC groups with nyc
++    result = tmpl.render(items=items)
++    # Each group should have 2 items
++    assert "NY:2" in result
++    assert "NYC:2" in result
++    # Should have exactly 2 groups
++    assert result.count("|") == 2
++
++
++@mark_dualiter("items", lambda: [{'name': 'alice'}, {'name': 'Bob'}, {'name': 'ALICE'}, {'name': 'bob'}])
++def test_groupby_case_insensitive_order(env_async, items):
++    """Test that case-insensitive grouping preserves first-seen spelling from sorted order."""
++    tmpl = env_async.from_string(
++        """
++    {%- for grouper, list in items()|groupby('name') -%}
++        {{ grouper }}-{{ list|length }}|
++    {%- endfor %}"""
++    )
++    # After sorting, 'ALICE' comes before 'alice', so ALICE is first-seen
++    # 'Bob' comes before 'bob', so Bob is first-seen
++    result = tmpl.render(items=items)
++    assert "ALICE-2" in result
++    assert "Bob-2" in result
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..7b3a670 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -852,3 +852,44 @@ class TestFilter:
+         with pytest.raises(TemplateRuntimeError, match="No filter named 'f'"):
+             t1.render(x=42)
+             t2.render(x=42)
++
++    def test_groupby_case_sensitive(self, env):
++        """Test case-sensitive grouping with case_sensitive=True."""
++        tmpl = env.from_string(
++            """
++        {%- for grouper, list in [{'name': 'NY'}, {'name': 'NYC'}, {'name': 'ny'}, {'name': 'nyc'}]|groupby('name', case_sensitive=true) -%}
++            {{ grouper }}|
++        {%- endfor %}"""
++        )
++        # Each different casing should be a separate group
++        assert tmpl.render().split("|") == ["NY", "NYC", "ny", "nyc", ""]
++
++    def test_groupby_case_insensitive(self, env):
++        """Test case-insensitive grouping with case_sensitive=False (default)."""
++        tmpl = env.from_string(
++            """
++        {%- for grouper, list in [{'name': 'NY'}, {'name': 'NYC'}, {'name': 'ny'}, {'name': 'nyc'}]|groupby('name') -%}
++            {{ grouper }}:{{ list|length }}|
++        {%- endfor %}"""
++        )
++        # Case-insensitive grouping - NY groups with ny, NYC groups with nyc
++        result = tmpl.render()
++        # Each group should have 2 items
++        assert "NY:2" in result
++        assert "NYC:2" in result
++        # Should have exactly 2 groups
++        assert result.count("|") == 2
++
++    def test_groupby_case_insensitive_order(self, env):
++        """Test that case-insensitive grouping preserves first-seen spelling from sorted order."""
++        tmpl = env.from_string(
++            """
++        {%- for grouper, list in [{'name': 'alice'}, {'name': 'Bob'}, {'name': 'ALICE'}, {'name': 'bob'}]|groupby('name') -%}
++            {{ grouper }}-{{ list|length }}|
++        {%- endfor %}"""
++        )
++        # After sorting, 'ALICE' comes before 'alice', so ALICE is first-seen
++        # 'Bob' comes before 'bob', so Bob is first-seen
++        result = tmpl.render()
++        assert "ALICE-2" in result
++        assert "Bob-2" in result

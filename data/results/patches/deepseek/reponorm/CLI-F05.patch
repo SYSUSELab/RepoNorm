@@ -1,0 +1,417 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..212bc94 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -16,6 +16,8 @@ from functools import update_wrapper
+ from gettext import gettext as _
+ from gettext import ngettext
+ from itertools import repeat
++import math
++import time
+ from types import TracebackType
+ 
+ from . import types
+@@ -280,6 +282,8 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: int | float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +431,45 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        if retry_cleanup is None:
++            if parent is not None:
++                retry_cleanup = parent.retry_cleanup
++            else:
++                retry_cleanup = 0
++
++        #: The number of additional attempts after a cleanup callback’s
++        #: first attempt. A root context defaults to zero. A child
++        #: inherits an omitted value; explicit zero disables retries for
++        #: that child.
++        #:
++        #: .. versionadded:: 8.2
++        self.retry_cleanup: int = retry_cleanup
++
++        if retry_cleanup_backoff is not None:
++            if isinstance(retry_cleanup_backoff, bool) or not isinstance(
++                retry_cleanup_backoff, (int, float)
++            ):
++                raise ValueError(
++                    "retry_cleanup_backoff must be a finite positive number"
++                )
++            if not (retry_cleanup_backoff > 0 and math.isfinite(retry_cleanup_backoff)):
++                raise ValueError(
++                    "retry_cleanup_backoff must be a finite positive number"
++                )
++        else:
++            if parent is not None:
++                retry_cleanup_backoff = parent.retry_cleanup_backoff
++            else:
++                retry_cleanup_backoff = 0.1
++
++        #: The initial delay in seconds before retrying a cleanup
++        #: callback.  Defaults to 0.1 at the root and inherits from the
++        #: parent when omitted or ``None``.  Must be a finite positive
++        #: number.
++        #:
++        #: .. versionadded:: 8.2
++        self.retry_cleanup_backoff: float = retry_cleanup_backoff
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -600,17 +643,64 @@ class Context:
+ 
+         :param f: The function to execute on teardown.
+         """
+-        return self._exit_stack.callback(f)
++        self._close_callbacks.append(f)
++        return f
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        .. versionchanged:: 8.2
++            Retry transient failures of cleanup callbacks when the
++            context has ``retry_cleanup`` set.
+         """
+-        self._exit_stack.close()
++        exceptions: list[BaseException] = []
++        callbacks = self._close_callbacks
++        self._close_callbacks = []
++        for f in reversed(callbacks):
++            try:
++                self._exec_close_callback(f)
++            except BaseException as e:
++                exceptions.append(e)
++
++        try:
++            self._exit_stack.close()
++        except BaseException as e:
++            exceptions.append(e)
++
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 
++        if exceptions:
++            raise exceptions[0]
++
++    def _exec_close_callback(self, f: t.Callable[..., t.Any]) -> None:
++        """Execute a close callback with retry logic."""
++        retries = self.retry_cleanup
++        if retries <= 0:
++            f()
++            return
++
++        backoff = self.retry_cleanup_backoff
++        delay = backoff
++        last_exc: BaseException | None = None
++
++        for attempt in range(retries + 1):
++            try:
++                f()
++                return
++            except (KeyboardInterrupt, SystemExit):
++                raise
++            except BaseException as e:
++                last_exc = e
++                if attempt < retries:
++                    time.sleep(delay)
++                    delay *= 2
++
++        # All retries exhausted, propagate the last exception.
++        raise last_exc  # type: ignore[misc]
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..2c4ffc2 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,264 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++
++def test_retry_cleanup_success_after_retry():
++    """A callback that fails transiently and then succeeds should succeed."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=2)
++    attempts = []
++
++    def flaky():
++        attempts.append(1)
++        if len(attempts) < 2:
++            raise ValueError("transient")
++
++    ctx.call_on_close(flaky)
++    ctx.close()
++    assert len(attempts) == 2
++
++
++def test_retry_cleanup_exhausted():
++    """A callback that always fails should propagate the last exception after retries."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=1)
++    attempts = []
++
++    def always_fails():
++        attempts.append(1)
++        raise ValueError("persistent")
++
++    ctx.call_on_close(always_fails)
++    with pytest.raises(ValueError, match="persistent"):
++        ctx.close()
++    # First attempt + 1 retry = 2 attempts
++    assert len(attempts) == 2
++
++
++def test_retry_cleanup_zero_no_retry():
++    """retry_cleanup=0 should not retry."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=0)
++    attempts = []
++
++    def fail_once():
++        attempts.append(1)
++        raise ValueError("fail")
++
++    ctx.call_on_close(fail_once)
++    with pytest.raises(ValueError):
++        ctx.close()
++    assert len(attempts) == 1
++
++
++def test_retry_cleanup_no_retry_on_keyboard_interrupt():
++    """KeyboardInterrupt should not be retried."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=2)
++    attempts = []
++
++    def raise_kbi():
++        attempts.append(1)
++        raise KeyboardInterrupt()
++
++    ctx.call_on_close(raise_kbi)
++    with pytest.raises(KeyboardInterrupt):
++        ctx.close()
++    assert len(attempts) == 1
++
++
++def test_retry_cleanup_no_retry_on_system_exit():
++    """SystemExit should not be retried."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=2)
++    attempts = []
++
++    def raise_se():
++        attempts.append(1)
++        raise SystemExit(1)
++
++    ctx.call_on_close(raise_se)
++    with pytest.raises(SystemExit):
++        ctx.close()
++    assert len(attempts) == 1
++
++
++def test_retry_cleanup_success_first_try():
++    """A callback that succeeds on first try should not retry."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=2)
++    called = False
++
++    def ok():
++        nonlocal called
++        called = True
++
++    ctx.call_on_close(ok)
++    ctx.close()
++    assert called
++
++
++def test_retry_cleanup_remaining_callbacks_still_run():
++    """If one callback exhausts its retries, remaining callbacks still run."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=1)
++    order = []
++
++    def always_fails():
++        order.append("fail")
++        raise ValueError("bad")
++
++    def always_ok():
++        order.append("ok")
++
++    # Register in order: always_fails first, always_ok second
++    ctx.call_on_close(always_fails)
++    ctx.call_on_close(always_ok)
++
++    # close runs in reverse order, so always_ok runs first, then always_fails
++    with pytest.raises(ValueError, match="bad"):
++        ctx.close()
++
++    # always_ok ran, always_fails ran twice (1 attempt + 1 retry)
++    assert order.count("ok") == 1
++    assert order.count("fail") == 2
++
++
++def test_retry_cleanup_backoff_default():
++    """Default retry_cleanup_backoff is 0.1 for root."""
++    ctx = click.Context(click.Command("test"))
++    assert ctx.retry_cleanup_backoff == 0.1
++
++
++def test_retry_cleanup_backoff_inherit():
++    """Child inherits parent's backoff when omitted."""
++    parent = click.Context(click.Command("parent"), retry_cleanup_backoff=0.5)
++    child = click.Context(click.Command("child"), parent=parent)
++    assert child.retry_cleanup_backoff == 0.5
++
++
++def test_retry_cleanup_backoff_explicit():
++    """Child can override backoff explicitly."""
++    parent = click.Context(click.Command("parent"), retry_cleanup_backoff=0.5)
++    child = click.Context(
++        click.Command("child"), parent=parent, retry_cleanup_backoff=2.0
++    )
++    assert child.retry_cleanup_backoff == 2.0
++
++
++def test_retry_cleanup_inherit():
++    """Child inherits retry_cleanup from parent when omitted."""
++    parent = click.Context(click.Command("parent"), retry_cleanup=3)
++    child = click.Context(click.Command("child"), parent=parent)
++    assert child.retry_cleanup == 3
++
++
++def test_retry_cleanup_explicit_zero_child():
++    """Explicit 0 on child disables retries for that child."""
++    parent = click.Context(click.Command("parent"), retry_cleanup=3)
++    child = click.Context(
++        click.Command("child"), parent=parent, retry_cleanup=0
++    )
++    assert child.retry_cleanup == 0
++
++
++def test_retry_cleanup_invalid_backoff_bool():
++    """Boolean values should be rejected for backoff."""
++    with pytest.raises(ValueError, match="must be a finite positive number"):
++        click.Context(click.Command("test"), retry_cleanup_backoff=True)
++
++
++def test_retry_cleanup_invalid_backoff_zero():
++    """Zero should be rejected for backoff."""
++    with pytest.raises(ValueError, match="must be a finite positive number"):
++        click.Context(click.Command("test"), retry_cleanup_backoff=0)
++
++
++def test_retry_cleanup_invalid_backoff_negative():
++    """Negative values should be rejected for backoff."""
++    with pytest.raises(ValueError, match="must be a finite positive number"):
++        click.Context(click.Command("test"), retry_cleanup_backoff=-1)
++
++
++def test_retry_cleanup_invalid_backoff_inf():
++    """Infinite values should be rejected for backoff."""
++    import math
++    with pytest.raises(ValueError, match="must be a finite positive number"):
++        click.Context(click.Command("test"), retry_cleanup_backoff=math.inf)
++
++
++def test_retry_cleanup_backoff_valid_values():
++    """Valid finite positive numbers should be accepted."""
++    ctx = click.Context(click.Command("test"), retry_cleanup_backoff=0.5)
++    assert ctx.retry_cleanup_backoff == 0.5
++    ctx2 = click.Context(click.Command("test"), retry_cleanup_backoff=2)
++    assert ctx2.retry_cleanup_backoff == 2
++    ctx3 = click.Context(click.Command("test"), retry_cleanup_backoff=3.0)
++    assert ctx3.retry_cleanup_backoff == 3.0
++
++
++def test_with_resource_not_retried():
++    """with_resource should not be retried; it exits normally."""
++    @contextmanager
++    def manager():
++        val = [1]
++        yield val
++        val[0] = 0
++
++    ctx = click.Context(click.Command("test"), retry_cleanup=5)
++
++    with ctx.scope():
++        rv = ctx.with_resource(manager())
++        assert rv[0] == 1
++
++    assert rv == [0]
++
++
++def test_call_on_close_decorator():
++    """call_on_close should still work as a decorator."""
++    called = []
++    ctx = click.Context(click.Command("test"))
++
++    @ctx.call_on_close
++    def my_callback():
++        called.append(True)
++
++    ctx.close()
++    assert called == [True]
++
++
++def test_retry_cleanup_mixed_success_and_failure():
++    """Multiple callbacks: some succeed, some fail after retries."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=2)
++    results = []
++
++    def always_ok():
++        results.append("ok")
++
++    fail_attempts = [0]
++
++    def sometimes_fails():
++        fail_attempts[0] += 1
++        if fail_attempts[0] < 2:
++            raise ValueError("not yet")
++        results.append("eventual_ok")
++
++    ctx.call_on_close(always_ok)
++    ctx.call_on_close(sometimes_fails)
++
++    # close runs in reverse: sometimes_fails first, then always_ok
++    ctx.close()
++    assert results == ["eventual_ok", "ok"]
++
++
++def test_successful_callback_not_run_again():
++    """Callbacks that already succeeded must not run again."""
++    ctx = click.Context(click.Command("test"), retry_cleanup=2)
++    call_count = 0
++
++    def once():
++        nonlocal call_count
++        call_count += 1
++
++    ctx.call_on_close(once)
++    ctx.close()
++    assert call_count == 1
++
++    # close a second time
++    ctx.close()
++    # Should not run again because _close_callbacks was cleared
++    assert call_count == 1
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 39dfbdb..1bb3c2c 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -49,6 +49,8 @@ ALLOWED_IMPORTS = {
+     "typing",
+     "types",
+     "gettext",
++    "math",
++    "time",
+ }
+ 
+ if WIN:

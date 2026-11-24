@@ -1,0 +1,245 @@
+diff --git a/dirty_equals/__init__.py b/dirty_equals/__init__.py
+index ba8214e..0a8fa64 100644
+--- a/dirty_equals/__init__.py
++++ b/dirty_equals/__init__.py
+@@ -19,6 +19,7 @@ from ._numeric import (
+     IsPositiveInt,
+ )
+ from ._other import FunctionCheck, IsJson, IsUUID
++from ._ip import IsIP
+ from ._sequence import Contains, HasLen, IsList, IsListOrTuple, IsTuple
+ from ._strings import IsAnyStr, IsBytes, IsStr
+ 
+@@ -69,6 +70,7 @@ __all__ = (
+     'FunctionCheck',
+     'IsJson',
+     'IsUUID',
++    'IsIP',
+     # strings
+     'IsStr',
+     'IsBytes',
+diff --git a/dirty_equals/_ip.py b/dirty_equals/_ip.py
+new file mode 100644
+index 0000000..65d761d
+--- /dev/null
++++ b/dirty_equals/_ip.py
+@@ -0,0 +1,219 @@
++import ipaddress
++from typing import Any, List, Optional, Tuple, Union
++
++from ._base import DirtyEquals
++from ._utils import plain_repr
++
++
++class IsIP(DirtyEquals[Union[ipaddress.IPv4Address, ipaddress.IPv6Address,
++                              ipaddress.IPv4Network, ipaddress.IPv6Network]]):
++    """
++    A class that checks if a value is a valid IP address or network,
++    optionally checking IP version, netmask, and network containment.
++    """
++
++    def __init__(
++        self,
++        version: Optional[int] = None,
++        *,
++        netmask: Optional[Union[str, int]] = None,
++        within: Optional[Union[str, ipaddress.IPv4Network, ipaddress.IPv6Network,
++                                List[Union[str, ipaddress.IPv4Network, ipaddress.IPv6Network]],
++                                Tuple[Union[str, ipaddress.IPv4Network, ipaddress.IPv6Network], ...]]] = None,
++    ):
++        if version is not None and version not in (4, 6):
++            raise ValueError(f'version must be None, 4, or 6, got {version}')
++
++        if netmask is not None and version is None:
++            raise TypeError("To check the netmask you must specify the IP version")
++
++        self.version = version
++        self.netmask = netmask
++        self._within = self._validate_within(within) if within is not None else None
++
++        # Build repr args
++        repr_args = [version] if version is not None else []
++        repr_kwargs = {}
++        if netmask is not None:
++            repr_kwargs['netmask'] = netmask
++        if within is not None:
++            repr_kwargs['within'] = within
++
++        if not repr_args and not repr_kwargs:
++            # No args at all -> IsIP()
++            super().__init__()
++        else:
++            super().__init__(*repr_args, **repr_kwargs)
++
++    def _validate_within(
++        self,
++        within: Any,
++    ) -> List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
++        """Validate and convert the `within` parameter to a list of network objects."""
++        if isinstance(within, (list, tuple)):
++            if not within:
++                raise ValueError("within must be a non-empty list/tuple")
++            networks = []
++            for item in within:
++                networks.append(self._parse_within_item(item))
++            return networks
++        else:
++            return [self._parse_within_item(within)]
++
++    def _parse_within_item(
++        self,
++        item: Any,
++    ) -> Union[ipaddress.IPv4Network, ipaddress.IPv6Network]:
++        """Parse a single `within` item into a network object.
++
++        Raises ValueError for invalid items including bare address strings
++        (no slash), CIDRs with host bits set, and non-string/non-network types.
++        """
++        if isinstance(item, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++            return item
++        elif isinstance(item, str):
++            if '/' not in item:
++                raise ValueError(
++                    f"Invalid network: {item!r} (bare address without a slash)"
++                )
++            # Try IPv4 first, then IPv6
++            try:
++                return ipaddress.IPv4Network(item, strict=True)
++            except (ValueError, ipaddress.NetmaskValueError):
++                pass
++            try:
++                return ipaddress.IPv6Network(item, strict=True)
++            except (ValueError, ipaddress.NetmaskValueError) as e:
++                raise ValueError(
++                    f"Invalid network: {item!r}"
++                ) from e
++        else:
++            raise ValueError(
++                f"Invalid within element: {item!r}, expected string or network object"
++            )
++
++    def _parse_other(self, other: Any) -> Optional[Union[
++        ipaddress.IPv4Address, ipaddress.IPv6Address,
++        ipaddress.IPv4Network, ipaddress.IPv6Network,
++    ]]:
++        """Parse the `other` value into an IP address or network object.
++        Returns None if parsing fails (invalid value).
++        """
++        # If it's already an ipaddress object
++        if isinstance(other, (ipaddress.IPv4Address, ipaddress.IPv6Address,
++                               ipaddress.IPv4Network, ipaddress.IPv6Network)):
++            return other
++
++        # If it's a string
++        if isinstance(other, str):
++            try:
++                # Try as address first
++                return ipaddress.ip_address(other)
++            except ValueError:
++                pass
++            try:
++                # Try as network (strict=False to allow host-bit normalization)
++                return ipaddress.ip_network(other, strict=False)
++            except ValueError:
++                return None
++
++        # If it's bytes (packed bytes)
++        if isinstance(other, bytes):
++            try:
++                return ipaddress.ip_address(other)
++            except ValueError:
++                return None
++
++        # If it's an integer
++        if isinstance(other, int) and not isinstance(other, bool):
++            if other < 0 or other >= 2**128:
++                return None
++            try:
++                return ipaddress.ip_address(other)
++            except ValueError:
++                return None
++
++        return None
++
++    def _check_version(self, parsed: Any) -> bool:
++        """Check version constraint."""
++        if self.version is None:
++            return True
++        if isinstance(parsed, (ipaddress.IPv4Address, ipaddress.IPv4Network)):
++            return self.version == 4
++        elif isinstance(parsed, (ipaddress.IPv6Address, ipaddress.IPv6Network)):
++            return self.version == 6
++        return False
++
++    def _check_netmask(self, parsed: Any) -> bool:
++        """Check netmask constraint."""
++        if self.netmask is None:
++            return True
++
++        # netmask only applies to network objects
++        if not isinstance(parsed, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++            return False
++
++        # Get the netmask of the parsed network
++        parsed_netmask_int = int(parsed.netmask)
++
++        # Convert self.netmask to int for comparison
++        if isinstance(self.netmask, int):
++            return parsed_netmask_int == self.netmask
++        elif isinstance(self.netmask, str):
++            try:
++                if self.version == 4:
++                    addr = ipaddress.IPv4Address(self.netmask)
++                else:
++                    addr = ipaddress.IPv6Address(self.netmask)
++                return parsed_netmask_int == int(addr)
++            except (ValueError, ipaddress.AddressValueError):
++                return False
++        return False
++
++    def _check_within(self, parsed: Any) -> bool:
++        """Check within constraint."""
++        if self._within is None:
++            return True
++
++        parsed_is_ipv4 = isinstance(parsed, (ipaddress.IPv4Address, ipaddress.IPv4Network))
++        parsed_is_ipv6 = isinstance(parsed, (ipaddress.IPv6Address, ipaddress.IPv6Network))
++
++        for network in self._within:
++            network_is_ipv4 = isinstance(network, ipaddress.IPv4Network)
++
++            # Version must match
++            if parsed_is_ipv4 and not network_is_ipv4:
++                continue
++            if parsed_is_ipv6 and network_is_ipv4:
++                continue
++
++            if isinstance(parsed, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
++                # Address must belong to the network
++                if parsed in network:
++                    return True
++            elif isinstance(parsed, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                # Network must be wholly contained in the configured network
++                if parsed.subnet_of(network):
++                    return True
++
++        return False
++
++    def equals(self, other: Any) -> bool:
++        parsed = self._parse_other(other)
++        if parsed is None:
++            return False
++
++        # Check version
++        if not self._check_version(parsed):
++            return False
++
++        # Check netmask
++        if not self._check_netmask(parsed):
++            return False
++
++        # Check within
++        if not self._check_within(parsed):
++            return False
++
++        return True

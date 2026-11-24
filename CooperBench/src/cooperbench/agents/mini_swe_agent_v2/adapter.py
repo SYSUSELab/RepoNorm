@@ -1,0 +1,308 @@
+"""Mini-SWE-Agent v2 adapter for CooperBench.
+
+This adapter wraps the mini-swe-agent v2 framework (tool-calling version)
+to conform to the AgentRunner interface used by CooperBench.
+"""
+
+import logging
+from pathlib import Path
+
+import yaml
+
+from cooperbench.agents import AgentResult
+from cooperbench.agents.mini_swe_agent_v2.agents.default import DefaultAgent
+from cooperbench.agents.mini_swe_agent_v2.config import get_config_path
+from cooperbench.agents.mini_swe_agent_v2.connectors import GitConnector
+from cooperbench.agents.mini_swe_agent_v2.connectors.messaging import MessagingConnector
+from cooperbench.agents.mini_swe_agent_v2.models.litellm_model import LitellmModel
+from cooperbench.agents.mini_swe_agent_v2.utils.serialize import recursive_merge
+from cooperbench.agents.registry import register
+from cooperbench.team_harness import (
+    COOP_TASK_SCRIPT_PATH,
+    INSTALL_SNIPPET_PATH,
+    TeamHarnessConfig,
+    TeamSession,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _install_team_cli_in_container(env) -> None:
+    """Drop the team CLI scripts into the v2 agent's container and
+    create the ``coop-task-*`` shell wrappers.
+
+    Mirrors what the Claude Code adapter does at setup time, but
+    inlined here because v2 doesn't have a templated setup.sh — it
+    just `sleep 2h`s an arbitrary image.  Best-effort: any step that
+    fails just logs a warning, so a broken team-CLI install doesn't
+    block the run.  Env vars (``CB_TEAM_*``) are pushed onto the
+    DockerEnvironment's container env at start-time, so this helper
+    only needs to install the binaries — not configure the shell.
+    """
+    from cooperbench.agents._coop.runtime import write_file_in_container
+
+    try:
+        write_file_in_container(env, "/tmp/cb-coop-task.py", COOP_TASK_SCRIPT_PATH.read_text())
+        write_file_in_container(env, "/tmp/cb-team-install.sh", INSTALL_SNIPPET_PATH.read_text())
+        env.execute(
+            {
+                "command": (
+                    "pip install --quiet --disable-pip-version-check redis >/dev/null 2>&1 "
+                    "|| pip3 install --quiet --disable-pip-version-check redis >/dev/null 2>&1 "
+                    "|| true; "
+                    "bash /tmp/cb-team-install.sh"
+                )
+            },
+            timeout=120,
+        )
+    except Exception as e:  # noqa: BLE001 -- best-effort
+        logger.warning("team CLI install in v2 container failed: %s", e)
+
+
+@register("mini_swe_agent_v2")
+class MiniSweAgentV2Runner:
+    """Adapter for mini-swe-agent v2 framework (tool-calling)."""
+
+    def run(
+        self,
+        task: str,
+        image: str,
+        *,
+        agent_id: str = "agent",
+        model_name: str = "gpt-4o",
+        agents: list[str] | None = None,
+        comm_url: str | None = None,
+        git_server_url: str | None = None,
+        git_enabled: bool = False,
+        messaging_enabled: bool = True,
+        config: dict | None = None,
+        agent_config: str | None = None,
+        log_dir: str | None = None,
+        team_role: str | None = None,
+        team_id: str | None = None,
+        task_list_url: str | None = None,
+        team_features: TeamHarnessConfig | None = None,
+        **kwargs,
+    ) -> AgentResult:
+        """Run mini-swe-agent v2 on a task.
+
+        When team-mode kwargs (``team_role``, ``team_id``,
+        ``task_list_url``) are set, the adapter attaches a
+        ``TeamPoller`` to the agent so each ``step()`` injects a fresh
+        team-task-list summary as a user message before the LLM call —
+        the same shape as the existing inbox-poll hook.
+        """
+        is_team = bool(team_role and team_id and task_list_url and agents and len(agents) > 1)
+
+        team_session: TeamSession | None = None
+        if is_team:
+            team_session = TeamSession(
+                run_id=team_id or "",
+                redis_url=task_list_url or "",  # host-side URL; env_for() rewrites
+                agents=list(agents or []),
+                team_volume=str((config or {}).get("team_volume") or ""),
+                config=team_features or TeamHarnessConfig(),
+            )
+            # Append the team-specific task-list section to the task
+            # so the LLM sees the coop-task-* CLI + role-specific
+            # workflow in its first user turn.  v2's existing coop
+            # template already covers messaging / git / submission;
+            # we add ONLY the task-list piece.
+            section = team_session.prompt_section(agent_id=agent_id)
+            if section:
+                task = task + "\n\n---\n\n" + section
+
+        # auto_refresh poller (None when feature disabled).
+        team_poller = team_session.loop_poller(agent_id=agent_id) if team_session else None
+        # Load coop config when multiple agents, otherwise solo config.
+        is_coop = bool(agents) and len(agents) > 1
+        config_name = "coop" if is_coop else "solo"
+        config_path = get_config_path(config_name)
+        with open(config_path) as f:
+            default_config = yaml.safe_load(f)
+
+        # If the caller passed an agent_config YAML path, deep-merge its
+        # `config:` block into the defaults.  This is what CooperBench's
+        # ``--agent-config`` flag forwards to the adapter.
+        if agent_config:
+            try:
+                with open(agent_config) as f:
+                    overrides = yaml.safe_load(f) or {}
+                default_config = recursive_merge(default_config, overrides.get("config", overrides))
+            except FileNotFoundError:
+                logger.error(f"agent_config file not found: {agent_config}")
+            except Exception as e:
+                logger.error(f"Error loading agent_config {agent_config}: {e}")
+
+        # Deep-merge passed config overrides into default config so that partial
+        # overrides (e.g. only agent.compaction_enabled) don't clobber sibling keys.
+        if config is not None:
+            default_config = recursive_merge(default_config, config)
+
+        agent_cfg = default_config.get("agent", {})
+        model_cfg = default_config.get("model", {})
+        env_cfg = default_config.get("environment", {})
+        backend = default_config.get("backend", "docker")
+
+        # Create environment based on backend
+        env_kwargs = {
+            "image": image,
+            "cwd": "/workspace/repo",
+            "timeout": env_cfg.get("timeout", 300),
+        }
+        container_env = dict(env_cfg.get("env") or {})
+        # In team mode, propagate the CB_TEAM_* env vars into every
+        # docker-exec the agent does so ``coop-task-*`` works without
+        # needing the agent to remember to set them.
+        if team_session is not None:
+            container_env.update(team_session.env_for(agent_id))
+        if container_env:
+            env_kwargs["env"] = container_env
+
+        if backend == "docker":
+            from cooperbench.agents.mini_swe_agent_v2.environments.docker import DockerEnvironment
+
+            if config and config.get("git_network"):
+                env_kwargs["network"] = config["git_network"]
+            # Need host.docker.internal mapping so the in-container
+            # coop-task-* CLI can reach Redis on the host (same as
+            # claude_code / codex adapters).  Also mount the shared
+            # team scratchpad if the feature is enabled.
+            if team_session is not None:
+                run_args = list(env_kwargs.get("run_args") or ["--rm"])
+                if "--add-host=host.docker.internal:host-gateway" not in run_args:
+                    run_args.append("--add-host=host.docker.internal:host-gateway")
+                run_args.extend(team_session.scratchpad_mount_args())
+                env_kwargs["run_args"] = run_args
+            env = DockerEnvironment(**env_kwargs)
+        else:
+            from cooperbench.agents.mini_swe_agent_v2.environments.modal import ModalEnvironment
+
+            env = ModalEnvironment(**env_kwargs)
+
+        # Setup messaging connector if enabled
+        comm = None
+        use_messaging = messaging_enabled and comm_url and agents and len(agents) > 1
+        if use_messaging:
+            comm = MessagingConnector(agent_id=agent_id, agents=agents, url=comm_url)
+
+        # Register only the bash tool with the model.  send_message is
+        # intercepted by DefaultAgent.execute_actions from inside the bash
+        # command string (``send_message <recipient> <<'MSG' ... MSG``).
+        # Exposing a separate send_message tool confuses smaller models
+        # into alternating between tools unreliably.
+        #
+        # Azure OpenAI: when AZURE_OPENAI_* is set, point litellm at the
+        # Azure deployment via the openai-compatible provider (model
+        # openai/<deployment> + api_base + api_key folded into model_kwargs).
+        from cooperbench.agents._azure import azure_litellm_model, resolve_azure_config
+
+        azure = resolve_azure_config()
+        if azure:
+            model_name = azure_litellm_model(model_name)
+            model_kwargs = dict(model_cfg.get("model_kwargs") or {})
+            model_kwargs.update({"api_base": azure["endpoint"], "api_key": azure["api_key"]})
+            model_cfg = {**model_cfg, "model_kwargs": model_kwargs}
+        model = LitellmModel(model_name=model_name, **model_cfg)
+
+        # Always set up a git connector. Coop points it at the shared server; solo gets a
+        # bare repo in its own sandbox. Both then submit by opening a PR, so there is one
+        # submission path rather than two that can drift apart.
+        git_connector = GitConnector(
+            agent_id=agent_id,
+            agents=agents or [agent_id],
+            server_url=git_server_url if (git_enabled and git_server_url) else "",
+        )
+        git_connector.setup(env)
+
+        # Setup team CLI in the container if either of its consumers
+        # (the task_list or the typed protocol verbs) is active.  Both
+        # share the same helper.
+        if team_session is not None and (team_session.config.task_list or team_session.config.protocol):
+            _install_team_cli_in_container(env)
+
+        # Create agent with template variables for collaboration
+        extra_vars = {
+            "agent_id": agent_id if (agents and len(agents) > 1) else None,
+            "agents": agents if agents else [],
+            "git_enabled": git_enabled,
+            "messaging_enabled": messaging_enabled,
+        }
+
+        agent = DefaultAgent(
+            model=model,
+            env=env,
+            comm=comm,
+            agent_id=agent_id,
+            **agent_cfg,
+        )
+        if log_dir:
+            agent.config.output_path = Path(log_dir) / f"{agent_id}_full_traj.json"
+        agent.extra_template_vars.update(extra_vars)
+        # Auto-refresh of the shared task list between LLM calls when
+        # team mode is active.  step() picks this up as ``agent.team_poller``.
+        if team_poller is not None:
+            agent.team_poller = team_poller
+
+        # Run agent
+        error_msg = None
+        result = {}
+        try:
+            result = agent.run(task=task)
+            status = result.get("exit_status", "Submitted")
+        except Exception as e:
+            status = "Error"
+            error_msg = str(e)
+        except BaseException:
+            # Preserve observations even on an operator interrupt. Never promote
+            # an unfinished workspace to a scored submission.
+            try:
+                agent.save(agent.config.output_path)
+            finally:
+                env.cleanup()
+            raise
+
+        # The submitted artifact is the agent's PR, not a local file. Reading a local
+        # patch.txt let an agent submit work it had never shared, so its colleague could not
+        # see what was coming and the shared remote had nothing to show. The PR is pushed, so
+        # what gets graded is exactly what the other agent could read.
+        patch = ""
+        try:
+            from cooperbench.agents._coop.runtime import normalize_patch
+
+            raw = git_connector.submitted_patch(env)
+            patch = normalize_patch(raw)
+        except Exception:
+            pass
+
+        # Save full trajectory (includes segments when compaction occurred)
+        if log_dir and agent._compaction_count > 0:
+            traj_path = Path(log_dir) / f"{agent_id}_full_traj.json"
+            agent.save(traj_path)
+            logger.info(
+                f"[{agent_id}] Full trajectory with segments saved to {traj_path} "
+                f"({agent._compaction_count} compaction(s))"
+            )
+
+        # Cleanup
+        env.cleanup()
+
+        # Tool-calling assistant turns leave content=None (the body lives in
+        # tool_calls).  CooperBench's downstream conversation extractor does
+        # ``"send_message" in content`` which raises TypeError on None — coerce
+        # to "" before returning.
+        sanitized_messages = []
+        for msg in agent.messages:
+            if msg.get("content") is None:
+                msg = {**msg, "content": ""}
+            sanitized_messages.append(msg)
+
+        return AgentResult(
+            status=status,
+            patch=patch,
+            cost=agent.cost,
+            steps=agent.n_calls,
+            messages=sanitized_messages,
+            sent_messages=agent.sent_messages,
+            error=error_msg,
+        )

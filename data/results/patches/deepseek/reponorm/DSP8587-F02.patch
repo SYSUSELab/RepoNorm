@@ -1,0 +1,142 @@
+diff --git a/dspy/streaming/messages.py b/dspy/streaming/messages.py
+index 9a73f19b..2360d402 100644
+--- a/dspy/streaming/messages.py
++++ b/dspy/streaming/messages.py
+@@ -14,6 +14,7 @@ class StreamResponse:
+     predict_name: str
+     signature_field_name: str
+     chunk: str
++    buffer_watermark: int = 0
+ 
+ 
+ @dataclass
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..a2615ed7 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -26,6 +26,7 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        end_buffer_size: int = 10,
+     ):
+         """
+         Args:
+@@ -48,6 +49,14 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        if not isinstance(end_buffer_size, int) or isinstance(end_buffer_size, bool):
++            raise ValueError("end_buffer_size must be an integer")
++        if end_buffer_size < 3:
++            raise ValueError("end_buffer_size must be at least 3")
++        if end_buffer_size > 64:
++            raise ValueError("end_buffer_size must be at most 64")
++        self.end_buffer_size = end_buffer_size
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -152,10 +161,12 @@ class StreamListener:
+             # The stream is started, we keep returning the token until we see the start of the next field.
+             token = None
+             self.field_end_queue.put(chunk_message)
+-            if self.field_end_queue.qsize() > 10:
+-                # We keep the last 10 tokens in the buffer to check if they form a valid identifier for end_identifier,
+-                # i.e., "[[ ## {next_field_name} ## ]]" for ChatAdapter to identify the end of the current field.
+-                # In most cases 10 tokens are enough to cover the end_identifier for all adapters.
++            buffer_watermark = min(self.field_end_queue.qsize(), self.end_buffer_size)
++            if self.field_end_queue.qsize() > self.end_buffer_size:
++                # We keep the last end_buffer_size tokens in the buffer to check if they form a valid identifier for
++                # end_identifier, i.e., "[[ ## {next_field_name} ## ]]" for ChatAdapter to identify the end of the
++                # current field. In most cases end_buffer_size tokens are enough to cover the end_identifier for all
++                # adapters.
+                 token = self.field_end_queue.get()
+             concat_message = "".join(self.field_end_queue.queue).strip()
+             if re.search(end_identifier, concat_message):
+@@ -166,7 +177,7 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++                return StreamResponse(self.predict_name, self.signature_field_name, token, buffer_watermark=buffer_watermark)
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6d..029e72ee 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -837,3 +837,72 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+     assert all_chunks[1].predict_name == "predict2"
+     assert all_chunks[1].signature_field_name == "judgement"
+     assert all_chunks[1].chunk == "The answer is humorous."
++
++
++# ----- end_buffer_size validation -----
++
++
++def test_end_buffer_size_default():
++    """Default end_buffer_size should be 10."""
++    listener = dspy.streaming.StreamListener("output")
++    assert listener.end_buffer_size == 10
++
++
++def test_end_buffer_size_valid_values():
++    """Boundary values 3 and 64 should work."""
++    listener = dspy.streaming.StreamListener("output", end_buffer_size=3)
++    assert listener.end_buffer_size == 3
++
++    listener = dspy.streaming.StreamListener("output", end_buffer_size=64)
++    assert listener.end_buffer_size == 64
++
++    listener = dspy.streaming.StreamListener("output", end_buffer_size=20)
++    assert listener.end_buffer_size == 20
++
++
++def test_end_buffer_size_non_integer():
++    """Non-integer values (including bool) must raise ValueError."""
++    with pytest.raises(ValueError, match="end_buffer_size must be an integer"):
++        dspy.streaming.StreamListener("output", end_buffer_size="abc")
++    with pytest.raises(ValueError, match="end_buffer_size must be an integer"):
++        dspy.streaming.StreamListener("output", end_buffer_size=3.5)
++    with pytest.raises(ValueError, match="end_buffer_size must be an integer"):
++        dspy.streaming.StreamListener("output", end_buffer_size=True)
++
++
++def test_end_buffer_size_below_3():
++    """Values below 3 must raise ValueError."""
++    with pytest.raises(ValueError, match="end_buffer_size must be at least 3"):
++        dspy.streaming.StreamListener("output", end_buffer_size=2)
++    with pytest.raises(ValueError, match="end_buffer_size must be at least 3"):
++        dspy.streaming.StreamListener("output", end_buffer_size=1)
++    with pytest.raises(ValueError, match="end_buffer_size must be at least 3"):
++        dspy.streaming.StreamListener("output", end_buffer_size=0)
++    with pytest.raises(ValueError, match="end_buffer_size must be at least 3"):
++        dspy.streaming.StreamListener("output", end_buffer_size=-1)
++
++
++def test_end_buffer_size_above_64():
++    """Values above 64 must raise ValueError."""
++    with pytest.raises(ValueError, match="end_buffer_size must be at most 64"):
++        dspy.streaming.StreamListener("output", end_buffer_size=65)
++    with pytest.raises(ValueError, match="end_buffer_size must be at most 64"):
++        dspy.streaming.StreamListener("output", end_buffer_size=100)
++
++
++# ----- buffer_watermark on StreamResponse -----
++
++
++def test_stream_response_buffer_watermark_default():
++    """Default buffer_watermark should be 0."""
++    resp = dspy.streaming.StreamResponse("predict1", "answer", "hello")
++    assert resp.buffer_watermark == 0
++
++
++def test_stream_response_buffer_watermark_explicit():
++    """buffer_watermark can be set explicitly."""
++    resp = dspy.streaming.StreamResponse("predict1", "answer", "hello", buffer_watermark=5)
++    assert resp.buffer_watermark == 5
++
++    resp = dspy.streaming.StreamResponse("predict1", "answer", "hello", buffer_watermark=10)
++    assert resp.buffer_watermark == 10

@@ -1,0 +1,196 @@
+diff --git a/dirty_equals/__init__.py b/dirty_equals/__init__.py
+index ba8214e..6116b45 100644
+--- a/dirty_equals/__init__.py
++++ b/dirty_equals/__init__.py
+@@ -18,7 +18,7 @@ from ._numeric import (
+     IsPositiveFloat,
+     IsPositiveInt,
+ )
+-from ._other import FunctionCheck, IsJson, IsUUID
++from ._other import FunctionCheck, IsIP, IsJson, IsUUID
+ from ._sequence import Contains, HasLen, IsList, IsListOrTuple, IsTuple
+ from ._strings import IsAnyStr, IsBytes, IsStr
+ 
+@@ -69,6 +69,7 @@ __all__ = (
+     'FunctionCheck',
+     'IsJson',
+     'IsUUID',
++    'IsIP',
+     # strings
+     'IsStr',
+     'IsBytes',
+diff --git a/dirty_equals/_other.py b/dirty_equals/_other.py
+index b2b8379..f59525e 100644
+--- a/dirty_equals/_other.py
++++ b/dirty_equals/_other.py
+@@ -1,9 +1,10 @@
+ import json
+-from typing import Any, Callable, TypeVar, overload
++from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_network
++from typing import Any, Callable, List, Optional, Tuple, TypeVar, Union, overload
+ from uuid import UUID
+ 
+ from ._base import DirtyEquals
+-from ._utils import plain_repr
++from ._utils import Omit, plain_repr
+ 
+ try:
+     from typing import Literal
+@@ -145,3 +146,101 @@ class FunctionCheck(DirtyEquals[Any]):
+ 
+     def equals(self, other: Any) -> bool:
+         return self.func(other)
++
++
++IP = Union[IPv4Address, IPv4Network, IPv6Address, IPv6Network, str, int, bytes]
++IPNetwork = Union[str, IPv4Network, IPv6Network]
++IPNetworks = Union[IPNetwork, List[IPNetwork], Tuple[IPNetwork, ...]]
++
++
++class IsIP(DirtyEquals[IP]):
++    """
++    Match an IP address or network, optionally constrained by version,
++    netmask, or containing networks.
++    """
++
++    def __init__(
++        self,
++        version: Literal[None, 4, 6] = None,
++        *,
++        netmask: Optional[Union[str, int]] = None,
++        within: Optional[IPNetworks] = None,
++    ):
++        """
++        Args:
++            version: The version of the IP to check, if omitted, versions 4 and 6 are both accepted.
++            netmask: The netmask of the IP to check, if omitted, any netmask is accepted. Requires version.
++            within: A strict CIDR network, or nonempty list or tuple of them.
++                Addresses must belong to one range; networks must be fully
++                contained in one range. Versions must match.
++
++        ```py title="IsIP"
++        from ipaddress import IPv4Address, IPv6Address, IPv4Network
++        from dirty_equals import IsIP
++
++        assert '179.27.154.96' == IsIP
++        assert '179.27.154.96' == IsIP(version=4)
++        assert '2001:0db8:0a0b:12f0:0000:0000:0000:0001' == IsIP(version=6)
++        assert IPv4Address('127.0.0.1') == IsIP
++        assert IPv4Network('43.48.0.0/12') == IsIP
++        assert IPv6Address('::eeff:ae3f:d473') == IsIP
++        assert '54.43.53.219/10' == IsIP(version=4, netmask='255.192.0.0')
++        assert '54.43.53.219/10' == IsIP(version=4, netmask=4290772992)
++        assert '::ffff:aebf:d473/12' == IsIP(version=6, netmask='fff0::')
++        assert 3232235521 == IsIP
++        ```
++        """
++        self.version = version
++        if netmask is not None and self.version is None:
++            raise TypeError('To check the netmask you must specify the IP version')
++        self.netmask = netmask
++        self.within = None
++        if within is not None:
++            ranges = within if isinstance(within, (list, tuple)) else [within]
++            if not ranges:
++                raise ValueError('within must contain at least one network')
++            if any(
++                not isinstance(item, (str, IPv4Network, IPv6Network)) or isinstance(item, str) and '/' not in item
++                for item in ranges
++            ):
++                raise ValueError('within must contain CIDR strings or network objects')
++            try:
++                self.within = tuple(ip_network(item, strict=True) for item in ranges)
++            except (TypeError, ValueError) as exc:
++                raise ValueError('within must contain valid strict networks') from exc
++        super().__init__(
++            version=version or Omit,
++            netmask=netmask if netmask is not None else Omit,
++            within=within if within is not None else Omit,
++        )
++
++    def equals(self, other: Any) -> bool:
++
++        if isinstance(other, (IPv4Network, IPv6Network)):
++            ip = other
++        elif isinstance(other, (str, bytes, int, IPv4Address, IPv6Address)):
++            ip = ip_network(other, strict=False)
++        else:
++            return False
++
++        if self.version:
++            if self.netmask is not None:
++                version_check = self.version == ip.version
++                address_format = {4: IPv4Address, 6: IPv6Address}[self.version]
++                netmask_check = int(address_format(self.netmask)) == int(ip.netmask)
++                if not (version_check and netmask_check):
++                    return False
++            elif self.version != ip.version:
++                return False
++
++        if self.within is not None:
++            return any(
++                isinstance(ip, IPv4Network)
++                and isinstance(network, IPv4Network)
++                and ip.subnet_of(network)
++                or isinstance(ip, IPv6Network)
++                and isinstance(network, IPv6Network)
++                and ip.subnet_of(network)
++                for network in self.within
++            )
++        return True
+diff --git a/docs/types/other.md b/docs/types/other.md
+index 0a783c8..adaaf75 100644
+--- a/docs/types/other.md
++++ b/docs/types/other.md
+@@ -8,6 +8,8 @@
+ 
+ ::: dirty_equals.IsUUID
+ 
++::: dirty_equals.IsIP
++
+ ::: dirty_equals.AnyThing
+ 
+ ::: dirty_equals.IsOneOf
+diff --git a/tests/test_ip_contribution.py b/tests/test_ip_contribution.py
+new file mode 100644
+index 0000000..2943c6a
+--- /dev/null
++++ b/tests/test_ip_contribution.py
+@@ -0,0 +1,37 @@
++from ipaddress import IPv4Address, IPv4Network
++
++import pytest
++
++import dirty_equals as de
++
++
++def test_ip_public_validator_and_composition():
++    value = IPv4Address('192.0.2.4')
++    validator = de.IsIP(4)
++    assert value == validator
++    assert validator.value is value
++    assert repr(validator) == repr(value)
++    assert value == (de.IsIP(4) & ~de.IsIP(6))
++    assert 'bad address' != de.IsIP()
++
++
++def test_ip_version_and_netmask_constraints():
++    assert '192.0.2.9/24' == de.IsIP(4, netmask='255.255.255.0')
++    assert '192.0.2.9/24' != de.IsIP(4, netmask=0)
++    assert '2001:db8::1' != de.IsIP(4)
++    with pytest.raises(TypeError, match='must specify the IP version'):
++        de.IsIP(netmask=0)
++
++
++def test_ip_within_requires_full_containment():
++    validator = de.IsIP(within=['192.0.2.0/24', '2001:db8::/32'])
++    assert '192.0.2.255' == validator
++    assert IPv4Network('192.0.2.128/25') == validator
++    assert IPv4Network('192.0.2.0/23') != validator
++    assert '2001:db9::1' != validator
++
++
++@pytest.mark.parametrize('within', [[], '192.0.2.1', '192.0.2.1/24', object()])
++def test_ip_rejects_invalid_range_configuration(within):
++    with pytest.raises(ValueError):
++        de.IsIP(within=within)

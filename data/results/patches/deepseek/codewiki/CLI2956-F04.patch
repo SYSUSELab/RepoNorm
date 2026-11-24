@@ -1,0 +1,118 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..2c3ecbe 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1196,6 +1196,9 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        for param in self.get_params(ctx):
++            param._check_required_if(ctx)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2356,6 +2359,17 @@ class Parameter:
+ 
+         return value
+ 
++    def _check_required_if(self, ctx: Context) -> None:
++        """Check if the option is required based on other parameters.
++
++        This is called after all parameters have been parsed.  The base
++        implementation does nothing; subclasses can override.
++
++        :param ctx: the current invocation context.
++        """
++        pass
++
++
+     def resolve_envvar_value(self, ctx: Context) -> str | None:
+         if self.envvar is None:
+             return None
+@@ -2549,6 +2563,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        required_if: cabc.Mapping[str, t.Any] | t.Callable[[Context, Option], bool] | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2559,6 +2574,28 @@ class Option(Parameter):
+             param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
+         )
+ 
++        # Validate and store required_if
++        if required_if is not None:
++            if isinstance(required_if, cabc.Mapping):
++                for key in required_if:
++                    if not isinstance(key, str):
++                        raise TypeError(
++                            "Keys in 'required_if' must be strings, got"
++                            f" {key.__class__.__name__!r}."
++                        )
++                    if key.startswith("-"):
++                        raise TypeError(
++                            f"Key {key!r} in 'required_if' must not start with"
++                            " an option prefix."
++                        )
++            elif not callable(required_if):
++                raise TypeError(
++                    "'required_if' must be a mapping, callable, or None, got"
++                    f" {required_if.__class__.__name__!r}."
++                )
++
++        self.required_if = required_if
++
+         if prompt is True:
+             if self.name is None:
+                 raise TypeError("'name' is required with 'prompt=True'.")
+@@ -3032,6 +3069,48 @@ class Option(Parameter):
+ 
+         return value, source
+ 
++    def _check_required_if(self, ctx: Context) -> None:
++        """Check if the option is required based on other parameters'
++        values or a callable predicate.
++
++        Called after all parameters have been parsed.  If the
++        condition is met and the option's value is missing, a
++        :class:`MissingParameter` error is raised.
++
++        :param ctx: the current invocation context.
++        """
++        if not self.required_if:
++            return
++
++        if isinstance(self.required_if, cabc.Mapping):
++            # Validate that all keys name existing parameters,
++            # regardless of whether the target already has a value.
++            param_names = {p.name for p in ctx.command.get_params(ctx)}
++            for key in self.required_if:
++                if key not in param_names:
++                    raise UsageError(
++                        f"Parameter {key!r} referenced in 'required_if' of"
++                        f" option {self.name!r} does not exist.",
++                        ctx=ctx,
++                    )
++
++        # If the target already has a non-missing value, skip the check.
++        value = ctx.params.get(self.name)
++        if not self.value_is_missing(value):
++            return
++
++        if callable(self.required_if):
++            if self.required_if(ctx, self):
++                raise MissingParameter(ctx=ctx, param=self)
++            return
++
++        # It's a mapping — check if all conditions match.
++        for key, expected_value in self.required_if.items():
++            actual_value = ctx.params.get(key)
++            if actual_value != expected_value:
++                return
++
++        raise MissingParameter(ctx=ctx, param=self)
+ 
+ class Argument(Parameter):
+     """Arguments are positional parameters to a command.  They generally

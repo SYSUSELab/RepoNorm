@@ -1,0 +1,410 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..876c72af 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add an opt-in installer for ordered gettext fallback chains,
++    preserving context-aware calls, formatting, and autoescaping.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b7..bbc56880 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -84,6 +84,43 @@ additional methods:
+     .. versionadded:: 2.5
+         Added new-style gettext support.
+ 
++Ordered Fallback Providers
++^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++``Environment.install_gettext_callables_with_fallback`` installs
++optional ordered chains with this signature::
++
++    install_gettext_callables_with_fallback(
++        gettext, ngettext, fallback_gettext_funcs=None,
++        fallback_ngettext_funcs=None, newstyle=None,
++        pgettext=None, npgettext=None, fallback_pgettext_funcs=None,
++        fallback_npgettext_funcs=None,
++    )
++
++Each fallback argument is a finite iterable of matching providers. The
++installer snapshots it, so later changes to a list do not change the
++installed chain. ``None`` or an empty iterable uses the normal
++installer.
++Non-empty contextual fallbacks require the corresponding ``pgettext``
++or ``npgettext`` primary and otherwise raise ``ValueError``.
++
++The primary runs first. A result equal to the source message indicates a
++miss; plural functions compare against the singular source for count 1
++and the plural source otherwise. Fallbacks run in order until one result
++differs. All misses return the selected source. Exceptions propagate and
++do not invoke later providers. Contextual providers receive the context
++on each attempt. Providers can use Jinja's context-aware decorators.
++
++Selection happens before existing new-style formatting and autoescaping.
++``newstyle=None`` preserves the current mode. Normal gettext chains work
++with direct calls and singular/plural ``trans`` blocks in either mode.
++Contextual chains support direct calls, not new ``trans`` syntax.
++Reinstallation replaces providers and chains; the normal uninstall
++method removes them. Applications not using this installer are
++unchanged.
++
++.. versionadded:: 3.1.0
++
+ .. method:: jinja2.Environment.uninstall_gettext_translations()
+ 
+     Uninstall the environment's globally installed translation.
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..b27e2c3a 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -181,6 +181,26 @@ def _make_new_gettext(func: t.Callable[[str], str]) -> t.Callable[..., str]:
+     return gettext
+ 
+ 
++def _make_gettext_with_fallback(
++    func: t.Callable[[str], str],
++    fallback_funcs: t.Sequence[t.Callable[[str], str]],
++) -> t.Callable[..., str]:
++    @pass_context
++    def gettext(__context: Context, __string: str) -> str:
++        rv = __context.call(func, __string)
++
++        if rv == __string:
++            for fallback_func in fallback_funcs:
++                rv = __context.call(fallback_func, __string)
++
++                if rv != __string:
++                    break
++
++        return t.cast(str, rv)
++
++    return gettext
++
++
+ def _make_new_ngettext(func: t.Callable[[str, str, int], str]) -> t.Callable[..., str]:
+     @pass_context
+     def ngettext(
+@@ -200,6 +220,85 @@ def _make_new_ngettext(func: t.Callable[[str, str, int], str]) -> t.Callable[...
+     return ngettext
+ 
+ 
++def _make_ngettext_with_fallback(
++    func: t.Callable[[str, str, int], str],
++    fallback_funcs: t.Sequence[t.Callable[[str, str, int], str]],
++) -> t.Callable[..., str]:
++    @pass_context
++    def ngettext(
++        __context: Context,
++        __singular: str,
++        __plural: str,
++        __num: int,
++    ) -> str:
++        rv = __context.call(func, __singular, __plural, __num)
++        expected = __singular if __num == 1 else __plural
++
++        if rv == expected:
++            for fallback_func in fallback_funcs:
++                rv = __context.call(fallback_func, __singular, __plural, __num)
++
++                if rv != expected:
++                    break
++
++        return t.cast(str, rv)
++
++    return ngettext
++
++
++def _make_pgettext_with_fallback(
++    func: t.Callable[[str, str], str],
++    fallback_funcs: t.Sequence[t.Callable[[str, str], str]],
++) -> t.Callable[..., str]:
++    @pass_context
++    def pgettext(__context: Context, __string_ctx: str, __string: str) -> str:
++        rv = __context.call(func, __string_ctx, __string)
++
++        if rv == __string:
++            for fallback_func in fallback_funcs:
++                rv = __context.call(fallback_func, __string_ctx, __string)
++
++                if rv != __string:
++                    break
++
++        return t.cast(str, rv)
++
++    return pgettext
++
++
++def _make_npgettext_with_fallback(
++    func: t.Callable[[str, str, str, int], str],
++    fallback_funcs: t.Sequence[t.Callable[[str, str, str, int], str]],
++) -> t.Callable[..., str]:
++    @pass_context
++    def npgettext(
++        __context: Context,
++        __string_ctx: str,
++        __singular: str,
++        __plural: str,
++        __num: int,
++    ) -> str:
++        rv = __context.call(func, __string_ctx, __singular, __plural, __num)
++        expected = __singular if __num == 1 else __plural
++
++        if rv == expected:
++            for fallback_func in fallback_funcs:
++                rv = __context.call(
++                    fallback_func,
++                    __string_ctx,
++                    __singular,
++                    __plural,
++                    __num,
++                )
++
++                if rv != expected:
++                    break
++
++        return t.cast(str, rv)
++
++    return npgettext
++
++
+ def _make_new_pgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str]:
+     @pass_context
+     def pgettext(
+@@ -261,6 +360,7 @@ class InternationalizationExtension(Extension):
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+             install_gettext_callables=self._install_callables,
++            install_gettext_callables_with_fallback=self._install_callables_with_fallback,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
+@@ -336,6 +436,73 @@ class InternationalizationExtension(Extension):
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
+ 
++    def _install_callables_with_fallback(
++        self,
++        gettext: t.Callable[[str], str],
++        ngettext: t.Callable[[str, str, int], str],
++        fallback_gettext_funcs: t.Optional[t.Iterable[t.Callable[[str], str]]] = None,
++        fallback_ngettext_funcs: t.Optional[
++            t.Iterable[t.Callable[[str, str, int], str]]
++        ] = None,
++        newstyle: t.Optional[bool] = None,
++        pgettext: t.Optional[t.Callable[[str, str], str]] = None,
++        npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        fallback_pgettext_funcs: t.Optional[
++            t.Iterable[t.Callable[[str, str], str]]
++        ] = None,
++        fallback_npgettext_funcs: t.Optional[
++            t.Iterable[t.Callable[[str, str, str, int], str]]
++        ] = None,
++    ) -> None:
++        """Install callables with ordered, snapshotted fallbacks.
++
++        Each chain uses the primary provider first, then its fallbacks
++        until a result differs from the selected source message.
++        Provider exceptions propagate. Formatting and autoescaping use
++        the existing installer; ``newstyle=None`` preserves its mode.
++        Contextual fallbacks require their corresponding primary.
++
++        .. versionadded:: 3.1.0
++        """
++        gettext_fallbacks = tuple(
++            () if fallback_gettext_funcs is None else fallback_gettext_funcs
++        )
++        ngettext_fallbacks = tuple(
++            () if fallback_ngettext_funcs is None else fallback_ngettext_funcs
++        )
++        pgettext_fallbacks = tuple(
++            () if fallback_pgettext_funcs is None else fallback_pgettext_funcs
++        )
++        npgettext_fallbacks = tuple(
++            () if fallback_npgettext_funcs is None else fallback_npgettext_funcs
++        )
++
++        if gettext_fallbacks:
++            gettext = _make_gettext_with_fallback(gettext, gettext_fallbacks)
++
++        if ngettext_fallbacks:
++            ngettext = _make_ngettext_with_fallback(ngettext, ngettext_fallbacks)
++
++        if pgettext_fallbacks:
++            if pgettext is None:
++                raise ValueError("fallback_pgettext_funcs requires pgettext")
++
++            pgettext = _make_pgettext_with_fallback(pgettext, pgettext_fallbacks)
++
++        if npgettext_fallbacks:
++            if npgettext is None:
++                raise ValueError("fallback_npgettext_funcs requires npgettext")
++
++            npgettext = _make_npgettext_with_fallback(npgettext, npgettext_fallbacks)
++
++        self._install_callables(
++            gettext,
++            ngettext,
++            newstyle=newstyle,
++            pgettext=pgettext,
++            npgettext=npgettext,
++        )
++
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+diff --git a/tests/test_n4c_author_translation_fallback.py b/tests/test_n4c_author_translation_fallback.py
+new file mode 100644
+index 00000000..8c988fbf
+--- /dev/null
++++ b/tests/test_n4c_author_translation_fallback.py
+@@ -0,0 +1,143 @@
++import pytest
++
++from jinja2 import Environment
++from jinja2 import pass_context
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++def test_context_provider_selection_and_formatting(newstyle):
++    env = Environment(autoescape=True, extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    @pass_context
++    def primary(context, message):
++        seen.append(("primary", context.environment, message))
++        return message
++
++    @pass_context
++    def fallback(context, message):
++        seen.append(("fallback", context.environment, message))
++        return "<b>%(name)s</b>"
++
++    env.install_gettext_callables_with_fallback(
++        primary,
++        lambda one, many, n: many,
++        fallback_gettext_funcs=[fallback],
++        newstyle=newstyle,
++    )
++    template = env.from_string("{% trans name=value %}Hi {{ name }}{% endtrans %}")
++    assert template.render(value="<x>") == "<b>&lt;x&gt;</b>"
++    assert seen == [
++        ("primary", env, "Hi %(name)s"),
++        ("fallback", env, "Hi %(name)s"),
++    ]
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++def test_all_provider_kinds_snapshot_context_and_short_circuit(newstyle):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    @pass_context
++    def gettext(context, message):
++        seen.append((context.environment, message))
++        return message
++
++    @pass_context
++    def ngettext(context, one, many, n):
++        seen.append((context.environment, n))
++        return one if n == 1 else many
++
++    @pass_context
++    def pgettext(context, domain, message):
++        seen.append((context.environment, domain))
++        return message
++
++    @pass_context
++    def npgettext(context, domain, one, many, n):
++        seen.append((context.environment, domain, n))
++        return one if n == 1 else many
++
++    fallbacks = [lambda message: "result"]
++    env.install_gettext_callables_with_fallback(
++        gettext,
++        ngettext,
++        fallback_gettext_funcs=iter(fallbacks),
++        fallback_ngettext_funcs=[lambda one, many, n: "items"],
++        newstyle=newstyle,
++        pgettext=pgettext,
++        npgettext=npgettext,
++        fallback_pgettext_funcs=[lambda domain, message: "context"],
++        fallback_npgettext_funcs=[lambda domain, one, many, n: "contexts"],
++    )
++    fallbacks[0] = lambda message: "changed"
++    text = env.from_string(
++        '{{ gettext("x") }}|{{ ngettext("one", "many", 2) }}|'
++        '{{ pgettext("menu", "x") }}|'
++        '{{ npgettext("menu", "one", "many", 2) }}'
++    ).render()
++    assert text == "result|items|context|contexts"
++    assert seen == [(env, "x"), (env, 2), (env, "menu"), (env, "menu", 2)]
++
++
++def test_provider_exception_does_not_call_later_provider():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    def broken(message):
++        raise LookupError("catalog failed")
++
++    env.install_gettext_callables_with_fallback(
++        broken,
++        lambda one, many, n: many,
++        fallback_gettext_funcs=[lambda message: seen.append(message) or "x"],
++    )
++    with pytest.raises(LookupError, match="catalog failed"):
++        env.from_string('{{ gettext("x") }}').render()
++    assert seen == []
++
++
++def test_reinstallation_and_uninstall_replace_all_providers():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    template = env.from_string('{{ gettext("x") }}')
++    for value in ("first", "second"):
++        env.install_gettext_callables_with_fallback(
++            lambda message: message,
++            lambda one, many, n: many,
++            fallback_gettext_funcs=[lambda message: value],
++        )
++        assert template.render() == value
++    env.install_gettext_callables(lambda message: "normal", lambda one, many, n: many)
++    assert template.render() == "normal"
++    env.uninstall_gettext_translations(None)
++    assert not {"gettext", "ngettext", "pgettext", "npgettext"}.intersection(
++        env.globals
++    )
++
++
++@pytest.mark.parametrize("kind", ["pgettext", "npgettext"])
++def test_contextual_fallback_requires_primary(kind):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    with pytest.raises(ValueError, match=kind):
++        env.install_gettext_callables_with_fallback(
++            lambda message: message,
++            lambda one, many, n: many,
++            **{"fallback_" + kind + "_funcs": [lambda *args: "result"]},
++        )
++
++
++def test_nonempty_falsey_iterable_is_not_missing():
++    class Providers:
++        def __bool__(self):
++            return False
++
++        def __iter__(self):
++            yield lambda message: "translated"
++
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    env.install_gettext_callables_with_fallback(
++        lambda message: message,
++        lambda one, many, n: many,
++        fallback_gettext_funcs=Providers(),
++    )
++    assert env.from_string('{{ gettext("x") }}').render() == "translated"

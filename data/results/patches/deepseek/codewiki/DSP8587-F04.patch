@@ -1,0 +1,268 @@
+diff --git a/dspy/streaming/streamify.py b/dspy/streaming/streamify.py
+index 5376d286..a2d446a2 100644
+--- a/dspy/streaming/streamify.py
++++ b/dspy/streaming/streamify.py
+@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Gene
+ 
+ import litellm
+ import ujson
+-from anyio import create_memory_object_stream, create_task_group
++from anyio import create_memory_object_stream, create_task_group, fail_after
+ from anyio.streams.memory import MemoryObjectSendStream
+ from litellm import ModelResponseStream
+ 
+@@ -177,32 +177,108 @@ def streamify(
+         async with create_task_group() as tg, send_stream, receive_stream:
+             tg.start_soon(generator, args, kwargs, send_stream)
+ 
+-            async for value in receive_stream:
+-                if isinstance(value, ModelResponseStream):
+-                    if len(predict_id_to_listener) == 0:
+-                        # No listeners are configured, yield the chunk directly for backwards compatibility.
++            # Check if any listeners have idle timeout configured
++            has_idle_timeout = any(
++                listener.idle_timeout_s is not None
++                for listeners in predict_id_to_listener.values()
++                for listener in listeners
++            )
++
++            if not has_idle_timeout:
++                # Use the original async for loop when no idle timeouts configured
++                async for value in receive_stream:
++                    if isinstance(value, ModelResponseStream):
++                        if len(predict_id_to_listener) == 0:
++                            # No listeners are configured, yield the chunk directly for backwards compatibility.
++                            yield value
++                        else:
++                            # We are receiving a chunk from the LM's response stream, delegate it to the listeners to
++                            # determine if we should yield a value to the user.
++                            output = None
++                            for listener in predict_id_to_listener[value.predict_id]:
++                                # There should be at most one listener provides a return value.
++                                output = listener.receive(value) or output
++                            if output:
++                                yield output
++                    elif isinstance(value, StatusMessage):
+                         yield value
+-                    else:
+-                        # We are receiving a chunk from the LM's response stream, delegate it to the listeners to
+-                        # determine if we should yield a value to the user.
+-                        output = None
+-                        for listener in predict_id_to_listener[value.predict_id]:
+-                            # There should be at most one listener provides a return value.
+-                            output = listener.receive(value) or output
+-                        if output:
+-                            yield output
+-                elif isinstance(value, StatusMessage):
+-                    yield value
+-                elif isinstance(value, Prediction):
+-                    if include_final_prediction_in_output_stream:
+-                        yield value
+-                    elif (
+-                        len(stream_listeners) == 0
+-                        or any(listener.cache_hit for listener in stream_listeners)
+-                        or not any(listener.stream_start for listener in stream_listeners)
+-                    ):
++                    elif isinstance(value, Prediction):
++                        if include_final_prediction_in_output_stream:
++                            yield value
++                        elif (
++                            len(stream_listeners) == 0
++                            or any(listener.cache_hit for listener in stream_listeners)
++                            or not any(listener.stream_start for listener in stream_listeners)
++                        ):
++                            yield value
++                        return
++            else:
++                # Idle timeouts are configured: use a polling loop that checks for timeouts
++                # Collect all timeout-enabled listeners in original order
++                all_timeout_listeners = [
++                    listener
++                    for listeners in predict_id_to_listener.values()
++                    for listener in listeners
++                    if listener.idle_timeout_s is not None
++                ]
++                # Deduplicate by identity while preserving order
++                seen = set()
++                ordered_timeout_listeners = []
++                for listener in all_timeout_listeners:
++                    if id(listener) not in seen:
++                        ordered_timeout_listeners.append(listener)
++                        seen.add(id(listener))
++
++                # Use a polling interval based on the minimum idle timeout (max 0.5s)
++                min_timeout = min(
++                    listener.idle_timeout_s
++                    for listener in ordered_timeout_listeners
++                )
++                poll_interval = min(min_timeout / 2, 0.5)
++                # Ensure a minimum poll interval for responsiveness
++                poll_interval = max(poll_interval, 0.05)
++
++                while True:
++                    try:
++                        # fail_after already imported at top
++                        with fail_after(poll_interval):
++                            value = await receive_stream.receive()
++                    except TimeoutError:
++                        # Check for idle timeouts on all timeout-enabled listeners in order
++                        timeout_response = None
++                        for listener in ordered_timeout_listeners:
++                            response = listener.tick()
++                            if response is not None:
++                                timeout_response = response
++                                break
++                        if timeout_response is not None:
++                            yield timeout_response
++                            tg.cancel_scope.cancel()
++                            return
++                        continue
++
++                    # Process the received value (same logic as above)
++                    if isinstance(value, ModelResponseStream):
++                        if len(predict_id_to_listener) == 0:
++                            yield value
++                        else:
++                            output = None
++                            for listener in predict_id_to_listener[value.predict_id]:
++                                output = listener.receive(value) or output
++                            if output:
++                                yield output
++                    elif isinstance(value, StatusMessage):
+                         yield value
+-                    return
++                    elif isinstance(value, Prediction):
++                        if include_final_prediction_in_output_stream:
++                            yield value
++                        elif (
++                            len(stream_listeners) == 0
++                            or any(listener.cache_hit for listener in stream_listeners)
++                            or not any(listener.stream_start for listener in stream_listeners)
++                        ):
++                            yield value
++                        return
+ 
+     if async_streaming:
+         return async_streamer
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..1bdf8417 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,8 @@
++import time
+ import re
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        idle_timeout_s: float | None = None,
++        clock: Callable[[], float] | None = None,
+     ):
+         """
+         Args:
+@@ -36,10 +39,26 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            idle_timeout_s: If set to a positive finite number, the stream listener will automatically emit an empty
++                StreamResponse and terminate the stream if no non-empty chunks are received for this many seconds.
++                None disables idle termination. Must not be a boolean.
++            clock: A callable that returns the current time in seconds, used to check the idle timeout. Defaults to
++                time.monotonic. Must use the same time domain as `tick(now_ts=...)`.
+         """
++        # Validate idle_timeout_s
++        if idle_timeout_s is not None:
++            if isinstance(idle_timeout_s, bool) or not isinstance(idle_timeout_s, (int, float)):
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++            if not (idle_timeout_s > 0 and idle_timeout_s < float('inf')):
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+         self.predict_name = predict_name
++        self.idle_timeout_s = idle_timeout_s
++        self.clock = clock or time.monotonic
++        self._last_active_ts: float | None = None
++        self._idle_timed_out: bool = False
+ 
+         self.field_start_queue = []
+         self.field_end_queue = Queue()
+@@ -83,6 +102,9 @@ class StreamListener:
+         end_identifier = self.adapter_identifiers[adapter_name]["end_identifier"]
+         start_indicator = self.adapter_identifiers[adapter_name]["start_indicator"]
+ 
++        if self._idle_timed_out:
++            return
++
+         if self.stream_end:
+             if self.allow_reuse:
+                 # Clear up the state for the next stream.
+@@ -112,6 +134,7 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
++                self._last_active_ts = self.clock()
+                 return
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+@@ -131,6 +154,7 @@ class StreamListener:
+                 # We have a full identifier, we can start the stream.
+                 self.stream_start = True
+                 self.field_start_queue = []
++                self._last_active_ts = self.clock()
+                 # Keep the part after the start_identifier from the concat_message, we need to write it to the buffer.
+                 value_start_index = concat_message.find(start_identifier) + len(start_identifier)
+                 chunk_message = concat_message[value_start_index:].lstrip()
+@@ -151,6 +175,8 @@ class StreamListener:
+         if self.stream_start:
+             # The stream is started, we keep returning the token until we see the start of the next field.
+             token = None
++            # Refresh last activity time on every non-empty chunk
++            self._last_active_ts = self.clock()
+             self.field_end_queue.put(chunk_message)
+             if self.field_end_queue.qsize() > 10:
+                 # We keep the last 10 tokens in the buffer to check if they form a valid identifier for end_identifier,
+@@ -168,6 +194,36 @@ class StreamListener:
+             if token:
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
++    def tick(self, now_ts: float | None = None) -> StreamResponse | None:
++        """Check if the idle timeout has expired and return a timeout response if so.
++
++        Args:
++            now_ts: The current timestamp in the clock's time domain. If None, uses the clock.
++
++        Returns:
++            A StreamResponse with an empty chunk if the timeout has expired, None otherwise.
++        """
++        if self.idle_timeout_s is None or self._idle_timed_out:
++            return None
++
++        now = now_ts if now_ts is not None else self.clock()
++
++        if self._last_active_ts is None:
++            return None  # No activity yet, field hasn't started
++
++        if now - self._last_active_ts < self.idle_timeout_s:
++            return None  # Timeout hasn't expired yet
++
++        # Timeout expired: emit one empty StreamResponse and clear state
++        self._idle_timed_out = True
++        self.stream_start = False
++        self.stream_end = False
++        self.cache_hit = False
++        self.field_start_queue = []
++        self.field_end_queue = Queue()
++
++        return StreamResponse(self.predict_name, self.signature_field_name, "")
++
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+ 

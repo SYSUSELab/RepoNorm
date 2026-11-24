@@ -1,0 +1,104 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..19bd241 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,18 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        timeout: int | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        if timeout is not None:
++            if isinstance(timeout, bool) or not isinstance(timeout, int):
++                raise ValueError("timeout must be an integer")
++            if timeout <= 0:
++                raise ValueError("timeout must be a positive integer")
++        self.timeout = timeout
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -506,6 +513,7 @@ class Editor:
+         return "vi"
+ 
+     def edit_file(self, filename: str) -> None:
++        import signal
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -516,8 +524,42 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            # Use start_new_session=True to create a new process group for proper cleanup
++            c = subprocess.Popen(
++                f'{editor} "{filename}"',
++                env=environ,
++                shell=True,
++                start_new_session=True,
++            )
++            try:
++                exit_code = c.wait(timeout=self.timeout)
++            except subprocess.TimeoutExpired:
++                # Request termination of the editor session
++                # Kill the entire process group on Unix-like systems
++                if not WIN:
++                    try:
++                        os.killpg(os.getpgid(c.pid), signal.SIGTERM)
++                    except ProcessLookupError:
++                        pass
++                else:
++                    c.terminate()
++                try:
++                    exit_code = c.wait(timeout=1)
++                except subprocess.TimeoutExpired:
++                    # Forcefully stop it and reap the process
++                    if not WIN:
++                        try:
++                            os.killpg(os.getpgid(c.pid), signal.SIGKILL)
++                        except ProcessLookupError:
++                            pass
++                    else:
++                        c.kill()
++                    c.wait()
++                raise ClickException(
++                    _("{editor}: Editing timed out after {timeout} seconds").format(
++                        editor=editor, timeout=self.timeout
++                    )
++                )
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..bc3513b 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    timeout: int | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,14 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param timeout: if set, the editor session is limited to this many seconds.
++                    If the editor does not complete within this time, it will be
++                    terminated and a :exc:`ClickException` will be raised.
++                    ``None`` (the default) means no timeout.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, timeout=timeout)
+ 
+     if filename is None:
+         return ed.edit(text)

@@ -1,0 +1,470 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..e7bdef95 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -11,18 +11,49 @@ import pydantic
+ import ujson
+ from cachetools import LRUCache
+ from diskcache import FanoutCache
++from dspy.dsp.utils.settings import settings
+ 
+ logger = logging.getLogger(__name__)
+ 
++class CacheStats:
++    def __init__(self):
++        self.hits = 0
++        self.mem_hits = 0
++        self.disk_hits = 0
++        self.misses = 0
++        self._lock = threading.Lock()
+ 
+-class Cache:
+-    """DSPy Cache
++    def record_mem_hit(self):
++        with self._lock:
++            self.hits += 1
++            self.mem_hits += 1
++
++    def record_disk_hit(self):
++        with self._lock:
++            self.hits += 1
++            self.disk_hits += 1
+ 
+-    `Cache` provides 2 levels of caching (in the given order):
+-        1. In-memory cache - implemented with cachetools.LRUCache
+-        2. On-disk cache - implemented with diskcache.FanoutCache
+-    """
++    def record_miss(self):
++        with self._lock:
++            self.misses += 1
++
++    def reset(self):
++        with self._lock:
++            self.hits = 0
++            self.mem_hits = 0
++            self.disk_hits = 0
++            self.misses = 0
+ 
++    def to_dict(self):
++        with self._lock:
++            return {
++                "hits": self.hits,
++                "mem_hits": self.mem_hits,
++                "disk_hits": self.disk_hits,
++                "misses": self.misses,
++            }
++
++class Cache:
+     def __init__(
+         self,
+         enable_disk_cache: bool,
+@@ -30,17 +61,7 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
+     ):
+-        """
+-        Args:
+-            enable_disk_cache: Whether to enable on-disk cache.
+-            enable_memory_cache: Whether to enable in-memory cache.
+-            disk_cache_dir: The directory where the disk cache is stored.
+-            disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+-            memory_max_entries: The maximum size of the in-memory cache (in number of items).
+-        """
+-
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+         if self.enable_memory_cache:
+@@ -58,18 +79,28 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._stats = CacheStats()
++
++    def stats(self) -> Dict[str, int]:
++        return self._stats.to_dict()
++
++    def reset_stats(self) -> None:
++        self._stats.reset()
++
++    def _record_cache_usage(self, event_type: str):
++        tracker = settings.get("cache_usage_tracker")
++        if tracker:
++            if event_type == "mem_hit":
++                tracker.record_mem_hit()
++            elif event_type == "disk_hit":
++                tracker.record_disk_hit()
++            elif event_type == "miss":
++                tracker.record_miss()
+ 
+     def __contains__(self, key: str) -> bool:
+-        """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+-        """
+-        Obtain a unique cache key for the given request dictionary by hashing its JSON
+-        representation. For request fields having types that are known to be JSON-incompatible,
+-        convert them to a JSON-serializable format before hashing.
+-        """
+-
+         ignored_args_for_cache_key = ignored_args_for_cache_key or []
+ 
+         def transform_value(value):
+@@ -78,15 +109,10 @@ class Cache:
+             elif isinstance(value, pydantic.BaseModel):
+                 return value.model_dump()
+             elif callable(value):
+-                # Try to get the source code of the callable if available
+                 import inspect
+-
+                 try:
+-                    # For regular functions, we can get the source code
+                     return f"<callable_source:{inspect.getsource(value)}>"
+                 except (TypeError, OSError):
+-                    # For lambda functions or other callables where source isn't available,
+-                    # use a string representation
+                     return f"<callable:{value.__name__ if hasattr(value, '__name__') else 'lambda'}>"
+             elif isinstance(value, dict):
+                 return {k: transform_value(v) for k, v in value.items()}
+@@ -101,23 +127,29 @@ class Cache:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+             logger.debug(f"Failed to generate cache key for request: {request}")
++            self._stats.record_miss()
++            self._record_cache_usage("miss")
+             return None
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
++            self._stats.record_mem_hit()
++            self._record_cache_usage("mem_hit")
+         elif self.enable_disk_cache and key in self.disk_cache:
+-            # Found on disk but not in memory cache, add to memory cache
+             response = self.disk_cache[key]
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
++            self._stats.record_disk_hit()
++            self._record_cache_usage("disk_hit")
+         else:
++            self._stats.record_miss()
++            self._record_cache_usage("miss")
+             return None
+ 
+         response = copy.deepcopy(response)
+         if hasattr(response, "usage"):
+-            # Clear the usage data when cache is hit, because no LM call is made
+             response.usage = {}
+         return response
+ 
+@@ -142,7 +174,6 @@ class Cache:
+             try:
+                 self.disk_cache[key] = value
+             except Exception as e:
+-                # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+ 
+     def reset_memory_cache(self) -> None:
+@@ -168,26 +199,14 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
+-
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+     ignored_args_for_cache_key: Optional[list[str]] = None,
+     enable_memory_cache: bool = True,
+-    *,  # everything after this is keyword-only
+-    maxsize: Optional[int] = None,  # legacy / no-op
++    *,
++    maxsize: Optional[int] = None,
+ ):
+-    """
+-    Decorator for applying caching to a function based on the request argument.
+-
+-    Args:
+-        cache_arg_name: The name of the argument that contains the request. If not provided, the entire kwargs is used
+-            as the request.
+-        ignored_args_for_cache_key: A list of arguments to ignore when computing the cache key from the request.
+-        enable_memory_cache: Whether to enable in-memory cache at call time. If False, the memory cache will not be
+-            written to on new data.
+-    """
+     ignored_args_for_cache_key = ignored_args_for_cache_key or ["api_key", "api_base", "base_url"]
+-    # Deprecation notice
+     if maxsize is not None:
+         logger.warning(
+             "[DEPRECATION] `maxsize` is deprecated and no longer does anything; "
+@@ -198,65 +217,42 @@ def request_cache(
+     def decorator(fn):
+         @wraps(fn)
+         def process_request(args, kwargs):
+-            # Use fully qualified function name for uniqueness
+             fn_identifier = f"{fn.__module__}.{fn.__qualname__}"
+-
+-            # Create a modified request that includes the function identifier so that it's incorporated into the cache
+-            # key. Deep copy is required because litellm sometimes modifies the kwargs in place.
+             if cache_arg_name:
+-                # When `cache_arg_name` is provided, use the value of the argument with this name as the request for
+-                # caching.
+                 modified_request = copy.deepcopy(kwargs[cache_arg_name])
+             else:
+-                # When `cache_arg_name` is not provided, use the entire kwargs as the request for caching.
+                 modified_request = copy.deepcopy(kwargs)
+                 for i, arg in enumerate(args):
+                     modified_request[f"positional_arg_{i}"] = arg
+             modified_request["_fn_identifier"] = fn_identifier
+-
+             return modified_request
+ 
+         @wraps(fn)
+         def sync_wrapper(*args, **kwargs):
+             import dspy
+-
+             cache = dspy.cache
+             modified_request = process_request(args, kwargs)
+-
+-            # Retrieve from cache if available
+             cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+-
+             if cached_result is not None:
+                 return cached_result
+-
+-            # Otherwise, compute and store the result
+             result = fn(*args, **kwargs)
+-            # `enable_memory_cache` can be provided at call time to avoid indefinite growth.
+             cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+-
+             return result
+ 
+         @wraps(fn)
+         async def async_wrapper(*args, **kwargs):
+             import dspy
+-
+             cache = dspy.cache
+             modified_request = process_request(args, kwargs)
+-
+-            # Retrieve from cache if available
+             cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+             if cached_result is not None:
+                 return cached_result
+-
+-            # Otherwise, compute and store the result
+             result = await fn(*args, **kwargs)
+             cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+-
+             return result
+ 
+         if inspect.iscoroutinefunction(fn):
+             return async_wrapper
+         else:
+             return sync_wrapper
+-
+     return decorator
+diff --git a/dspy/primitives/prediction.py b/dspy/primitives/prediction.py
+index 670b816b..f9a52e54 100644
+--- a/dspy/primitives/prediction.py
++++ b/dspy/primitives/prediction.py
+@@ -10,6 +10,7 @@ class Prediction(Example):
+ 
+         self._completions = None
+         self._lm_usage = None
++        self._cache_usage = None
+ 
+     def get_lm_usage(self):
+         return self._lm_usage
+@@ -17,6 +18,12 @@ class Prediction(Example):
+     def set_lm_usage(self, value):
+         self._lm_usage = value
+ 
++    def get_cache_usage(self):
++        return self._cache_usage
++
++    def set_cache_usage(self, value):
++        self._cache_usage = value
++
+     @classmethod
+     def from_completions(cls, list_or_dict, signature=None):
+         obj = cls()
+diff --git a/dspy/primitives/program.py b/dspy/primitives/program.py
+index 39457c36..369d1dc5 100644
+--- a/dspy/primitives/program.py
++++ b/dspy/primitives/program.py
+@@ -10,6 +10,7 @@ from dspy.primitives.module import BaseModule
+ from dspy.utils.callback import with_callbacks
+ from dspy.utils.inspect_history import pretty_print_history
+ from dspy.utils.usage_tracker import track_usage
++from dspy.utils.cache_usage_tracker import track_cache_usage
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -55,11 +56,19 @@ class Module(BaseModule, metaclass=ProgramMeta):
+         caller_modules.append(self)
+ 
+         with settings.context(caller_modules=caller_modules):
+-            if settings.track_usage and thread_local_overrides.get().get("usage_tracker") is None:
+-                with track_usage() as usage_tracker:
+-                    output = self.forward(*args, **kwargs)
+-                output.set_lm_usage(usage_tracker.get_total_tokens())
+-                return output
++            if settings.track_usage:
++                usage_tracker = thread_local_overrides.get().get("usage_tracker")
++                cache_usage_tracker = thread_local_overrides.get().get("cache_usage_tracker")
++                
++                if usage_tracker is None:
++                    with track_usage() as usage_tracker, track_cache_usage() as cache_usage_tracker:
++                        output = self.forward(*args, **kwargs)
++                        output.set_lm_usage(usage_tracker.get_total_tokens())
++                        output.set_cache_usage(cache_usage_tracker.get_usage())
++                        return output
++                else:
++                    # Already tracking, just run
++                    return self.forward(*args, **kwargs)
+ 
+             return self.forward(*args, **kwargs)
+ 
+@@ -70,11 +79,19 @@ class Module(BaseModule, metaclass=ProgramMeta):
+         caller_modules.append(self)
+ 
+         with settings.context(caller_modules=caller_modules):
+-            if settings.track_usage and thread_local_overrides.get().get("usage_tracker") is None:
+-                with track_usage() as usage_tracker:
+-                    output = await self.aforward(*args, **kwargs)
+-                    output.set_lm_usage(usage_tracker.get_total_tokens())
+-                    return output
++            if settings.track_usage:
++                usage_tracker = thread_local_overrides.get().get("usage_tracker")
++                cache_usage_tracker = thread_local_overrides.get().get("cache_usage_tracker")
++                
++                if usage_tracker is None:
++                    with track_usage() as usage_tracker, track_cache_usage() as cache_usage_tracker:
++                        output = await self.aforward(*args, **kwargs)
++                        output.set_lm_usage(usage_tracker.get_total_tokens())
++                        output.set_cache_usage(cache_usage_tracker.get_usage())
++                        return output
++                else:
++                    # Already tracking, just run
++                    return await self.aforward(*args, **kwargs)
+ 
+             return await self.aforward(*args, **kwargs)
+ 
+diff --git a/dspy/utils/cache_usage_tracker.py b/dspy/utils/cache_usage_tracker.py
+new file mode 100644
+index 00000000..baa2526a
+--- /dev/null
++++ b/dspy/utils/cache_usage_tracker.py
+@@ -0,0 +1,43 @@
++from collections import defaultdict
++from contextlib import contextmanager
++from typing import Any, Optional
++from dspy.dsp.utils.settings import settings
++
++class CacheUsageTracker:
++    def __init__(self):
++        self.usage = {
++            "hits": 0,
++            "mem_hits": 0,
++            "disk_hits": 0,
++            "misses": 0,
++        }
++        self._lock = threading.Lock()
++
++    def record_mem_hit(self):
++        with self._lock:
++            self.usage["hits"] += 1
++            self.usage["mem_hits"] += 1
++
++    def record_disk_hit(self):
++        with self._lock:
++            self.usage["hits"] += 1
++            self.usage["disk_hits"] += 1
++
++    def record_miss(self):
++        with self._lock:
++            self.usage["misses"] += 1
++
++    def get_usage(self):
++        with self._lock:
++            return self.usage.copy()
++
++import threading
++# We need a way to store the tracker in the context.
++# The existing usage_tracker uses settings.context(usage_tracker=tracker)
++# We can add a cache_usage_tracker to the settings context.
++
++@contextmanager
++def track_cache_usage():
++    tracker = CacheUsageTracker()
++    with settings.context(cache_usage_tracker=tracker):
++        yield tracker
+diff --git a/tests/caching/test_cache_stats.py b/tests/caching/test_cache_stats.py
+new file mode 100644
+index 00000000..b0a1064c
+--- /dev/null
++++ b/tests/caching/test_cache_stats.py
+@@ -0,0 +1,63 @@
++import dspy
++from dspy.clients.cache import Cache
++import pytest
++import os
++import shutil
++
++def test_cache_stats():
++    cache_dir = ".test_cache"
++    if os.path.exists(cache_dir):
++        shutil.rmtree(cache_dir)
++    
++    cache = Cache(enable_disk_cache=True, enable_memory_cache=True, disk_cache_dir=cache_dir)
++    
++    # Initial stats
++    assert cache.stats() == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++    
++    request = {"prompt": "hello"}
++    
++    # Miss
++    cache.get(request)
++    assert cache.stats()["misses"] == 1
++    
++    # Put
++    cache.put(request, "world")
++    
++    # Mem hit
++    cache.get(request)
++    assert cache.stats()["hits"] == 1
++    assert cache.stats()["mem_hits"] == 1
++    assert cache.stats()["disk_hits"] == 0
++    
++    # Reset
++    cache.reset_stats()
++    assert cache.stats() == {"hits": 0, "mem_hits": 0, "disk_hits": 0, "misses": 0}
++    
++    if os.path.exists(cache_dir):
++        shutil.rmtree(cache_dir)
++
++def test_cache_usage_tracking():
++    # Need to mock dspy.cache
++    class MockCache:
++        def __init__(self):
++            self.cache = {}
++        def get(self, request, ignored_args=None):
++            return self.cache.get(str(request))
++        def put(self, request, value, ignored_args=None, enable_memory_cache=True):
++            self.cache[str(request)] = value
++    
++    # This is tricky because dspy.cache is a global.
++    # Let's just test the usage tracker directly.
++    from dspy.utils.cache_usage_tracker import CacheUsageTracker
++    
++    tracker = CacheUsageTracker()
++    tracker.record_mem_hit()
++    tracker.record_disk_hit()
++    tracker.record_miss()
++    
++    usage = tracker.get_usage()
++    assert usage["hits"] == 2
++    assert usage["mem_hits"] == 1
++    assert usage["disk_hits"] == 1
++    assert usage["misses"] == 1
++

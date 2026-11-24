@@ -1,0 +1,220 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..07c9ff04 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add hierarchical ``groupby`` results for an explicit positive number of
++    attribute levels.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..76959e69 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1161,9 +1161,10 @@ class _GroupTuple(t.NamedTuple):
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.List[t.Union[str, int]]],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    levels: t.Optional[int] = None,
++) -> "t.List[_GroupTuple]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+     nested access, like ``"address.city"``. Unlike Python's ``groupby``,
+@@ -1203,12 +1204,71 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    Multi-level grouping is supported by providing a list of attributes
++    and specifying the ``levels`` parameter. For example, to group by
++    department and then by role:
++
++    .. sourcecode:: jinja
++
++        {% for dept_group in users|groupby(["department", "role"], levels=2) %}
++          <h2>{{ dept_group.grouper }}</h2>
++          {% for role_group in dept_group.list %}
++            <h3>{{ role_group.grouper }}</h3>
++            <ul>{% for user in role_group.list %}
++              <li>{{ user.name }}</li>
++            {% endfor %}</ul>
++          {% endfor %}
++        {% endfor %}
++
++    .. versionchanged:: 3.1
++        Added multi-level grouping with ``levels`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
++    if levels is not None:
++        if type(levels) is not int or levels < 1:
++            raise FilterArgumentError("levels must be a positive integer")
++        if isinstance(attribute, str):
++            attribute = [item.strip() for item in attribute.split(",")]
++        elif not isinstance(attribute, list):
++            attribute = [attribute]
++        if len(attribute) != levels:
++            raise FilterArgumentError("levels must equal the number of attributes")
++
++    # Handle multi-level grouping
++    if levels is not None and levels > 1:
++        assert isinstance(attribute, list)
++        # First level grouping
++        first_attr = attribute[0]
++        expr = make_attrgetter(environment, first_attr, default=default)
++        first_level_groups = [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value, key=expr), expr)
++        ]
++
++        # Apply recursive grouping to each first-level group
++        if levels > 1:
++            for group in first_level_groups:
++                # Recursively group the items in this group
++                remaining_attrs = attribute[1:]
++                remaining_levels = levels - 1
++                group.list[:] = sync_do_groupby(
++                    environment, group.list, remaining_attrs, default, remaining_levels
++                )
++
++        return first_level_groups
++
++    # Single-level grouping (original behavior)
++    if isinstance(attribute, list):
++        if len(attribute) == 1:
++            attribute = attribute[0]
++        else:
++            raise FilterArgumentError("Multiple attributes require levels parameter")
++
+     expr = make_attrgetter(environment, attribute, default=default)
+     return [
+         _GroupTuple(key, list(values))
+@@ -1220,14 +1280,15 @@ def sync_do_groupby(
+ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.List[t.Union[str, int]]],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    levels: t.Optional[int] = None,
++) -> "t.List[_GroupTuple]":
++    # Convert async iterable to list first
++    value_list = await auto_to_list(value)
++
++    # Use the sync version for the actual grouping logic
++    return sync_do_groupby(environment, value_list, attribute, default, levels)
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_levels_contribution.py b/tests/test_groupby_levels_contribution.py
+new file mode 100644
+index 00000000..0a50b0a2
+--- /dev/null
++++ b/tests/test_groupby_levels_contribution.py
+@@ -0,0 +1,88 @@
++import asyncio
++from copy import deepcopy
++
++import pytest
++
++from jinja2 import Environment
++from jinja2.exceptions import FilterArgumentError
++
++
++def test_levels_form_complete_hierarchy_without_mutation():
++    env = Environment()
++    rows = [
++        {"department": "eng", "role": "dev", "id": 1},
++        {"department": "sales", "role": "rep", "id": 2},
++        {"department": "eng", "role": "dev", "id": 3},
++    ]
++    before = deepcopy(rows)
++    attrs = ["department", "role"]
++
++    groups = env.call_filter("groupby", iter(rows), [attrs], {"levels": 2})
++    leaves = [row for outer in groups for inner in outer.list for row in inner.list]
++
++    assert sorted(row["id"] for row in leaves) == [1, 2, 3]
++    assert groups[0].grouper == "eng"
++    assert groups[0].list[0].grouper == "dev"
++    assert groups[0].list[0].list == [rows[0], rows[2]]
++    assert attrs == ["department", "role"]
++    assert rows == before
++
++
++def test_levels_accept_comma_separated_dotted_and_numeric_attributes():
++    env = Environment()
++    rows = [
++        {"meta": [{"department": "eng"}], "role": "dev"},
++        {"meta": [{"department": "eng"}], "role": "manager"},
++    ]
++    groups = env.call_filter(
++        "groupby", rows, ["meta.0.department, role"], {"levels": 2}
++    )
++
++    assert [group.grouper for group in groups] == ["eng"]
++    assert [group.grouper for group in groups[0].list] == ["dev", "manager"]
++
++
++def test_levels_apply_default_at_each_depth():
++    env = Environment()
++    rows = [{"department": "eng"}, {}]
++    groups = env.call_filter(
++        "groupby",
++        rows,
++        [["department", "role"]],
++        {"levels": 2, "default": "missing"},
++    )
++
++    assert [(g.grouper, [child.grouper for child in g.list]) for g in groups] == [
++        ("eng", ["missing"]),
++        ("missing", ["missing"]),
++    ]
++
++
++@pytest.mark.parametrize(
++    ("attributes", "levels"),
++    [(["a", "b"], 1), (["a"], 2), (["a"], 0), (["a"], True), (["a"], 1.5)],
++)
++def test_levels_validate_attribute_count_and_domain(attributes, levels):
++    env = Environment()
++
++    with pytest.raises(FilterArgumentError):
++        env.call_filter("groupby", [], [attributes], {"levels": levels})
++
++
++def test_levels_async_accepts_async_input_and_preserves_group_interface():
++    async def rows():
++        for value in [{"a": "x", "b": 2}, {"a": "x", "b": 1}]:
++            yield value
++
++    async def run():
++        env = Environment(enable_async=True)
++        return await env.call_filter("groupby", rows(), [["a", "b"]], {"levels": 2})
++
++    groups = asyncio.run(run())
++
++    assert tuple(groups[0]) == ("x", groups[0].list)
++    assert [tuple(child) for child in groups[0].list] == [
++        (1, [groups[0].list[0].list[0]]),
++        (2, [groups[0].list[1].list[0]]),
++    ]
++    assert repr(groups[0]).startswith("('x', [")

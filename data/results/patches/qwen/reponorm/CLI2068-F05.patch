@@ -1,0 +1,332 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..9a78753 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        lock_files: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.lock_files = lock_files
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -506,26 +508,73 @@ class Editor:
+         return "vi"
+ 
+     def edit_file(self, filename: str) -> None:
++        import errno
++        import stat
+         import subprocess
+ 
+-        editor = self.get_editor()
+-        environ: dict[str, str] | None = None
++        # Handle file locking if enabled and filename is provided
++        lock_path: str | None = None
++        if self.lock_files and filename is not None:
++            basename = os.path.basename(filename)
++            lock_name = f".{basename}.lock"
++            lock_path = os.path.join(os.path.dirname(filename), lock_name)
+ 
+-        if self.env:
+-            environ = os.environ.copy()
+-            environ.update(self.env)
++            # Try to create lock file atomically using O_EXCL
++            try:
++                fd = os.open(
++                    lock_path,
++                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
++                    stat.S_IRUSR | stat.S_IWUSR,
++                )
++                with os.fdopen(fd, "w") as f:
++                    f.write(f"PID: {os.getpid()}\n")
++                    f.write(f"Time: {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
++            except OSError as e:
++                if e.errno == errno.EEXIST:
++                    # Lock exists, read it for better error message
++                    try:
++                        with open(lock_path, "r") as lf:
++                            lock_info = lf.read().strip()
++                    except OSError:
++                        lock_info = None
++                    raise ClickException(
++                        _("File is locked by another process.\nLock file: {path}\nLock info: {info}").format(
++                            path=lock_path, info=lock_info or "unknown"
++                        )
++                    ) from e
++                else:
++                    raise ClickException(
++                        _("Failed to create lock file: {e}").format(e=e)
++                    ) from e
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
+-            if exit_code != 0:
++            editor = self.get_editor()
++            environ: dict[str, str] | None = None
++
++            if self.env:
++                environ = os.environ.copy()
++                environ.update(self.env)
++
++            try:
++                c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++                exit_code = c.wait()
++                if exit_code != 0:
++                    raise ClickException(
++                        _("{editor}: Editing failed").format(editor=editor)
++                    )
++            except OSError as e:
+                 raise ClickException(
+-                    _("{editor}: Editing failed").format(editor=editor)
+-                )
+-        except OSError as e:
+-            raise ClickException(
+-                _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+-            ) from e
++                    _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
++                ) from e
++        finally:
++            # Remove lock file on exit (success or failure)
++            if lock_path is not None:
++                try:
++                    os.unlink(lock_path)
++                except OSError as e:
++                    raise ClickException(
++                        _("Failed to remove lock file: {e}").format(e=e)
++                    ) from e
+ 
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..51698b0 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    lock_files: bool = False,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,20 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param lock_files: if ``True``, create a lock file before editing a
++                       filename to prevent concurrent edits. The lock file
++                       is named ``.{basename}.lock`` and contains the PID
++                       and timestamp. Defaults to ``False``.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        lock_files=lock_files,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..46645df 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,187 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_files_enabled(runner):
++    """Test that lock_files creates and removes lock file on successful edit."""
++    import os
++    import tempfile
++    
++    with runner.isolated_filesystem():
++        # Create a test file
++        test_file = "test.txt"
++        with open(test_file, "w") as f:
++            f.write("original content\n")
++        
++        # Edit with lock_files enabled using sed (simple editor)
++        result = click.edit(filename=test_file, editor="sed -i 's/original/modified/'", lock_files=True)
++        
++        # Check lock file was created and removed
++        lock_file = f".{os.path.basename(test_file)}.lock"
++        assert not os.path.exists(lock_file), "Lock file should be removed after successful edit"
++        
++        # Check file was modified
++        with open(test_file, "r") as f:
++            content = f.read()
++        assert "modified" in content
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_files_concurrent_access(runner):
++    """Test that concurrent access is prevented by lock file."""
++    import os
++    import time
++    
++    with runner.isolated_filesystem():
++        # Create a test file
++        test_file = "concurrent.txt"
++        with open(test_file, "w") as f:
++            f.write("content\n")
++        
++        # Create lock file manually to simulate another process
++        lock_file = f".{os.path.basename(test_file)}.lock"
++        with open(lock_file, "w") as f:
++            f.write(f"PID: 12345\nTime: 2024-01-01T12:00:00\n")
++        
++        # Try to edit - should fail with ClickException
++        from click.exceptions import ClickException
++        with pytest.raises(ClickException) as exc_info:
++            click.edit(filename=test_file, editor="cat", lock_files=True)
++        
++        # Check error message contains lock info
++        assert lock_file in str(exc_info.value)
++        assert "12345" in str(exc_info.value) or "unknown" in str(exc_info.value)
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_files_content_format(runner):
++    """Test that lock file has correct format with PID and Time."""
++    import os
++    import time
++    
++    with runner.isolated_filesystem():
++        # Create a test file
++        test_file = "format_test.txt"
++        with open(test_file, "w") as f:
++            f.write("content\n")
++        
++        # Manually create lock file to check format
++        lock_file = f".{os.path.basename(test_file)}.lock"
++        pid = os.getpid()
++        current_time = time.strftime('%Y-%m-%dT%H:%M:%S')
++        
++        # Use O_EXCL to atomically create lock
++        fd = os.open(lock_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
++        with os.fdopen(fd, "w") as f:
++            f.write(f"PID: {pid}\n")
++            f.write(f"Time: {current_time}\n")
++        
++        # Read and verify format
++        with open(lock_file, "r") as f:
++            content = f.read()
++        
++        assert f"PID: {pid}" in content
++        assert "Time:" in content
++        
++        # Clean up
++        os.unlink(lock_file)
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_files_different_dirs(runner):
++    """Test that same basename in different directories have independent locks."""
++    import os
++    
++    with runner.isolated_filesystem():
++        # Create two directories
++        dir1 = "dir1"
++        dir2 = "dir2"
++        os.makedirs(dir1)
++        os.makedirs(dir2)
++        
++        # Create test files with same name in different dirs
++        file1 = os.path.join(dir1, "test.txt")
++        file2 = os.path.join(dir2, "test.txt")
++        
++        with open(file1, "w") as f:
++            f.write("content1\n")
++        with open(file2, "w") as f:
++            f.write("content2\n")
++        
++        # Create lock for file1
++        lock1 = os.path.join(dir1, ".test.txt.lock")
++        with open(lock1, "w") as f:
++            f.write(f"PID: 11111\nTime: 2024-01-01T12:00:00\n")
++        
++        # Editing file2 should succeed because lock is in different directory
++        result = click.edit(filename=file2, editor="sed -i 's/content2/modified2/'", lock_files=True)
++        
++        # Lock for file1 should still exist
++        assert os.path.exists(lock1)
++        
++        # File2 should be modified
++        with open(file2, "r") as f:
++            content = f.read()
++        assert "modified2" in content
++        
++        # Clean up
++        os.unlink(lock1)
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_files_false_no_locking(runner):
++    """Test that lock_files=False preserves existing behavior (no locking)."""
++    import os
++    with runner.isolated_filesystem():
++        # Create a test file
++        test_file = "no_lock.txt"
++        with open(test_file, "w") as f:
++            f.write("content\n")
++        
++        # Edit with lock_files=False (default)
++        click.edit(filename=test_file, editor="sed -i 's/content/modified/'", lock_files=False)
++        
++        # No lock file should be created
++        lock_file = f".{os.path.basename(test_file)}.lock"
++        assert not os.path.exists(lock_file)
++        
++        # File should be modified
++        with open(test_file, "r") as f:
++            content = f.read()
++        assert "modified" in content
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_files_nonzero_exit(runner):
++    """Test that lock is removed even when editor exits with nonzero code."""
++    import os
++    from click.exceptions import ClickException
++    
++    with runner.isolated_filesystem():
++        # Create a test file
++        test_file = "nonzero.txt"
++        with open(test_file, "w") as f:
++            f.write("content\n")
++        
++        # Use an editor that always fails
++        with pytest.raises(ClickException):
++            click.edit(filename=test_file, editor="false", lock_files=True)
++        
++        # Lock file should be removed even on failure
++        lock_file = f".{os.path.basename(test_file)}.lock"
++        assert not os.path.exists(lock_file)
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="Unix-specific lock behavior")
++def test_edit_lock_text_form_ignores_locking(runner):
++    """Test that locking does not apply to the text form (temporary file)."""
++    import os
++    
++    # When editing text (not filename), no lock should be attempted
++    # The text form uses a temporary file, so no .lock file should be created anywhere
++    result = click.edit(text="some text", editor="cat", lock_files=True, require_save=False)
++    # Text form returns the edited content or None based on require_save
++    # The key point is that no lock file is created for temp files
++    assert result is None or result == "some text\n"

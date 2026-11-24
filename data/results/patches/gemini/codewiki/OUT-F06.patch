@@ -1,0 +1,199 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..697b8b1 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,6 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Callable, Optional, Any
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -13,6 +13,9 @@ from outlines.processors.base_logits_processor import (
+ if TYPE_CHECKING:
+     from xgrammar.contrib.hf import LogitsProcessor
+ 
++# Sentinel value to indicate that no validation callback was provided
++_NOT_PROVIDED = object()
++
+ 
+ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+     """Logits processor for XGrammar.
+@@ -53,12 +56,18 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self,
++        model: SteerableModel,
++        validate_grammar: Optional[Callable[[str], None]] = None,
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        validate_grammar
++            A callback to validate the grammar string.
+ 
+         """
+         import xgrammar as xgr
+@@ -69,6 +78,8 @@ class XGrammarBackend(BaseBackend):
+                 "The xgrammar backend only supports Transformers models"
+             )
+ 
++        self.validate_grammar = validate_grammar
++
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+@@ -78,8 +89,15 @@ class XGrammarBackend(BaseBackend):
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
++    def _validate(self, grammar: str, validate_grammar: Any):
++        if validate_grammar is _NOT_PROVIDED:
++            validate_grammar = self.validate_grammar
++        
++        if validate_grammar is not None:
++            validate_grammar(grammar)
++
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self, json_schema: str, validate_grammar: Optional[Callable[[str], None]] = _NOT_PROVIDED
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +105,8 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        validate_grammar
++            A callback to validate the grammar string.
+ 
+         Returns
+         -------
+@@ -94,18 +114,23 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        self._validate(json_schema, validate_grammar)
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self, regex: str, validate_grammar: Optional[Callable[[str], None]] = _NOT_PROVIDED
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        validate_grammar
++            A callback to validate the grammar string.
+ 
+         Returns
+         -------
+@@ -113,16 +138,21 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        self._validate(regex, validate_grammar)
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self, grammar: str, validate_grammar: Optional[Callable[[str], None]] = _NOT_PROVIDED
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        validate_grammar
++            A callback to validate the grammar string.
+ 
+         Returns
+         -------
+@@ -130,5 +160,6 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        self._validate(grammar, validate_grammar)
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+         return XGrammarLogitsProcessor(compiled_grammar)
+diff --git a/tests/backends/test_xgrammar_validation.py b/tests/backends/test_xgrammar_validation.py
+new file mode 100644
+index 0000000..523b21c
+--- /dev/null
++++ b/tests/backends/test_xgrammar_validation.py
+@@ -0,0 +1,61 @@
++import pytest
++from unittest.mock import MagicMock, patch
++from outlines.backends.xgrammar import XGrammarBackend
++from outlines.models.transformers import Transformers
++
++@pytest.fixture
++def mock_model():
++    model = MagicMock(spec=Transformers)
++    model.model = MagicMock()
++    model.model.config = MagicMock()
++    model.model.config._name_or_path = "gpt2"
++    model.hf_tokenizer = MagicMock()
++    return model
++
++def test_xgrammar_validation_callback(mock_model):
++    # Mock xgrammar
++    import sys
++    from unittest.mock import MagicMock
++    mock_xgrammar = MagicMock()
++    sys.modules["xgrammar"] = mock_xgrammar
++    
++    # Mock transformers.AutoConfig
++    import transformers
++    mock_auto_config = MagicMock()
++    mock_auto_config.from_pretrained.return_value.vocab_size = 50257
++    
++    with patch("transformers.AutoConfig", mock_auto_config):
++        
++        # 1. Test default validation
++        validation_called = False
++        def validator(grammar):
++            nonlocal validation_called
++            validation_called = True
++            if grammar == "invalid":
++                raise ValueError("Invalid grammar")
++
++        backend = XGrammarBackend(mock_model, validate_grammar=validator)
++        
++        # Test valid grammar
++        backend.get_regex_logits_processor("valid")
++        assert validation_called is True
++        
++        # Test invalid grammar
++        validation_called = False
++        with pytest.raises(ValueError, match="Invalid grammar"):
++            backend.get_regex_logits_processor("invalid")
++        assert validation_called is True
++        
++        # 2. Test override validation
++        validation_called = False
++        def override_validator(grammar):
++            nonlocal validation_called
++            validation_called = True
++            
++        backend.get_regex_logits_processor("valid", validate_grammar=override_validator)
++        assert validation_called is True
++        
++        # 3. Test disable validation
++        validation_called = False
++        backend.get_regex_logits_processor("valid", validate_grammar=None)
++        assert validation_called is False

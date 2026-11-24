@@ -1,0 +1,182 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..d82354f3 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add optional bounded raw translation caching with partition, resize,
++    clear, and independent overlay state.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b7..3d9389a9 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -68,7 +68,7 @@ additional methods:
+ 
+     .. versionchanged:: 2.5 Added new-style gettext support.
+ 
+-.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None)
++.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None, cache_size=0, cache_partition=None)
+ 
+     Install the given ``gettext``, ``ngettext``, ``pgettext``, and
+     ``npgettext`` callables into the environment. They should behave
+@@ -84,6 +84,20 @@ additional methods:
+     .. versionadded:: 2.5
+         Added new-style gettext support.
+ 
++    Translation callables may use ``cache_size`` (default ``0``) and a
++    hashable ``cache_partition``. A positive capacity enables bounded
++    LRU caching.
++    Results are raw provider values, before formatting and autoescaping.
++    Context, messages, count, function kind, and partition distinguish
++    keys. Use a distinct partition for every locale or request state.
++    ``set_translation_cache_partition(value)`` changes the partition and
++    clears old entries; ``clear_translation_cache()`` clears entries;
++    ``resize_translation_cache(capacity)`` immediately applies a
++    non-negative bound, with zero clearing and disabling caching.
++    Invalid capacities raise ``ValueError``. Installation and
++    uninstallation clear old results.
++    Environments and overlays maintain independent cache state.
++
+ .. method:: jinja2.Environment.uninstall_gettext_translations()
+ 
+     Uninstall the environment's globally installed translation.
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..e75b546f 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -2,6 +2,7 @@
+ import pprint
+ import re
+ import typing as t
++from collections import OrderedDict
+ 
+ from markupsafe import Markup
+ 
+@@ -263,9 +264,85 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            clear_translation_cache=self._clear_translation_cache,
++            resize_translation_cache=self._resize_translation_cache,
++            set_translation_cache_partition=self._set_translation_cache_partition,
+             newstyle_gettext=False,
++            i18n_cache_size=0,
++            i18n_cache_partition=None,
++            i18n_translation_cache=OrderedDict(),
+         )
+ 
++    def bind(self, environment: Environment) -> "InternationalizationExtension":
++        """Bind independent translation cache state to an overlay.
++
++        .. versionchanged:: 3.1.0
++            Translation cache state is independent across overlays.
++        """
++        rv = t.cast("InternationalizationExtension", super().bind(environment))
++        environment.globals = dict(environment.globals)
++        environment.i18n_translation_cache = OrderedDict(  # type: ignore
++            self.environment.i18n_translation_cache  # type: ignore
++        )
++        for name, method in (
++            ("install_gettext_translations", rv._install),
++            ("install_null_translations", rv._install_null),
++            ("install_gettext_callables", rv._install_callables),
++            ("uninstall_gettext_translations", rv._uninstall),
++            ("extract_translations", rv._extract),
++            ("clear_translation_cache", rv._clear_translation_cache),
++            ("resize_translation_cache", rv._resize_translation_cache),
++            ("set_translation_cache_partition", rv._set_translation_cache_partition),
++        ):
++            setattr(environment, name, method)
++        return rv
++
++    def _clear_translation_cache(self) -> None:
++        """Clear this environment's application translation cache."""
++        self.environment.i18n_translation_cache.clear()  # type: ignore
++
++    def _resize_translation_cache(self, capacity: int) -> None:
++        """Set capacity, evict excess entries, and disable at zero."""
++        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
++            raise ValueError(
++                "translation cache capacity must be a non-negative integer"
++            )
++        self.environment.i18n_cache_size = capacity  # type: ignore
++        cache = self.environment.i18n_translation_cache  # type: ignore
++        while len(cache) > capacity:
++            cache.popitem(last=False)
++        if capacity == 0:
++            cache.clear()
++
++    def _set_translation_cache_partition(self, partition: t.Hashable) -> None:
++        """Change the cache partition and clear existing entries."""
++        hash(partition)
++        if partition != self.environment.i18n_cache_partition:  # type: ignore
++            self.environment.i18n_cache_partition = partition  # type: ignore
++            self._clear_translation_cache()
++
++    def _cache_callable(
++        self, kind: str, function: t.Callable[..., str]
++    ) -> t.Callable[..., str]:
++        @pass_context
++        def cached(context: Context, *args: t.Any) -> str:
++            environment = context.environment
++            capacity = environment.i18n_cache_size  # type: ignore
++            if capacity == 0:
++                return t.cast(str, context.call(function, *args))
++            key = (kind, environment.i18n_cache_partition, args)  # type: ignore
++            cache = environment.i18n_translation_cache  # type: ignore
++            try:
++                result = cache.pop(key)
++            except KeyError:
++                result = t.cast(str, context.call(function, *args))
++            cache[key] = result
++            while len(cache) > capacity:
++                cache.popitem(last=False)
++            return t.cast(str, result)
++
++        return cached
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -319,7 +396,23 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Hashable = None,
+     ) -> None:
++        """Install providers with optional raw translation caching.
++
++        .. versionchanged:: 3.1.0
++           Add cache size and application partition options.
++        """
++        self._clear_translation_cache()
++        self._resize_translation_cache(cache_size)
++        self._set_translation_cache_partition(cache_partition)
++        gettext = self._cache_callable("gettext", gettext)
++        ngettext = self._cache_callable("ngettext", ngettext)
++        if pgettext is not None:
++            pgettext = self._cache_callable("pgettext", pgettext)
++        if npgettext is not None:
++            npgettext = self._cache_callable("npgettext", npgettext)
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+         if self.environment.newstyle_gettext:  # type: ignore
+@@ -337,6 +430,12 @@ class InternationalizationExtension(Extension):
+         )
+ 
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
++        """Remove translation globals and clear cached provider results.
++
++        .. versionchanged:: 3.1.0
++           Clear the translation cache when uninstalling providers.
++        """
++        self._clear_translation_cache()
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+ 

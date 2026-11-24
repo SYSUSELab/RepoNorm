@@ -1,0 +1,207 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d..14be23c 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add ``expand_searchpath`` parameter to ``FileSystemLoader`` to expand
++    environment variables and user home directory in search paths. :issue:`XXX`
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..6029438 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -170,9 +170,15 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param expand_searchpath: Expand environment variables (``$VAR``,
++        ``${VAR}``) and user home directory (``~``) in the search path.
++        Defaults to ``False``.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++
++    .. versionadded:: 3.1
++        Added the ``expand_searchpath`` parameter.
+     """
+ 
+     def __init__(
+@@ -180,11 +186,17 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        expand_searchpath: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+-        self.searchpath = [os.fspath(p) for p in searchpath]
++        if expand_searchpath:
++            self.searchpath = [
++                os.path.expanduser(os.path.expandvars(os.fspath(p))) for p in searchpath
++            ]
++        else:
++            self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..313a4e6 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,150 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++class TestFileSystemLoaderExpandSearchPath:
++    """Tests for the expand_searchpath parameter in FileSystemLoader."""
++
++    def test_expand_searchpath_default_false(self, tmp_path):
++        """Default behavior should not expand paths."""
++        template_dir = tmp_path / "templates"
++        template_dir.mkdir()
++        (template_dir / "test.html").write_text("Hello")
++
++        loader = loaders.FileSystemLoader(str(template_dir))
++        # Should preserve the path literally
++        assert loader.searchpath == [str(template_dir)]
++
++    def test_expand_searchpath_true_no_vars(self, tmp_path):
++        """With expand_searchpath=True but no vars, paths should be normalized."""
++        template_dir = tmp_path / "templates"
++        template_dir.mkdir()
++        (template_dir / "test.html").write_text("Hello")
++
++        loader = loaders.FileSystemLoader(str(template_dir), expand_searchpath=True)
++        assert loader.searchpath == [str(template_dir)]
++
++    def test_expand_searchpath_env_var(self, tmp_path, monkeypatch):
++        """Environment variables should be expanded when enabled."""
++        env_var_name = f"JINJA_TEST_PATH_{os.getpid()}"
++        monkeypatch.setenv(env_var_name, str(tmp_path))
++
++        # Use $VAR syntax for environment variable expansion
++        loader = loaders.FileSystemLoader(
++            "$" + env_var_name + "/templates", expand_searchpath=True
++        )
++        expected = os.path.join(tmp_path, "templates")
++        assert loader.searchpath == [expected]
++
++    def test_expand_searchpath_tilde(self, tmp_path, monkeypatch):
++        """Tilde expansion should work when enabled."""
++        # Create a temp dir under home to test ~ expansion
++        home_subdir = Path.home() / (".jinja_test_" + str(os.getpid()))
++        try:
++            home_subdir.mkdir(exist_ok=True)
++            (home_subdir / "test.html").write_text("Home Template")
++
++            # Use ~ prefix to trigger tilde expansion
++            loader = loaders.FileSystemLoader(
++                "~/.jinja_test_" + str(os.getpid()), expand_searchpath=True
++            )
++            # The tilde should be expanded to the home directory
++            assert loader.searchpath[0] == str(home_subdir)
++        finally:
++            import shutil
++            if home_subdir.exists():
++                shutil.rmtree(home_subdir)
++
++    def test_expand_searchpath_list_of_paths(self, tmp_path, monkeypatch):
++        """List of paths should all be expanded when enabled."""
++        path1 = tmp_path / "templates1"
++        path2 = tmp_path / "templates2"
++        path1.mkdir()
++        path2.mkdir()
++        (path1 / "t1.html").write_text("T1")
++        (path2 / "t2.html").write_text("T2")
++
++        env_var_name = f"JINJA_TEST_PATH_{os.getpid()}"
++        monkeypatch.setenv(env_var_name, str(tmp_path))
++
++        # Use $VAR syntax for environment variable expansion
++        loader = loaders.FileSystemLoader(
++            ["$" + env_var_name + "/templates1", "$" + env_var_name + "/templates2"],
++            expand_searchpath=True,
++        )
++        assert len(loader.searchpath) == 2
++        assert os.path.join(tmp_path, "templates1") in loader.searchpath
++        assert os.path.join(tmp_path, "templates2") in loader.searchpath
++
++    def test_expand_searchpath_pathlike(self, tmp_path):
++        """PathLike objects should be converted and expanded."""
++        template_dir = tmp_path / "templates"
++        template_dir.mkdir()
++        (template_dir / "test.html").write_text("Hello")
++
++        loader = loaders.FileSystemLoader(
++            Path(tmp_path) / "templates", expand_searchpath=True
++        )
++        assert loader.searchpath == [str(template_dir)]
++
++    def test_expand_searchpath_undefined_env_var(self, tmp_path):
++        """Undefined environment variables remain as-is."""
++        template_dir = tmp_path / "templates"
++        template_dir.mkdir()
++        (template_dir / "test.html").write_text("Hello")
++
++        loader = loaders.FileSystemLoader(
++            "${UNDEFINED_VAR_12345}/templates", expand_searchpath=True
++        )
++        # Undefined var should remain in the path
++        assert "${UNDEFINED_VAR_12345}/templates" in loader.searchpath[0]
++
++    def test_expand_searchpath_empty_var(self, tmp_path, monkeypatch):
++        """Empty environment variable produces relative or absolute path."""
++        env_var_name = f"JINJA_EMPTY_{os.getpid()}"
++        monkeypatch.setenv(env_var_name, "")
++
++        loader = loaders.FileSystemLoader(
++            f"${{env_var_name}}/templates", expand_searchpath=True
++        )
++        # Empty var results in just "/templates" (absolute) or "./templates" (relative)
++        assert "templates" in loader.searchpath[0]
++
++    def test_expand_searchpath_order_preserved(self, tmp_path, monkeypatch):
++        """Order of paths should be preserved after expansion."""
++        path1 = tmp_path / "first"
++        path2 = tmp_path / "second"
++        path1.mkdir()
++        path2.mkdir()
++
++        env_var_name = f"JINJA_ORDER_{os.getpid()}"
++        monkeypatch.setenv(env_var_name, str(tmp_path))
++
++        loader = loaders.FileSystemLoader(
++            [f"${{env_var_name}}/second", f"${{env_var_name}}/first"],
++            expand_searchpath=True,
++        )
++        # Order should be preserved
++        assert loader.searchpath[0].endswith("second")
++        assert loader.searchpath[1].endswith("first")
++
++    def test_expand_searchpath_no_effect_after_init(self, tmp_path, monkeypatch):
++        """Changes to environment after init should not affect search paths."""
++        template_dir = tmp_path / "templates"
++        template_dir.mkdir()
++        (template_dir / "test.html").write_text("Hello")
++
++        env_var_name = f"JINJA_NO_EFFECT_{os.getpid()}"
++        monkeypatch.setenv(env_var_name, str(tmp_path))
++
++        loader = loaders.FileSystemLoader(
++            f"${{env_var_name}}/templates", expand_searchpath=True
++        )
++        original_path = loader.searchpath[0]
++
++        # Change the environment variable
++        monkeypatch.setenv(env_var_name, str(tmp_path / "other"))
++
++        # Loader's search path should not change
++        assert loader.searchpath[0] == original_path

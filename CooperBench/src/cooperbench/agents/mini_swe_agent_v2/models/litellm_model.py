@@ -1,0 +1,300 @@
+import json
+import logging
+import os
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Literal
+
+import litellm
+from pydantic import BaseModel
+
+from cooperbench.agents.mini_swe_agent_v2.models import GLOBAL_MODEL_STATS
+from cooperbench.agents.mini_swe_agent_v2.models.utils.actions_toolcall import (
+    BASH_TOOL,
+    format_toolcall_observation_messages,
+    parse_toolcall_actions,
+)
+from cooperbench.agents.mini_swe_agent_v2.models.utils.anthropic_utils import _reorder_anthropic_thinking_blocks
+from cooperbench.agents.mini_swe_agent_v2.models.utils.cache_control import set_cache_control
+from cooperbench.agents.mini_swe_agent_v2.models.utils.openai_multimodal import expand_multimodal_content
+from cooperbench.agents.mini_swe_agent_v2.models.utils.retry import retry
+
+logger = logging.getLogger("litellm_model")
+
+
+class LitellmModelConfig(BaseModel):
+    model_name: str
+    """Model name. Highly recommended to include the provider in the model name, e.g., `anthropic/claude-sonnet-4-5-20250929`."""
+    model_kwargs: dict[str, Any] = {}
+    """Additional arguments passed to the API."""
+    litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
+    """Model registry for cost tracking and model metadata. See the local model guide (https://mini-swe-agent.com/latest/models/local_models/) for more details."""
+    set_cache_control: Literal["default_end"] | None = None
+    """Set explicit cache control markers, for example for Anthropic models"""
+    cost_tracking: Literal["default", "ignore_errors"] = os.getenv("MSWEA_COST_TRACKING", "default")
+    """Cost tracking mode for this model. Can be "default" or "ignore_errors" (ignore errors/missing cost info)"""
+    format_error_template: str = "{{ error }}"
+    """Template used when the LM's output is not in the expected format."""
+    observation_template: str = (
+        "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
+        "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
+    )
+    """Template used to render the observation after executing an action."""
+    multimodal_regex: str = ""
+    """Regex to extract multimodal content. Empty string disables multimodal processing."""
+    capture_token_ids: bool = False
+    """Record the exact prompt/response token IDs the inference server used.
+
+    When True, requests carry ``extra_body={"return_token_ids": true}`` so vLLM (>=0.10.2) /
+    SGLang return ``prompt_token_ids`` and ``token_ids`` alongside the usual response. They are
+    stored on each assistant message as ``extra["token_capture"]`` and persist into the saved
+    trajectory.
+
+    This exists for token-level training (distillation, TITO-style SFT), where re-tokenizing a
+    trajectory afterwards is not equivalent: BPE is non-injective, tool-call serialization can
+    differ between inference and training, and under context compaction the prompt a turn
+    actually saw no longer exists in the final message list. Capturing at request time makes
+    the training input identical to what the model saw, by construction.
+
+    Off by default; it only adds response payload when explicitly enabled.
+    """
+
+
+def _with_return_token_ids(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Add ``return_token_ids`` to the request's ``extra_body`` without clobbering it.
+
+    ``extra_body`` is how litellm forwards non-OpenAI fields to the backend, and callers may
+    already be using it, so merge rather than replace.
+    """
+    merged = dict(kwargs)
+    extra_body = dict(merged.get("extra_body") or {})
+    extra_body.setdefault("return_token_ids", True)
+    merged["extra_body"] = extra_body
+    return merged
+
+
+def _extract_token_capture(response: Any) -> dict[str, list[int]] | None:
+    """Pull prompt/output token ids out of a response, or None if the server did not send them.
+
+    Servers differ on placement: vLLM puts ``prompt_token_ids`` on the response and
+    ``token_ids`` on the choice, and some versions nest both under the choice.
+
+    litellm adds a third location. It rebuilds every response into its own model, keeping only
+    fields it knows about; top-level extras survive on ``ModelResponse``, but anything extra on
+    a *choice* is swept into ``provider_specific_fields`` by ``convert_to_model_response_object``.
+    That is where vLLM's per-choice ``token_ids`` actually ends up, so checking only the raw key
+    silently yields nothing and every turn looks uncaptured.
+
+    Note this requires an OpenAI-style provider prefix. litellm's Anthropic path builds its
+    response through a different transform that discards these fields entirely.
+    """
+    try:
+        dumped = response.model_dump()
+    except AttributeError:
+        return None
+    choice = (dumped.get("choices") or [{}])[0]
+    psf = choice.get("provider_specific_fields") or {}
+
+    prompt_ids = dumped.get("prompt_token_ids") or choice.get("prompt_token_ids") or psf.get("prompt_token_ids")
+    output_ids = (
+        choice.get("token_ids")
+        or choice.get("output_token_ids")
+        or psf.get("token_ids")
+        or psf.get("output_token_ids")
+        or (choice.get("message") or {}).get("token_ids")
+    )
+
+    def _clean(ids: Any) -> list[int] | None:
+        if isinstance(ids, list) and ids and all(isinstance(i, int) for i in ids):
+            return ids
+        return None
+
+    prompt_ids, output_ids = _clean(prompt_ids), _clean(output_ids)
+    if prompt_ids is None or output_ids is None:
+        return None
+    return {"prompt_token_ids": prompt_ids, "output_token_ids": output_ids}
+
+
+class LitellmModel:
+    abort_exceptions: list[type[BaseException]] = [
+        litellm.exceptions.UnsupportedParamsError,
+        litellm.exceptions.NotFoundError,
+        litellm.exceptions.PermissionDeniedError,
+        litellm.exceptions.ContextWindowExceededError,
+        litellm.exceptions.AuthenticationError,
+        KeyboardInterrupt,
+    ]
+
+    def __init__(self, *, config_class: Callable = LitellmModelConfig, extra_tools: list[dict] | None = None, **kwargs):
+        self.config = config_class(**kwargs)
+        self._tools = [BASH_TOOL] + (extra_tools or [])
+        if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
+            litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
+
+    def _query(self, messages: list[dict[str, str]], **kwargs):
+        merged = self.config.model_kwargs | kwargs
+        if self.config.capture_token_ids:
+            merged = _with_return_token_ids(merged)
+        try:
+            return litellm.completion(
+                model=self.config.model_name,
+                messages=messages,
+                tools=self._tools,
+                **merged,
+            )
+        except litellm.exceptions.AuthenticationError as e:
+            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
+            raise e
+
+    def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
+        prepared = [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
+        prepared = _reorder_anthropic_thinking_blocks(prepared)
+        return set_cache_control(prepared, mode=self.config.set_cache_control)
+
+    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
+            with attempt:
+                response = self._query(self._prepare_messages_for_api(messages), **kwargs)
+        cost_output = self._calculate_cost(response)
+        GLOBAL_MODEL_STATS.add(cost_output["cost"])
+        message = response.choices[0].message.model_dump()
+        message["extra"] = {
+            "actions": self._parse_actions(response),
+            "response": response.model_dump(),
+            **cost_output,
+            "timestamp": time.time(),
+        }
+        if self.config.capture_token_ids:
+            capture = _extract_token_capture(response)
+            if capture is None:
+                # Loud, because a silently empty capture only shows up much later as a
+                # training set with no usable rows.
+                logger.warning(
+                    "capture_token_ids is set but the server returned no token ids; "
+                    "vLLM >=0.10.2 or SGLang with return_token_ids support is required"
+                )
+            else:
+                message["extra"]["token_capture"] = capture
+        return message
+
+    def _calculate_cost(self, response) -> dict[str, float]:
+        try:
+            cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
+            if cost <= 0.0:
+                raise ValueError(f"Cost must be > 0.0, got {cost}")
+        except Exception as e:
+            cost = 0.0
+            if self.config.cost_tracking != "ignore_errors":
+                msg = (
+                    f"Error calculating cost for model {self.config.model_name}: {e}, perhaps it's not registered? "
+                    "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
+                    "globally with export MSWEA_COST_TRACKING='ignore_errors'. "
+                    "Alternatively check the 'Cost tracking' section in the documentation at "
+                    "https://klieret.short.gy/mini-local-models. "
+                    " Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
+                )
+                logger.critical(msg)
+                raise RuntimeError(msg) from e
+        return {"cost": cost}
+
+    @staticmethod
+    def _serialize_transcript_for_summary(messages: list[dict]) -> str:
+        """Flatten turn-wise messages into a single text transcript.
+
+        Used by summarize_context so the conversation is presented as data to
+        summarize rather than as turns the model should continue. Without this,
+        the model can role-play as the next agent turn (emitting tool-call-like
+        text) instead of producing a summary.
+        """
+        parts = []
+        for m in messages:
+            role = m.get("role", "?")
+            content = m.get("content", "") or ""
+            if role == "assistant":
+                tool_calls = m.get("tool_calls") or []
+                tc_text = ""
+                if tool_calls:
+                    lines = []
+                    for tc in tool_calls:
+                        fn = (tc.get("function") or {}).get("name", "?")
+                        args = (tc.get("function") or {}).get("arguments", "")
+                        lines.append(f"  -> tool_call {fn}({args})")
+                    tc_text = "\n" + "\n".join(lines)
+                parts.append(f"[assistant]\n{content}{tc_text}\n")
+            elif role == "tool":
+                parts.append(f"[tool_output]\n{content}\n")
+            else:
+                parts.append(f"[{role}]\n{content}\n")
+        return "\n".join(parts)
+
+    def summarize_context(self, messages: list[dict], summary_prompt: str) -> dict:
+        """Call the model to summarize conversation history for context compaction.
+
+        The prior conversation is serialized into a single user message as a
+        transcript (rather than passed as turn-wise messages). This frames the
+        model as an outside observer producing a summary, preventing mode
+        contamination where the model continues the conversation as the next
+        assistant turn.
+        """
+        prepared = self._prepare_messages_for_api(messages)
+        transcript = self._serialize_transcript_for_summary(prepared)
+        summary_messages = [
+            {
+                "role": "user",
+                "content": (f"{summary_prompt}\n\n--- BEGIN TRANSCRIPT ---\n{transcript}\n--- END TRANSCRIPT ---"),
+            }
+        ]
+        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
+            with attempt:
+                response = litellm.completion(
+                    model=self.config.model_name,
+                    messages=summary_messages,
+                    **self.config.model_kwargs,
+                )
+        cost_output = self._calculate_cost(response)
+        GLOBAL_MODEL_STATS.add(cost_output["cost"])
+        return {
+            "role": "assistant",
+            "content": response.choices[0].message.content or "",
+            "extra": {
+                "summary": True,
+                **cost_output,
+                "response": response.model_dump(),
+                "timestamp": time.time(),
+            },
+        }
+
+    def _parse_actions(self, response) -> list[dict]:
+        """Parse tool calls from the response. Raises FormatError if unknown tool."""
+        tool_calls = response.choices[0].message.tool_calls or []
+        return parse_toolcall_actions(tool_calls, format_error_template=self.config.format_error_template)
+
+    def format_message(self, **kwargs) -> dict:
+        return expand_multimodal_content(kwargs, pattern=self.config.multimodal_regex)
+
+    def format_observation_messages(
+        self, message: dict, outputs: list[dict], template_vars: dict | None = None
+    ) -> list[dict]:
+        """Format execution outputs into tool result messages."""
+        actions = message.get("extra", {}).get("actions", [])
+        return format_toolcall_observation_messages(
+            actions=actions,
+            outputs=outputs,
+            observation_template=self.config.observation_template,
+            template_vars=template_vars,
+            multimodal_regex=self.config.multimodal_regex,
+        )
+
+    def get_template_vars(self, **kwargs) -> dict[str, Any]:
+        return self.config.model_dump()
+
+    def serialize(self) -> dict:
+        return {
+            "info": {
+                "config": {
+                    "model": self.config.model_dump(mode="json"),
+                    "model_type": f"{self.__class__.__module__}.{self.__class__.__name__}",
+                },
+            }
+        }

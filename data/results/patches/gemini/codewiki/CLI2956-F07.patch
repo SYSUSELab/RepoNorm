@@ -1,0 +1,174 @@
+diff --git a/reproduce_conflict.py b/reproduce_conflict.py
+new file mode 100644
+index 0000000..80cb94b
+--- /dev/null
++++ b/reproduce_conflict.py
+@@ -0,0 +1,30 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo", "foo", conflicts_with=["bar"])
++@click.option("--bar", "bar")
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++runner = CliRunner()
++
++print("Test 1: Both provided")
++result = runner.invoke(cli, ["--foo", "1", "--bar", "2"])
++print(result.output)
++print(result.exit_code)
++
++print("\nTest 2: Only one provided")
++result = runner.invoke(cli, ["--foo", "1"])
++print(result.output)
++print(result.exit_code)
++
++print("\nTest 3: Invalid conflict")
++@click.command()
++@click.option("--foo", "foo", conflicts_with=["baz"])
++def invalid_cli(foo):
++    pass
++
++result = runner.invoke(invalid_cli, ["--foo", "1"])
++print(result.output)
++print(result.exit_code)
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..b0f4dae 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -782,36 +782,9 @@ class Context:
+                     kwargs[param.name] = param.type_cast_value(  # type: ignore
+                         ctx, param.get_default(ctx)
+                     )
+-
+-            # Track all kwargs as params, so that forward() will pass
+-            # them on in subsequent calls.
+-            ctx.params.update(kwargs)
+-        else:
+             ctx = self
+ 
+-        with augment_usage_errors(self):
+-            with ctx:
+-                return callback(*args, **kwargs)
+-
+-    def forward(self, cmd: Command, /, *args: t.Any, **kwargs: t.Any) -> t.Any:
+-        """Similar to :meth:`invoke` but fills in default keyword
+-        arguments from the current context if the other command expects
+-        it.  This cannot invoke callbacks directly, only other commands.
+-
+-        .. versionchanged:: 8.0
+-            All ``kwargs`` are tracked in :attr:`params` so they will be
+-            passed if ``forward`` is called at multiple levels.
+-        """
+-        # Can only forward to other commands, not direct callbacks.
+-        if not isinstance(cmd, Command):
+-            raise TypeError("Callback is not a command.")
+-
+-        for param in self.params:
+-            if param not in kwargs:
+-                kwargs[param] = self.params[param]
+-
+-        return self.invoke(cmd, *args, **kwargs)
+-
++        return ctx.invoke(callback, **kwargs)
+     def set_parameter_source(self, name: str, source: ParameterSource) -> None:
+         """Set the source of a parameter. This indicates the location
+         from which the value of the parameter was obtained.
+@@ -943,7 +916,6 @@ class Command:
+         self.add_help_option = add_help_option
+         self._help_option = None
+         self.no_args_is_help = no_args_is_help
+-        self.hidden = hidden
+         self.deprecated = deprecated
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+@@ -1020,7 +992,6 @@ class Command:
+             all_names.difference_update(param.opts)
+             all_names.difference_update(param.secondary_opts)
+         return list(all_names)
+-
+     def get_help_option(self, ctx: Context) -> Option | None:
+         """Returns the help option object.
+ 
+@@ -1222,6 +1193,20 @@ class Command:
+             ).format(name=self.name, extra_message=extra_message)
+             echo(style(message, fg="red"), err=True)
+ 
++        # Validate conflicts_with
++        param_names = {p.name for p in self.params}
++        for param in self.params:
++            if not isinstance(param, Option) or not param.conflicts_with: continue
++            for conflict in param.conflicts_with:
++                if conflict == param.name:
++                    raise UsageError(f"Option {param.opts[0]!r} cannot conflict with itself.")
++                if conflict not in param_names:
++                    raise UsageError(f"Option {param.opts[0]!r} conflicts with unknown option {conflict!r}.")
++                if (
++                    ctx.get_parameter_source(param.name) in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT)
++                    and ctx.get_parameter_source(conflict) in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT)
++                ):
++                    raise UsageError(f"Option {param.opts[0]!r} cannot be used together with {conflict!r}.")
+         if self.callback is not None:
+             return ctx.invoke(self.callback, **ctx.params)
+ 
+@@ -1550,7 +1535,6 @@ class Group(Command):
+         # The result callback that is stored. This can be set or
+         # overridden with the :func:`result_callback` decorator.
+         self._result_callback = result_callback
+-
+         if self.chain:
+             for param in self.params:
+                 if isinstance(param, Argument) and not param.required:
+@@ -2548,6 +2532,7 @@ class Option(Parameter):
+         hidden: bool = False,
+         show_choices: bool = True,
+         show_envvar: bool = False,
++        conflicts_with: cabc.Sequence[str] | None = None,
+         deprecated: bool | str = False,
+         **attrs: t.Any,
+     ) -> None:
+@@ -2579,9 +2564,16 @@ class Option(Parameter):
+ 
+         self.prompt = prompt_text
+         self.confirmation_prompt = confirmation_prompt
++        if conflicts_with:
++            if isinstance(conflicts_with, str):
++                raise TypeError("conflicts_with must be a sequence of strings.")
++            for conflict in conflicts_with:
++                if not isinstance(conflict, str):
++                    raise TypeError("conflicts_with must be a sequence of strings.")
+         self.prompt_required = prompt_required
+         self.hide_input = hide_input
+         self.hidden = hidden
++        self.conflicts_with = conflicts_with or ()
+ 
+         # If prompt is enabled but not required, then the option can be
+         # used as a flag to indicate using prompt or flag_value.
+@@ -2670,6 +2662,7 @@ class Option(Parameter):
+             is_flag=self.is_flag,
+             flag_value=self.flag_value,
+             count=self.count,
++            conflicts_with=self.conflicts_with,
+             hidden=self.hidden,
+         )
+         return info_dict
+diff --git a/test_debug.py b/test_debug.py
+new file mode 100644
+index 0000000..1fa121f
+--- /dev/null
++++ b/test_debug.py
+@@ -0,0 +1,12 @@
++import click
++from click.testing import CliRunner
++
++@click.command()
++@click.option("--foo", "foo")
++@click.option("--bar", "bar", conflicts_with=["foo"])
++def cli(foo, bar):
++    click.echo(f"foo={foo}, bar={bar}")
++
++runner = CliRunner()
++result = runner.invoke(cli, ["--foo", "1", "--bar", "2"], catch_exceptions=False)
++print(f"Result: {result.exit_code}, Output: {result.output}")

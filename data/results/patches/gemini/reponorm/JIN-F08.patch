@@ -1,0 +1,150 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..12fb93e 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -7,6 +7,7 @@ import typing as t
+ from collections import abc
+ from itertools import chain
+ from itertools import groupby
++from collections import namedtuple
+ 
+ from markupsafe import escape
+ from markupsafe import Markup
+@@ -1144,17 +1145,26 @@ def do_round(
+     return t.cast(float, func(value * (10**precision)) / (10**precision))
+ 
+ 
+-class _GroupTuple(t.NamedTuple):
+-    grouper: t.Any
+-    list: t.List
++class _GroupTuple(namedtuple("_GroupTuple", ["grouper", "list", "count"])):
++    def __new__(cls, grouper, list, count=None):
++        return super().__new__(cls, grouper, list, count)
+ 
+-    # Use the regular tuple repr to hide this subclass if users print
+-    # out the value during debugging.
+-    def __repr__(self) -> str:
+-        return tuple.__repr__(self)
++    def __iter__(self):
++        if self.count is None:
++            return iter((self.grouper, self.list))
++        return super().__iter__()
++
++    def __getitem__(self, index):
++        if self.count is None:
++            if index == 0: return self.grouper
++            if index == 1: return self.list
++            raise IndexError
++        return super().__getitem__(index)
+ 
+-    def __str__(self) -> str:
+-        return tuple.__str__(self)
++    def __repr__(self) -> str:
++        if self.count is None:
++            return tuple.__repr__((self.grouper, self.list))
++        return super().__repr__()
+ 
+ 
+ @pass_environment
+@@ -1163,6 +1173,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    with_counts: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,10 +1221,14 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    result = []
++    for key, values in groupby(sorted(value, key=expr), expr):
++        items = list(values)
++        if with_counts:
++            result.append(_GroupTuple(key, items, len(items)))
++        else:
++            result.append(_GroupTuple(key, items))
++    return result
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1237,17 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    with_counts: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    result = []
++    for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr):
++        items = await auto_to_list(values)
++        if with_counts:
++            result.append(_GroupTuple(key, items, len(items)))
++        else:
++            result.append(_GroupTuple(key, items))
++    return result
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_counts.py b/tests/test_groupby_counts.py
+new file mode 100644
+index 0000000..f2d68e6
+--- /dev/null
++++ b/tests/test_groupby_counts.py
+@@ -0,0 +1,47 @@
++import pytest
++import asyncio
++from jinja2 import Environment
++
++def test_groupby_counts():
++    env = Environment()
++    items = [{"city": "NY", "name": "a"}, {"city": "NY", "name": "b"}, {"city": "LA", "name": "c"}]
++    
++    # Test with_counts=True
++    # Pass env as the first argument because of @pass_environment
++    result = env.filters["groupby"](env, items, "city", with_counts=True)
++    assert len(result) == 2
++    assert result[0].grouper == "LA"
++    assert result[0].count == 1
++    assert result[1].grouper == "NY"
++    assert result[1].count == 2
++    
++    # Test unpacking
++    for grouper, items_list, count in result:
++        assert len(items_list) == count
++        
++    # Test with_counts=False (default)
++    result = env.filters["groupby"](env, items, "city", with_counts=False)
++    assert len(result) == 2
++    for grouper, items_list in result:
++        assert isinstance(items_list, list)
++        
++    # Test default
++    result = env.filters["groupby"](env, items, "city")
++    assert len(result) == 2
++    for grouper, items_list in result:
++        assert isinstance(items_list, list)
++
++def test_groupby_counts_async():
++    async def run():
++        env = Environment(enable_async=True)
++        items = [{"city": "NY", "name": "a"}, {"city": "NY", "name": "b"}, {"city": "LA", "name": "c"}]
++        
++        # Test with_counts=True
++        result = await env.filters["groupby"](env, items, "city", with_counts=True)
++        assert len(result) == 2
++        assert result[0].grouper == "LA"
++        assert result[0].count == 1
++        assert result[1].grouper == "NY"
++        assert result[1].count == 2
++    
++    asyncio.run(run())

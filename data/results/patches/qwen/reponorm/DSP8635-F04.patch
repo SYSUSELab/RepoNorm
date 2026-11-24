@@ -1,0 +1,170 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..425c5181 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -23,6 +23,70 @@ TIPS = {
+         "persona": 'Include a persona that is relevant to the task in the instruction (ie. "You are a ...")',
+     }
+ 
++
++def truncate_description(description, max_chars):
++    """Truncate a description to fit within max_chars characters.
++    
++    Args:
++        description: The string to truncate.
++        max_chars: Maximum number of characters allowed. None means no limit.
++                   Must be a positive integer if not None.
++    
++    Returns:
++        The truncated description or the original if within limit.
++    
++    Raises:
++        ValueError: If max_chars is not None and is not a positive integer.
++    """
++    if max_chars is None:
++        return description
++    
++    # Validate max_chars: must be a positive integer, not boolean
++    if isinstance(max_chars, bool):
++        raise ValueError("max_chars must be a positive integer or None, not a boolean")
++    
++    if not isinstance(max_chars, int):
++        raise ValueError(f"max_chars must be a positive integer or None, got {type(max_chars).__name__}")
++    
++    if max_chars <= 0:
++        raise ValueError(f"max_chars must be a positive integer or None, got {max_chars}")
++    
++    # Count Python string characters, not encoded bytes
++    desc_len = len(description)
++    
++    if desc_len <= max_chars:
++        return description
++    
++    # Cap of one produces only …
++    if max_chars == 1:
++        return "…"
++    
++    # Reserve one character for the ellipsis
++    cap = max_chars - 1
++    
++    # Try to find the last complete sentence ending (. ! or ?, followed by whitespace or end)
++    # that fits within cap characters
++    last_sentence_end = -1
++    
++    # Search backwards from cap position
++    for i in range(cap - 1, -1, -1):
++        char = description[i]
++        if char in ".!?":
++            # Check if followed by whitespace or end of string
++            if i + 1 >= cap or description[i + 1].isspace():
++                last_sentence_end = i + 1
++                break
++    
++    if last_sentence_end > 0:
++        # Truncate at the sentence boundary and add ellipsis
++        result = description[:last_sentence_end].rstrip() + "…"
++        return result
++    else:
++        # No sentence boundary found, take hard prefix of cap-1 characters
++        result = description[:cap].rstrip() + "…"
++        return result
++
++
+ ### SIGNATURES USED TO HELP WITH INSTRUCTION GENERATION ###
+ 
+ class DescribeProgram(dspy.Signature):
+@@ -131,6 +195,7 @@ def generate_instruction_class(
+ 
+     return dspy.Predict(GenerateSingleModuleInstruction)
+ 
++
+ ### CLASS RESPONSIBLE FOR GENERATING A NEW INSTRUCTION, USING THE HELPER SIGNATURES ABOVE ###
+ 
+ class GenerateModuleInstruction(dspy.Module):
+@@ -143,6 +208,7 @@ class GenerateModuleInstruction(dspy.Module):
+         use_instruct_history=True,
+         use_tip=True,
+         verbose=False,
++        max_description_chars=None,
+     ):
+         super().__init__()
+         self.use_dataset_summary = use_dataset_summary
+@@ -151,6 +217,7 @@ class GenerateModuleInstruction(dspy.Module):
+         self.use_instruct_history = use_instruct_history
+         self.use_tip = use_tip
+         self.verbose = verbose
++        self.max_description_chars = max_description_chars
+ 
+         self.program_code_string = program_code_string
+         self.describe_program = dspy.Predict(DescribeProgram)
+@@ -220,6 +287,10 @@ class GenerateModuleInstruction(dspy.Module):
+                 if self.verbose:
+                     print(f"PROGRAM DESCRIPTION: {program_description}")
+ 
++                # Truncate program description if needed
++                if self.max_description_chars is not None:
++                    program_description = truncate_description(program_description, self.max_description_chars)
++
+                 inputs = []
+                 outputs = []
+                 for field_name, field in get_signature(program.predictors()[pred_i]).fields.items():
+@@ -241,6 +312,11 @@ class GenerateModuleInstruction(dspy.Module):
+                     module=module_code,
+                     max_depth=10,
+                 ).module_description
++                
++                # Truncate module description if needed
++                if self.max_description_chars is not None:
++                    module_description = truncate_description(module_description, self.max_description_chars)
++                    
+             except Exception as e:
+                 if self.verbose:
+                     print(f"Error getting program description. Running without program aware proposer. Error: {e}")
+@@ -266,6 +342,7 @@ class GenerateModuleInstruction(dspy.Module):
+ 
+         return dspy.Prediction(proposed_instruction=proposed_instruction)
+ 
++
+ ### CLASS USED TO GENERATE THE FULL SET OF INSTRUCTIONS GIVEN THE SPECIFIED CRITERIA ###
+ 
+ class GroundedProposer(Proposer):
+@@ -284,9 +361,20 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        max_description_chars=2000,
+     ):
+         super().__init__()
++        
++        # Validate max_description_chars
++        if max_description_chars is not None:
++            if isinstance(max_description_chars, bool):
++                raise ValueError("max_description_chars must be a positive integer or None, not a boolean")
++            if not isinstance(max_description_chars, int):
++                raise ValueError(f"max_description_chars must be a positive integer or None, got {type(max_description_chars).__name__}")
++            if max_description_chars <= 0:
++                raise ValueError(f"max_description_chars must be a positive integer or None, got {max_description_chars}")
++        
+         self.program_aware = program_aware
+         self.use_dataset_summary = use_dataset_summary
+         self.use_task_demos = use_task_demos
+@@ -297,6 +385,7 @@ class GroundedProposer(Proposer):
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        self.max_description_chars = max_description_chars
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -411,7 +500,8 @@ class GroundedProposer(Proposer):
+             use_task_demos=self.use_task_demos and demo_candidates,
+             use_instruct_history=self.use_instruct_history and instruction_history,
+             use_tip=self.use_tip,
+-            verbose=self.verbose
++            verbose=self.verbose,
++            max_description_chars=self.max_description_chars,
+         )
+ 
+         # Generate a new instruction for our predictor, using the temperature specified for this round

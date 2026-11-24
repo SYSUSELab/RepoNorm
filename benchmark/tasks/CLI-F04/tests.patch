@@ -1,0 +1,243 @@
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..f0c2a32 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -1,4 +1,7 @@
+ import logging
++import threading
++import time
++import warnings
+ from contextlib import contextmanager
+ 
+ import pytest
+@@ -543,3 +546,230 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++
++def test_cleanup_timeout_set():
++    """Test setting cleanup_timeout explicitly."""
++    ctx = click.Context(click.Command("test"))
++    assert ctx.cleanup_timeout is None
++
++    ctx = click.Context(click.Command("test"), cleanup_timeout=5.0)
++    assert ctx.cleanup_timeout == 5.0
++
++
++def test_cleanup_timeout_no_timeout():
++    """Test normal cleanup without timeout (legacy behavior)."""
++    ctx = click.Context(click.Command("test"))
++    cleanup_calls = []
++
++    def cleanup():
++        time.sleep(1.0)
++        cleanup_calls.append("called")
++
++    ctx.call_on_close(cleanup)
++    ctx.close()
++
++    assert cleanup_calls == ["called"]
++
++
++def test_cleanup_timeout_fast_cleanup():
++    """Test cleanup that completes within timeout."""
++    ctx = click.Context(click.Command("test"), cleanup_timeout=1.0)
++    cleanup_calls = []
++
++    def fast_cleanup():
++        cleanup_calls.append("fast")
++
++    ctx.call_on_close(fast_cleanup)
++
++    start = time.time()
++    ctx.close()
++    duration = time.time() - start
++
++    assert cleanup_calls == ["fast"]
++    assert duration < 3  # Generous scheduling tolerance.
++
++
++def test_cleanup_timeout_slow_cleanup(capfd):
++    """A timeout returns control but does not claim to kill a Python thread."""
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.05)
++    cleanup_calls = []
++    started = threading.Event()
++    release = threading.Event()
++    finished = threading.Event()
++
++    def slow_cleanup():
++        cleanup_calls.append("started")
++        started.set()
++        release.wait(5)
++        cleanup_calls.append("finished")
++        finished.set()
++
++    ctx.call_on_close(slow_cleanup)
++
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        start = time.time()
++        ctx.close()
++        duration = time.time() - start
++
++        assert duration < 3
++        assert started.wait(1)
++        assert cleanup_calls == ["started"]
++        messages = [str(item.message) for item in caught]
++        messages.append(capfd.readouterr().err.strip())
++        assert any(messages)
++
++    release.set()
++    assert finished.wait(1)
++    assert cleanup_calls == ["started", "finished"]
++
++
++def test_cleanup_timeout_exception_propagation():
++    """Test that exceptions in fast cleanup are propagated."""
++    ctx = click.Context(click.Command("test"), cleanup_timeout=1.0)
++
++    def failing_cleanup():
++        raise ValueError("Test error")
++
++    ctx.call_on_close(failing_cleanup)
++
++    with pytest.raises(ValueError, match="Test error"):
++        ctx.close()
++
++
++def test_cleanup_timeout_multiple_callbacks():
++    """Test cleanup timeout with multiple callbacks."""
++    ctx = click.Context(click.Command("test"), cleanup_timeout=3)
++    results = []
++
++    def cleanup1():
++        results.append("cleanup1")
++        time.sleep(0.05)
++
++    def cleanup2():
++        results.append("cleanup2")
++        time.sleep(0.05)
++
++    def cleanup3():
++        results.append("cleanup3")
++        time.sleep(0.05)
++
++    ctx.call_on_close(cleanup1)
++    ctx.call_on_close(cleanup2)
++    ctx.call_on_close(cleanup3)
++
++    start = time.time()
++    ctx.close()
++    duration = time.time() - start
++
++    # All should complete within timeout
++    assert duration < 5
++    assert results == ["cleanup3", "cleanup2", "cleanup1"]
++
++
++def test_cleanup_timeout_with_context_managers():
++    """Test cleanup timeout with context managers."""
++    cleanup_calls = []
++
++    @contextmanager
++    def test_manager():
++        cleanup_calls.append("enter")
++        try:
++            yield "resource"
++        finally:
++            time.sleep(0.05)  # Small delay in cleanup
++            cleanup_calls.append("exit")
++
++    ctx = click.Context(click.Command("test"), cleanup_timeout=1.0)
++
++    with ctx.scope():
++        resource = ctx.with_resource(test_manager())
++        assert resource == "resource"
++        assert cleanup_calls == ["enter"]
++
++    # Should complete cleanup normally
++    assert cleanup_calls == ["enter", "exit"]
++
++
++def test_cleanup_timeout_edge_case_zero():
++    """Test edge case with zero timeout should raise ValueError."""
++    with pytest.raises(ValueError):
++        click.Context(click.Command("test"), cleanup_timeout=0.0)
++
++
++def test_cleanup_timeout_negative():
++    """Test negative timeout should raise ValueError."""
++    with pytest.raises(ValueError):
++        click.Context(click.Command("test"), cleanup_timeout=-1.0)
++
++
++def test_cleanup_timeout_small_valid():
++    """Test very small but valid timeout."""
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.001)
++    assert ctx.cleanup_timeout == 0.001
++
++    cleanup_calls = []
++    finished = threading.Event()
++
++    def fast_cleanup():
++        cleanup_calls.append("fast")
++        finished.set()
++
++    ctx.call_on_close(fast_cleanup)
++    with warnings.catch_warnings(record=True):
++        warnings.simplefilter("always")
++        ctx.close()
++    assert finished.wait(2)
++    assert cleanup_calls == ["fast"]
++
++
++def test_cleanup_timeout_generations_and_late_error(capfd, recwarn):
++    events = []
++    release = threading.Event()
++    started = threading.Event()
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.05)
++
++    def old():
++        events.append("old-start")
++        started.set()
++        assert release.wait(5)
++        events.append("old-end")
++        raise ValueError("late-generation-error")
++
++    ctx.call_on_close(old)
++    try:
++        ctx.close()
++        assert started.wait(1)
++        ctx.call_on_close(lambda: events.append("new"))
++        ctx.close()
++        ctx.close()
++        assert events == ["old-start", "new"]
++        release.set()
++        deadline = time.monotonic() + 3
++        output = ""
++        while time.monotonic() < deadline:
++            output += capfd.readouterr().err
++            output += "\n".join(str(item.message) for item in recwarn)
++            if "late-generation-error" in output:
++                break
++            time.sleep(0.01)
++        assert "late-generation-error" in output
++        assert events == ["old-start", "new", "old-end"]
++    finally:
++        release.set()
++
++
++def test_cleanup_timeout_preserves_new_resources_registered_by_cleanup():
++    events = []
++    ctx = click.Context(click.Command("test"), cleanup_timeout=2)
++
++    def first_generation():
++        events.append("first")
++        ctx.call_on_close(lambda: events.append("second"))
++
++    ctx.call_on_close(first_generation)
++    ctx.close()
++    assert events == ["first"]
++    ctx.close()
++    assert events == ["first", "second"]

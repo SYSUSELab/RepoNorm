@@ -1,0 +1,621 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..b283efc1 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,4 +1,5 @@
+ import random
++import re
+ 
+ import dspy
+ from dspy.propose.dataset_summary_generator import create_dataset_summary
+@@ -72,6 +73,22 @@ class DescribeModule(dspy.Signature):
+     )
+ 
+ 
++class ShortenInstruction(dspy.Signature):
++    """Shorten an instruction to fit within a maximum character limit while preserving its meaning."""
++    long_instruction = dspy.InputField(
++        desc="The original instruction that needs to be shortened.",
++        prefix="LONG INSTRUCTION:",
++    )
++    max_chars = dspy.InputField(
++        desc="The maximum number of characters allowed for the shortened instruction.",
++        prefix="MAX CHARACTERS:",
++    )
++    proposed_instruction = dspy.OutputField(
++        desc="A shortened version of the instruction that fits within the character limit.",
++        prefix="PROPOSED INSTRUCTION:",
++    )
++
++
+ def generate_instruction_class(
+     use_dataset_summary=True,
+     program_aware=True,
+@@ -284,9 +301,20 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        min_instr_chars=30,
++        max_instr_chars=600,
++        rephrase_when_too_long=False,
+     ):
+         super().__init__()
++        
++        # Validate instruction length bounds
++        self._validate_bounds(min_instr_chars, max_instr_chars)
++        
++        self.min_instr_chars = min_instr_chars
++        self.max_instr_chars = max_instr_chars
++        self.rephrase_when_too_long = rephrase_when_too_long
++        
+         self.program_aware = program_aware
+         self.use_dataset_summary = use_dataset_summary
+         self.use_task_demos = use_task_demos
+@@ -323,6 +351,117 @@ class GroundedProposer(Proposer):
+                 self.use_dataset_summary = False
+                 print("")
+ 
++    @staticmethod
++    def _validate_bounds(min_chars, max_chars):
++        """Validate that instruction length bounds are non-boolean nonnegative integers with min <= max."""
++        # Check for boolean type (bool is a subclass of int in Python)
++        if isinstance(min_chars, bool) or isinstance(max_chars, bool):
++            raise ValueError("min_instr_chars and max_instr_chars must be non-boolean integers")
++        
++        # Check for non-negative integers
++        if not isinstance(min_chars, int) or not isinstance(max_chars, int):
++            raise ValueError("min_instr_chars and max_instr_chars must be integers")
++        
++        if min_chars < 0 or max_chars < 0:
++            raise ValueError("min_instr_chars and max_instr_chars must be non-negative")
++        
++        if min_chars > max_chars:
++            raise ValueError("min_instr_chars must be less than or equal to max_instr_chars")
++
++    def _truncate_at_sentence_boundary(self, text, max_len):
++        """Truncate text at the last sentence boundary that fits within max_len.
++        
++        Returns the truncated text with '...' appended if truncation occurred.
++        If no sentence boundary is found, returns hard-truncated text.
++        """
++        if len(text) <= max_len:
++            return text
++        
++        # Reserve one character for '...'
++        search_limit = max_len - 1
++        
++        # Find the last sentence boundary (. ! or ? followed by whitespace/end)
++        # Pattern matches . ! or ? followed by optional whitespace and either end or more whitespace
++        pattern = r'[.!?](?:\s|$)'
++        match = None
++        for m in re.finditer(pattern, text[:search_limit]):
++            match = m
++            
++        if match:
++            # Truncate at the sentence boundary
++            end_pos = match.end()
++            result = text[:end_pos].rstrip() + "…"
++            return result
++        else:
++            # No sentence boundary found, hard truncate
++            return text[:max_len - 1] + "…"
++
++    def _apply_length_constraints(self, generated_instruction, basic_instruction, lm_kwargs):
++        """Apply instruction length constraints to the generated instruction.
++        
++        Returns the final instruction after applying length constraints.
++        """
++        measured_len = len(generated_instruction)
++        
++        # Handle zero cap case
++        if self.max_instr_chars == 0:
++            if self.verbose:
++                print(f"Instruction truncated to empty string due to zero max length cap. Measured length: {measured_len}")
++            return ""
++        
++        # Check if instruction is too short
++        if measured_len < self.min_instr_chars:
++            if self.verbose:
++                print(f"Generated instruction ({measured_len} chars) shorter than min ({self.min_instr_chars}). Falling back to canonical basic instruction.")
++            return basic_instruction[:self.max_instr_chars] if len(basic_instruction) > self.max_instr_chars else basic_instruction
++        
++        # Check if instruction is too long
++        if measured_len > self.max_instr_chars:
++            if self.rephrase_when_too_long:
++                # Rephrase the instruction
++                original_temp = lm_kwargs.get("temperature")
++                try:
++                    shorten_predictor = dspy.Predict(ShortenInstruction)
++                    with dspy.settings.context(lm=self.prompt_model):
++                        self.prompt_model.kwargs["temperature"] = lm_kwargs.get("temperature", 0.5)
++                        shortened = shorten_predictor(
++                            long_instruction=generated_instruction,
++                            max_chars=self.max_instr_chars,
++                        ).proposed_instruction
++                    
++                    # Strip the output prefix
++                    shortened = strip_prefix(shortened)
++                    
++                    # Check if rephrased instruction is valid
++                    if not shortened or len(shortened) < self.min_instr_chars:
++                        if self.verbose:
++                            print(f"Rephrased instruction empty or too short ({len(shortened) if shortened else 0} chars). Falling back to canonical basic instruction.")
++                        return basic_instruction[:self.max_instr_chars] if len(basic_instruction) > self.max_instr_chars else basic_instruction
++                    
++                    # Hard-truncate if still overlong
++                    if len(shortened) > self.max_instr_chars:
++                        if self.verbose:
++                            print(f"Rephrased instruction ({len(shortened)} chars) still exceeds max ({self.max_instr_chars}). Hard-truncating.")
++                        return shortened[:self.max_instr_chars]
++                    
++                    if self.verbose:
++                        print(f"Rephrased instruction from {measured_len} to {len(shortened)} chars (max: {self.max_instr_chars})")
++                    return shortened
++                finally:
++                    # Restore original temperature
++                    if original_temp is not None:
++                        self.prompt_model.kwargs["temperature"] = original_temp
++                    elif "temperature" in self.prompt_model.kwargs:
++                        del self.prompt_model.kwargs["temperature"]
++            else:
++                # Truncate without rephrasing
++                truncated = self._truncate_at_sentence_boundary(generated_instruction, self.max_instr_chars)
++                if self.verbose:
++                    print(f"Instruction ({measured_len} chars) exceeds max ({self.max_instr_chars}). Truncating to {len(truncated)} chars.")
++                return truncated
++        
++        return generated_instruction
++
+     def propose_instructions_for_program(
+         self,
+         trainset,
+@@ -403,6 +542,9 @@ class GroundedProposer(Proposer):
+             program, pred_i, trial_logs, MAX_INSTRUCT_IN_HISTORY,
+         )
+ 
++        # Get the basic instruction for fallback
++        basic_instruction = get_signature(program.predictors()[pred_i]).instructions
++
+         # Create our instruction generator class (given specific criteria for this round of proposal)
+         instruction_generator = GenerateModuleInstruction(
+             program_code_string=self.program_code_string,
+@@ -415,10 +557,8 @@ class GroundedProposer(Proposer):
+         )
+ 
+         # Generate a new instruction for our predictor, using the temperature specified for this round
+-        original_temp = self.prompt_model.kwargs["temperature"]
+-
+-        epsilon = self.rng.uniform(0.01, 0.05)
+-        modified_temp = T + epsilon
++        original_temp = self.prompt_model.kwargs.get("temperature")
++        modified_temp = T + self.rng.uniform(0.01, 0.05)
+ 
+         with dspy.settings.context(lm=self.prompt_model):
+             self.prompt_model.kwargs["temperature"] = modified_temp
+@@ -439,4 +579,11 @@ class GroundedProposer(Proposer):
+             self.prompt_model.inspect_history(n=1)
+             print(f"PROPOSED INSTRUCTION: {proposed_instruction}")
+ 
+-        return strip_prefix(proposed_instruction)
++        # Apply length constraints
++        final_instruction = self._apply_length_constraints(
++            proposed_instruction, 
++            basic_instruction,
++            {"temperature": original_temp}
++        )
++        
++        return final_instruction
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..5dac6725 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -26,7 +26,10 @@ def test_propose_instructions_for_program(demo_candidates):
+     assert isinstance(result, dict)
+     assert len(result) == len(program.predictors())
+     for pred_instructions in result.values():
+-        assert pred_instructions == ["instruction"]
++        # Generated instruction "instruction" (11 chars) is shorter than min_instr_chars (30),
++        # so it falls back to the canonical basic instruction
++        expected_basic_instruction = "Given the fields `question`, produce the fields `answer`."
++        assert pred_instructions == [expected_basic_instruction]
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -51,4 +54,394 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         trial_logs={},
+         tip=None,
+     )
+-    assert result == "instruction"
++    # Generated instruction "instruction" (11 chars) is shorter than min_instr_chars (30),
++    # so it falls back to the canonical basic instruction
++    expected_basic_instruction = "Given the fields `question`, produce the fields `answer`."
++    assert result == expected_basic_instruction
++
++
++class TestGroundedProposerBounds:
++    """Test validation of instruction length bounds."""
++    
++    def test_valid_bounds(self):
++        """Test that valid bounds are accepted."""
++        prompt_model = DummyLM([{"proposed_instruction": "test"}] * 10)
++        program = Predict("question -> answer")
++        
++        # Default values should work
++        proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[])
++        assert proposer.min_instr_chars == 30
++        assert proposer.max_instr_chars == 600
++        
++        # Custom valid bounds should work
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            min_instr_chars=10,
++            max_instr_chars=100
++        )
++        assert proposer.min_instr_chars == 10
++        assert proposer.max_instr_chars == 100
++    
++    def test_boolean_rejected(self):
++        """Test that boolean values are rejected."""
++        prompt_model = DummyLM([{"proposed_instruction": "test"}] * 10)
++        program = Predict("question -> answer")
++        
++        with pytest.raises(ValueError, match="non-boolean"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=True,
++                max_instr_chars=100
++            )
++        
++        with pytest.raises(ValueError, match="non-boolean"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=10,
++                max_instr_chars=False
++            )
++    
++    def test_negative_rejected(self):
++        """Test that negative values are rejected."""
++        prompt_model = DummyLM([{"proposed_instruction": "test"}] * 10)
++        program = Predict("question -> answer")
++        
++        with pytest.raises(ValueError, match="non-negative"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=-1,
++                max_instr_chars=100
++            )
++        
++        with pytest.raises(ValueError, match="non-negative"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=10,
++                max_instr_chars=-5
++            )
++    
++    def test_min_greater_than_max_rejected(self):
++        """Test that min > max is rejected."""
++        prompt_model = DummyLM([{"proposed_instruction": "test"}] * 10)
++        program = Predict("question -> answer")
++        
++        with pytest.raises(ValueError, match="less than or equal"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=100,
++                max_instr_chars=50
++            )
++    
++    def test_non_integer_rejected(self):
++        """Test that non-integer values are rejected."""
++        prompt_model = DummyLM([{"proposed_instruction": "test"}] * 10)
++        program = Predict("question -> answer")
++        
++        with pytest.raises(ValueError, match="integers"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=10.5,
++                max_instr_chars=100
++            )
++        
++        with pytest.raises(ValueError, match="integers"):
++            GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                min_instr_chars=10,
++                max_instr_chars="100"
++            )
++
++
++class TestInstructionLengthConstraints:
++    """Test instruction length constraint application."""
++    
++    def test_short_instruction_fallback(self):
++        """Test that short instructions fall back to basic instruction."""
++        prompt_model = DummyLM([{"proposed_instruction": "short"}] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], verbose=False)
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # "short" (5 chars) < min_instr_chars (30), so fallback to basic instruction
++        expected_basic_instruction = "Given the fields `question`, produce the fields `answer`."
++        assert result == expected_basic_instruction
++    
++    def test_long_instruction_truncation(self):
++        """Test that long instructions are truncated without rephrasing."""
++        long_instruction = "A" * 700  # 700 chars, exceeds max (600)
++        prompt_model = DummyLM([{"proposed_instruction": long_instruction}] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], verbose=False)
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # Should be truncated to at most 600 chars
++        assert len(result) <= 600
++    
++    def test_zero_max_returns_empty(self):
++        """Test that zero max returns empty string."""
++        prompt_model = DummyLM([{"proposed_instruction": "anything"}] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            min_instr_chars=0, max_instr_chars=0,
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        assert result == ""
++    
++    def test_sentence_boundary_truncation(self):
++        """Test truncation at sentence boundary."""
++        # Instruction with multiple sentences
++        instruction = "First sentence. Second sentence! Third sentence? Final sentence."
++        prompt_model = DummyLM([{"proposed_instruction": instruction}] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            min_instr_chars=0, max_instr_chars=25,  # Should truncate after "First sentence."
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # Should end with "..." and be around 25 chars
++        assert result.endswith("…")
++        assert len(result) <= 25
++    
++    def test_hard_truncation_no_boundary(self):
++        """Test hard truncation when no sentence boundary found."""
++        # Instruction without sentence boundaries
++        instruction = "This is a very long instruction without any punctuation marks"
++        prompt_model = DummyLM([{"proposed_instruction": instruction}] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            min_instr_chars=0, max_instr_chars=20,
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # Should be hard-truncated with "..."
++        assert result.endswith("…")
++        assert len(result) <= 20
++    
++    def test_within_bounds_unchanged(self):
++        """Test that instructions within bounds are unchanged."""
++        instruction = "This is a perfectly fine instruction that fits within bounds."
++        prompt_model = DummyLM([{"proposed_instruction": instruction}] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            min_instr_chars=10,
++            max_instr_chars=100,
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        assert result == instruction
++    
++    def test_rephrase_when_too_long_enabled(self):
++        """Test rephrasing when enabled for overlong instructions."""
++        long_instruction = "A" * 700  # 700 chars, exceeds max (600)
++        prompt_model = DummyLM([
++            {"proposed_instruction": long_instruction},  # First call generates long instruction
++            {"proposed_instruction": "Shortened version"},  # ShortenInstruction call
++        ] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            max_instr_chars=600,
++            rephrase_when_too_long=True,
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # Should be shortened (not just truncated)
++        assert len(result) <= 600
++    
++    def test_rephrase_fallback_on_empty(self):
++        """Test fallback to basic instruction when rephrased result is empty."""
++        long_instruction = "A" * 700
++        prompt_model = DummyLM([
++            {"proposed_instruction": long_instruction},  # First call generates long instruction
++            {"proposed_instruction": ""},  # ShortenInstruction returns empty
++        ] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            max_instr_chars=600,
++            rephrase_when_too_long=True,
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # Should fall back to basic instruction
++        expected_basic_instruction = "Given the fields `question`, produce the fields `answer`."
++        assert result == expected_basic_instruction
++    
++    def test_rephrase_fallback_on_too_short(self):
++        """Test fallback to basic instruction when rephrased result is too short."""
++        long_instruction = "A" * 700
++        prompt_model = DummyLM([
++            {"proposed_instruction": long_instruction},  # First call generates long instruction
++            {"proposed_instruction": "too short"},  # ShortenInstruction returns too short
++        ] * 10)
++        program = Predict("question -> answer")
++        
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, 
++            program=program, 
++            trainset=[],
++            min_instr_chars=30,
++            max_instr_chars=600,
++            rephrase_when_too_long=True,
++            verbose=False
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program,
++            predictor=None,
++            pred_i=0,
++            T=0.5,
++            demo_candidates=None,
++            demo_set_i=0,
++            trial_logs={},
++            tip=None,
++        )
++        # Should fall back to basic instruction
++        expected_basic_instruction = "Given the fields `question`, produce the fields `answer`."
++        assert result == expected_basic_instruction
++    
++    def test_verbose_reports_action(self):
++        """Test that verbose mode reports the action taken."""
++        short_instruction = "short"
++        prompt_model = DummyLM([{"proposed_instruction": short_instruction}] * 10)
++        program = Predict("question -> answer")
++        
++        import io
++        import sys
++        
++        old_stdout = sys.stdout
++        sys.stdout = buffer = io.StringIO()
++        
++        try:
++            proposer = GroundedProposer(
++                prompt_model=prompt_model, 
++                program=program, 
++                trainset=[],
++                verbose=True
++            )
++            result = proposer.propose_instruction_for_predictor(
++                program=program,
++                predictor=None,
++                pred_i=0,
++                T=0.5,
++                demo_candidates=None,
++                demo_set_i=0,
++                trial_logs={},
++                tip=None,
++            )
++        finally:
++            sys.stdout = old_stdout
++        
++        output = buffer.getvalue()
++        # Should report fallback action
++        assert "fallback" in output.lower() or "shorter" in output.lower()

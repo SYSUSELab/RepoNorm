@@ -1,0 +1,620 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..86ce631 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -6,6 +6,7 @@ import errno
+ import inspect
+ import os
+ import sys
++import time
+ import typing as t
+ from collections import abc
+ from collections import Counter
+@@ -165,6 +166,35 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++
++class _TrackedParamsDict(dict):
++    """A dict subclass that records assignments to tracked option params."""
++
++    def __init__(self, ctx: Context) -> None:
++        super().__init__()
++        self._ctx = ctx
++        self._option_names: set[str] = {
++            p.name
++            for p in ctx.command.get_params(ctx)
++            if p.name is not None and isinstance(p, Option)
++        }
++
++    def __setitem__(self, key: str, value: t.Any) -> None:
++        history = self._ctx._option_history
++        if history is not None and key in self._option_names:
++            source = (
++                self._ctx._parameter_source.get(key)
++                if self._ctx._parsing_assignment
++                else None
++            )
++            history.setdefault(key, []).append({
++                "value": value,
++                "source": source,
++                "timestamp": time.time(),
++            })
++        super().__setitem__(key, value)
++
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -438,6 +468,12 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._option_history: dict[str, list[dict[str, t.Any]]] | None = (
++            {} if getattr(command, 'track_changes', False) else None
++        )
++        self._parsing_assignment = False
++        if self._option_history is not None:
++            self.params = _TrackedParamsDict(self)
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -839,6 +875,35 @@ class Context:
+         """
+         return self._parameter_source.get(name)
+ 
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        """Return a list of all values assigned to the given option, in
++        assignment order, along with their source and timestamp.
++
++        Returns ``None`` if tracking is not enabled on the current
++        command.  Returns an empty list if tracking is enabled but
++        *name* does not identify a known option on the current command.
++
++        *name* may be the option's Python parameter name, a long option
++        such as ``"--count"``, or a short option such as ``"-c"``.
++
++        .. versionadded:: 8.2
++        """
++        if self._option_history is None:
++            return None
++
++        # Resolve name to internal parameter name
++        for param in self.command.get_params(self):
++            if isinstance(param, Option) and param.name is not None:
++                if (
++                    name == param.name
++                    or name in param.opts
++                    or name in param.secondary_opts
++                ):
++                    key = param.name
++                    return [dict(e) for e in self._option_history.get(key, [])]  # snapshot
++
++        return []
++
+ 
+ class Command:
+     """Commands are the basic building block of command line interfaces in
+@@ -916,6 +981,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        track_changes: bool = False,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -945,6 +1011,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -2421,7 +2488,14 @@ class Parameter:
+                 value = None
+ 
+         if self.expose_value:
+-            ctx.params[self.name] = value  # type: ignore
++            if ctx._option_history is not None:
++                ctx._parsing_assignment = True
++                try:
++                    ctx.params[self.name] = value  # type: ignore
++                finally:
++                    ctx._parsing_assignment = False
++            else:
++                ctx.params[self.name] = value  # type: ignore
+ 
+         return value, args
+ 
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index e5e5119..6d40af4 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -26,6 +26,7 @@ click.echo(json.dumps(rv))
+ """
+ 
+ ALLOWED_IMPORTS = {
++    "time",
+     "__future__",
+     "weakref",
+     "os",
+diff --git a/tests/test_option_history.py b/tests/test_option_history.py
+new file mode 100644
+index 0000000..a7549c1
+--- /dev/null
++++ b/tests/test_option_history.py
+@@ -0,0 +1,473 @@
++import time
++import pytest
++import click
++from click.core import Context, ParameterSource, Option
++
++
++def test_get_option_history_returns_none_when_disabled():
++    """When tracking is disabled, get_option_history returns None."""
++    @click.command()
++    @click.option("--count", default=1)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = cli([], standalone_mode=False)
++    assert rv is None
++
++
++def test_get_option_history_empty_list_for_unknown_name():
++    """When tracking is enabled but name doesn't identify an option, returns []."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("nonexistent")
++
++    rv = cli([], standalone_mode=False)
++    assert rv == []
++
++
++def test_get_option_history_unknown_name_still_returns_list():
++    """Returns [] for unknown option name even when tracking is enabled."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("--nonexistent")
++
++    rv = cli([], standalone_mode=False)
++    assert rv == []
++
++
++def test_get_option_history_by_python_name():
++    """Lookup by Python parameter name works."""
++    @click.command(track_changes=True)
++    @click.option("--count", "-c", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = cli(["--count", "5"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] == 5
++
++
++def test_get_option_history_by_long_opt():
++    """Lookup by --long-option works."""
++    @click.command(track_changes=True)
++    @click.option("--count", "-c", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("--count")
++
++    rv = cli(["-c", "5"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] == 5
++
++
++def test_get_option_history_by_short_opt():
++    """Lookup by -short works."""
++    @click.command(track_changes=True)
++    @click.option("--count", "-c", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("-c")
++
++    rv = cli(["--count", "5"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] == 5
++
++
++def test_history_entry_shape():
++    """Each entry has value, source, and timestamp keys."""
++    @click.command(track_changes=True)
++    @click.option("--name", default="world")
++    def cli(name):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("name")
++
++    rv = cli(["--name", "hello"], standalone_mode=False)
++    assert len(rv) == 1
++    entry = rv[0]
++    assert "value" in entry
++    assert "source" in entry
++    assert "timestamp" in entry
++    assert entry["value"] == "hello"
++    assert entry["source"] == ParameterSource.COMMANDLINE
++    assert isinstance(entry["timestamp"], float)
++
++
++def test_default_source():
++    """When no value is provided, uses DEFAULT source."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=42, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = cli([], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["source"] == ParameterSource.DEFAULT
++    assert rv[0]["value"] == 42
++
++
++def test_environment_source(runner):
++    """When value comes from environment, uses ENVIRONMENT source."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, envvar="TEST_COUNT", type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = runner.invoke(cli, [], env={"TEST_COUNT": "99"}, standalone_mode=False)
++    assert rv.exit_code == 0
++    assert len(rv.return_value) == 1
++    assert rv.return_value[0]["source"] == ParameterSource.ENVIRONMENT
++    assert rv.return_value[0]["value"] == 99
++
++
++def test_commandline_source():
++    """When value comes from command line, uses COMMANDLINE source."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = cli(["--count", "5"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["source"] == ParameterSource.COMMANDLINE
++    assert rv[0]["value"] == 5
++
++
++def test_manual_assignment_appends_with_source_none():
++    """Manual assignment via ctx.params appends with source=None."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        ctx.params["count"] = 99
++        return ctx.get_option_history("count")
++
++    rv = cli([], standalone_mode=False)
++    assert len(rv) == 2
++    assert rv[0]["source"] == ParameterSource.DEFAULT
++    assert rv[0]["value"] == 1
++    assert rv[1]["source"] is None
++    assert rv[1]["value"] == 99
++
++
++def test_manual_assignment_does_not_inherit_previous_source():
++    """Manual assignment must not inherit the parser's earlier source."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        ctx.params["count"] = 99
++        return ctx.get_option_history("count")
++
++    rv = cli(["--count", "5"], standalone_mode=False)
++    assert len(rv) == 2
++    assert rv[0]["source"] == ParameterSource.COMMANDLINE
++    assert rv[0]["value"] == 5
++    assert rv[1]["source"] is None
++    assert rv[1]["value"] == 99
++
++
++def test_repeated_manual_assignments_retain_order():
++    """Repeated manual assignments are all retained in order."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        ctx.params["count"] = 10
++        ctx.params["count"] = 20
++        return ctx.get_option_history("count")
++
++    rv = cli(["--count", "5"], standalone_mode=False)
++    assert len(rv) == 3
++    assert rv[0]["value"] == 5
++    assert rv[1]["value"] == 10
++    assert rv[2]["value"] == 20
++
++
++def test_snapshot_isolation():
++    """Returned snapshots don't change when new values are assigned."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        hist = ctx.get_option_history("count")
++        orig_len = len(hist)
++        ctx.params["count"] = 99
++        assert len(hist) == orig_len, "Snapshot should not grow"
++        return hist
++
++    rv = cli([], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] == 1
++
++
++def test_snapshot_entry_immutable():
++    """Mutating returned entries should not affect history."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        hist = ctx.get_option_history("count")
++        # Mutate the returned entry (dict copy)
++        if hist:
++            hist[0]["value"] = 999
++        # Get a fresh snapshot
++        hist2 = ctx.get_option_history("count")
++        return hist2
++
++    rv = cli([], standalone_mode=False)
++    assert rv[0]["value"] == 1, "Mutation of snapshot should not affect underlying history"
++
++
++def test_multiple_option_recorded_once_with_tuple():
++    """Multiple option is recorded once with final tuple."""
++    @click.command(track_changes=True)
++    @click.option("--name", multiple=True)
++    def cli(name):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("name")
++
++    rv = cli(["--name", "a", "--name", "b"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] == ("a", "b")
++    assert rv[0]["source"] == ParameterSource.COMMANDLINE
++
++
++def test_boolean_flag():
++    """Boolean flag is tracked correctly."""
++    @click.command(track_changes=True)
++    @click.option("--verbose", "-v", is_flag=True)
++    def cli(verbose):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("verbose")
++
++    rv = cli(["-v"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] is True
++    assert rv[0]["source"] == ParameterSource.COMMANDLINE
++
++
++def test_boolean_flag_default():
++    """Boolean flag default (False) is tracked with DEFAULT source."""
++    @click.command(track_changes=True)
++    @click.option("--verbose", "-v", is_flag=True)
++    def cli(verbose):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("verbose")
++
++    rv = cli([], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] is False
++    assert rv[0]["source"] == ParameterSource.DEFAULT
++
++
++def test_group_subcommand_independence(runner):
++    """Group and subcommand have independent histories."""
++    @click.group(track_changes=True)
++    @click.option("--verbose", "-v", is_flag=True)
++    def cli(verbose):
++        pass
++
++    @cli.command(track_changes=True)
++    @click.option("--name", default="world")
++    def hello(name):
++        ctx = click.get_current_context()
++        return {
++            "sub_name": ctx.get_option_history("name"),
++            "sub_verbose": ctx.get_option_history("verbose"),
++            "parent_verbose": ctx.parent.get_option_history("verbose"),
++        }
++
++    rv = runner.invoke(cli, ["-v", "hello", "--name", "test"], standalone_mode=False)
++    assert rv.exit_code == 0
++    data = rv.return_value
++    # Subcommand's own option
++    assert len(data["sub_name"]) == 1
++    assert data["sub_name"][0]["value"] == "test"
++    assert data["sub_name"][0]["source"] == ParameterSource.COMMANDLINE
++    # Subcommand doesn't have 'verbose' (it's on the group)
++    assert data["sub_verbose"] == []
++    # Parent has verbose
++    assert len(data["parent_verbose"]) == 1
++    assert data["parent_verbose"][0]["value"] is True
++    assert data["parent_verbose"][0]["source"] == ParameterSource.COMMANDLINE
++
++
++def test_group_tracking_does_not_leak_to_subcommand(runner):
++    """Enabling tracking on a group does not enable it on a subcommand."""
++    @click.group(track_changes=True)
++    @click.option("--verbose", "-v", is_flag=True)
++    def cli(verbose):
++        pass
++
++    @cli.command()  # no track_changes
++    @click.option("--name", default="world")
++    def hello(name):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("name")
++
++    rv = runner.invoke(cli, ["-v", "hello", "--name", "test"], standalone_mode=False)
++    assert rv.exit_code == 0
++    assert rv.return_value is None
++
++
++def test_subcommand_tracking_does_not_leak_to_group(runner):
++    """Enabling tracking on a subcommand does not enable it on the group."""
++    @click.group()  # no track_changes
++    @click.option("--verbose", "-v", is_flag=True)
++    def cli(verbose):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("verbose")
++
++    @cli.command(track_changes=True)
++    @click.option("--name", default="world")
++    def hello(name):
++        pass
++
++    rv = runner.invoke(cli, ["-v", "hello", "--name", "test"], standalone_mode=False)
++    assert rv.exit_code == 0
++    assert rv.return_value is None
++
++
++def test_fresh_history_each_invocation(runner):
++    """Each invocation creates a fresh history."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv1 = runner.invoke(cli, ["--count", "5"], standalone_mode=False)
++    rv2 = runner.invoke(cli, ["--count", "10"], standalone_mode=False)
++    assert rv1.exit_code == 0
++    assert rv2.exit_code == 0
++    assert rv1.return_value[0]["value"] == 5
++    assert rv2.return_value[0]["value"] == 10
++
++
++def test_timestamp_roughly_current_time():
++    """Timestamp should be roughly current time."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    before = time.time()
++    rv = cli([], standalone_mode=False)
++    after = time.time()
++    assert len(rv) == 1
++    ts = rv[0]["timestamp"]
++    assert before - 2 <= ts <= after + 2, f"Timestamp {ts} outside range [{before}, {after}]"
++
++
++def test_no_history_for_arguments():
++    """Positional arguments are not option history entries."""
++    @click.command(track_changes=True)
++    @click.argument("input_file")
++    @click.option("--output", "-o", default="out.txt")
++    def cli(input_file, output):
++        ctx = click.get_current_context()
++        return (
++            ctx.get_option_history("input_file"),
++            ctx.get_option_history("output"),
++        )
++
++    rv = cli(["in.txt", "-o", "out.log"], standalone_mode=False)
++    arg_hist, opt_hist = rv
++    assert arg_hist == [], "Arguments should have no history"
++    assert len(opt_hist) == 1
++    assert opt_hist[0]["value"] == "out.log"
++
++
++def test_default_map_source(runner):
++    """Default map values use DEFAULT_MAP source."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=1, type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = runner.invoke(cli, [], standalone_mode=False, default_map={"count": 77})
++    assert rv.exit_code == 0
++    assert len(rv.return_value) == 1
++    assert rv.return_value[0]["source"] == ParameterSource.DEFAULT_MAP
++    assert rv.return_value[0]["value"] == 77
++
++
++def test_prompt_source(runner):
++    """Prompted values use PROMPT source."""
++    @click.command(track_changes=True)
++    @click.option("--name", prompt=True, default="world")
++    def cli(name):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("name")
++
++    rv = runner.invoke(cli, [], standalone_mode=False, input="Alice\n")
++    assert rv.exit_code == 0
++    assert len(rv.return_value) == 1
++    assert rv.return_value[0]["source"] == ParameterSource.PROMPT
++    assert rv.return_value[0]["value"] == "Alice"
++
++
++def test_unselected_default_not_in_history():
++    """Click must not evaluate unselected lower-precedence default to manufacture history."""
++    @click.command(track_changes=True)
++    @click.option("--count", default=2, envvar="TEST_COUNT", type=int)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    # When --count is given on command line, only COMMANDLINE entry should appear
++    rv = cli(["--count", "5"], standalone_mode=False)
++    assert len(rv) == 1, f"Expected 1 entry, got {len(rv)}"
++    assert rv[0]["source"] == ParameterSource.COMMANDLINE
++    assert rv[0]["value"] == 5
++
++
++def test_value_after_type_conversion():
++    """Recorded value is the final exposed value after type conversion."""
++    @click.command(track_changes=True)
++    @click.option("--count", type=click.IntRange(0, 100))
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = cli(["--count", "42"], standalone_mode=False)
++    assert rv[0]["value"] == 42
++    assert isinstance(rv[0]["value"], int)
++
++
++def test_value_after_callback():
++    """Recorded value is the value after callback processing."""
++    @click.command(track_changes=True)
++    @click.option("--count", type=int,
++                  callback=lambda ctx, param, value: value * 2 if value else value)
++    def cli(count):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("count")
++
++    rv = cli(["--count", "21"], standalone_mode=False)
++    assert rv[0]["value"] == 42
++
++
++def test_flag_with_count():
++    """Flag with count option."""
++    @click.command(track_changes=True)
++    @click.option("-v", "--verbose", count=True)
++    def cli(verbose):
++        ctx = click.get_current_context()
++        return ctx.get_option_history("verbose")
++
++    rv = cli(["-vvv"], standalone_mode=False)
++    assert len(rv) == 1
++    assert rv[0]["value"] == 3
++    assert rv[0]["source"] == ParameterSource.COMMANDLINE

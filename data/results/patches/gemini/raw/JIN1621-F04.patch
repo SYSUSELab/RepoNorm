@@ -1,0 +1,587 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..6766410 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -177,17 +177,35 @@ class FileSystemLoader(BaseLoader):
+ 
+     def __init__(
+         self,
+-        searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        searchpath: t.Union[
++            str,
++            os.PathLike,
++            t.Sequence[t.Union[str, os.PathLike, t.Tuple[t.Union[str, os.PathLike], int]]],
++        ],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+-        self.searchpath = [os.fspath(p) for p in searchpath]
++        self.searchpath = []
++        for item in searchpath:
++            if isinstance(item, tuple):
++                if len(item) != 2:
++                    raise TypeError("Tuple must have 2 elements")
++                path, priority = item
++                if not isinstance(priority, int) or isinstance(priority, bool):
++                    raise TypeError("Priority must be an integer")
++                self.searchpath.append((os.fspath(path), priority))
++            else:
++                self.searchpath.append((os.fspath(item), 0))
++
++        self.searchpath.sort(key=lambda x: x[1], reverse=True)
++        self.searchpath = [item[0] for item in self.searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
++
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+diff --git a/temp_loaders.py b/temp_loaders.py
+new file mode 100644
+index 0000000..209242c
+--- /dev/null
++++ b/temp_loaders.py
+@@ -0,0 +1,489 @@
++"""API and implementations for loading templates from different data
++sources.
++"""
++import importlib.util
++import os
++import sys
++import typing as t
++import weakref
++import zipimport
++from collections import abc
++from hashlib import sha1
++from importlib import import_module
++from types import ModuleType
++
++from .exceptions import TemplateNotFound
++from .utils import internalcode
++from .utils import open_if_exists
++
++if t.TYPE_CHECKING:
++    from .environment import Environment
++    from .environment import Template
++
++
++def split_template_path(template: str) -> t.List[str]:
++    """Split a path into segments and perform a sanity check.  If it detects
++    '..' in the path it will raise a `TemplateNotFound` error.
++    """
++    pieces = []
++    for piece in template.split("/"):
++        if (
++            os.path.sep in piece
++            or (os.path.altsep and os.path.altsep in piece)
++            or piece == os.path.pardir
++        ):
++            raise TemplateNotFound(template)
++        elif piece and piece != ".":
++            pieces.append(piece)
++    return pieces
++
++
++class BaseLoader:
++    """Baseclass for all loaders.  Subclass this and override `get_source` to
++    implement a custom loading mechanism.  The environment provides a
++    `get_template` method that calls the loader's `load` method to get the
++    :class:`Template` object.
++
++    A very basic example for a loader that looks up templates on the file
++    system could look like this::
++
++        from jinja2 import BaseLoader, TemplateNotFound
++        from os.path import join, exists, getmtime
++
++        class MyLoader(BaseLoader):
++
++            def __init__(self, path):
++                self.path = path
++
++            def get_source(self, environment, template):
++                path = join(self.path, template)
++                if not exists(path):
++                    raise TemplateNotFound(template)
++                mtime = getmtime(path)
++                with open(path) as f:
++                    source = f.read()
++                return source, path, lambda: mtime == getmtime(path)
++    """
++
++    #: if set to `False` it indicates that the loader cannot provide access
++    #: to the source of templates.
++    #:
++    #: .. versionadded:: 2.4
++    has_source_access = True
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        """Get the template source, filename and reload helper for a template.
++        It's passed the environment and template name and has to return a
++        tuple in the form ``(source, filename, uptodate)`` or raise a
++        `TemplateNotFound` error if it can't locate the template.
++
++        The source part of the returned tuple must be the source of the
++        template as a string. The filename should be the name of the
++        file on the filesystem if it was loaded from there, otherwise
++        ``None``. The filename is used by Python for the tracebacks
++        if no loader extension is used.
++
++        The last item in the tuple is the `uptodate` function.  If auto
++        reloading is enabled it's always called to check if the template
++        changed.  No arguments are passed so the function must store the
++        old state somewhere (for example in a closure).  If it returns `False`
++        the template will be reloaded.
++        """
++        if not self.has_source_access:
++            raise RuntimeError(
++                f"{type(self).__name__} cannot provide access to the source"
++            )
++        raise TemplateNotFound(template)
++
++    def list_templates(self) -> t.List[str]:
++        """Iterates over all templates.  If the loader does not support that
++        it should raise a :exc:`TypeError` which is the default behavior.
++        """
++        raise TypeError("this loader cannot iterate over all templates")
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        """Loads a template.  This method looks up the template in the cache
++        or loads one by calling :meth:`get_source`.  Subclasses should not
++        override this method as loaders working on collections of other
++        loaders (such as :class:`PrefixLoader` or :class:`ChoiceLoader`)
++        will not call this method but `get_source` directly.
++        """
++        code = None
++        if globals is None:
++            globals = {}
++
++        # first we try to get the source for this template together
++        # with the filename and the uptodate function.
++        source, filename, uptodate = self.get_source(environment, name)
++
++        # try to load the code from the bytecode cache if there is a
++        # bytecode cache configured.
++        bcc = environment.bytecode_cache
++        if bcc is not None:
++            bucket = bcc.get_bucket(environment, name, filename, source)
++            code = bucket.code
++
++        # if we don't have code so far (not cached, no longer up to
++        # date)
++        if code is None:
++            code = environment.compile(source, name, filename)
++
++        # if the bytecode cache is available and the template was not
++        # up to date, we put the new code into the cache.
++        if bcc is not None and bucket is not None:
++            bucket.code = code
++            bcc.set_bucket(bucket)
++
++        return environment.template_class.from_code(environment, code, globals, uptodate)
++
++
++class ChoiceLoader(BaseLoader):
++    """This loader works like the `PrefixLoader` just that no prefix is
++    specified.  If a template could not be found by one loader the next one
++    is tried.
++
++    >>> loader = ChoiceLoader([
++    ...     FileSystemLoader('/path/to/user/templates'),
++    ...     FileSystemLoader('/path/to/system/templates')
++    ... ])
++
++    This is useful if you want to allow users to override builtin templates
++    from a different location.
++    """
++
++    def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        self.loaders = loaders
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        for loader in self.loaders:
++            try:
++                return loader.get_source(environment, template)
++            except TemplateNotFound:
++                pass
++        raise TemplateNotFound(template)
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        for loader in self.loaders:
++            try:
++                return loader.load(environment, name, globals)
++            except TemplateNotFound:
++                pass
++        raise TemplateNotFound(name)
++
++    def list_templates(self) -> t.List[str]:
++        found = set()
++        for loader in self.loaders:
++            found.update(loader.list_templates())
++        return sorted(found)
++
++
++class PrefixLoader(BaseLoader):
++    """A loader that is passed a dict of loaders where each loader is bound
++    to a prefix. The prefix is delimited from the template by a slash per
++    default, which can be changed by setting the `delimiter` argument.
++
++    >>> loader = PrefixLoader({
++    ...     'app1':     PackageLoader('app1'),
++    ...     'app2':     PackageLoader('app2')
++    ... })
++
++    Loading a template called `app1/index.html` will load `index.html` from
++    the `app1` loader.
++    """
++
++    def __init__(
++        self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
++    ) -> None:
++        self.mapping = mapping
++        self.delimiter = delimiter
++
++    def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        try:
++            prefix, local_name = template.split(self.delimiter, 1)
++            loader = self.mapping[prefix]
++        except (ValueError, KeyError) as e:
++            raise TemplateNotFound(template) from e
++        return loader, local_name
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        loader, local_name = self.get_loader(template)
++        try:
++            return loader.get_source(environment, local_name)
++        except TemplateNotFound as e:
++            # re-raise the exception with the correct filename here.
++            # (the one that includes the prefix)
++            raise TemplateNotFound(template) from e
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        loader, local_name = self.get_loader(name)
++        try:
++            return loader.load(environment, local_name, globals)
++        except TemplateNotFound as e:
++            # re-raise the exception with the correct filename here.
++            # (the one that includes the prefix)
++            raise TemplateNotFound(name) from e
++
++    def list_templates(self) -> t.List[str]:
++        result = []
++        for prefix, loader in self.mapping.items():
++            for template in loader.list_templates():
++                result.append(prefix + self.delimiter + template)
++        return result
++
++
++class FileSystemLoader(BaseLoader):
++    """Load templates from a directory in the file system.
++
++    The path can be relative or absolute. Relative paths are relative to
++    the current working directory.
++
++    .. code-block:: python
++
++        loader = FileSystemLoader("templates")
++
++    A list of paths can be given. The directories will be searched in
++    order, stopping at the first matching template.
++
++    .. code-block:: python
++
++        loader = FileSystemLoader(["/override/templates", "/default/templates"])
++
++    :param searchpath: A path, or list of paths, to the directory that
++        contains the templates.
++    :param encoding: Use this encoding to read the text from template
++        files.
++    :param followlinks: Follow symbolic links in the path.
++
++    .. versionchanged:: 2.8
++        Added the ``followlinks`` parameter.
++    """
++
++    def __init__(
++        self,
++        searchpath: t.Union[
++            str,
++            os.PathLike,
++            t.Sequence[t.Union[str, os.PathLike, t.Tuple[t.Union[str, os.PathLike], int]]],
++        ],
++        encoding: str = "utf-8",
++        followlinks: bool = False,
++    ) -> None:
++        if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
++            searchpath = [searchpath]
++
++        self.searchpath = []
++        for item in searchpath:
++            if isinstance(item, tuple):
++                if len(item) != 2:
++                    raise TypeError("Tuple must have 2 elements")
++                path, priority = item
++                if not isinstance(priority, int) or isinstance(priority, bool):
++                    raise TypeError("Priority must be an integer")
++                self.searchpath.append((os.fspath(path), priority))
++            else:
++                self.searchpath.append((os.fspath(item), 0))
++
++        self.searchpath.sort(key=lambda x: x[1], reverse=True)
++        self.searchpath = [item[0] for item in self.searchpath]
++        self.encoding = encoding
++        self.followlinks = followlinks
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            filename = os.path.join(searchpath, *pieces)
++            f = open_if_exists(filename)
++            if f is None:
++                continue
++            try:
++                contents = f.read().decode(self.encoding)
++            finally:
++                f.close()
++
++            mtime = os.path.getmtime(filename)
++
++            def uptodate() -> bool:
++                try:
++                    return os.path.getmtime(filename) == mtime
++                except OSError:
++                    return False
++
++            return contents, filename, uptodate
++        raise TemplateNotFound(template)
++
++    def list_templates(self) -> t.List[str]:
++        found = set()
++        for searchpath in self.searchpath:
++            walk_dir = os.walk(searchpath, followlinks=self.followlinks)
++            for dirpath, _, filenames in walk_dir:
++                for filename in filenames:
++                    template = (
++                        os.path.join(dirpath, filename)[len(searchpath) :]
++                        .strip(os.path.sep)
++                        .replace(os.path.sep, "/")
++                    )
++                    if template[:2] == "./":
++                        template = template[2:]
++                    if template not in found:
++                        found.add(template)
++        return sorted(found)
++
++
++class PackageLoader(BaseLoader):
++    """Load templates from a directory in a Python package.
++
++    :param package_name: Import name of the package that contains the
++        template directory.
++    :param package_path: Directory within the imported package that
++        contains the templates.
++    :param encoding: Encoding of template files.
++
++    The following example looks up templates in the ``pages`` directory
++    within the ``project.ui`` package.
++
++    .. code-block:: python
++
++        loader = PackageLoader("project.ui", "pages")
++
++    Only packages installed as directories (standard pip behavior) or
++    zip files (if the package is in the python path) are supported.
++    """
++
++    def __init__(
++        self,
++        package_name: str,
++        package_path: str = "templates",
++        encoding: str = "utf-8",
++    ) -> None:
++        self.package_name = package_name
++        self.package_path = package_path
++        self.encoding = encoding
++        self.package_path = package_path
++
++        # find the package
++        spec = importlib.util.find_spec(package_name)
++        if spec is None or spec.origin is None:
++            raise SystemError(f"the package {package_name!r} could not be found")
++
++        loader = spec.loader
++        if loader is None or not hasattr(loader, "get_data"):
++            raise SystemError(f"the package {package_name!r} is not a valid package")
++
++        self._loader = loader
++        self._template_path = os.path.join(
++            os.path.dirname(spec.origin or ""), package_path
++        )
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        pieces = split_template_path(template)
++        p = os.path.join(self._template_path, *pieces)
++        try:
++            contents = self._loader.get_data(p)
++        except (OSError, IOError):
++            raise TemplateNotFound(template)
++        return contents.decode(self.encoding), p, None
++
++    def list_templates(self) -> t.List[str]:
++        # This is a bit of a hack, but it's the only way to list templates
++        # in a package loader.
++        if not hasattr(self._loader, "get_data"):
++            raise TypeError("this loader cannot iterate over all templates")
++
++        # if the package is a directory, we can list the files
++        if os.path.isdir(self._template_path):
++            found = set()
++            for dirpath, _, filenames in os.walk(self._template_path):
++                for filename in filenames:
++                    template = (
++                        os.path.join(dirpath, filename)[len(self._template_path) :]
++                        .strip(os.path.sep)
++                        .replace(os.path.sep, "/")
++                    )
++                    if template[:2] == "./":
++                        template = template[2:]
++                    found.add(template)
++            return sorted(found)
++
++        # if the package is a zip file, we can't list the files
++        raise TypeError("this loader cannot iterate over all templates")
++
++
++class DictLoader(BaseLoader):
++    """Loads a template from a python dict.  It's passed a dict of template
++    names and template sources.
++
++    >>> loader = DictLoader({'index.html': 'source here'})
++
++    This loader is useful for testing or if you want to load templates from
++    a database or other resources.
++    """
++
++    def __init__(self, mapping: t.Mapping[str, str]) -> None:
++        self.mapping = mapping
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        if template in self.mapping:
++            return self.mapping[template], None, lambda: True
++        raise TemplateNotFound(template)
++
++    def list_templates(self) -> t.List[str]:
++        return sorted(self.mapping.keys())
++
++
++class FunctionLoader(BaseLoader):
++    """A loader that is passed a function which returns the source for the
++    templates.
++
++    >>> def load_template(name):
++    ...     if name == 'index.html':
++    ...         return '...'
++    ...
++    >>> loader = FunctionLoader(load_template)
++
++    The function is passed the name of the template and should return a
++    string with the template source, or `None` if the template cannot be
++    found.
++    """
++
++    def __init__(
++        self, load_func: t.Callable[[str], t.Optional[str]]
++    ) -> None:
++        self.load_func = load_func
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        rv = self.load_func(template)
++        if rv is None:
++            raise TemplateNotFound(template)
++        return rv, None, None
+diff --git a/tests/test_loader_priority.py b/tests/test_loader_priority.py
+new file mode 100644
+index 0000000..83406a6
+--- /dev/null
++++ b/tests/test_loader_priority.py
+@@ -0,0 +1,44 @@
++import os
++import pytest
++from jinja2 import FileSystemLoader
++
++def test_filesystem_loader_priority():
++    # Create some dummy directories
++    os.makedirs("dir1", exist_ok=True)
++    os.makedirs("dir2", exist_ok=True)
++    os.makedirs("dir3", exist_ok=True)
++    os.makedirs("dir4", exist_ok=True)
++    
++    # Test case: (path, priority)
++    # Input: [("dir1", 1), ("dir2", 2), "dir3", ("dir4", 0)]
++    # Expected: ['dir2', 'dir1', 'dir3', 'dir4']
++    
++    loader = FileSystemLoader([("dir1", 1), ("dir2", 2), "dir3", ("dir4", 0)])
++    assert loader.searchpath == ['dir2', 'dir1', 'dir3', 'dir4']
++
++def test_filesystem_loader_priority_errors():
++    # Test invalid tuple length
++    with pytest.raises(TypeError, match="Tuple must have 2 elements"):
++        FileSystemLoader([("dir1", 1, 2)])
++    
++    # Test non-integer priority
++    with pytest.raises(TypeError, match="Priority must be an integer"):
++        FileSystemLoader([("dir1", "high")])
++        
++    # Test boolean priority
++    with pytest.raises(TypeError, match="Priority must be an integer"):
++        FileSystemLoader([("dir1", True)])
++
++def test_filesystem_loader_priority_stable_sort():
++    # Test stable ordering for same priority
++    # Input: [("dir1", 1), ("dir2", 1)]
++    # Expected: ['dir1', 'dir2']
++    loader = FileSystemLoader([("dir1", 1), ("dir2", 1)])
++    assert loader.searchpath == ['dir1', 'dir2']
++
++def test_filesystem_loader_priority_negative():
++    # Test negative priorities
++    # Input: [("dir1", -1), ("dir2", -2)]
++    # Expected: ['dir1', 'dir2']
++    loader = FileSystemLoader([("dir1", -1), ("dir2", -2)])
++    assert loader.searchpath == ['dir1', 'dir2']

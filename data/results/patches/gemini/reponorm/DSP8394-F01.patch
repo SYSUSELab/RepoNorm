@@ -1,0 +1,130 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..1a89ce20 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -7,7 +7,7 @@ import litellm
+ from litellm.caching.caching import Cache as LitellmCache
+ 
+ from dspy.clients.base_lm import BaseLM, inspect_history
+-from dspy.clients.cache import Cache
++from dspy.clients.cache import Cache, request_cache
+ from dspy.clients.embedding import Embedder
+ from dspy.clients.lm import LM
+ from dspy.clients.provider import Provider, TrainingJob
+@@ -112,4 +112,5 @@ __all__ = [
+     "enable_litellm_logging",
+     "disable_litellm_logging",
+     "configure_cache",
++    "request_cache",
+ ]
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..4445064c 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,6 +2,8 @@ import copy
+ import inspect
+ import logging
+ import threading
++import contextvars
++from contextlib import contextmanager
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -58,9 +60,23 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._bypass_var = contextvars.ContextVar('dspy_cache_bypass', default=False)
++
++    @contextmanager
++    def bypass(self):
++        """
++        Context manager to bypass cache reads.
++        """
++        token = self._bypass_var.set(True)
++        try:
++            yield
++        finally:
++            self._bypass_var.reset(token)
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
++        if self._bypass_var.get():
++            return False
+         return key in self.memory_cache or key in self.disk_cache
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+@@ -97,6 +113,9 @@ class Cache:
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
++        if self._bypass_var.get():
++            return None
++
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+diff --git a/tests/caching/test_cache_bypass.py b/tests/caching/test_cache_bypass.py
+new file mode 100644
+index 00000000..326e00d1
+--- /dev/null
++++ b/tests/caching/test_cache_bypass.py
+@@ -0,0 +1,58 @@
++import dspy
++import pytest
++import asyncio
++
++def test_sync_bypass():
++    cache = dspy.cache
++    cache.reset_memory_cache()
++    
++    @dspy.request_cache()
++    def my_func(x):
++        return x * 2
++        
++    # First call: cache miss
++    res1 = my_func(x=10)
++    assert res1 == 20
++    
++    # Second call: cache hit
++    res2 = my_func(x=10)
++    assert res2 == 20
++    
++    # Bypass
++    with cache.bypass():
++        # Should be a cache miss
++        res3 = my_func(x=10)
++        assert res3 == 20
++        
++        # Should write to cache
++        res4 = my_func(x=10)
++        assert res4 == 20
++        
++    # After bypass: should be a cache hit
++    res5 = my_func(x=10)
++    assert res5 == 20
++
++def test_async_bypass():
++    cache = dspy.cache
++    cache.reset_memory_cache()
++    
++    @dspy.request_cache()
++    async def my_async_func(x):
++        await asyncio.sleep(0.01)
++        return x * 2
++        
++    async def run():
++        # First call: cache miss
++        res1 = await my_async_func(x=10)
++        assert res1 == 20
++        
++        # Bypass
++        with cache.bypass():
++            res2 = await my_async_func(x=10)
++            assert res2 == 20
++            
++        # After bypass: cache hit
++        res3 = await my_async_func(x=10)
++        assert res3 == 20
++        
++    asyncio.run(run())

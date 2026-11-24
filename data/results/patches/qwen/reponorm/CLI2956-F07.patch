@@ -1,0 +1,176 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..e6d55bf 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1222,9 +1222,54 @@ class Command:
+             ).format(name=self.name, extra_message=extra_message)
+             echo(style(message, fg="red"), err=True)
+ 
++        # Check for conflicting options
++        self._check_param_conflicts(ctx)
++
+         if self.callback is not None:
+             return ctx.invoke(self.callback, **ctx.params)
+ 
++    def _check_param_conflicts(self, ctx: Context) -> None:
++        """Check for conflicting options that were both explicitly provided."""
++        params = ctx.command.get_params(ctx)
++        
++        # Build a mapping of parameter names to their option strings
++        name_to_opts: dict[str, list[str]] = {}
++        for param in params:
++            if param.name is not None:
++                name_to_opts[param.name] = param.opts
++        
++        # Check each parameter with conflicts_with
++        for param in params:
++            if param.conflicts_with is None:
++                continue
++            
++            # Get the source of this parameter's value
++            param_source = ctx.get_parameter_source(param.name)  # type: ignore
++            if param_source not in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):
++                continue
++            
++            # Check each conflicting parameter
++            for conflict_name in param.conflicts_with:
++                if conflict_name not in name_to_opts:
++                    raise UsageError(
++                        f"Option '{param.opts[0]}' has an unknown conflict: '{conflict_name}'."
++                    )
++                
++                conflict_param = next(
++                    p for p in params if p.name == conflict_name
++                )
++                conflict_source = ctx.get_parameter_source(conflict_name)
++                
++                # Only trigger conflict if both are COMMANDLINE or PROMPT
++                if conflict_source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):
++                    conflict_opts = conflict_param.opts
++                    first_opt = param.opts[0]
++                    second_opt = conflict_opts[0] if conflict_opts else conflict_name
++                    
++                    raise UsageError(
++                        f"Option '{first_opt}' cannot be used together with '{second_opt}'."
++                    )
++
+     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
+         """Return a list of completions for the incomplete value. Looks
+         at the names of options and chained multi-commands.
+@@ -2091,6 +2136,7 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        conflicts_with: str | cabc.Sequence[str] | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2165,12 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.conflicts_with: list[str] | None = None
++        if conflicts_with is not None:
++            if isinstance(conflicts_with, str):
++                self.conflicts_with = [conflicts_with]
++            else:
++                self.conflicts_with = list(conflicts_with)
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2188,6 +2240,7 @@ class Parameter:
+             "multiple": self.multiple,
+             "default": self.default,
+             "envvar": self.envvar,
++            "conflicts_with": self.conflicts_with or [],
+         }
+ 
+     def __repr__(self) -> str:
+@@ -2549,6 +2602,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        conflicts_with: str | cabc.Sequence[str] | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2556,7 +2610,12 @@ class Option(Parameter):
+ 
+         default_is_missing = "default" not in attrs
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls,
++            type=type,
++            multiple=multiple,
++            deprecated=deprecated,
++            conflicts_with=conflicts_with,
++            **attrs,
+         )
+ 
+         if prompt is True:
+@@ -2641,6 +2700,21 @@ class Option(Parameter):
+             if deprecated and prompt:
+                 raise ValueError("`deprecated` options cannot use `prompt`.")
+ 
++            # Validate conflicts_with configuration
++            if self.conflicts_with is not None:
++                for conflict_name in self.conflicts_with:
++                    if not isinstance(conflict_name, str):
++                        raise TypeError(
++                            f"conflicts_with must be a string or sequence of strings, "
++                            f"got {conflict_name!r}"
++                        )
++                    # Check for self-referencing
++                    if self.name is not None and conflict_name == self.name:
++                        from click.exceptions import UsageError
++                        raise UsageError(
++                            f"Option '{self.opts[0]}' cannot conflict with itself."
++                        )
++
+             if self.nargs == -1:
+                 raise TypeError("nargs=-1 is not supported for options.")
+ 
+@@ -2671,6 +2745,7 @@ class Option(Parameter):
+             flag_value=self.flag_value,
+             count=self.count,
+             hidden=self.hidden,
++            conflicts_with=self.conflicts_with or [],
+         )
+         return info_dict
+ 
+diff --git a/tests/test_info_dict.py b/tests/test_info_dict.py
+index 20fe68c..0bb21f9 100644
+--- a/tests/test_info_dict.py
++++ b/tests/test_info_dict.py
+@@ -19,6 +19,7 @@ HELP_OPTION = (
+         "multiple": False,
+         "default": False,
+         "envvar": None,
++        "conflicts_with": [],
+         "help": "Show this message and exit.",
+         "prompt": None,
+         "is_flag": True,
+@@ -40,6 +41,7 @@ NAME_ARGUMENT = (
+         "multiple": False,
+         "default": None,
+         "envvar": None,
++        "conflicts_with": [],
+     },
+ )
+ NUMBER_OPTION = (
+@@ -55,6 +57,7 @@ NUMBER_OPTION = (
+         "multiple": False,
+         "default": 1,
+         "envvar": None,
++        "conflicts_with": [],
+         "help": None,
+         "prompt": None,
+         "is_flag": False,
+@@ -196,6 +199,7 @@ HELLO_GROUP = (
+                 "multiple": False,
+                 "default": False,
+                 "envvar": None,
++        "conflicts_with": [],
+                 "help": None,
+                 "prompt": None,
+                 "is_flag": True,

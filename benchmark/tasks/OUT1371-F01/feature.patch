@@ -1,0 +1,186 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..e1ab6d8 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -23,6 +23,8 @@ class Prompt:
+ 
+     template: jinja2.Template
+     signature: Optional[inspect.Signature]
++    _content: Optional[str] = None
++    _path: Optional[Path] = None
+ 
+     def __call__(self, *args, **kwargs) -> str:
+         """Render and return the template.
+@@ -39,8 +41,27 @@ class Prompt:
+         else:
+             return self.template.render(**kwargs)
+ 
++    def with_filters(self, filters: Optional[Dict[str, Callable]]) -> "Prompt":
++        """Return an independent prompt with additional or overridden filters.
++
++        The existing callable signature and string or file template source are
++        retained. ``None`` and empty mappings retain the current filter set.
++        """
++        combined = self.template.environment.filters.copy()
++        if filters is not None:
++            combined.update(filters)
++        if self._path is not None:
++            template = self._template_from_file(self._path, combined)
++        elif self._content is not None:
++            template = self._template_from_str(self._content, combined)
++        else:
++            raise ValueError("Derivation requires a prompt created from a string or file.")
++        return type(self)(template, self.signature, self._content, self._path)
++
+     @classmethod
+-    def from_str(cls, content: str):
++    def from_str(
++        cls, content: str, filters: Optional[Dict[str, Callable]] = None
++    ):
+         """
+         Create an instance of the class from a string.
+ 
+@@ -53,10 +74,12 @@ class Prompt:
+         -------
+         An instance of the class with the provided content as a template.
+         """
+-        return cls(cls._template_from_str(content), None)
++        return cls(cls._template_from_str(content, filters), None, content)
+ 
+     @classmethod
+-    def from_file(cls, path: Path):
++    def from_file(
++        cls, path: Path, filters: Optional[Dict[str, Callable]] = None
++    ):
+         """
+         Create a Prompt instance from a file containing a Jinja template.
+ 
+@@ -75,10 +98,12 @@ class Prompt:
+         """
+         # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+         # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++        return cls(cls._template_from_file(path, filters), None, _path=Path(path).resolve())
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
++    def _template_from_str(
++        _, content: str, filters: Optional[Dict[str, Callable]] = None
++    ) -> jinja2.Template:
+         # Dedent, and remove extra linebreak
+         cleaned_template = inspect.cleandoc(content)
+ 
+@@ -93,35 +118,25 @@ class Prompt:
+         # used to continue to the next line without linebreak.
+         cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
+ 
+-        env = jinja2.Environment(
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
+-        )
+-        env.filters["name"] = get_fn_name
+-        env.filters["description"] = get_fn_description
+-        env.filters["source"] = get_fn_source
+-        env.filters["signature"] = get_fn_signature
+-        env.filters["schema"] = get_schema
+-        env.filters["args"] = get_fn_args
++        env = create_jinja_env(None, filters)
+ 
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(
++        _, path: Path, filters: Optional[Dict[str, Callable]] = None
++    ) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+-        env = jinja2.Environment(
+-            loader=jinja2.FileSystemLoader(file_directory),
+-            trim_blocks=True,
+-            lstrip_blocks=True,
+-            keep_trailing_newline=True,
+-            undefined=jinja2.StrictUndefined,
+-        )
++        env = create_jinja_env(jinja2.FileSystemLoader(file_directory), filters)
++
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
++def prompt(
++    fn: Optional[Callable] = None,
++    *,
++    filters: Optional[Dict[str, Callable]] = None,
++) -> Callable:
+     """Decorate a function that contains a prompt template.
+ 
+     This allows to define prompts in the docstring of a function and simplify their
+@@ -152,11 +167,26 @@ def prompt(fn: Callable) -> Prompt:
+     ...
+     >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+ 
++    Additional Jinja2 filters can be provided as keyword arguments to the decorator.
++
++    >>> def reverse(s: str) -> str:
++    ...     return s[::-1]
++    ...
++    >>> @outlines.prompt(filters={ 'reverse': reverse })
++    ... def reverse_prompt(text):
++    ...     '''{{ text | reverse }}'''
++    ...
++    >>> prompt = reverse_prompt("Hello")
++    >>> print(prompt)
++    ... "olleH"
++
+     Returns
+     -------
+     A `Prompt` callable class which will render the template when called.
+ 
+     """
++    if fn is None:
++        return lambda fn: prompt(fn, filters=filters)
+ 
+     signature = inspect.signature(fn)
+ 
+@@ -166,9 +196,37 @@ def prompt(fn: Callable) -> Prompt:
+     if docstring is None:
+         raise TypeError("Could not find a template in the function's docstring.")
+ 
+-    template = Prompt._template_from_str(cast(str, docstring))
++    template = Prompt._template_from_str(cast(str, docstring), filters)
++
++    return Prompt(template, signature, cast(str, docstring))
++
++
++def create_jinja_env(
++    loader: Optional[jinja2.BaseLoader] = None,
++    filters: Optional[Dict[str, Callable]] = None,
++) -> jinja2.Environment:
++    env = jinja2.Environment(
++        loader=loader,
++        trim_blocks=True,
++        lstrip_blocks=True,
++        keep_trailing_newline=True,
++        undefined=jinja2.StrictUndefined,
++    )
++
++    env.filters.update(
++        {
++            "name": get_fn_name,
++            "description": get_fn_description,
++            "source": get_fn_source,
++            "signature": get_fn_signature,
++            "schema": get_schema,
++            "args": get_fn_args,
++        }
++    )
++    if filters is not None:
++        env.filters.update(filters)
+ 
+-    return Prompt(template, signature)
++    return env
+ 
+ 
+ def get_fn_name(fn: Callable):

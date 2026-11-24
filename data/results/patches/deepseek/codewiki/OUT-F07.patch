@@ -1,0 +1,167 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..fce721f 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,7 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++import warnings
++from typing import TYPE_CHECKING, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -20,34 +21,74 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+     This class wraps the `xgr.contrib.hf.LogitsProcessor` class and adds
+     a `reset` method to reset the logits processor for a new generation.
+ 
++    If a ``fallback_processor`` is provided, it will be used when the
++    primary XGrammar logits processor raises an exception. The fallback
++    takes over permanently once activated, avoiding repeated retries of
++    the failing primary processor.
++
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(
++        self,
++        compiled_grammar: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
++    ):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
+ 
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional fallback logits processor used when the primary
++            processor raises an exception during ``process_logits``.
++
+         """
+         import xgrammar as xgr
+ 
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
++        self.fallback_processor = fallback_processor
++        self._use_fallback = False
+         super().__init__("torch")
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+         self.xgrammar_logits_processor = None
++        self._use_fallback = False
++        if self.fallback_processor is not None:
++            self.fallback_processor.reset()
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
+-        if self.xgrammar_logits_processor is None:
++        if self.xgrammar_logits_processor is None and not self._use_fallback:
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        if self._use_fallback and self.fallback_processor is not None:
++            return self.fallback_processor(input_ids, logits)
++        try:
++            return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++        except Exception:
++            if self.fallback_processor is not None:
++                warnings.warn(
++                    "XGrammar logits processor raised an exception; "
++                    "falling back to the fallback processor.",
++                    RuntimeWarning,
++                )
++                self._use_fallback = True
++                return self.fallback_processor(input_ids, logits)
++            else:
++                raise
++
++    def __call__(self, input_ids: TensorType, logits: TensorType) -> TensorType:
++        """Apply the logits processor, with optional fallback.
++
++        Delegates to the base ``__call__`` (shape normalization) and
++        then calls ``process_logits`` which contains the fallback logic.
++        """
++        return super().__call__(input_ids, logits)
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -79,7 +120,8 @@ class XGrammarBackend(BaseBackend):
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self, json_schema: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -88,6 +130,9 @@ class XGrammarBackend(BaseBackend):
+         json_schema: str
+             The JSON schema to create a logits processor from.
+ 
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional fallback logits processor.
++
+         Returns
+         -------
+         LogitsProcessor
+@@ -97,9 +142,12 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor=fallback_processor)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self, regex: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+@@ -107,6 +155,9 @@ class XGrammarBackend(BaseBackend):
+         regex: str
+             The regex to create a logits processor from.
+ 
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional fallback logits processor.
++
+         Returns
+         -------
+         LogitsProcessor
+@@ -114,9 +165,12 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor=fallback_processor)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self, grammar: str,
++        fallback_processor: Optional[OutlinesLogitsProcessor] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+@@ -124,6 +178,9 @@ class XGrammarBackend(BaseBackend):
+         grammar: str
+             The context-free grammar to create a logits processor from.
+ 
++        fallback_processor: Optional[OutlinesLogitsProcessor]
++            An optional fallback logits processor.
++
+         Returns
+         -------
+         LogitsProcessor
+@@ -131,4 +188,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, fallback_processor=fallback_processor)

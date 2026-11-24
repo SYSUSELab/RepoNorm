@@ -1,0 +1,138 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..7185c81a 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,4 +1,5 @@
+ import random
++import math
+ 
+ import dspy
+ from dspy.propose.dataset_summary_generator import create_dataset_summary
+@@ -23,6 +24,98 @@ TIPS = {
+         "persona": 'Include a persona that is relevant to the task in the instruction (ie. "You are a ...")',
+     }
+ 
++
++def _get_valid_weight(weight):
++    """
++    Get the valid weight for a tip entry.
++    
++    Returns:
++        - The weight if it's a positive finite number
++        - 0 if it's invalid (non-numeric, boolean, nonfinite, or nonpositive)
++    """
++    # Check for boolean first (bool is subclass of int in Python)
++    if isinstance(weight, bool):
++        return 0
++    
++    # Check for numeric types
++    if not isinstance(weight, (int, float)):
++        return 0
++    
++    # Check for non-positive
++    if weight <= 0:
++        return 0
++    
++    # Check for non-finite (inf, nan)
++    if not math.isfinite(weight):
++        return 0
++    
++    return weight
++
++
++def _weighted_choice(rng, items, weights=None):
++    """
++    Select an item from items using the given weights.
++    
++    Args:
++        rng: Random number generator (can be random module or Random instance)
++        items: List of items to choose from
++        weights: Dictionary mapping items to their weights
++        
++    Returns:
++        Selected item
++        
++    Behavior:
++        - Missing keys have weight 1
++        - Unknown keys are ignored
++        - Zero-weight entries are never selected when any positive weight exists
++        - None and all-zero effective mapping use uniform selection
++        - Uses cumulative probability approach to avoid overflow with large weights
++    """
++    # Handle None weights: treat as uniform selection (all weights = 1)
++    if weights is None:
++        weights = {}
++
++    # Build list of (item, weight) pairs for valid items only
++    valid_items = []
++    total_weight = 0.0
++    
++    for item in items:
++        weight = weights.get(item, 1)  # Default weight is 1 for missing keys
++        valid_weight = _get_valid_weight(weight)
++        
++        if valid_weight > 0:
++            valid_items.append((item, valid_weight))
++            total_weight += valid_weight
++    
++    # If no valid items, fall back to uniform selection over all items
++    if not valid_items:
++        return rng.choice(items)
++    
++    # If only one valid item, return it
++    if len(valid_items) == 1:
++        return valid_items[0][0]
++    
++    # Use cumulative probability approach to avoid overflow
++    # Normalize weights to probabilities
++    cumulative_weights = []
++    cumulative_sum = 0.0
++    
++    for item, weight in valid_items:
++        cumulative_sum += weight
++        cumulative_weights.append((cumulative_sum, item))
++    
++    # Generate random number in [0, total_weight)
++    r = rng.random() * total_weight
++    
++    # Find the item whose cumulative range contains r
++    for cum_weight, item in cumulative_weights:
++        if r < cum_weight:
++            return item
++    
++    # Fallback (shouldn't reach here due to floating point precision)
++    return valid_items[-1][0]
++
++
+ ### SIGNATURES USED TO HELP WITH INSTRUCTION GENERATION ###
+ 
+ class DescribeProgram(dspy.Signature):
+@@ -284,7 +377,8 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        tip_weights=None,
+     ):
+         super().__init__()
+         self.program_aware = program_aware
+@@ -297,6 +391,7 @@ class GroundedProposer(Proposer):
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        self.tip_weights = tip_weights
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -361,8 +456,8 @@ class GroundedProposer(Proposer):
+                 if self.set_tip_randomly:
+                     if self.verbose:
+                         print("Using a randomly generated configuration for our grounded proposer.")
+-                    # Randomly select the tip
+-                    selected_tip_key = self.rng.choice(list(TIPS.keys()))
++                    # Randomly select the tip based on weights
++                    selected_tip_key = _weighted_choice(self.rng, list(TIPS.keys()), self.tip_weights)
+                     selected_tip = TIPS[selected_tip_key]
+                     self.use_tip = bool(
+                         selected_tip,

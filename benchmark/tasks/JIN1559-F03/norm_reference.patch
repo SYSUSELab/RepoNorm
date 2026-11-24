@@ -1,0 +1,469 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..64455844 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -23,6 +23,8 @@ Unreleased
+     -   ``unicode_urlencode`` is renamed to ``url_quote``.
+ 
+ -   Add support for native types in macros. :issue:`1510`
++-   Allow ``trans`` blocks to query priority translation providers through a
++    bounded, observable fallback sequence.
+ 
+ 
+ Version 3.0.3
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b7..d6f1028b 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -68,7 +68,7 @@ additional methods:
+ 
+     .. versionchanged:: 2.5 Added new-style gettext support.
+ 
+-.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None)
++.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None, priority_gettext=None, priority_ngettext=None)
+ 
+     Install the given ``gettext``, ``ngettext``, ``pgettext``, and
+     ``npgettext`` callables into the environment. They should behave
+@@ -78,6 +78,11 @@ additional methods:
+     If ``newstyle`` is activated, the callables are wrapped to work like
+     newstyle callables.  See :ref:`newstyle-gettext` for more information.
+ 
++    Optional priority providers receive the source message and current
++    fallback level. Plural providers also receive the plural message and
++    count. A result equal to the applicable source message continues to
++    the next level; the first different result is used.
++
+     .. versionchanged:: 3.0
+         Added ``pgettext`` and ``npgettext``.
+ 
+diff --git a/docs/templates.rst b/docs/templates.rst
+index 89958b86..ce52ef07 100644
+--- a/docs/templates.rst
++++ b/docs/templates.rst
+@@ -1693,6 +1693,15 @@ To bind more than one expression, separate each with a comma (``,``).
+ To pluralize, specify both the singular and plural forms separated by
+ the ``pluralize`` tag.
+ 
++The optional ``priority`` expression requests fallback levels starting
++at 0. It is converted to an integer and limited to level 9. Invalid and
++negative values use only level 0. If no priority provider is installed,
++the ordinary translation callable is used once.
++
++.. code-block:: jinja
++
++    {% trans priority=user.translation_priority %}Welcome{% endtrans %}
++
+ .. code-block:: jinja
+ 
+     {% trans count=list|length %}
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..9b23cd55 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -319,6 +319,8 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], str]] = None,
++        priority_ngettext: t.Optional[t.Callable[[str, str, int, int], str]] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -333,11 +335,23 @@ class InternationalizationExtension(Extension):
+                 npgettext = _make_new_npgettext(npgettext)
+ 
+         self.environment.globals.update(
+-            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
++            gettext=gettext,
++            ngettext=ngettext,
++            pgettext=pgettext,
++            npgettext=npgettext,
++            priority_gettext=priority_gettext,
++            priority_ngettext=priority_ngettext,
+         )
+ 
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+-        for key in ("gettext", "ngettext", "pgettext", "npgettext"):
++        for key in (
++            "gettext",
++            "ngettext",
++            "pgettext",
++            "npgettext",
++            "priority_gettext",
++            "priority_ngettext",
++        ):
+             self.environment.globals.pop(key, None)
+ 
+     def _extract(
+@@ -362,9 +376,12 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        priority_expr: t.Optional[nodes.Expr] = None
+         trimmed = None
++        have_params = False  # Track if we've parsed any parameters for comma handling
++
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if have_params:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -382,13 +399,27 @@ class InternationalizationExtension(Extension):
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                # Handle priority parameter specially - don't add to variables
++                if token.value == "priority":
++                    if priority_expr is not None:
++                        parser.fail(
++                            "priority parameter defined twice.",
++                            token.lineno,
++                            exc=TemplateAssertionError,
++                        )
++                    priority_expr = var
++                    have_params = True
++                    continue
++                variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+             else:
+                 variables[token.value] = var = nodes.Name(token.value, "load")
+ 
++            have_params = True
++
+             if plural_expr is None:
+                 if isinstance(var, nodes.Call):
+                     plural_expr = nodes.Name("_trans", "load")
+@@ -459,6 +490,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            priority_expr,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +546,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        priority_expr: t.Optional[nodes.Expr] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -526,49 +559,144 @@ class InternationalizationExtension(Extension):
+             if plural:
+                 plural = plural.replace("%%", "%")
+ 
+-        # singular only:
+-        if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++        # If priority is specified, use priority-aware translation
++        if priority_expr is not None:
++            # Use extension method to handle priority-based translation
++            if plural_expr is None:
++                # singular only with priority
++                node = self.call_method(
++                    "_priority_gettext",
++                    [nodes.Const(singular), priority_expr],
++                )
++            else:
++                # plural with priority
++                node = self.call_method(
++                    "_priority_ngettext",
++                    [
++                        nodes.Const(singular),
++                        nodes.Const(plural),
++                        plural_expr,
++                        priority_expr,
++                    ],
++                )
+ 
+-        # singular and plural
++            # For priority-based translations, handle variables
++            if variables:
++                for key, value in variables.items():
++                    if num_called_num and key == "num":
++                        continue
++                    node.kwargs.append(nodes.Keyword(key, value))
+         else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
+-
+-        # in case newstyle gettext is used, the method is powerful
+-        # enough to handle the variable expansion and autoescape
+-        # handling itself
+-        if newstyle:
+-            for key, value in variables.items():
+-                # the function adds that later anyways in case num was
+-                # called num, so just skip it.
+-                if num_called_num and key == "num":
+-                    continue
+-                node.kwargs.append(nodes.Keyword(key, value))
++            # Original behavior without priority
++            # singular only:
++            if plural_expr is None:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++
++            # singular and plural
++            else:
++                ngettext = nodes.Name("ngettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
++
++            # in case newstyle gettext is used, the method is powerful
++            # enough to handle the variable expansion and autoescape
++            # handling itself
++            if newstyle:
++                for key, value in variables.items():
++                    # the function adds that later anyways in case num was
++                    # called num, so just skip it.
++                    if num_called_num and key == "num":
++                        continue
++                    node.kwargs.append(nodes.Keyword(key, value))
+ 
+-        # otherwise do that here
++            # otherwise do that here
++            else:
++                # mark the return value as safe if we are in an
++                # environment with autoescaping turned on
++                node = nodes.MarkSafeIfAutoescape(node)
++                if variables:
++                    node = nodes.Mod(
++                        node,
++                        nodes.Dict(
++                            [
++                                nodes.Pair(nodes.Const(key), value)
++                                for key, value in variables.items()
++                            ]
++                        ),
++                    )
++        return nodes.Output([node])
++
++    @staticmethod
++    def _priority_limit(value: t.Any) -> int:
++        try:
++            return max(0, min(int(value), 9))
++        except (TypeError, ValueError, OverflowError):
++            return 0
++
++    @pass_context
++    def _priority_gettext(
++        self, context: Context, message: str, priority: t.Any, **variables: t.Any
++    ) -> str:
++        resolver = context.resolve("priority_gettext")
++        if isinstance(resolver, Undefined):
++            resolver = None
++        if resolver is None:
++            if context.environment.newstyle_gettext:  # type: ignore
++                return t.cast(
++                    str, context.call(context.resolve("gettext"), message, **variables)
++                )
++            result = context.call(context.resolve("gettext"), message)
+         else:
+-            # mark the return value as safe if we are in an
+-            # environment with autoescaping turned on
+-            node = nodes.MarkSafeIfAutoescape(node)
+-            if variables:
+-                node = nodes.Mod(
+-                    node,
+-                    nodes.Dict(
+-                        [
+-                            nodes.Pair(nodes.Const(key), value)
+-                            for key, value in variables.items()
+-                        ]
++            result = message
++            for level in range(self._priority_limit(priority) + 1):
++                result = context.call(resolver, message, level)
++                if result != message:
++                    break
++        if context.eval_ctx.autoescape:
++            result = Markup(result)
++        if variables or context.environment.newstyle_gettext:  # type: ignore
++            result = result % variables
++        return t.cast(str, result)
++
++    @pass_context
++    def _priority_ngettext(
++        self,
++        context: Context,
++        singular: str,
++        plural: str,
++        num: int,
++        priority: t.Any,
++        **variables: t.Any,
++    ) -> str:
++        source = singular if num == 1 else plural
++        resolver = context.resolve("priority_ngettext")
++        if isinstance(resolver, Undefined):
++            resolver = None
++        if resolver is None:
++            if context.environment.newstyle_gettext:  # type: ignore
++                return t.cast(
++                    str,
++                    context.call(
++                        context.resolve("ngettext"), singular, plural, num, **variables
+                     ),
+                 )
+-        return nodes.Output([node])
++            result = context.call(context.resolve("ngettext"), singular, plural, num)
++        else:
++            result = source
++            for level in range(self._priority_limit(priority) + 1):
++                result = context.call(resolver, singular, plural, num, level)
++                if result != source:
++                    break
++        variables.setdefault("num", num)
++        if context.eval_ctx.autoescape:
++            result = Markup(result)
++        return t.cast(str, result % variables)
+ 
+ 
+ class ExprStmtExtension(Extension):
+diff --git a/tests/test_n4c_author_translation_priority.py b/tests/test_n4c_author_translation_priority.py
+new file mode 100644
+index 00000000..c17b364a
+--- /dev/null
++++ b/tests/test_n4c_author_translation_priority.py
+@@ -0,0 +1,125 @@
++import math
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import pass_context
++from jinja2 import TemplateAssertionError
++
++
++@pytest.mark.parametrize(
++    ("value", "levels"),
++    [(-3, [0]), (None, [0]), ("bad", [0]), (1.9, [0, 1]), (99, list(range(10)))],
++)
++def test_priority_normalization_and_cap(value, levels):
++    seen = []
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    env.install_gettext_callables(
++        lambda message: message,
++        lambda singular, plural, count: plural,
++        priority_gettext=lambda message, level: seen.append(level) or message,
++    )
++    template = env.from_string("{% trans priority=value %}source{% endtrans %}")
++    assert template.render(value=value) == "source"
++    assert seen == levels
++
++
++def test_priority_overflow_and_duplicate():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++    env.install_gettext_callables(
++        lambda message: message,
++        lambda singular, plural, count: plural,
++        priority_gettext=lambda message, level: seen.append(level) or message,
++    )
++    env.from_string("{% trans priority=value %}x{% endtrans %}").render(value=math.inf)
++    assert seen == [0]
++    with pytest.raises(TemplateAssertionError, match="priority.*twice"):
++        env.from_string("{% trans priority=1, priority=2 %}x{% endtrans %}")
++
++
++def test_priority_short_circuit_plural_and_fallback_once():
++    levels = []
++    ordinary = []
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    env.install_gettext_callables(
++        lambda message: ordinary.append(message) or message,
++        lambda singular, plural, count: plural,
++        priority_ngettext=lambda singular, plural, count, level: levels.append(level)
++        or ("translated" if level == 2 else plural),
++    )
++    plural = env.from_string(
++        "{% trans n=2, priority=8 %}one{% pluralize %}many{% endtrans %}"
++    )
++    assert plural.render() == "translated"
++    assert levels == [0, 1, 2]
++
++    env.install_gettext_callables(
++        lambda message: ordinary.append(message) or message,
++        lambda singular, plural, count: plural,
++    )
++    assert (
++        env.from_string("{% trans priority=9 %}plain{% endtrans %}").render() == "plain"
++    )
++    assert ordinary == ["plain"]
++    env.uninstall_gettext_translations(None)
++    assert "priority_gettext" not in env.globals
++    assert "priority_ngettext" not in env.globals
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++def test_priority_variables_trim_and_autoescape(newstyle):
++    env = Environment(extensions=["jinja2.ext.i18n"], autoescape=True)
++    env.install_gettext_callables(
++        lambda message: message,
++        lambda singular, plural, count: plural,
++        newstyle=newstyle,
++        priority_gettext=lambda message, level: "<b>%(name)s</b>",
++    )
++    template = env.from_string(
++        "{% trans priority=2, name=name, trimmed %}\nHi {{ name }}\n{% endtrans %}"
++    )
++    assert template.render(name="<x>") == "<b>&lt;x&gt;</b>"
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++@pytest.mark.parametrize("escape", [False, True])
++def test_priority_fallback_keeps_existing_provider_formatting(newstyle, escape):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    @pass_context
++    def gettext(context, message):
++        seen.append(context.environment)
++        return "<b>%(name)s</b>"
++
++    @pass_context
++    def ngettext(context, singular, plural, count):
++        seen.append(context.environment)
++        return "<b>%(name)s</b>"
++
++    env.install_gettext_callables(gettext, ngettext, newstyle=newstyle)
++    source = (
++        "{% autoescape escape %}{% trans priority=2, n=2, name=name %}"
++        "one{% pluralize %}many{% endtrans %}{% endautoescape %}"
++    )
++    assert env.from_string(source).render(name="<x>", escape=escape) == (
++        env.from_string(source.replace("priority=2, ", "")).render(
++            name="<x>", escape=escape
++        )
++    )
++    assert seen == [env, env]
++
++
++@pytest.mark.parametrize("resolver", [False, True])
++def test_priority_newstyle_literal_percent(resolver):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    kwargs = {"priority_gettext": lambda message, level: message} if resolver else {}
++    env.install_gettext_callables(
++        lambda message: message,
++        lambda singular, plural, count: plural,
++        newstyle=True,
++        **kwargs,
++    )
++    source = "{% trans priority=2 %}100% ready{% endtrans %}"
++    assert env.from_string(source).render() == "100% ready"

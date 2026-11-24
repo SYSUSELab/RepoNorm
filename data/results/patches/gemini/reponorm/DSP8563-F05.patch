@@ -1,0 +1,335 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..3dc2edfc 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,7 @@
+ import asyncio
+ import inspect
++import json
++import re
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -113,93 +115,23 @@ class Tool(Type):
+         self.desc = self.desc or desc
+         self.args = self.args or args
+         self.arg_types = self.arg_types or arg_types
+-        self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
++        self.arg_desc = self.arg_desc or arg_desc
+ 
+-    def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
+-        for k, v in kwargs.items():
+-            if k not in self.args:
+-                if self.has_kwargs:
+-                    continue
+-                else:
+-                    raise ValueError(f"Arg {k} is not in the tool's args.")
+-            try:
+-                instance = v.model_dump() if hasattr(v, "model_dump") else v
+-                type_str = self.args[k].get("type")
+-                if type_str is not None and type_str != "Any":
+-                    validate(instance=instance, schema=self.args[k])
+-            except ValidationError as e:
+-                raise ValueError(f"Arg {k} is invalid: {e.message}")
+-
+-        # Parse the args to the correct type.
+-        parsed_kwargs = {}
+-        for k, v in kwargs.items():
+-            if k in self.arg_types and self.arg_types[k] != Any:
+-                # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+-                # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+-                pydantic_wrapper = create_model("Wrapper", value=(self.arg_types[k], ...))
+-                parsed = pydantic_wrapper.model_validate({"value": v})
+-                parsed_kwargs[k] = parsed.value
+-            else:
+-                parsed_kwargs[k] = v
+-        return parsed_kwargs
+-
+-    def format(self):
+-        return str(self)
+-
+-    def format_as_litellm_function_call(self):
+-        return {
+-            "type": "function",
+-            "function": {
+-                "name": self.name,
+-                "description": self.desc,
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": self.args,
+-                    "required": list(self.args.keys()),
+-                },
+-            },
+-        }
+-
+-    def _run_async_in_sync(self, coroutine):
+-        try:
+-            loop = asyncio.get_running_loop()
+-        except RuntimeError:
+-            return asyncio.run(coroutine)
+-
+-        return loop.run_until_complete(coroutine)
++    async def acall(self, **kwargs):
++        """Asynchronously call the tool."""
++        return await with_callbacks(self.func)(**kwargs)
+ 
+-    @with_callbacks
+     def __call__(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            if settings.allow_tool_async_sync_conversion:
+-                return self._run_async_in_sync(result)
+-            else:
+-                raise ValueError(
+-                    "You are calling `__call__` on an async tool, please use `acall` instead or set "
+-                    "`allow_async=True` to run the async tool in sync mode."
+-                )
+-        return result
+-
+-    @with_callbacks
+-    async def acall(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            return await result
+-        else:
+-            # We should allow calling a sync tool in the async path.
+-            return result
++        """Call the tool."""
++        return with_callbacks(self.func)(**kwargs)
+ 
+     @classmethod
+-    def from_mcp_tool(cls, session: "mcp.client.session.ClientSession", tool: "mcp.types.Tool") -> "Tool":
++    def from_mcp(cls, session: "mcp.ClientSession", tool: "mcp.types.Tool") -> "Tool":
+         """
+-        Build a DSPy tool from an MCP tool and a ClientSession.
++        Build a DSPy tool from an MCP tool.
+ 
+         Args:
+-            session: The MCP session to use.
++            session: The MCP client session.
+             tool: The MCP tool to convert.
+ 
+         Returns:
+@@ -258,32 +190,100 @@ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
++        note: str | None = None
++        comment: str | None = None
++        annotation: str | None = None
++        tags: list[str] | None = None
++        priority: str | int | None = None
++        meta: dict[str, Any] | None = None
+ 
+     tool_calls: list[ToolCall]
+ 
+     @classmethod
+-    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
++    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]], comments: list[str] | None = None) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+ 
+         Args:
+             dict_list: A list of dictionaries, where each dictionary should have 'name' and 'args' keys.
++            comments: Optional list of comment strings.
+ 
+         Returns:
+             A ToolCalls instance.
+-
+-        Example:
+-
+-            ```python
+-            tool_calls_dict = [
+-                {"name": "search", "args": {"query": "hello"}},
+-                {"name": "translate", "args": {"text": "world"}}
+-            ]
+-            tool_calls = ToolCalls.from_dict_list(tool_calls_dict)
+-            ```
+         """
+-        tool_calls = [cls.ToolCall(**item) for item in tool_calls_dicts]
++        combined_comment = None
++        if comments:
++            if not isinstance(comments, list):
++                raise ValueError("Comments must be a list of strings")
++            filtered_comments = [c for c in comments if isinstance(c, str) and c.strip()]
++            if filtered_comments:
++                combined_comment = "\n".join(filtered_comments)
++
++        tool_calls = []
++        for item in tool_calls_dicts:
++            if not isinstance(item, dict):
++                raise ValueError("Item must be a dictionary")
++            
++            item_copy = item.copy()
++            if combined_comment:
++                item_copy["comment"] = combined_comment
++            
++            tool_calls.append(cls.ToolCall(**item_copy))
++            
+         return cls(tool_calls=tool_calls)
+ 
++    @classmethod
++    def from_string(cls, text: str) -> "ToolCalls":
++        """Parse a JSON string with optional Python-style comments."""
++        def parse_json_with_comments(text):
++            comments = []
++            cleaned_text = []
++            in_string = False
++            escaped = False
++            
++            i = 0
++            while i < len(text):
++                char = text[i]
++                if escaped:
++                    cleaned_text.append(char)
++                    escaped = False
++                    i += 1
++                    continue
++                
++                if char == '"':
++                    in_string = not in_string
++                    cleaned_text.append(char)
++                    i += 1
++                    continue
++                    
++                if not in_string and char == '#':
++                    comment_start = i + 1
++                    while i < len(text) and text[i] != '\n':
++                        i += 1
++                    comment = text[comment_start:i].strip()
++                    if comment:
++                        comments.append(comment)
++                    continue
++                    
++                if char == '\\':
++                    escaped = True
++                    
++                cleaned_text.append(char)
++                i += 1
++                
++            return "".join(cleaned_text), comments
++
++        cleaned, comments = parse_json_with_comments(text)
++        data = json.loads(cleaned)
++        
++        if isinstance(data, dict):
++            items = data.get("tool_calls", [data])
++        elif isinstance(data, list):
++            items = data
++        else:
++            raise ValueError("Invalid JSON format")
++            
++        return cls.from_dict_list(items, comments=comments)
++
+     @classmethod
+     def description(cls) -> str:
+         return (
+@@ -292,7 +292,6 @@ class ToolCalls(Type):
+         )
+ 
+     def format(self) -> list[dict[str, Any]]:
+-        # The tool_call field is compatible with OpenAI's tool calls schema.
+         return [
+             {
+                 "type": "tool_calls",
+@@ -309,6 +308,38 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    def format_with_metadata(self) -> list[dict[str, Any]]:
++        result = []
++        for tool_call in self.tool_calls:
++            call_dict = {
++                "type": "function",
++                "function": {
++                    "name": tool_call.name,
++                    "arguments": tool_call.args,
++                },
++            }
++            
++            # Add metadata if present
++            metadata = {}
++            if tool_call.note is not None: metadata["note"] = tool_call.note
++            if tool_call.comment is not None: metadata["comment"] = tool_call.comment
++            if tool_call.annotation is not None: metadata["annotation"] = tool_call.annotation
++            if tool_call.tags is not None: metadata["tags"] = tool_call.tags
++            if tool_call.priority is not None: metadata["priority"] = tool_call.priority
++            if tool_call.meta is not None: metadata["meta"] = tool_call.meta
++            
++            if metadata:
++                call_dict.update(metadata)
++                
++            result.append(call_dict)
++            
++        return [
++            {
++                "type": "tool_calls",
++                "tool_calls": result,
++            }
++        ]
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..f0c7df43 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,55 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++def test_tool_calls_metadata_and_comments():
++    # Test metadata
++    tool_calls_dicts = [
++        {"name": "search", "args": {"query": "hello"}, "note": "my note", "tags": ["a", "b"]}
++    ]
++    tool_calls = ToolCalls.from_dict_list(tool_calls_dicts)
++    formatted = tool_calls.format_with_metadata()
++    
++    assert formatted[0]["tool_calls"][0]["note"] == "my note"
++    assert formatted[0]["tool_calls"][0]["tags"] == ["a", "b"]
++    
++    # Test comments
++    json_str = '{"tool_calls": [{"name": "search", "args": {"query": "hello"}}]} # my comment'
++    tool_calls = ToolCalls.from_string(json_str)
++    assert tool_calls.tool_calls[0].comment == "my comment"
++    
++    # Test comments override
++    json_str = '{"tool_calls": [{"name": "search", "args": {"query": "hello"}, "comment": "explicit"}]} # document comment'
++    tool_calls = ToolCalls.from_string(json_str)
++    assert tool_calls.tool_calls[0].comment == "document comment"
++
++def test_tool_calls_metadata_and_comments():
++    # Test metadata
++    tool_calls_dicts = [
++        {"name": "search", "args": {"query": "hello"}, "note": "my note", "tags": ["a", "b"]}
++    ]
++    tool_calls = ToolCalls.from_dict_list(tool_calls_dicts)
++    formatted = tool_calls.format_with_metadata()
++    assert formatted[0]["tool_calls"][0]["note"] == "my note"
++    assert formatted[0]["tool_calls"][0]["tags"] == ["a", "b"]
++    assert "comment" not in formatted[0]["tool_calls"][0]
++
++    # Test comments
++    json_str = '{"name": "search", "args": {"query": "hello"}} # my comment'
++    tool_calls = ToolCalls.from_string(json_str)
++    formatted = tool_calls.format_with_metadata()
++    assert formatted[0]["tool_calls"][0]["comment"] == "my comment"
++
++    # Test combined comments
++    json_str = """
++    [
++        {"name": "search", "args": {"query": "hello"}},
++        {"name": "translate", "args": {"text": "world"}}
++    ]
++    # comment 1
++    # comment 2
++    """
++    tool_calls = ToolCalls.from_string(json_str)
++    formatted = tool_calls.format_with_metadata()
++    assert formatted[0]["tool_calls"][0]["comment"] == "comment 1\ncomment 2"
++    assert formatted[0]["tool_calls"][1]["comment"] == "comment 1\ncomment 2"

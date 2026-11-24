@@ -1,0 +1,116 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..034a3d1 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -484,12 +484,13 @@ class Editor:
+         editor: str | None = None,
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+-        extension: str = ".txt",
++        extension: str = ".txt", handle_exit_codes: cabc.Mapping[int, cabc.Callable[[int], t.Any]] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.handle_exit_codes = handle_exit_codes
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -518,7 +519,14 @@ class Editor:
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+             exit_code = c.wait()
+-            if exit_code != 0:
++            if self.handle_exit_codes and exit_code in self.handle_exit_codes:
++                try:
++                    self.handle_exit_codes[exit_code](exit_code)
++                except Exception as e:
++                    raise ClickException(
++                        _("{editor}: Handler failed").format(editor=editor)
++                    ) from e
++            elif exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+                 )
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..a7599d9 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -649,6 +649,7 @@ def edit(
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+     extension: str = ".txt",
++    handle_exit_codes: cabc.Mapping[int, cabc.Callable[[int], t.Any]] | None = None,
+     filename: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+@@ -674,13 +675,17 @@ def edit(
+     :param extension: the extension to tell the editor about.  This defaults
+                       to `.txt` but changing this might change syntax
+                       highlighting.
++    :param handle_exit_codes: a mapping of exit codes to callables that
++                              are invoked when the editor exits with that
++                              code. If the code is matched, the editing
++                              failure is suppressed.
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, handle_exit_codes=handle_exit_codes)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_edit_exit_codes.py b/tests/test_edit_exit_codes.py
+new file mode 100644
+index 0000000..a56a251
+--- /dev/null
++++ b/tests/test_edit_exit_codes.py
+@@ -0,0 +1,44 @@
++import click
++import os
++import pytest
++from click.exceptions import ClickException
++
++def test_edit_exit_codes():
++    # Create a temporary editor script
++    editor_script = "editor_test.sh"
++    with open(editor_script, "w") as f:
++        f.write("#!/bin/sh\n")
++        f.write("exit 1\n")
++    os.chmod(editor_script, 0o755)
++
++    # Set the editor environment variable
++    os.environ["EDITOR"] = f"./{editor_script}"
++
++    # Test with handler
++    handler_called = False
++    def handler(code):
++        nonlocal handler_called
++        handler_called = True
++        assert code == 1
++
++    click.edit("hello", handle_exit_codes={1: handler})
++    assert handler_called
++
++    # Test without handler (should raise ClickException)
++    with pytest.raises(ClickException):
++        click.edit("hello")
++
++    # Test with failing handler
++    def failing_handler(code):
++        raise ValueError("Handler failed")
++
++    with pytest.raises(ClickException) as excinfo:
++        click.edit("hello", handle_exit_codes={1: failing_handler})
++    assert "Handler failed" in str(excinfo.value)
++    assert isinstance(excinfo.value.__cause__, ValueError)
++
++    # Cleanup
++    os.remove(editor_script)
++    if "EDITOR" in os.environ:
++        del os.environ["EDITOR"]
++

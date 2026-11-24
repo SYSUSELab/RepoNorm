@@ -1,0 +1,310 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..0609f41 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -17,6 +17,7 @@ from .async_utils import auto_aiter
+ from .async_utils import auto_await
+ from .async_utils import auto_to_list
+ from .exceptions import FilterArgumentError
++from .runtime import StrictUndefined
+ from .runtime import Undefined
+ from .utils import htmlsafe_json_dumps
+ from .utils import pass_context
+@@ -1163,6 +1164,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = True,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1203,6 +1205,14 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    By default, ``include_empty`` is ``True``, which includes items with
++    a ``None`` or other falsy grouping key. Set it to ``False`` to
++    exclude items whose resolved grouping key is falsy (after default
++    substitution).
++
++    .. versionchanged:: 3.5
++        Added the ``include_empty`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+@@ -1210,9 +1220,28 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
++    key_values = [(expr(item), item) for item in value]
++
++    if not include_empty:
++        key_values = [
++            (k, v) for k, v in key_values if not isinstance(k, StrictUndefined) and k
++        ]
++
++    def sort_key(kv):
++        k, v = kv
++        if isinstance(k, Undefined):
++            if isinstance(k, StrictUndefined):
++                k._fail_with_undefined_error()
++            return (2, 0)
++        if k is None:
++            return (1, 0)
++        return (0, k)
++
++    key_values.sort(key=sort_key)
++
+     return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
++        _GroupTuple(key, [v for _, v in group])
++        for key, group in groupby(key_values, lambda kv: kv[0])
+     ]
+ 
+ 
+@@ -1222,11 +1251,33 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = True,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
++    key_values = [
++        (expr(item), item) async for item in auto_aiter(value)
++    ]
++
++    if not include_empty:
++        key_values = [
++            (k, v) for k, v in key_values if not isinstance(k, StrictUndefined) and k
++        ]
++
++    def sort_key(kv):
++        k, v = kv
++        if isinstance(k, Undefined):
++            if isinstance(k, StrictUndefined):
++                k._fail_with_undefined_error()
++            return (2, 0)
++        if k is None:
++            return (1, 0)
++        return (0, k)
++
++    key_values.sort(key=sort_key)
++
+     return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++        _GroupTuple(key, [v for _, v in group])
++        for key, group in groupby(key_values, lambda kv: kv[0])
+     ]
+ 
+ 
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..cd4dc10 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -3,7 +3,7 @@ from collections import namedtuple
+ import pytest
+ from markupsafe import Markup
+ 
+-from jinja2 import Environment
++from jinja2 import Environment, StrictUndefined, UndefinedError
+ from jinja2.async_utils import auto_aiter
+ 
+ 
+@@ -251,3 +251,100 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++
++@mark_dualiter(
++    "users",
++    lambda: [
++        {"name": "emma", "city": "NY"},
++        {"name": "smith", "city": "WA"},
++        {"name": "john"},
++        {"name": "jane", "city": None},
++        {"name": "bob", "city": ""},
++    ],
++)
++def test_groupby_include_empty_false(env_async, users):
++    """Test include_empty=False removes items with falsy grouping keys."""
++    tmpl = env_async.from_string(
++        "{% for group in users()|groupby(\"city\", include_empty=False) %}"
++        "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++        "{% endfor %}"
++    )
++    out = tmpl.render(users=users)
++    assert out == "NY:emma WA:smith "
++
++
++@mark_dualiter(
++    "users",
++    lambda: [
++        {"name": "missing2"},
++        {"name": "none1", "city": None},
++        {"name": "empty", "city": ""},
++        {"name": "zulu", "city": "z"},
++        {"name": "missing1"},
++        {"name": "none2", "city": None},
++    ],
++)
++def test_groupby_include_empty_order(env_async, users):
++    """Test ordering: normal keys (including empty str), then None, then Undefined."""
++    tmpl = env_async.from_string(
++        "{% for group in users()|groupby(\"city\") %}"
++        "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++        "{% endfor %}"
++    )
++    out = tmpl.render(users=users)
++    assert out == ":empty z:zulu None:none1,none2 :missing2,missing1 "
++
++
++@mark_dualiter(
++    "users",
++    lambda: [
++        {"name": "a", "city": None},
++        {"name": "b"},
++        {"name": "c", "city": None},
++        {"name": "d"},
++    ],
++)
++def test_groupby_include_empty_interleaved(env_async, users):
++    """Test interleaved None and Undefined produce single groups."""
++    tmpl = env_async.from_string(
++        "{% for group in users()|groupby(\"city\") %}"
++        "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++        "{% endfor %}"
++    )
++    out = tmpl.render(users=users)
++    assert out == "None:a,c :b,d "
++
++
++def test_groupby_include_empty_strict_undefined(env_async):
++    """Test StrictUndefined raises error when include_empty=True."""
++    env = Environment(undefined=StrictUndefined, enable_async=True)
++    tmpl = env.from_string(
++        "{% for group in users|groupby(\"city\") %}"
++        "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++        "{% endfor %}"
++    )
++    with pytest.raises(UndefinedError):
++        tmpl.render(
++            users=[
++                {"name": "john", "city": "NY"},
++                {"name": "jane"},
++            ]
++        )
++
++
++def test_groupby_include_empty_strict_undefined_filtered(env_async):
++    """Test StrictUndefined items are filtered when include_empty=False."""
++    env = Environment(undefined=StrictUndefined, enable_async=True)
++    tmpl = env.from_string(
++        "{% for group in users|groupby(\"city\", include_empty=False) %}"
++        "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++        "{% endfor %}"
++    )
++    out = tmpl.render(
++        users=[
++            {"name": "john", "city": "NY"},
++            {"name": "jane"},
++        ]
++    )
++    assert out == "NY:john "
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..d97a8b6 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -852,3 +852,89 @@ class TestFilter:
+         with pytest.raises(TemplateRuntimeError, match="No filter named 'f'"):
+             t1.render(x=42)
+             t2.render(x=42)
++
++    def test_groupby_include_empty_false(self, env):
++        """Test include_empty=False removes items with falsy grouping keys."""
++        tmpl = env.from_string(
++            "{% for city, items in users|groupby(\"city\", include_empty=False) %}"
++            "{{ city }}: {{ items|map(attribute=\"name\")|join(\", \") }}\n"
++            "{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "emma", "city": "NY"},
++                {"name": "smith", "city": "WA"},
++                {"name": "john"},
++                {"name": "jane", "city": None},
++                {"name": "bob", "city": ""},
++            ]
++        )
++        assert out == "NY: emma\nWA: smith\n"
++
++    def test_groupby_include_empty_order(self, env):
++        """Test ordering: normal keys (including empty str), then None, then Undefined."""
++        tmpl = env.from_string(
++            "{% for group in users|groupby(\"city\") %}"
++            "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++            "{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "missing2"},
++                {"name": "none1", "city": None},
++                {"name": "empty", "city": ""},
++                {"name": "zulu", "city": "z"},
++                {"name": "missing1"},
++                {"name": "none2", "city": None},
++            ]
++        )
++        assert out == ":empty z:zulu None:none1,none2 :missing2,missing1 "
++
++    def test_groupby_include_empty_interleaved(self, env):
++        """Test interleaved None and Undefined produce single groups."""
++        tmpl = env.from_string(
++            "{% for group in users|groupby(\"city\") %}"
++            "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++            "{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "a", "city": None},
++                {"name": "b"},
++                {"name": "c", "city": None},
++                {"name": "d"},
++            ]
++        )
++        assert out == "None:a,c :b,d "
++
++    def test_groupby_include_empty_strict_undefined(self, env):
++        """Test StrictUndefined raises error when include_empty=True."""
++        env = Environment(undefined=StrictUndefined)
++        tmpl = env.from_string(
++            "{% for group in users|groupby(\"city\") %}"
++            "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++            "{% endfor %}"
++        )
++        with pytest.raises(UndefinedError):
++            tmpl.render(
++                users=[
++                    {"name": "john", "city": "NY"},
++                    {"name": "jane"},
++                ]
++            )
++
++    def test_groupby_include_empty_strict_undefined_filtered(self, env):
++        """Test StrictUndefined items are filtered when include_empty=False."""
++        env = Environment(undefined=StrictUndefined)
++        tmpl = env.from_string(
++            "{% for group in users|groupby(\"city\", include_empty=False) %}"
++            "{{ group.grouper }}:{{ group.list|map(attribute=\"name\")|join(\",\") }} "
++            "{% endfor %}"
++        )
++        out = tmpl.render(
++            users=[
++                {"name": "john", "city": "NY"},
++                {"name": "jane"},
++            ]
++        )
++        assert out == "NY:john "

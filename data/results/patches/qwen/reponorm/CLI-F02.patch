@@ -1,0 +1,490 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..8b9b27d 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,11 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param on_exit: An optional callback invoked when the context is torn
++        down. Receives the context being closed. This is called once per
++        completed teardown, not for nested entries of the same context.
++
++    .. versionadded:: 8.3
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +285,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        on_exit: t.Callable[[Context], None] | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,10 +433,25 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        #: Callback to invoke when the context is torn down.
++        self._on_exit: t.Callable[[Context], None] | None = on_exit
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._closed = False
++        self._in_cleanup = False
++
++    @property
++    def on_exit(self) -> t.Callable[[Context], None] | None:
++        """Callback to invoke when the context is torn down."""
++        return self._on_exit
++
++    @on_exit.setter
++    def on_exit(self, value: t.Callable[[Context], None] | None) -> None:
++        """Set the callback to invoke when the context is torn down."""
++        self._on_exit = value
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -479,6 +500,7 @@ class Context:
+         self._depth -= 1
+         if self._depth == 0:
+             self.close()
++            self._in_cleanup = False
+         pop_context()
+ 
+     @contextmanager
+@@ -607,9 +629,25 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
+-        self._exit_stack = ExitStack()
++        if self._closed:
++            return
++        self._closed = True
++        self._in_cleanup = True
++        try:
++            self._exit_stack.close()
++        finally:
++            # Invoke the on_exit callback if defined.
++            if self._on_exit is not None:
++                try:
++                    self._on_exit(self)
++                except (KeyboardInterrupt, SystemExit):
++                    raise
++                except Exception:
++                    # Ignore other exceptions from the callback but continue
++                    # with normal resource cleanup.
++                    pass
++            # In case the context is reused, create a new exit stack.
++            self._exit_stack = ExitStack()
+ 
+     @property
+     def command_path(self) -> str:
+@@ -1338,8 +1376,12 @@ class Command:
+                     # by its truthiness/falsiness
+                     ctx.exit()
+             except (EOFError, KeyboardInterrupt) as e:
+-                echo(file=sys.stderr)
+-                raise Abort() from e
++                # Only convert to Abort() if not in cleanup phase
++                # (i.e., exception came from command body, not on_exit callback)
++                if not ctx._in_cleanup:
++                    echo(file=sys.stderr)
++                    raise Abort() from e
++                raise
+             except ClickException as e:
+                 if not standalone_mode:
+                     raise
+diff --git a/src/click/testing.py b/src/click/testing.py
+index 73462db..cf424bc 100644
+--- a/src/click/testing.py
++++ b/src/click/testing.py
+@@ -489,6 +489,13 @@ class CliRunner:
+ 
+                 exit_code = e_code
+ 
++            except KeyboardInterrupt as e:
++                if not catch_exceptions:
++                    raise
++                exception = e
++                exit_code = 1
++                exc_info = sys.exc_info()
++
+             except Exception as e:
+                 if not catch_exceptions:
+                     raise
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..7f89e37 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,365 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++
++# Tests for on_exit callback parameter
++
++
++def test_on_exit_basic(runner):
++    """Test basic on_exit callback invocation."""
++    called = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: called.append("exit")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert called == ["exit"]
++
++
++def test_on_exit_callback_receives_context(runner):
++    """Test that on_exit callback receives the Context being closed."""
++    received_ctx = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: received_ctx.append(c)
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert len(received_ctx) == 1
++    # The callback receives a context, we just verify it was called
++
++
++def test_on_exit_callback_sees_command_identity(runner):
++    """Test that on_exit callback can observe final command identity."""
++    observed_commands = []
++
++    @click.group()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: observed_commands.append(c.command.name)
++
++    @cli.command()
++    def sub():
++        pass
++
++    result = runner.invoke(cli, ["sub"], standalone_mode=False)
++    assert not result.exception
++    # The callback sees the command of the context it's attached to
++    assert "cli" in observed_commands
++
++
++def test_on_exit_callback_sees_parsed_params(runner):
++    """Test that on_exit callback can observe parsed parameters."""
++    observed_params = []
++
++    @click.command()
++    @click.option("--name", default="default")
++    @click.pass_context
++    def cli(ctx, name):
++        ctx.params["name"] = name
++        ctx.on_exit = lambda c: observed_params.append(c.params.get("name"))
++
++    result = runner.invoke(cli, ["--name", "test"], standalone_mode=False)
++    assert not result.exception
++    assert observed_params == ["test"]
++
++
++def test_on_exit_single_invocation_per_teardown(runner):
++    """Test that on_exit runs once per completed teardown."""
++    call_count = [0]
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: call_count.append(1)
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert len(call_count) == 2
++
++
++def test_on_exit_nested_context_no_duplicate(runner):
++    """Test that nested with ctx doesn't invoke callback multiple times."""
++    call_count = [0]
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: call_count.append(1)
++        # Simulate nested context entry
++        with click.Context(cli, parent=ctx) as inner_ctx:
++            pass
++        # Outer context exit should only trigger once
++        return None
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert len(call_count) == 2
++
++
++def test_on_exit_separate_enter_exit_cycle(runner):
++    """Test that a later separate enter/exit cycle invokes callback again."""
++    call_counts = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: call_counts.append(1)
++
++    # First invocation
++    result1 = runner.invoke(cli, standalone_mode=False)
++    assert not result1.exception
++    
++    # Second invocation (separate cycle)
++    result2 = runner.invoke(cli, standalone_mode=False)
++    assert not result2.exception
++    
++    assert call_counts == [1, 1]
++
++
++def test_on_exit_explicit_exit_no_double_invoke(runner):
++    """Test that calling ctx.exit() and leaving enclosing context doesn't invoke twice."""
++    call_count = [0]
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: call_count.append(1)
++        ctx.exit()
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert len(call_count) == 2
++
++
++def test_on_exit_scope_cleanup_false_not_triggered(runner):
++    """Test that scope(cleanup=False) does not trigger on_exit."""
++    call_count = [0]
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: call_count.append(1)
++        # Create a scoped context without cleanup
++        with ctx.scope(cleanup=False) as scoped_ctx:
++            pass
++        # The scoped context shouldn't trigger on_exit
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    # Main context should still trigger on_exit
++    assert len(call_count) == 2
++
++
++def test_on_exit_parent_child_independent_callbacks(runner):
++    """Test that parent and child contexts have independent callbacks."""
++    parent_calls = []
++    child_calls = []
++
++    @click.group()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: parent_calls.append("parent")
++
++    @cli.command()
++    @click.pass_context
++    def sub(ctx):
++        ctx.on_exit = lambda c: child_calls.append("child")
++
++    result = runner.invoke(cli, ["sub"], standalone_mode=False)
++    assert not result.exception
++    # Both parent and child callbacks should be invoked
++    assert parent_calls == ["parent"]
++    assert child_calls == ["child"]
++
++
++def test_on_exit_normal_command_completion(runner):
++    """Test on_exit works with normal command completion."""
++    events = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: events.append("on_exit")
++        events.append("command_body")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert events == ["command_body", "on_exit"]
++
++
++def test_on_exit_command_raises_exception(runner):
++    """Test on_exit runs even when command raises an exception."""
++    events = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: events.append("on_exit")
++        raise ValueError("test error")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert result.exception is not None
++    assert isinstance(result.exception, ValueError)
++    # on_exit should still be called
++    assert events == ["on_exit"]
++
++
++def test_on_exit_chained_subcommands(runner):
++    """Test on_exit works with chained subcommands."""
++    events = []
++
++    @click.group()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: events.append(f"cli_{c.command.name}")
++
++    @cli.group()
++    @click.pass_context
++    def group(ctx):
++        ctx.on_exit = lambda c: events.append(f"group_{c.command.name}")
++
++    @group.command()
++    @click.pass_context
++    def cmd(ctx):
++        ctx.on_exit = lambda c: events.append(f"cmd_{c.command.name}")
++
++    result = runner.invoke(cli, ["group", "cmd"], standalone_mode=False)
++    assert not result.exception
++    # All levels should have their callbacks invoked
++    assert "cli_cli" in events
++    assert "group_group" in events
++    assert "cmd_cmd" in events
++
++
++def test_on_exit_ignore_regular_exception(runner):
++    """Test that ordinary Exception from callback is ignored."""
++    events = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: (_ for _ in ()).throw(ValueError("callback error"))
++        events.append("command_body")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    # Command should complete normally despite callback error
++    assert events == ["command_body"]
++
++
++def test_on_exit_keyboard_interrupt_propagates(runner):
++    """Test that KeyboardInterrupt propagates through on_exit."""
++    events = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: (_ for _ in ()).throw(KeyboardInterrupt())
++        events.append("command_body")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert result.exception is not None
++    assert isinstance(result.exception, KeyboardInterrupt)
++
++
++def test_on_exit_system_exit_propagates(runner):
++    """Test that SystemExit propagates through on_exit."""
++    events = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        ctx.on_exit = lambda c: (_ for _ in ()).throw(SystemExit(42))
++        events.append("command_body")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert result.exception is not None
++    assert isinstance(result.exception, SystemExit)
++    assert result.exception.code == 42
++
++
++def test_on_exit_resource_cleanup_after_keyboard_interrupt(runner):
++    """Test resources are released when KeyboardInterrupt propagates."""
++    cleaned_up = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        def cleanup():
++            cleaned_up.append(True)
++        
++        ctx.call_on_close(cleanup)
++        ctx.on_exit = lambda c: (_ for _ in ()).throw(KeyboardInterrupt())
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert result.exception is not None
++    assert isinstance(result.exception, KeyboardInterrupt)
++    # Cleanup should still happen
++    assert cleaned_up == [True]
++
++
++def test_on_exit_resource_cleanup_after_system_exit(runner):
++    """Test resources are released when SystemExit propagates."""
++    cleaned_up = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        def cleanup():
++            cleaned_up.append(True)
++        
++        ctx.call_on_close(cleanup)
++        ctx.on_exit = lambda c: (_ for _ in ()).throw(SystemExit(1))
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert result.exception is not None
++    assert isinstance(result.exception, SystemExit)
++    # Cleanup should still happen
++    assert cleaned_up == [True]
++
++
++def test_on_exit_omitted_preserves_existing_behavior(runner):
++    """Test that omitting on_exit preserves existing behavior."""
++    events = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        # No on_exit set
++        events.append("command_body")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    assert events == ["command_body"]
++
++
++def test_on_exit_with_context_manager_resources(runner):
++    """Test on_exit works alongside context manager resources."""
++    resources = []
++
++    @click.command()
++    @click.pass_context
++    def cli(ctx):
++        @contextmanager
++        def resource():
++            resources.append("acquire")
++            try:
++                yield object()
++            finally:
++                resources.append("release")
++
++        ctx.on_exit = lambda c: resources.append("on_exit")
++        ctx.with_resource(resource())
++        resources.append("use")
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert not result.exception
++    # Resources should be properly managed
++    assert resources == ["acquire", "use", "release", "on_exit"]

@@ -1,0 +1,142 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..fb72fb43 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Normalize logical template paths for filesystem and package loaders
++    while preserving root safety and original request names.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..02413df4 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -446,6 +446,16 @@ Here a list of the builtin loaders Jinja provides:
+ 
+ .. autoclass:: jinja2.PackageLoader
+ 
++    Filesystem and package loaders normalize logical template names.
++    Both slash styles separate segments; empty and dot segments vanish,
++    and internal parent steps may return to the template root. Root
++    escapes, leading separators, and ASCII drive prefixes are rejected.
++    Missing or rejected requests report their original spelling.
++    Package directories and archives use the same logical name rules.
++    Configured encoding, physical filenames, and freshness semantics
++    remain unchanged. Environment caches retain the original request
++    name, so equivalent spellings may use separate compiled entries.
++
+ .. autoclass:: jinja2.DictLoader
+ 
+ .. autoclass:: jinja2.FunctionLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..e5929668 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -21,6 +21,32 @@ if t.TYPE_CHECKING:
+     from .environment import Template
+ 
+ 
++def _normalize_template_path(template: str) -> str:
++    if (
++        template.startswith(("/", "\\"))
++        or len(template) >= 2
++        and template[0] in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++        and template[1] == ":"
++    ):
++        raise TemplateNotFound(template)
++
++    pieces: t.List[str] = []
++
++    for piece in template.replace("\\", "/").split("/"):
++        if not piece or piece == ".":
++            continue
++
++        if piece == "..":
++            if not pieces:
++                raise TemplateNotFound(template)
++
++            pieces.pop()
++        else:
++            pieces.append(piece)
++
++    return "/".join(pieces)
++
++
+ def split_template_path(template: str) -> t.List[str]:
+     """Split a path into segments and perform a sanity check.  If it detects
+     '..' in the path it will raise a `TemplateNotFound` error.
+@@ -171,6 +197,12 @@ class FileSystemLoader(BaseLoader):
+         files.
+     :param followlinks: Follow symbolic links in the path.
+ 
++    Logical names accept both slash styles and safe internal parent
++    steps. Parent steps may not escape the template root.
++
++    .. versionchanged:: 3.1.0
++        Normalize logical template paths before filesystem lookup.
++
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
+     """
+@@ -191,7 +223,8 @@ class FileSystemLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+-        pieces = split_template_path(template)
++        original_name = template
++        pieces = split_template_path(_normalize_template_path(template))
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+@@ -211,7 +244,7 @@ class FileSystemLoader(BaseLoader):
+                     return False
+ 
+             return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        raise TemplateNotFound(original_name)
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+@@ -257,6 +290,12 @@ class PackageLoader(BaseLoader):
+     contributor. Zip files contributing to a namespace are not
+     supported.
+ 
++    Logical names use both slash styles and safe internal parent steps,
++    without allowing parent steps to escape the template root.
++
++    .. versionchanged:: 3.1.0
++        Normalize logical template paths in directory and zip packages.
++
+     .. versionchanged:: 3.0
+         No longer uses ``setuptools`` as a dependency.
+ 
+@@ -326,13 +365,15 @@ class PackageLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Optional[t.Callable[[], bool]]]:
++        original_name = template
++        template = _normalize_template_path(template)
+         p = os.path.join(self._template_root, *split_template_path(template))
+         up_to_date: t.Optional[t.Callable[[], bool]]
+ 
+         if self._archive is None:
+             # Package is a directory.
+             if not os.path.isfile(p):
+-                raise TemplateNotFound(template)
++                raise TemplateNotFound(original_name)
+ 
+             with open(p, "rb") as f:
+                 source = f.read()
+@@ -347,7 +388,7 @@ class PackageLoader(BaseLoader):
+             try:
+                 source = self._loader.get_data(p)  # type: ignore
+             except OSError as e:
+-                raise TemplateNotFound(template) from e
++                raise TemplateNotFound(original_name) from e
+ 
+             # Could use the zip's mtime for all template mtimes, but
+             # would need to safely reload the module if it's out of

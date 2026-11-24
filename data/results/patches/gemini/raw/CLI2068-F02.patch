@@ -1,0 +1,114 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..2ee9444 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        timeout: int | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.timeout = timeout
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -508,6 +510,11 @@ class Editor:
+     def edit_file(self, filename: str) -> None:
+         import subprocess
+ 
++        if self.timeout is not None and (
++            not isinstance(self.timeout, int) or self.timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive integer")
++
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+ 
+@@ -517,7 +524,19 @@ class Editor:
+ 
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            try:
++                exit_code = c.wait(timeout=self.timeout)
++            except subprocess.TimeoutExpired:
++                c.terminate()
++                try:
++                    c.wait(timeout=1)
++                except subprocess.TimeoutExpired:
++                    c.kill()
++                raise ClickException(
++                    _("{editor}: Editing timed out after {timeout} seconds").format(
++                        editor=editor, timeout=self.timeout
++                    )
++                )
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..2a50e31 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    timeout: int | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,11 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param timeout: the number of seconds to wait for the editor to close.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, timeout=timeout)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..7cb0158 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,33 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++def test_edit_timeout():
++    import subprocess
++    import click
++    import os
++
++    # Create a slow editor script
++    editor_script = """#!/bin/bash
++    sleep 2
++    exit 0
++    """
++    with open("slow_editor.sh", "w") as f:
++        f.write(editor_script)
++    os.chmod("slow_editor.sh", 0o755)
++
++    # Test timeout
++    with pytest.raises(click.ClickException) as excinfo:
++        click.edit("hello", editor="./slow_editor.sh", timeout=1)
++    assert "Editing timed out after 1 seconds" in str(excinfo.value)
++
++    # Test no timeout
++    click.edit("hello", editor="true", timeout=None)
++
++    # Test invalid timeout
++    with pytest.raises(ValueError) as excinfo:
++        click.edit("hello", editor="true", timeout=-1)
++    assert "timeout must be a positive integer" in str(excinfo.value)
++    
++    # Cleanup
++    os.remove("slow_editor.sh")

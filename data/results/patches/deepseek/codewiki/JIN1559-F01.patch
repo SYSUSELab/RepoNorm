@@ -1,0 +1,164 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..d76b26a 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -355,6 +355,10 @@ class InternationalizationExtension(Extension):
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+         num_called_num = False
++        context: t.Optional[str] = None
++        if parser.stream.current.type == "string":
++            context = parser.stream.current.value
++            next(parser.stream)
+ 
+         # find all the variables referenced.  Additionally a variable can be
+         # defined in the body of the trans block too, but this is checked at
+@@ -459,6 +463,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            context=context,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +519,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        context: t.Optional[str] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -528,19 +534,33 @@ class InternationalizationExtension(Extension):
+ 
+         # singular only:
+         if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            if context is not None:
++                gettext = nodes.Name("pgettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(context), nodes.Const(singular)], [], None, None)
++            else:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+ 
+         # singular and plural
+         else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
++            if context is not None:
++                ngettext = nodes.Name("npgettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [nodes.Const(context), nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
++            else:
++                ngettext = nodes.Name("ngettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
+ 
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..97432ac 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -27,6 +27,10 @@ i18n_templates = {
+     "plural2.html": "{% trans user_count=get_user_count() %}{{ user_count }}s"
+     "{% pluralize %}{{ user_count }}p{% endtrans %}",
+     "stringformat.html": '{{ _("User: %(num)s")|format(num=user_count) }}',
++    "context_singular.html": '{% trans "fruit" %}Apple{% endtrans %}',
++    "context_plural.html": '{% trans "fruit" count=num %}{{ num }} apple{% pluralize %}{{ num }} apples{% endtrans %}',
++    "context_singular_trimmed.html": '{% trans "fruit" trimmed %}  Apple  {% endtrans %}',
++    "context_plural_trimmed.html": '{% trans "fruit" trimmed count=num %}  {{ num }} apple  {% pluralize %}  {{ num }} apples  {% endtrans %}',
+ }
+ 
+ newstyle_i18n_templates = {
+@@ -49,6 +53,10 @@ newstyle_i18n_templates = {
+     "novars.html": "{% trans %}%(hello)s{% endtrans %}",
+     "vars.html": "{% trans %}{{ foo }}%(foo)s{% endtrans %}",
+     "explicitvars.html": '{% trans foo="42" %}%(foo)s{% endtrans %}',
++    "context_singular.html": '{% trans "fruit" %}Apple{% endtrans %}',
++    "context_plural.html": '{% trans "fruit" count=num %}{{ num }} apple{% pluralize %}{{ num }} apples{% endtrans %}',
++    "context_singular_trimmed.html": '{% trans "fruit" trimmed %}  Apple  {% endtrans %}',
++    "context_plural_trimmed.html": '{% trans "fruit" trimmed count=num %}  {{ num }} apple  {% pluralize %}  {{ num }} apples  {% endtrans %}',
+ }
+ 
+ 
+@@ -465,6 +473,38 @@ class TestInternationalization:
+             (3, "npgettext", ("babel", "%(users)s user", "%(users)s users", None), []),
+         ]
+ 
++    def test_context_block_singular(self):
++        tmpl = i18n_env.get_template("context_singular.html")
++        assert tmpl.render(LANGUAGE="de") == "Apple"
++
++    def test_context_block_plural(self):
++        tmpl = i18n_env.get_template("context_plural.html")
++        assert tmpl.render(LANGUAGE="de", num=1) == "1 Apple"
++        assert tmpl.render(LANGUAGE="de", num=5) == "5 Apples"
++
++    def test_context_block_singular_trimmed(self):
++        tmpl = i18n_env.get_template("context_singular_trimmed.html")
++        assert tmpl.render(LANGUAGE="de") == "Apple"
++
++    def test_context_block_plural_trimmed(self):
++        tmpl = i18n_env.get_template("context_plural_trimmed.html")
++        assert tmpl.render(LANGUAGE="de", num=1) == "1 Apple"
++        assert tmpl.render(LANGUAGE="de", num=5) == "5 Apples"
++
++    def test_extract_context_blocks(self):
++        from jinja2.ext import babel_extract
++
++        source = BytesIO(
++            b"""
++            {% trans "fruit" %}Apple{% endtrans %}
++            {% trans "fruit" count=num %}{{ num }} apple{% pluralize %}{{ num }} apples{% endtrans %}
++            """
++        )
++        result = list(
++            babel_extract(source, ("pgettext", "npgettext", "gettext", "ngettext", "_"), [], {})
++        )
++        assert result[0] == (2, "pgettext", ("fruit", "Apple"), []), f"got {result[0]}"
++        assert result[1] == (3, "npgettext", ("fruit", "%(num)s apple", "%(num)s apples", None), []), f"got {result[1]}"
+ 
+ class TestScope:
+     def test_basic_scope_behavior(self):
+@@ -597,7 +637,23 @@ class TestNewstyleInternationalization:
+         tmpl = newstyle_i18n_env.get_template("npgettext.html")
+         assert tmpl.render(LANGUAGE="de", apples=1) == "1 Apple"
+         assert tmpl.render(LANGUAGE="de", apples=5) == "5 Apples"
++    def test_context_block_singular(self):
++        tmpl = newstyle_i18n_env.get_template("context_singular.html")
++        assert tmpl.render(LANGUAGE="de") == "Apple"
++
++    def test_context_block_plural(self):
++        tmpl = newstyle_i18n_env.get_template("context_plural.html")
++        assert tmpl.render(LANGUAGE="de", num=1) == "1 Apple"
++        assert tmpl.render(LANGUAGE="de", num=5) == "5 Apples"
++
++    def test_context_block_singular_trimmed(self):
++        tmpl = newstyle_i18n_env.get_template("context_singular_trimmed.html")
++        assert tmpl.render(LANGUAGE="de") == "Apple"
+ 
++    def test_context_block_plural_trimmed(self):
++        tmpl = newstyle_i18n_env.get_template("context_plural_trimmed.html")
++        assert tmpl.render(LANGUAGE="de", num=1) == "1 Apple"
++        assert tmpl.render(LANGUAGE="de", num=5) == "5 Apples"
+ 
+ class TestAutoEscape:
+     def test_scoped_setting(self):

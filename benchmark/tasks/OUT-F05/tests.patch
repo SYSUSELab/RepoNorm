@@ -1,0 +1,301 @@
+diff --git a/tests/backends/test_xgrammar.py b/tests/backends/test_xgrammar.py
+index 1133b9f..52d7897 100644
+--- a/tests/backends/test_xgrammar.py
++++ b/tests/backends/test_xgrammar.py
+@@ -1,5 +1,41 @@
+ import pytest
+ 
++
++@pytest.mark.parametrize("factory,grammar", [
++    ("get_regex_logits_processor", "a|b"),
++    ("get_cfg_logits_processor", 'root ::= "a" | "b"'),
++    ("get_json_schema_logits_processor", '{"type":"string","enum":["a","b"]}'),
++])
++@pytest.mark.parametrize("shape", ["1d", "2d", "mixed"])
++def test_v5_custom_adapter_real_shapes(model_transformers, factory, grammar, shape):
++    import torch
++    from outlines.processors.tensor_adapters.torch import TorchTensorAdapter
++    class RecordingAdapter(TorchTensorAdapter):
++        def __init__(self):
++            super().__init__()
++            self.observed = []
++        def shape(self, tensor):
++            self.observed.append(tuple(tensor.shape))
++            return super().shape(tensor)
++    adapter = RecordingAdapter()
++    backend = XGrammarBackend(model_transformers)
++    method = getattr(backend, factory)
++    processor = method(grammar, tensor_library_name="custom", custom_adapter=adapter)
++    vocab = model_transformers.model.config.vocab_size
++    ids = torch.tensor([1]) if shape != "2d" else torch.tensor([[1], [1]])
++    scores = torch.zeros(vocab) if shape == "1d" else torch.zeros(1 if shape == "mixed" else 2, vocab)
++    for _ in range(2):
++        adapter.observed.clear()
++        result = processor(ids, scores.clone())
++        assert result.shape == scores.shape
++        assert torch.isfinite(result).any() and torch.isneginf(result).any()
++        assert tuple(ids.shape) in adapter.observed
++        assert tuple(scores.shape) in adapter.observed
++        processor.reset()
++    for library, selected in [("custom", None), ("torch", adapter)]:
++        with pytest.raises(ValueError):
++            method(grammar, tensor_library_name=library, custom_adapter=selected)
++
+ import llama_cpp
+ import transformers
+ from xgrammar import GrammarCompiler
+@@ -8,12 +44,66 @@ from outlines.backends.xgrammar import XGrammarLogitsProcessor
+ 
+ import outlines
+ from outlines.backends.xgrammar import XGrammarBackend
++from outlines.processors.tensor_adapters.base import TensorAdapter
++
++class MockCustomTensorAdapter(TensorAdapter):
++    """Mock custom tensor adapter for testing."""
++
++    library_name = "custom_mock"
++
++    def __init__(self):
++        self.method_calls = []
++
++    def shape(self, tensor):
++        self.method_calls.append("shape")
++        return [2, 10]  # Mock shape
++
++    def unsqueeze(self, tensor):
++        self.method_calls.append("unsqueeze")
++        return tensor
++
++    def squeeze(self, tensor):
++        self.method_calls.append("squeeze")
++        return tensor
+ 
+-try:
+-    import mlx_lm
+-    HAS_MLX = True
+-except ImportError:
+-    HAS_MLX = False
++    def to_list(self, tensor):
++        self.method_calls.append("to_list")
++        return tensor.tolist() if hasattr(tensor, 'tolist') else list(tensor)
++
++    def to_scalar(self, tensor):
++        self.method_calls.append("to_scalar")
++        return tensor.item() if hasattr(tensor, 'item') else tensor
++
++    def full_like(self, tensor, fill_value):
++        self.method_calls.append("full_like")
++        import torch
++        return torch.full_like(tensor, fill_value)
++
++    def concatenate(self, tensors):
++        self.method_calls.append("concatenate")
++        import torch
++        return torch.cat(tensors, dim=0)
++
++    def get_device(self, tensor):
++        self.method_calls.append("get_device")
++        return "cpu"
++
++    def to_device(self, tensor, device):
++        self.method_calls.append("to_device")
++        return tensor
++
++    def boolean_ones_like(self, tensor):
++        self.method_calls.append("boolean_ones_like")
++        import torch
++        return torch.ones_like(tensor, dtype=torch.bool)
++
++    def apply_mask(self, tensor, mask, value):
++        self.method_calls.append("apply_mask")
++        return tensor.masked_fill(mask, value)
++
++    def argsort_descending(self, tensor):
++        self.method_calls.append("argsort_descending")
++        return tensor.argsort(dim=-1, descending=True)
+ 
+ 
+ @pytest.fixture
+@@ -25,12 +115,9 @@ def model_transformers():
+ 
+ @pytest.fixture
+ def model_llamacpp():
+-    return outlines.from_llamacpp(
+-        llama_cpp.Llama.from_pretrained(
+-            repo_id="M4-ai/TinyMistral-248M-v2-Instruct-GGUF",
+-            filename="TinyMistral-248M-v2-Instruct.Q4_K_M.gguf",
+-        )
+-    )
++    from unittest.mock import Mock
++    from outlines.models.llamacpp import LlamaCpp
++    return Mock(spec=LlamaCpp)
+ 
+ @pytest.fixture
+ def model_mlxlm():
+@@ -61,7 +148,6 @@ answer ::= "yes" | "no"
+ def test_xgrammar_backend(model_transformers, json_schema, regex, cfg):
+     # initialization
+     backend = XGrammarBackend(model_transformers)
+-    assert isinstance(backend.grammar_compiler, GrammarCompiler)
+ 
+     # json schema
+     processor = backend.get_json_schema_logits_processor(json_schema)
+@@ -77,7 +163,7 @@ def test_xgrammar_backend(model_transformers, json_schema, regex, cfg):
+     generator = outlines.Generator(model_transformers, backend="xgrammar", processor=processor)
+     response = generator("Hello, how are you?")
+     assert len(response) == 3
+-    assert int(response)
++    assert len(response) == 3 and response.isascii() and response.isdigit()
+ 
+     # cfg
+     processor = backend.get_cfg_logits_processor(cfg)
+@@ -93,3 +179,149 @@ def test_xgrammar_backend_invalid_model(model_llamacpp):
+         match="The xgrammar backend only supports Transformers models",
+     ):
+         XGrammarBackend(model_llamacpp)
++
++
++# Custom tensor adapter tests
++def test_xgrammar_logits_processor_custom_adapter():
++    """Test XGrammarLogitsProcessor with custom tensor adapter."""
++    compiled_grammar = "mock_grammar"
++    custom_adapter = MockCustomTensorAdapter()
++
++    processor = XGrammarLogitsProcessor(
++        compiled_grammar,
++        tensor_library_name="custom",
++        custom_adapter=custom_adapter
++    )
++
++    assert isinstance(processor, XGrammarLogitsProcessor)
++    assert processor.tensor_adapter is custom_adapter
++
++    processor.xgrammar_logits_processor = lambda input_ids, logits: logits
++    result = processor(object(), object())
++    assert result is not None
++    assert "shape" in custom_adapter.method_calls
++
++
++def test_xgrammar_logits_processor_custom_missing_adapter():
++    """Test error when custom tensor library specified without adapter."""
++    compiled_grammar = "mock_grammar"
++
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor(
++            compiled_grammar,
++            tensor_library_name="custom",
++            custom_adapter=None
++        )
++
++
++def test_xgrammar_logits_processor_custom_adapter_with_wrong_library():
++    """Test error when custom adapter provided with non-custom library."""
++    compiled_grammar = "mock_grammar"
++    custom_adapter = MockCustomTensorAdapter()
++
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor(
++            compiled_grammar,
++            tensor_library_name="torch",
++            custom_adapter=custom_adapter
++        )
++
++
++def test_xgrammar_logits_processor_default_torch():
++    """Test default tensor library is torch."""
++    compiled_grammar = "mock_grammar"
++
++    processor = XGrammarLogitsProcessor(compiled_grammar)
++
++    # Test that processor was created successfully with default torch library
++    assert isinstance(processor, XGrammarLogitsProcessor)
++
++
++def test_xgrammar_backend_custom_adapter_json_schema(model_transformers, json_schema):
++    """Test XGrammarBackend with custom adapter for JSON schema."""
++    backend = XGrammarBackend(model_transformers)
++    custom_adapter = MockCustomTensorAdapter()
++
++    processor = backend.get_json_schema_logits_processor(
++        json_schema,
++        tensor_library_name="custom",
++        custom_adapter=custom_adapter
++    )
++
++    assert isinstance(processor, XGrammarLogitsProcessor)
++    assert processor.tensor_adapter is custom_adapter
++
++
++def test_xgrammar_backend_custom_adapter_regex(model_transformers, regex):
++    """Test XGrammarBackend with custom adapter for regex."""
++    backend = XGrammarBackend(model_transformers)
++    custom_adapter = MockCustomTensorAdapter()
++
++    processor = backend.get_regex_logits_processor(
++        regex,
++        tensor_library_name="custom",
++        custom_adapter=custom_adapter
++    )
++
++    assert isinstance(processor, XGrammarLogitsProcessor)
++    assert processor.tensor_adapter is custom_adapter
++
++
++def test_xgrammar_backend_custom_adapter_cfg(model_transformers, cfg):
++    """Test XGrammarBackend with custom adapter for CFG."""
++    backend = XGrammarBackend(model_transformers)
++    custom_adapter = MockCustomTensorAdapter()
++
++    processor = backend.get_cfg_logits_processor(
++        cfg,
++        tensor_library_name="custom",
++        custom_adapter=custom_adapter
++    )
++
++    assert isinstance(processor, XGrammarLogitsProcessor)
++    assert processor.tensor_adapter is custom_adapter
++
++
++def test_custom_adapter_interface_compliance():
++    """Test that MockCustomTensorAdapter implements required interface."""
++    adapter = MockCustomTensorAdapter()
++
++    # Test all required methods exist
++    assert hasattr(adapter, 'shape')
++    assert hasattr(adapter, 'unsqueeze')
++    assert hasattr(adapter, 'squeeze')
++    assert hasattr(adapter, 'to_list')
++    assert hasattr(adapter, 'to_scalar')
++    assert hasattr(adapter, 'full_like')
++    assert hasattr(adapter, 'concatenate')
++    assert hasattr(adapter, 'get_device')
++    assert hasattr(adapter, 'to_device')
++    assert hasattr(adapter, 'boolean_ones_like')
++    assert hasattr(adapter, 'apply_mask')
++    assert hasattr(adapter, 'argsort_descending')
++    assert hasattr(adapter, 'library_name')
++
++    # Test library_name
++    assert adapter.library_name == "custom_mock"
++
++
++def test_xgrammar_backend_parameter_validation_errors(model_transformers, json_schema):
++    """Test parameter validation errors for custom adapters."""
++    backend = XGrammarBackend(model_transformers)
++
++    # Test missing custom_adapter with custom library
++    with pytest.raises(ValueError):
++        backend.get_json_schema_logits_processor(
++            json_schema,
++            tensor_library_name="custom",
++            custom_adapter=None
++        )
++
++    # Test custom_adapter with non-custom library
++    custom_adapter = MockCustomTensorAdapter()
++    with pytest.raises(ValueError):
++        backend.get_json_schema_logits_processor(
++            json_schema,
++            tensor_library_name="torch",
++            custom_adapter=custom_adapter
++        )

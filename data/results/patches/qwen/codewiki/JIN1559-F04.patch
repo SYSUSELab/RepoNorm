@@ -1,0 +1,244 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..126698f 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -1114,6 +1114,33 @@ class Environment:
+ 
+         return ChainMap(d, self.globals)
+ 
++    def extract_translations_with_metadata(
++        self, source: str, source_name: t.Optional[str] = None
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Extract translation blocks with their metadata.
++        
++        Returns an iterator of independent record mappings for metadata-bearing
++        translation blocks. Each record contains:
++        - source: the original source string
++        - lineno: the block's line number
++        - metadata: a copy of the metadata mapping (note, created, modified)
++        - messages: list of message dicts with lineno, function, and message
++        
++        Repeated extraction is stable and has no retained Environment state;
++        callers may modify returned records without affecting later results.
++        """
++        from .ext import extract_translations_with_metadata as ext_extract
++        
++        # Get the InternationalizationExtension if available
++        for ext in self.iter_extensions():
++            if type(ext).__name__ == "InternationalizationExtension":
++                break
++        else:
++            # No i18n extension, nothing to extract
++            return
++        
++        yield from ext_extract(source, self)
++
+ 
+ class Template:
+     """A compiled template that can be rendered.
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..201aa07 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -363,15 +363,53 @@ class InternationalizationExtension(Extension):
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
++        metadata: t.Dict[str, str] = {}
++        just_consumed_comma = False
+         while parser.stream.current.type != "block_end":
+-            if variables:
+-                parser.stream.expect("comma")
+-
++            # Don't expect comma if we just consumed one
++            if not just_consumed_comma:
++                if variables or metadata:
++                    parser.stream.expect("comma")
+             # skip colon for python compatibility
+             if parser.stream.skip_if("colon"):
+                 break
+ 
++            # Expect a name token (variable, metadata key, or modifier)
+             token = parser.stream.expect("name")
++            
++            # Check for metadata keys (note, created, modified)
++            if token.value in ("note", "created", "modified"):
++                if token.value in metadata:
++                    parser.fail(
++                        f"trans metadata key {token.value!r} defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                if parser.stream.current.type != "assign":
++                    parser.fail(
++                        f"trans metadata key {token.value!r} missing assignment.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                next(parser.stream)
++                # Validate that the value is a string literal
++                expr = parser.parse_expression()
++                if not isinstance(expr, nodes.Const) or not isinstance(expr.value, str):
++                    parser.fail(
++                        f"trans metadata key {token.value!r} must have a string literal value.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                metadata[token.value] = expr.value
++                # After metadata, optionally consume comma and continue
++                parser.stream.skip_if("comma")
++                just_consumed_comma = True
++                continue
++            
++            # Before processing variable/modifier, expect comma only if we have existing variables
++            # (metadata doesn't require comma before variables)
++            if variables and not just_consumed_comma:
++                parser.stream.expect("comma")
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -388,6 +426,10 @@ class InternationalizationExtension(Extension):
+                 continue
+             else:
+                 variables[token.value] = var = nodes.Name(token.value, "load")
++            
++            # After processing variable/modifier, optionally consume comma
++            parser.stream.skip_if("comma")
++            just_consumed_comma = True
+ 
+             if plural_expr is None:
+                 if isinstance(var, nodes.Call):
+@@ -459,6 +501,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            metadata or None,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +557,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        metadata: t.Optional[t.Dict[str, str]] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -568,7 +612,10 @@ class InternationalizationExtension(Extension):
+                         ]
+                     ),
+                 )
+-        return nodes.Output([node])
++        output_node = nodes.Output([node])
++        if metadata:
++            output_node.metadata = metadata
++        return output_node
+ 
+ 
+ class ExprStmtExtension(Extension):
+@@ -852,3 +899,105 @@ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+ loopcontrols = LoopControlExtension
+ debug = DebugExtension
++
++
++def extract_translations_with_metadata(
++    source: t.Union[str, nodes.Template],
++    environment: "Environment",
++) -> t.Iterator[t.Dict[str, t.Any]]:
++    """Extract translations with metadata from a template source.
++    
++    Returns an iterator of independent record mappings for metadata-bearing 
++    translation blocks. Each record contains:
++    - source: the template source (or empty string if Template node provided)
++    - lineno: the line number of the trans block start
++    - metadata: a copy of the metadata mapping (note, created, modified)
++    - messages: list of message records with lineno, function, and message
++    
++    Repeated extraction is stable and has no retained Environment state;
++    callers may modify returned records without affecting later results.
++    """
++    from .nodes import Output, Mod, Call, Name, Const, MarkSafeIfAutoescape, Dict, Pair
++    
++    # Parse the source if it's a string
++    if isinstance(source, str):
++        ast = environment.parse(source)
++    else:
++        ast = source
++    
++    # Iterate through all Output nodes that have metadata
++    for node in ast.find_all(Output):
++        if hasattr(node, 'metadata') and node.metadata:
++            trans_lineno = node.lineno
++            
++            # Extract messages from this block
++            messages = []
++            for msg_node in node.nodes:
++                # Handle both Mod nodes and direct MarkSafeIfAutoescape nodes
++                if isinstance(msg_node, Mod):
++                    left = msg_node.left
++                else:
++                    left = msg_node
++                
++                # Unwrap MarkSafeIfAutoescape if present
++                if isinstance(left, MarkSafeIfAutoescape):
++                    left = left.expr
++                
++                # Get the call node (gettext, ngettext, pgettext, etc.)
++                if isinstance(left, Call):
++                    call_node = left
++                    args = call_node.args
++                    
++                    # Determine the function name
++                    if isinstance(call_node.node, Name):
++                        func_name = call_node.node.name
++                    else:
++                        func_name = '_'
++                    
++                    # Get the message(s)
++                    if args:
++                        if len(args) == 1:
++                            first_arg = args[0]
++                            if isinstance(first_arg, Const):
++                                # Singular message
++                                messages.append({
++                                    'lineno': trans_lineno,
++                                    'function': func_name,
++                                    'message': first_arg.value,
++                                })
++                            elif isinstance(first_arg, Dict):
++                                # Contextual message (plural forms)
++                                plural_forms = []
++                                for pair in first_arg.items:
++                                    if isinstance(pair, Pair) and isinstance(pair.key, Const):
++                                        plural_forms.append(pair.key.value)
++                                
++                                messages.append({
++                                    'lineno': trans_lineno,
++                                    'function': func_name,
++                                    'message': tuple(plural_forms),
++                                })
++                        elif len(args) >= 2:
++                            # Plural form (ngettext): singular, plural, [num]
++                            singular = None
++                            plural = None
++                            for arg in args[:2]:
++                                if isinstance(arg, Const):
++                                    if singular is None:
++                                        singular = arg.value
++                                    else:
++                                        plural = arg.value
++                            
++                            if singular is not None or plural is not None:
++                                messages.append({
++                                    'lineno': trans_lineno,
++                                    'function': func_name,
++                                    'message': (singular, plural),
++                                })
++            
++            yield {
++                'source': source if isinstance(source, str) else '',
++                'lineno': trans_lineno,
++                'metadata': dict(node.metadata),
++                'messages': messages,
++            }

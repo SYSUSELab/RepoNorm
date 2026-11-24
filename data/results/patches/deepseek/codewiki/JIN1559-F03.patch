@@ -1,0 +1,312 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..1983cb6 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -241,6 +241,126 @@ def _make_new_npgettext(
+ 
+     return npgettext
+ 
++# ---- Priority gettext/ngettext helpers ----
++
++
++@pass_context
++def _priority_gettext_impl(
++    __context: Context, __message: str, __max_level: int
++) -> str:
++    """Priority gettext for old style (no formatting)."""
++    priority_func = __context.resolve("priority_gettext")
++    if isinstance(priority_func, Undefined):
++        gettext = __context.resolve("gettext")
++        return __context.call(gettext, __message)
++    try:
++        max_level = int(__max_level)
++    except (ValueError, TypeError):
++        max_level = 0
++    if max_level < 0:
++        max_level = 0
++    max_level = min(max_level, 9)
++    for level in range(max_level + 1):
++        rv = __context.call(priority_func, __message, level)
++        if rv != __message:
++            return rv
++    return __message
++
++
++@pass_context
++def _priority_ngettext_impl(
++    __context: Context,
++    __singular: str,
++    __plural: str,
++    __num: int,
++    __max_level: int,
++) -> str:
++    """Priority ngettext for old style (no formatting)."""
++    priority_func = __context.resolve("priority_ngettext")
++    if isinstance(priority_func, Undefined):
++        ngettext = __context.resolve("ngettext")
++        return __context.call(ngettext, __singular, __plural, __num)
++    try:
++        max_level = int(__max_level)
++    except (ValueError, TypeError):
++        max_level = 0
++    if max_level < 0:
++        max_level = 0
++    max_level = min(max_level, 9)
++    for level in range(max_level + 1):
++        rv = __context.call(priority_func, __singular, __plural, __num, level)
++        plural_used = __plural if __num != 1 else __singular
++        if rv != plural_used:
++            return rv
++    return __singular if __num == 1 else __plural
++
++
++@pass_context
++def _priority_gettext_newstyle_impl(
++    __context: Context,
++    __message: str,
++    __max_level: int,
++    **variables: t.Any,
++) -> str:
++    """Priority gettext for new style (handles formatting and autoescape)."""
++    priority_func = __context.resolve("priority_gettext")
++    if isinstance(priority_func, Undefined):
++        gettext = __context.resolve("gettext")
++        rv = __context.call(gettext, __message)
++    else:
++        try:
++            max_level = int(__max_level)
++        except (ValueError, TypeError):
++            max_level = 0
++        if max_level < 0:
++            max_level = 0
++        max_level = min(max_level, 9)
++        for level in range(max_level + 1):
++            rv = __context.call(priority_func, __message, level)
++            if rv != __message:
++                break
++        else:
++            rv = __message
++    if __context.eval_ctx.autoescape:
++        rv = Markup(rv)
++    return rv % variables  # type: ignore
++
++
++@pass_context
++def _priority_ngettext_newstyle_impl(
++    __context: Context,
++    __singular: str,
++    __plural: str,
++    __num: int,
++    __max_level: int,
++    **variables: t.Any,
++) -> str:
++    """Priority ngettext for new style (handles formatting and autoescape)."""
++    variables.setdefault("num", __num)
++    priority_func = __context.resolve("priority_ngettext")
++    if isinstance(priority_func, Undefined):
++        ngettext = __context.resolve("ngettext")
++        rv = __context.call(ngettext, __singular, __plural, __num)
++    else:
++        try:
++            max_level = int(__max_level)
++        except (ValueError, TypeError):
++            max_level = 0
++        if max_level < 0:
++            max_level = 0
++        max_level = min(max_level, 9)
++        plural_used = __plural if __num != 1 else __singular
++        for level in range(max_level + 1):
++            rv = __context.call(priority_func, __singular, __plural, __num, level)
++            if rv != plural_used:
++                break
++        else:
++            rv = plural_used
++    if __context.eval_ctx.autoescape:
++        rv = Markup(rv)
++    return rv % variables  # type: ignore
++
++
+ 
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+@@ -257,6 +377,10 @@ class InternationalizationExtension(Extension):
+     def __init__(self, environment: Environment) -> None:
+         super().__init__(environment)
+         environment.globals["_"] = _gettext_alias
++        environment.globals["_priority_gettext_impl"] = _priority_gettext_impl
++        environment.globals["_priority_ngettext_impl"] = _priority_ngettext_impl
++        environment.globals["_priority_gettext_newstyle_impl"] = _priority_gettext_newstyle_impl
++        environment.globals["_priority_ngettext_newstyle_impl"] = _priority_ngettext_newstyle_impl
+         environment.extend(
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+@@ -319,6 +443,8 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], str]] = None,
++        priority_ngettext: t.Optional[t.Callable[[str, str, int, int], str]] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -332,12 +458,24 @@ class InternationalizationExtension(Extension):
+             if npgettext is not None:
+                 npgettext = _make_new_npgettext(npgettext)
+ 
+-        self.environment.globals.update(
+-            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+-        )
++        # Build globals dict, excluding None values for optional callables
++        # so that context.resolve returns Undefined instead of None.
++        globals_dict = {
++            'gettext': gettext,
++            'ngettext': ngettext,
++        }
++        if pgettext is not None:
++            globals_dict['pgettext'] = pgettext
++        if npgettext is not None:
++            globals_dict['npgettext'] = npgettext
++        if priority_gettext is not None:
++            globals_dict['priority_gettext'] = priority_gettext
++        if priority_ngettext is not None:
++            globals_dict['priority_ngettext'] = priority_ngettext
++        self.environment.globals.update(globals_dict)
+ 
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+-        for key in ("gettext", "ngettext", "pgettext", "npgettext"):
++        for key in ("gettext", "ngettext", "pgettext", "npgettext", "priority_gettext", "priority_ngettext"):
+             self.environment.globals.pop(key, None)
+ 
+     def _extract(
+@@ -362,9 +500,10 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        priority_expr: t.Optional[nodes.Expr] = None
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if variables or priority_expr is not None:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -380,7 +519,23 @@ class InternationalizationExtension(Extension):
+                 )
+ 
+             # expressions
+-            if parser.stream.current.type == "assign":
++            if token.value == "priority":
++                if parser.stream.current.type != "assign":
++                    parser.fail(
++                        "priority requires a value",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                if priority_expr is not None:
++                    parser.fail(
++                        "translatable variable 'priority' defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                next(parser.stream)
++                priority_expr = parser.parse_expression()
++                continue
++            elif parser.stream.current.type == "assign":
+                 next(parser.stream)
+                 variables[token.value] = var = parser.parse_expression()
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+@@ -388,7 +543,6 @@ class InternationalizationExtension(Extension):
+                 continue
+             else:
+                 variables[token.value] = var = nodes.Name(token.value, "load")
+-
+             if plural_expr is None:
+                 if isinstance(var, nodes.Call):
+                     plural_expr = nodes.Name("_trans", "load")
+@@ -459,6 +613,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++        priority_expr=priority_expr,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +669,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        priority_expr: t.Optional[nodes.Expr] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -528,19 +684,52 @@ class InternationalizationExtension(Extension):
+ 
+         # singular only:
+         if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            if priority_expr is not None:
++                if newstyle:
++                    func_name = "_priority_gettext_newstyle_impl"
++                else:
++                    func_name = "_priority_gettext_impl"
++                gettext = nodes.Name(func_name, "load")
++                node = nodes.Call(
++                    gettext,
++                    [nodes.Const(singular), priority_expr],
++                    [],
++                    None,
++                    None,
++                )
++            else:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+ 
+         # singular and plural
+         else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
++            if priority_expr is not None:
++                if newstyle:
++                    func_name = "_priority_ngettext_newstyle_impl"
++                else:
++                    func_name = "_priority_ngettext_impl"
++                ngettext = nodes.Name(func_name, "load")
++                node = nodes.Call(
++                    ngettext,
++                    [
++                        nodes.Const(singular),
++                        nodes.Const(plural),
++                        plural_expr,
++                        priority_expr,
++                    ],
++                    [],
++                    None,
++                    None,
++                )
++            else:
++                ngettext = nodes.Name("ngettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
+ 
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+@@ -571,6 +760,7 @@ class InternationalizationExtension(Extension):
+         return nodes.Output([node])
+ 
+ 
++
+ class ExprStmtExtension(Extension):
+     """Adds a `do` tag to Jinja that works like the print statement just
+     that it doesn't print the return value.

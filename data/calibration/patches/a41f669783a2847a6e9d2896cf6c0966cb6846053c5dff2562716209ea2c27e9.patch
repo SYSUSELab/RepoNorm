@@ -1,0 +1,161 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..f9ae52e 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,12 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add optional batching for values of ``multiple=True`` options.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/docs/options.md b/docs/options.md
+index c2dd2b6..eea3523 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -17,6 +17,10 @@ Useful and often used kwargs are:
+ - `required`: Makes option required.
+ - `type`: Sets {ref}`parameter type <parameter-types>`
+ 
++Options using `multiple=True` may set a positive integer `batch_size` to
++group their final converted and callback-processed tuple into ordered,
++non-empty tuples. Omitting it preserves the existing flat tuple.
++
+ ```{contents}
+ :depth: 2
+ :local: true
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..5d4c329 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2499,6 +2499,9 @@ class Option(Parameter):
+                      multiple times and recorded.  This is similar to ``nargs``
+                      in how it works but supports arbitrary number of
+                      arguments.
++    :param batch_size: With ``multiple=True``, group the final ordered
++                       value tuple into non-empty tuples of at most this
++                       size. Parsing is unchanged; this is not streaming.
+     :param count: this flag makes an option increment an integer.
+     :param allow_from_autoenv: if this is enabled then the value of this
+                                parameter will be pulled from an environment
+@@ -2508,6 +2511,9 @@ class Option(Parameter):
+     :param hidden: hide this option from help outputs.
+     :param attrs: Other command arguments described in :class:`Parameter`.
+ 
++    .. versionchanged:: 8.3.0
++        Added the ``batch_size`` parameter.
++
+     .. versionchanged:: 8.2
+         ``envvar`` used with ``flag_value`` will always use the ``flag_value``,
+         previously it would use the value of the environment variable.
+@@ -2541,6 +2547,7 @@ class Option(Parameter):
+         is_flag: bool | None = None,
+         flag_value: t.Any | None = None,
+         multiple: bool = False,
++        batch_size: int | None = None,
+         count: bool = False,
+         allow_from_autoenv: bool = True,
+         type: types.ParamType | t.Any | None = None,
+@@ -2636,6 +2643,7 @@ class Option(Parameter):
+         self.show_default = show_default
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
++        self.batch_size = batch_size
+ 
+         if __debug__:
+             if deprecated and prompt:
+@@ -2662,6 +2670,14 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++            if batch_size is not None:
++                if not multiple:
++                    raise TypeError("'batch_size' is only valid with 'multiple=True'.")
++                if isinstance(batch_size, bool) or not isinstance(batch_size, int):
++                    raise TypeError("'batch_size' must be a positive integer.")
++                if batch_size <= 0:
++                    raise ValueError("'batch_size' must be a positive integer.")
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+@@ -3032,6 +3048,18 @@ class Option(Parameter):
+ 
+         return value, source
+ 
++    def process_value(self, ctx: Context, value: t.Any) -> t.Any:
++        """Process the value, applying batching if configured."""
++        value = super().process_value(ctx, value)
++
++        if self.batch_size is None:
++            return value
++        values = (*value,)
++        return tuple(
++            values[index : index + self.batch_size]
++            for index in range(0, len(values), self.batch_size)
++        )
++
+ 
+ class Argument(Parameter):
+     """Arguments are positional parameters to a command.  They generally
+diff --git a/tests/test_n4c_author_option_batching.py b/tests/test_n4c_author_option_batching.py
+new file mode 100644
+index 0000000..a27bc00
+--- /dev/null
++++ b/tests/test_n4c_author_option_batching.py
+@@ -0,0 +1,49 @@
++import pytest
++
++import click
++
++
++def test_batching_runs_after_conversion_and_callback(runner):
++    def reverse(ctx, param, value):
++        assert value == (1, 2, 3)
++        return tuple(reversed(value))
++
++    @click.command()
++    @click.option("--item", multiple=True, type=int, callback=reverse, batch_size=2)
++    def cli(item):
++        click.echo(repr(item))
++
++    result = runner.invoke(cli, ["--item", "1", "--item", "2", "--item", "3"])
++    assert result.exit_code == 0
++    assert result.output == "((3, 2), (1,))\n"
++
++
++def test_batching_preserves_falsy_values_and_empty_input(runner):
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=2)
++    def cli(item):
++        click.echo(repr(item))
++
++    assert runner.invoke(cli).output == "()\n"
++    result = runner.invoke(cli, ["--item", "", "--item", "0", "--item", "x"])
++    assert result.output == "(('', '0'), ('x',))\n"
++
++
++def test_batch_size_validation_is_strict():
++    for value in (True, False, 1.5, "2"):
++        with pytest.raises(TypeError):
++            click.Option(["--item"], multiple=True, batch_size=value)
++    for value in (0, -1):
++        with pytest.raises(ValueError):
++            click.Option(["--item"], multiple=True, batch_size=value)
++    with pytest.raises(TypeError):
++        click.Option(["--item"], batch_size=2)
++
++
++def test_none_preserves_existing_multiple_tuple(runner):
++    @click.command()
++    @click.option("--item", multiple=True)
++    def cli(item):
++        click.echo(repr(item))
++
++    assert runner.invoke(cli, ["--item", "a", "--item", "b"]).output == "('a', 'b')\n"

@@ -1,0 +1,756 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..7a695ce4 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -33,6 +33,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    ttl: Optional[float] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +44,7 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        ttl: Time-to-live in seconds for cache entries (None means no expiration).
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,9 +74,34 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        ttl=ttl,
+     )
+ 
+ 
++def set_ttl(seconds: Optional[float]) -> None:
++    """Set the TTL (time-to-live) for the active global DSPy cache.
++
++    Changes the lifetime used by subsequent writes without clearing entries,
++    extending existing deadlines, or changing the active cache's enabled layers,
++    location or capacity. Setting TTL back to ``None`` makes new writes
++    nonexpiring; already expiring entries still expire.
++
++    Args:
++        seconds: Time-to-live in seconds (positive finite number) or None for
++                 no expiration.
++
++    Raises:
++        ValueError: If seconds is zero, negative, nonfinite, boolean, or
++                    nonnumeric.
++    """
++    import dspy
++
++    cache = dspy.cache
++    if not isinstance(cache, Cache):
++        raise RuntimeError("No active DSPy cache is configured.")
++    cache.set_ttl(seconds)
++
++
+ litellm.telemetry = False
+ litellm.cache = None  # By default we disable litellm cache and use DSPy on-disk cache.
+ 
+@@ -112,4 +139,5 @@ __all__ = [
+     "enable_litellm_logging",
+     "disable_litellm_logging",
+     "configure_cache",
++    "set_ttl",
+ ]
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..a42a06dc 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,6 +2,7 @@ import copy
+ import inspect
+ import logging
+ import threading
++import time
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -15,6 +16,37 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++class _CacheEntry:
++    """Internal wrapper for cache entries with optional TTL expiration."""
++    __slots__ = ('value', 'deadline')
++
++    def __init__(self, value: Any, deadline: Optional[float]):
++        self.value = value
++        self.deadline = deadline  # None means no expiration; float is a Unix timestamp
++
++    def is_expired(self, now: Optional[float] = None) -> bool:
++        if self.deadline is None:
++            return False
++        if now is None:
++            now = time.time()
++        return now > self.deadline
++
++
++def _validate_ttl(ttl):
++    """Validate the TTL value. Returns the validated value (or None)."""
++    if ttl is None:
++        return None
++    if isinstance(ttl, bool):
++        raise ValueError(f"TTL must be a positive number of seconds, got bool ({ttl!r})")
++    if not isinstance(ttl, (int, float)):
++        raise ValueError(f"TTL must be a positive number of seconds, got {type(ttl).__name__} ({ttl!r})")
++    if ttl <= 0:
++        raise ValueError(f"TTL must be a positive number of seconds, got {ttl!r}")
++    if not (float('-inf') < ttl < float('inf')):
++        raise ValueError(f"TTL must be a finite number of seconds, got {ttl!r}")
++    return float(ttl)
++
++
+ class Cache:
+     """DSPy Cache
+ 
+@@ -30,7 +62,7 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        ttl: Optional[float] = None,
+     ):
+         """
+         Args:
+@@ -39,8 +71,10 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            ttl: Time-to-live in seconds for cache entries (None means no expiration).
+         """
+ 
++        self.ttl = _validate_ttl(ttl)
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+         if self.enable_memory_cache:
+@@ -59,9 +93,38 @@ class Cache:
+ 
+         self._lock = threading.RLock()
+ 
++    def set_ttl(self, ttl: Optional[float]) -> None:
++        """Change the TTL used by subsequent writes.
++
++        Does not clear entries, extend existing deadlines, or change enabled
++        layers, location or capacity. Setting ttl back to None makes new writes
++        nonexpiring; already expiring entries still expire.
++
++        Args:
++            ttl: Time-to-live in seconds (positive finite number) or None for
++                 no expiration.
++
++        Raises:
++            ValueError: If ttl is zero, negative, nonfinite, boolean, or
++                        nonnumeric.
++        """
++        validated = _validate_ttl(ttl)
++        with self._lock:
++            self.ttl = validated
++
+     def __contains__(self, key: str) -> bool:
+-        """Check if a key is in the cache."""
+-        return key in self.memory_cache or key in self.disk_cache
++        """Check if a key is in the cache (expired entries count as not present)."""
++        if self.enable_memory_cache and key in self.memory_cache:
++            entry = self.memory_cache[key]
++            if isinstance(entry, _CacheEntry) and entry.is_expired():
++                # Expired in memory — remove it
++                with self._lock:
++                    del self.memory_cache[key]
++                return False
++            return True
++        if self.enable_disk_cache and key in self.disk_cache:
++            return True
++        return False
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+@@ -105,13 +168,28 @@ class Cache:
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+-                response = self.memory_cache[key]
++                entry = self.memory_cache[key]
++                if isinstance(entry, _CacheEntry):
++                    if entry.is_expired():
++                        del self.memory_cache[key]
++                        return None
++                    response = entry.value
++                else:
++                    response = entry
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+             response = self.disk_cache[key]
+-            if self.enable_memory_cache:
+-                with self._lock:
+-                    self.memory_cache[key] = response
++            if response is not None:
++                if isinstance(response, _CacheEntry):
++                    if response.is_expired():
++                        return None
++                    response_value = response.value
++                else:
++                    response_value = response
++                if self.enable_memory_cache:
++                    with self._lock:
++                        self.memory_cache[key] = response
++                response = response_value
+         else:
+             return None
+ 
+@@ -134,13 +212,26 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return
+ 
++        ttl = self.ttl
++        now = time.time()
++
++        if ttl is not None:
++            deadline = now + ttl
++            entry = _CacheEntry(value, deadline)
++        else:
++            deadline = None
++            entry = value
++
+         if self.enable_memory_cache and enable_memory_cache:
+             with self._lock:
+-                self.memory_cache[key] = value
++                self.memory_cache[key] = entry
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                if ttl is not None:
++                    self.disk_cache.set(key, entry, expire=ttl)
++                else:
++                    self.disk_cache[key] = value
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+@@ -166,7 +257,11 @@ class Cache:
+ 
+         with self._lock:
+             with open(filepath, "rb") as f:
+-                self.memory_cache = cloudpickle.load(f)
++                loaded = cloudpickle.load(f)
++                # Convert any old-format plain values in loaded cache to entries
++                # so that is_expired checks work uniformly; plain values have no
++                # deadline and are treated as nonexpiring.
++                self.memory_cache = loaded
+ 
+ 
+ def request_cache(
+diff --git a/tests/clients/test_cache_ttl.py b/tests/clients/test_cache_ttl.py
+new file mode 100644
+index 00000000..41d80a1c
+--- /dev/null
++++ b/tests/clients/test_cache_ttl.py
+@@ -0,0 +1,503 @@
++"""Tests for TTL (time-to-live) support in DSPy cache."""
++
++import copy
++import math
++import pickle
++import shutil
++import tempfile
++import time
++
++import pytest
++
++from dspy.clients.cache import Cache, _CacheEntry, _validate_ttl
++
++
++# ---------------------------------------------------------------------------
++# _validate_ttl
++# ---------------------------------------------------------------------------
++
++class TestValidateTtl:
++    def test_valid_positive(self):
++        assert _validate_ttl(1.0) == 1.0
++        assert _validate_ttl(0.001) == 0.001
++        assert _validate_ttl(100) == 100.0
++        assert _validate_ttl(10.5) == 10.5
++
++    def test_valid_none(self):
++        assert _validate_ttl(None) is None
++
++    def test_rejects_zero(self):
++        with pytest.raises(ValueError, match="positive"):
++            _validate_ttl(0)
++
++    def test_rejects_negative(self):
++        with pytest.raises(ValueError, match="positive"):
++            _validate_ttl(-1)
++
++    def test_rejects_infinity(self):
++        with pytest.raises(ValueError, match="finite|positive"):
++            _validate_ttl(float("inf"))
++
++    def test_rejects_neg_infinity(self):
++        with pytest.raises(ValueError, match="finite|positive"):
++            _validate_ttl(float("-inf"))
++
++    def test_rejects_nan(self):
++        with pytest.raises(ValueError, match="finite|positive"):
++            _validate_ttl(float("nan"))
++
++    def test_rejects_bool_true(self):
++        with pytest.raises(ValueError, match="positive number"):
++            _validate_ttl(True)
++
++    def test_rejects_bool_false(self):
++        with pytest.raises(ValueError, match="positive number"):
++            _validate_ttl(False)
++
++    def test_rejects_string(self):
++        with pytest.raises(ValueError, match="positive number"):
++            _validate_ttl("10")
++
++
++# ---------------------------------------------------------------------------
++# Cache construction with ttl
++# ---------------------------------------------------------------------------
++
++class TestCacheConstruction:
++    def test_default_ttl_is_none(self):
++        c = Cache(enable_disk_cache=False, enable_memory_cache=True, disk_cache_dir="/tmp/nonexistent")
++        assert c.ttl is None
++
++    def test_ttl_set_at_construction(self):
++        c = Cache(enable_disk_cache=False, enable_memory_cache=True, disk_cache_dir="/tmp/nonexistent", ttl=60)
++        assert c.ttl == 60.0
++
++    def test_invalid_ttl_at_construction_raises(self):
++        with pytest.raises(ValueError):
++            Cache(enable_disk_cache=False, enable_memory_cache=True, disk_cache_dir="/tmp/nonexistent", ttl=-1)
++
++    def test_ttl_property_readonly_via_underscore(self):
++        c = Cache(enable_disk_cache=False, enable_memory_cache=True, disk_cache_dir="/tmp/nonexistent", ttl=30)
++        assert c.ttl == 30.0
++
++
++# ---------------------------------------------------------------------------
++# Memory-only cache with TTL
++# ---------------------------------------------------------------------------
++
++class TestTtlMemoryOnly:
++    @pytest.fixture
++    def cache(self):
++        return Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=0.1,  # 100 ms
++        )
++
++    def test_entry_expires(self, cache):
++        cache.put({"key": "val"}, "hello")
++        assert cache.get({"key": "val"}) == "hello"
++        time.sleep(0.15)
++        assert cache.get({"key": "val"}) is None
++
++    def test_entry_not_expired_before_ttl(self, cache):
++        cache.put({"key": "val"}, "hello")
++        assert cache.get({"key": "val"}) == "hello"
++
++    def test_contains_expired_returns_false(self, cache):
++        cache.put({"key": "val"}, "hello")
++        k = cache.cache_key({"key": "val"})
++        assert k in cache
++        time.sleep(0.15)
++        assert k not in cache
++
++    def test_multiple_entries_independent_expiry(self, cache):
++        cache.put({"k": "1"}, "a")
++        cache.put({"k": "2"}, "b")
++        time.sleep(0.15)
++        assert cache.get({"k": "1"}) is None
++        assert cache.get({"k": "2"}) is None
++
++    def test_overwrite_resets_ttl(self, cache):
++        cache.put({"k": "x"}, "first")
++        time.sleep(0.08)  # Not yet expired
++        cache.put({"k": "x"}, "second")  # Overwrite resets deadline
++        time.sleep(0.08)  # Past original deadline, within new deadline
++        assert cache.get({"k": "x"}) == "second"
++        time.sleep(0.08)  # Past new deadline
++        assert cache.get({"k": "x"}) is None
++
++    def test_read_does_not_renew_ttl(self, cache):
++        cache.put({"k": "x"}, "hello")
++        time.sleep(0.08)
++        assert cache.get({"k": "x"}) == "hello"  # Read does not renew
++        time.sleep(0.08)  # Total ~0.16 > 0.1, should expire
++        assert cache.get({"k": "x"}) is None
++
++
++# ---------------------------------------------------------------------------
++# Disk-only cache with TTL
++# ---------------------------------------------------------------------------
++
++class TestTtlDiskOnly:
++    @pytest.fixture
++    def cache(self):
++        tmpdir = tempfile.mkdtemp(prefix="dspy_ttl_disk_")
++        yield Cache(
++            enable_disk_cache=True,
++            enable_memory_cache=False,
++            disk_cache_dir=tmpdir,
++            ttl=0.1,
++        )
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++    def test_entry_expires(self, cache):
++        cache.put({"k": "v"}, "hello")
++        assert cache.get({"k": "v"}) == "hello"
++        time.sleep(0.15)
++        assert cache.get({"k": "v"}) is None
++
++    def test_contains_after_expiry(self, cache):
++        cache.put({"k": "v"}, "hello")
++        k = cache.cache_key({"k": "v"})
++        time.sleep(0.15)
++        assert k not in cache
++
++    def test_overwrite_resets_ttl(self, cache):
++        cache.put({"k": "x"}, "first")
++        time.sleep(0.08)
++        cache.put({"k": "x"}, "second")
++        time.sleep(0.08)
++        assert cache.get({"k": "x"}) == "second"
++        time.sleep(0.08)
++        assert cache.get({"k": "x"}) is None
++
++
++# ---------------------------------------------------------------------------
++# Combined memory + disk cache with TTL
++# ---------------------------------------------------------------------------
++
++class TestTtlCombined:
++    @pytest.fixture
++    def cache(self):
++        tmpdir = tempfile.mkdtemp(prefix="dspy_ttl_combined_")
++        yield Cache(
++            enable_disk_cache=True,
++            enable_memory_cache=True,
++            disk_cache_dir=tmpdir,
++            ttl=0.15,
++        )
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++    def test_entry_expires(self, cache):
++        cache.put({"k": "v"}, "hello")
++        assert cache.get({"k": "v"}) == "hello"
++        time.sleep(0.2)
++        assert cache.get({"k": "v"}) is None
++
++    def test_disk_promotion_does_not_renew_ttl(self, cache):
++        """Entry promoted from disk to memory must not have its deadline reset."""
++        cache.put({"k": "v"}, "hello")
++        assert cache.get({"k": "v"}) == "hello"
++        cache.reset_memory_cache()
++        time.sleep(0.08)
++        assert cache.get({"k": "v"}) == "hello"  # Promoted from disk
++        time.sleep(0.10)  # Total ~0.18 > 0.15
++        assert cache.get({"k": "v"}) is None
++
++    def test_load_memory_preserves_deadline(self, cache, tmp_path):
++        """Save / load memory cache must not reset deadlines."""
++        cache.put({"k": "v"}, "hello")
++        fp = str(tmp_path / "mem.pkl")
++        cache.save_memory_cache(fp)
++        cache.reset_memory_cache()
++        cache.load_memory_cache(fp)
++        time.sleep(0.2)
++        assert cache.get({"k": "v"}) is None
++
++
++# ---------------------------------------------------------------------------
++# No TTL (original behavior preserved)
++# ---------------------------------------------------------------------------
++
++class TestNoTtl:
++    @pytest.fixture
++    def cache(self):
++        return Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=None,
++        )
++
++    def test_entry_persists(self, cache):
++        cache.put({"k": "v"}, "hello")
++        time.sleep(0.15)
++        assert cache.get({"k": "v"}) == "hello"
++
++    def test_contains(self, cache):
++        cache.put({"k": "v"}, "hello")
++        k = cache.cache_key({"k": "v"})
++        assert k in cache
++
++
++# ---------------------------------------------------------------------------
++# set_ttl method
++# ---------------------------------------------------------------------------
++
++class TestSetTtl:
++    @pytest.fixture
++    def cache(self):
++        return Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=None,
++        )
++
++    def test_updates_ttl(self, cache):
++        assert cache.ttl is None
++        cache.set_ttl(30)
++        assert cache.ttl == 30.0
++
++    def test_back_to_none(self, cache):
++        cache.set_ttl(30)
++        cache.set_ttl(None)
++        assert cache.ttl is None
++
++    def test_invalid_raises_and_unchanged(self, cache):
++        with pytest.raises(ValueError):
++            cache.set_ttl(0)
++        assert cache.ttl is None
++
++    def test_invalid_negative(self, cache):
++        with pytest.raises(ValueError):
++            cache.set_ttl(-5)
++        assert cache.ttl is None
++
++    def test_invalid_bool(self, cache):
++        with pytest.raises(ValueError):
++            cache.set_ttl(True)
++        assert cache.ttl is None
++
++    def test_affects_only_new_writes(self, cache):
++        """Setting TTL must not retroactively expire existing entries."""
++        cache.put({"k": "old"}, "old_entry")
++        cache.set_ttl(0.1)
++        cache.put({"k": "new"}, "new_ttl_entry")
++        # Old entry has no TTL
++        assert cache.get({"k": "old"}) == "old_entry"
++        time.sleep(0.15)
++        assert cache.get({"k": "old"}) == "old_entry"
++        assert cache.get({"k": "new"}) is None
++
++    def test_none_after_ttl(self, cache):
++        """Switching back to None makes new writes nonexpiring."""
++        cache.set_ttl(0.1)
++        cache.put({"k": "will_expire"}, "ephemeral")
++        cache.set_ttl(None)
++        cache.put({"k": "persistent"}, "forever")
++        time.sleep(0.15)
++        assert cache.get({"k": "will_expire"}) is None
++        assert cache.get({"k": "persistent"}) == "forever"
++
++    def test_does_not_clear_entries(self, cache):
++        cache.put({"k": "v"}, "value")
++        cache.set_ttl(60)
++        assert cache.get({"k": "v"}) == "value"
++
++    def test_does_not_change_configuration(self, cache):
++        cache.set_ttl(60)
++        cache.put({"k": "v"}, "value")
++        assert cache.get({"k": "v"}) == "value"
++
++
++# ---------------------------------------------------------------------------
++# Cache disabled
++# ---------------------------------------------------------------------------
++
++class TestCacheDisabled:
++    def test_disabled_ignores_ttl(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=False,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=0.1,
++        )
++        c.put({"k": "v"}, "hello")
++        assert c.get({"k": "v"}) is None
++
++
++# ---------------------------------------------------------------------------
++# Cross-instance disk expiry
++# ---------------------------------------------------------------------------
++
++class TestCrossInstanceDiskTtl:
++    def test_expiry_survives_new_instance(self):
++        tmpdir = tempfile.mkdtemp(prefix="dspy_ttl_cross_")
++        try:
++            c1 = Cache(
++                enable_disk_cache=True,
++                enable_memory_cache=False,
++                disk_cache_dir=tmpdir,
++                ttl=0.1,
++            )
++            c1.put({"k": "v"}, "hello")
++            time.sleep(0.15)
++            c2 = Cache(
++                enable_disk_cache=True,
++                enable_memory_cache=False,
++                disk_cache_dir=tmpdir,
++                ttl=None,
++            )
++            assert c2.get({"k": "v"}) is None
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++
++    def test_unexpired_visible_to_new_instance(self):
++        tmpdir = tempfile.mkdtemp(prefix="dspy_ttl_cross2_")
++        try:
++            c1 = Cache(
++                enable_disk_cache=True,
++                enable_memory_cache=False,
++                disk_cache_dir=tmpdir,
++                ttl=60,
++            )
++            c1.put({"k": "v"}, "hello")
++            c2 = Cache(
++                enable_disk_cache=True,
++                enable_memory_cache=False,
++                disk_cache_dir=tmpdir,
++                ttl=None,
++            )
++            assert c2.get({"k": "v"}) == "hello"
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++
++
++# ---------------------------------------------------------------------------
++# Existing behavior preserved
++# ---------------------------------------------------------------------------
++
++class TestExistingBehaviorPreserved:
++    def test_deepcopy(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=60,
++        )
++        original = {"a": [1, 2, 3]}
++        c.put({"k": "v"}, original)
++        retrieved = c.get({"k": "v"})
++        retrieved["a"].append(4)
++        assert original["a"] == [1, 2, 3]
++
++    def test_usage_cleared(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=60,
++        )
++
++        class FakeResponse:
++            def __init__(self):
++                self.usage = {"prompt_tokens": 10}
++
++        resp = FakeResponse()
++        c.put({"k": "v"}, resp)
++        retrieved = c.get({"k": "v"})
++        assert retrieved.usage == {}
++
++    def test_cache_miss_returns_none(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=60,
++        )
++        assert c.get({"nonexistent": "key"}) is None
++
++    def test_request_cache_decorator_works_with_ttl(self):
++        """The request_cache decorator must function correctly when dspy.cache has TTL."""
++        from unittest.mock import patch
++
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=None,
++        )
++        from dspy.clients.cache import request_cache
++
++        with patch("dspy.cache", c):
++            @request_cache()
++            def fn(prompt, model):
++                return f"Response for {prompt} with {model}"
++
++            r1 = fn(prompt="Hello", model="gpt-4")
++            assert r1 == "Response for Hello with gpt-4"
++
++            with patch.object(c, "get") as mock_get:
++                mock_get.return_value = "Cached"
++                r2 = fn(prompt="Hello", model="gpt-4")
++                assert r2 == "Cached"
++
++
++# ---------------------------------------------------------------------------
++# Edge cases
++# ---------------------------------------------------------------------------
++
++class TestEdgeCases:
++    def test_very_short_ttl(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=0.001,
++        )
++        c.put({"k": "v"}, "value")
++        time.sleep(0.01)
++        assert c.get({"k": "v"}) is None
++
++    def test_large_ttl(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=1e9,
++        )
++        c.put({"k": "v"}, "value")
++        assert c.get({"k": "v"}) == "value"
++
++    def test_nonexpiring_and_expiring_coexist(self):
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=None,
++        )
++        c.put({"k": "persistent"}, "forever")
++        c.set_ttl(0.1)
++        c.put({"k": "temporary"}, "ephemeral")
++        time.sleep(0.15)
++        assert c.get({"k": "persistent"}) == "forever"
++        assert c.get({"k": "temporary"}) is None
++
++    def test_usage_cleared_on_ttl_hit(self):
++        """Clear usage on cache hit even when TTL is set."""
++        c = Cache(
++            enable_disk_cache=False,
++            enable_memory_cache=True,
++            disk_cache_dir="/tmp/nonexistent",
++            ttl=60,
++        )
++
++        class Resp:
++            usage = {"prompt_tokens": 5}
++
++        c.put({"k": "v"}, Resp())
++        retrieved = c.get({"k": "v"})
++        assert retrieved.usage == {}

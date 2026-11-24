@@ -1,0 +1,556 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..1dc59f92 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,8 @@
+ import asyncio
++import math
++import re
+ import inspect
++from decimal import Decimal
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -15,6 +18,12 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++# Regex patterns and multipliers for scalar coercion
++_DURATION_PATTERN = re.compile(r'^\s*(\d+(?:\.\d*)?|\.\d+)\s*(ms|s|m|h)\s*$')
++_SIZE_PATTERN = re.compile(r'^\s*(\d+(?:\.\d*)?|\.\d+)\s*(KB|MB|GB)\s*$')
++_DURATION_MULTIPLIERS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
++_SIZE_MULTIPLIERS = {"KB": 1000, "MB": 1000000, "GB": 1000000000}
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -115,9 +124,91 @@ class Tool(Type):
+         self.arg_types = self.arg_types or arg_types
+         self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+ 
++    @staticmethod
++    def _coerce_value(v: str, type_str: str | None) -> object:
++        """Try to coerce a scalar string value according to the JSON schema type.
++
++        Returns the coerced value on success, or None to keep the original value
++        (which will then go through the existing schema validation error path).
++        """
++        stripped = v.strip()
++
++        # --- Unit coercion (duration and size) ---
++        # Applies for integer/number types, and also when type is unspecified.
++        if type_str in ("integer", "number", None):
++            # Duration pattern: nonnegative magnitude + ms|s|m|h, no exponent notation
++            m = _DURATION_PATTERN.match(stripped)
++            if m:
++                magn_str = m.group(1)
++                if 'e' not in magn_str.lower():
++                    unit = m.group(2)
++                    seconds = float(magn_str) * _DURATION_MULTIPLIERS[unit]
++                    if type_str == "integer":
++                        if seconds == int(seconds):
++                            return int(seconds)
++                        # non-integral seconds -> keep original for validation to fail
++                    else:
++                        return seconds
++
++            # Size pattern: nonnegative magnitude + KB|MB|GB, no exponent notation
++            m = _SIZE_PATTERN.match(stripped)
++            if m:
++                magn_str = m.group(1)
++                if 'e' not in magn_str.lower():
++                    unit = m.group(2)
++                    bytes_val = Decimal(magn_str) * Decimal(_SIZE_MULTIPLIERS[unit])
++                    # Truncate fractional bytes toward zero
++                    return int(bytes_val)
++
++        # --- Boolean coercion (only for boolean fields) ---
++        if type_str == "boolean":
++            lower = stripped.lower()
++            if lower == "true":
++                return True
++            if lower == "false":
++                return False
++            return None  # will fail schema validation
++
++        # --- Numeric coercion (only for integer/number fields) ---
++        if type_str in ("integer", "number"):
++            lower_stripped = stripped.lower()
++            # Reject NaN, Inf and variants
++            if lower_stripped in ("nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"):
++                return None
++            if type_str == "integer":
++                # Plain integer strings (optional sign, digits only) keep exact precision.
++                if re.fullmatch(r"[+-]?\d+", stripped):
++                    return int(stripped)
++            try:
++                val = float(stripped)
++            except ValueError:
++                return None
++            if math.isinf(val) or math.isnan(val):
++                return None
++            if type_str == "integer":
++                if val == int(val):
++                    return int(val)
++                return None  # non-integral -> keep original, validation will fail
++            return val
++
++        return None
++
+     def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
++        # Coerce scalar strings before schema validation.
++        coerced = {}
+         for k, v in kwargs.items():
++            typ = self.args[k].get("type") if k in self.args else None
++            if k in self.args and isinstance(v, str) and typ != "string":
++                new_val = self._coerce_value(v, typ)
++                if new_val is not None:
++                    coerced[k] = new_val
++                else:
++                    coerced[k] = v
++            else:
++                coerced[k] = v
++
++        # Validate the args value comply to the json schema.
++        for k, v in coerced.items():
+             if k not in self.args:
+                 if self.has_kwargs:
+                     continue
+@@ -133,7 +224,7 @@ class Tool(Type):
+ 
+         # Parse the args to the correct type.
+         parsed_kwargs = {}
+-        for k, v in kwargs.items():
++        for k, v in coerced.items():
+             if k in self.arg_types and self.arg_types[k] != Any:
+                 # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+                 # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+diff --git a/tests/adapters/test_tool_coercion.py b/tests/adapters/test_tool_coercion.py
+new file mode 100644
+index 00000000..1af4dbe1
+--- /dev/null
++++ b/tests/adapters/test_tool_coercion.py
+@@ -0,0 +1,422 @@
++"""Tests for scalar string coercion in Tool arguments.
++
++Coercion applies before schema validation so that common string representations
++of booleans, integers, floats, durations and sizes are accepted.
++"""
++
++import pytest
++from typing import Any
++from dspy.adapters.types.tool import Tool
++
++
++# ---------------------------------------------------------------------------
++# Boolean coercion
++# ---------------------------------------------------------------------------
++
++def test_coerce_boolean():
++    def func(flag: bool):
++        return flag
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(flag="true")
++    assert result["flag"] is True
++
++
++def test_coerce_boolean_variants():
++    def func(flag: bool):
++        return flag
++    tool = Tool(func)
++    for s in ("True", "TRUE", "true"):
++        result = tool._validate_and_parse_args(flag=s)
++        assert result["flag"] is True, f"failed for {s!r}"
++    for s in ("false", "False", "FALSE"):
++        result = tool._validate_and_parse_args(flag=s)
++        assert result["flag"] is False, f"failed for {s!r}"
++
++
++def test_coerce_boolean_with_whitespace():
++    def func(flag: bool):
++        return flag
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(flag="  true  ")
++    assert result["flag"] is True
++
++
++def test_coerce_boolean_invalid_stays_string_then_fails():
++    def func(flag: bool):
++        return flag
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(flag="yes")
++
++
++# ---------------------------------------------------------------------------
++# Integer coercion
++# ---------------------------------------------------------------------------
++
++def test_coerce_integer():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(count="42")
++    assert result["count"] == 42
++    assert isinstance(result["count"], int)
++
++
++def test_coerce_integer_negative():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(count="-7")
++    assert result["count"] == -7
++
++
++def test_coerce_integer_positive_sign():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(count="+99")
++    assert result["count"] == 99
++
++
++def test_coerce_integer_large_exact():
++    """Large integers beyond binary-float precision stay exact."""
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    val = "1234567890123456789"
++    result = tool._validate_and_parse_args(count=val)
++    assert result["count"] == 1234567890123456789
++
++
++def test_coerce_integer_integral_float_string():
++    """A string with a decimal point that is integral (e.g. '3.0') should be accepted as int."""
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(count="3.0")
++    assert result["count"] == 3
++    assert isinstance(result["count"], int)
++
++
++def test_coerce_integer_nonintegral_fails():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(count="3.14")
++
++
++def test_coerce_integer_nan_fails():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(count="NaN")
++
++
++def test_coerce_integer_inf_fails():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(count="Infinity")
++
++
++# ---------------------------------------------------------------------------
++# Number (float) coercion
++# ---------------------------------------------------------------------------
++
++def test_coerce_number():
++    def func(ratio: float):
++        return ratio
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(ratio="3.14")
++    assert abs(result["ratio"] - 3.14) < 1e-12
++
++
++def test_coerce_number_integer_string():
++    def func(ratio: float):
++        return ratio
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(ratio="42")
++    assert result["ratio"] == 42.0
++
++
++def test_coerce_number_negative():
++    def func(ratio: float):
++        return ratio
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(ratio="-2.5")
++    assert result["ratio"] == -2.5
++
++
++def test_coerce_number_exponent():
++    def func(ratio: float):
++        return ratio
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(ratio="1.5e2")
++    assert result["ratio"] == 150.0
++
++
++def test_coerce_number_nan_fails():
++    def func(ratio: float):
++        return ratio
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(ratio="NaN")
++
++
++def test_coerce_number_inf_fails():
++    def func(ratio: float):
++        return ratio
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(ratio="Inf")
++
++
++# ---------------------------------------------------------------------------
++# Duration coercion
++# ---------------------------------------------------------------------------
++
++def test_coerce_duration_integer_seconds():
++    def func(timeout: int):
++        return timeout
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(timeout="5s")
++    assert result["timeout"] == 5
++    assert isinstance(result["timeout"], int)
++
++
++def test_coerce_duration_number_seconds():
++    def func(timeout: float):
++        return timeout
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(timeout="1.5s")
++    assert abs(result["timeout"] - 1.5) < 1e-12
++
++
++def test_coerce_duration_ms_nonintegral_fails_integer():
++    """500ms = 0.5s, non-integral for int schema, should fail."""
++    def func(timeout: int):
++        return timeout
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(timeout="500ms")
++
++
++def test_coerce_duration_minutes():
++    def func(timeout: float):
++        return timeout
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(timeout="2m")
++    assert abs(result["timeout"] - 120.0) < 1e-12
++
++
++def test_coerce_duration_hours():
++    def func(timeout: float):
++        return timeout
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(timeout="1h")
++    assert abs(result["timeout"] - 3600.0) < 1e-12
++
++
++def test_coerce_duration_whitespace():
++    def func(timeout: float):
++        return timeout
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(timeout="  30 s  ")
++    assert result["timeout"] == 30.0
++
++
++# ---------------------------------------------------------------------------
++# Size coercion
++# ---------------------------------------------------------------------------
++
++def test_coerce_size_kb():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(size="1KB")
++    assert result["size"] == 1000
++
++
++def test_coerce_size_mb():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(size="2.5MB")
++    assert result["size"] == 2500000
++
++
++def test_coerce_size_gb():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(size="1GB")
++    assert result["size"] == 1000000000
++
++
++def test_coerce_size_fractional_truncates():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(size="1.001KB")
++    assert result["size"] == 1001
++
++
++def test_coerce_size_whitespace():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(size="  100  KB  ")
++    assert result["size"] == 100000
++
++
++def test_coerce_size_unknown_unit_fails():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(size="10XB")
++
++
++def test_coerce_size_lowercase_unit_fails():
++    """Units are case-sensitive; 'kb' is not recognized."""
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(size="10kb")
++
++
++# ---------------------------------------------------------------------------
++# Edge cases: string fields, unknown kwargs, non-string values
++# ---------------------------------------------------------------------------
++
++def test_no_coercion_for_string_fields():
++    """String-typed fields must not be coerced."""
++    def func(name: str):
++        return name
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(name="true")
++    assert result["name"] == "true"
++    result = tool._validate_and_parse_args(name="42")
++    assert result["name"] == "42"
++
++
++def test_no_coercion_for_unknown_kwargs():
++    """Unknown kwargs pass through unchanged when function accepts **kwargs."""
++    from dspy.adapters.types.tool import Tool
++    def func(known: int, **kwargs):
++        return known
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(known="5", unknown="true")
++    # unknown kwargs are allowed (not in schema but has_kwargs=True); no coercion
++    assert result["unknown"] == "true"
++    assert result["known"] == 5
++
++
++def test_no_coercion_for_non_string_values():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(count=42)
++    assert result["count"] == 42
++
++
++def test_coerce_boolean_non_string_passthrough():
++    def func(flag: bool):
++        return flag
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(flag=True)
++    assert result["flag"] is True
++
++
++def test_coerce_value_none():
++    """_coerce_value returns None for non-coercible inputs."""
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    result = Tool._coerce_value("  hello  ", "integer")
++    assert result is None
++
++
++def test_no_coercion_on_duration_string_field():
++    def func(name: str):
++        return name
++    tool = Tool(func)
++    result = tool._validate_and_parse_args(name="5s")
++    assert result["name"] == "5s"
++
++
++def test_numeric_field_garbage_fails():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(count="not_a_number")
++
++
++def test_numeric_field_expression_fails():
++    """Arithmetic expressions should not be evaluated."""
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(count="2+2")
++
++
++def test_numeric_field_trailing_text_fails():
++    def func(count: int):
++        return count
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(count="42px")
++
++
++def test_duration_exponent_not_accepted():
++    def func(timeout: float):
++        return timeout
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(timeout="1e3ms")
++
++
++def test_size_exponent_not_accepted():
++    def func(size: int):
++        return size
++    tool = Tool(func)
++    with pytest.raises(ValueError):
++        tool._validate_and_parse_args(size="1e3KB")
++
++
++# ---------------------------------------------------------------------------
++# Async tool path (acall) - smoke test
++# ---------------------------------------------------------------------------
++
++@pytest.mark.asyncio
++async def test_async_coerce_boolean():
++    async def func(flag: bool):
++        return flag
++    tool = Tool(func)
++    result = await tool.acall(flag="true")
++    assert result is True
++
++
++@pytest.mark.asyncio
++async def test_async_coerce_integer():
++    async def func(count: int):
++        return count
++    tool = Tool(func)
++    result = await tool.acall(count="42")
++    assert result == 42
++    assert isinstance(result, int)
++
++
++@pytest.mark.asyncio
++async def test_async_coerce_duration():
++    async def func(timeout: float):
++        return timeout
++    tool = Tool(func)
++    result = await tool.acall(timeout="5s")
++    assert result == 5.0

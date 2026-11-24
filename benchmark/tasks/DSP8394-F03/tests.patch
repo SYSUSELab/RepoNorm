@@ -1,0 +1,111 @@
+diff --git a/tests/clients/test_cache_ttl.py b/tests/clients/test_cache_ttl.py
+new file mode 100644
+index 0000000..0ab1cf8
+--- /dev/null
++++ b/tests/clients/test_cache_ttl.py
+@@ -0,0 +1,105 @@
++import time
++
++import pytest
++
++import dspy
++from dspy.clients import configure_cache, set_ttl
++from dspy.clients.cache import Cache
++
++
++def make_cache(tmp_path, disk=True, memory=True, ttl=0.8):
++    return Cache(disk, memory, str(tmp_path), memory_max_entries=10, ttl=ttl)
++
++
++@pytest.mark.parametrize('disk,memory', [(False, True), (True, False), (True, True)])
++def test_lifetime_and_nonexpiring_default(tmp_path, disk, memory):
++    cache = make_cache(tmp_path / 'expiring', disk, memory)
++    forever = make_cache(tmp_path / 'forever', disk, memory, None)
++    request = {'prompt': 'lifetime'}
++    cache.put(request, {'answer': [42]})
++    forever.put(request, {'answer': [42]})
++    assert cache.get(request) == forever.get(request) == {'answer': [42]}
++    time.sleep(1.1)
++    assert cache.get(request) is None
++    assert forever.get(request) == {'answer': [42]}
++
++
++def test_disk_promotion_does_not_renew_lifetime(tmp_path):
++    cache = make_cache(tmp_path, ttl=1.2)
++    request = {'prompt': 'promote'}
++    cache.put(request, 'original')
++    time.sleep(0.7)
++    cache.reset_memory_cache()
++    assert cache.get(request) == 'original'
++    time.sleep(0.7)
++    assert cache.get(request) is None
++    cache.reset_memory_cache()
++    assert cache.get(request) is None
++
++
++def test_overwrite_starts_new_lifetime(tmp_path):
++    cache = make_cache(tmp_path, ttl=1.2)
++    request = {'prompt': 'overwrite'}
++    cache.put(request, 'old')
++    time.sleep(0.7)
++    cache.put(request, 'new')
++    time.sleep(0.7)
++    assert cache.get(request) == 'new'
++    cache.reset_memory_cache()
++    assert cache.get(request) == 'new'
++    time.sleep(0.7)
++    assert cache.get(request) is None
++
++
++def test_disk_reopen_preserves_deadline(tmp_path):
++    request = {'prompt': 'reopen'}
++    make_cache(tmp_path, memory=False).put(request, 'value')
++    reopened = make_cache(tmp_path, memory=False, ttl=None)
++    assert reopened.get(request) == 'value'
++    time.sleep(1.1)
++    assert reopened.get(request) is None
++
++
++@pytest.mark.parametrize('disk,memory', [(False, True), (True, False), (True, True)])
++def test_set_ttl_changes_future_writes_only(tmp_path, monkeypatch, disk, memory):
++    monkeypatch.setattr(dspy, 'cache', None)
++    configure_cache(enable_disk_cache=disk, enable_memory_cache=memory,
++                    disk_cache_dir=str(tmp_path), memory_max_entries=10, ttl=0.8)
++    dspy.cache.put({'key': 'old'}, 'expires')
++    set_ttl(None)
++    assert dspy.cache.get({'key': 'old'}) == 'expires'
++    dspy.cache.put({'key': 'new'}, 'forever')
++    time.sleep(1.1)
++    assert dspy.cache.get({'key': 'old'}) is None
++    assert dspy.cache.get({'key': 'new'}) == 'forever'
++    set_ttl(0.8)
++    dspy.cache.put({'key': 'latest'}, 'expires again')
++    time.sleep(1.1)
++    assert dspy.cache.get({'key': 'latest'}) is None
++    assert dspy.cache.get({'key': 'new'}) == 'forever'
++
++
++@pytest.mark.parametrize('invalid', [0, -1, float('inf'), float('nan'), True, '2'])
++def test_invalid_ttl_does_not_change_global_cache(tmp_path, monkeypatch, invalid):
++    cache = make_cache(tmp_path, disk=False, ttl=None)
++    monkeypatch.setattr(dspy, 'cache', cache)
++    cache.put({'key': 'stable'}, 'value')
++    with pytest.raises(ValueError):
++        make_cache(tmp_path, disk=False, ttl=invalid)
++    with pytest.raises(ValueError):
++        set_ttl(invalid)
++    assert dspy.cache.get({'key': 'stable'}) == 'value'
++    assert dspy.cache is cache
++
++
++def test_disabled_layers_and_saved_deadlines(tmp_path):
++    disabled = make_cache(tmp_path / 'disabled', disk=False, memory=False)
++    disabled.put({'key': 1}, 'value')
++    assert disabled.get({'key': 1}) is None
++    cache = make_cache(tmp_path / 'memory', disk=False)
++    cache.put({'key': 1}, 'value')
++    saved = str(tmp_path / 'saved.pkl')
++    cache.save_memory_cache(saved)
++    time.sleep(1.1)
++    cache.load_memory_cache(saved)
++    assert cache.get({'key': 1}) is None

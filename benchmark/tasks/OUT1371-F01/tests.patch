@@ -1,0 +1,196 @@
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..b7a930a 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -321,6 +321,38 @@ def test_prompt_args():
+     )
+ 
+ 
++def test_prompt_with_additional_filters():
++    def tagged(s: str, prefix: str) -> str:
++        return f"{prefix}:{s}"
++
++    @outlines.prompt(filters={"tagged": tagged})
++    def test_tpl(variable):
++        """{{ variable | tagged("value") }} test"""
++
++    assert list(test_tpl.signature.parameters) == ["variable"]
++
++    p = test_tpl("test")
++    assert p == "value:test test"
++
++    p = test_tpl(variable="example")
++    assert p == "value:example test"
++
++
++def test_custom_filters_override_existing_filters():
++    def local_upper(value):
++        return f"local-upper:{value}"
++
++    def local_name(value):
++        return f"local-name:{value}"
++
++    prompt = Prompt.from_str(
++        "{{ value | upper }} / {{ value | name }}",
++        filters={"upper": local_upper, "name": local_name},
++    )
++
++    assert prompt(value="example") == "local-upper:example / local-name:example"
++
++
+ @pytest.fixture
+ def temp_prompt_file():
+     test_dir = tempfile.mkdtemp()
+@@ -386,6 +418,28 @@ A:
+     assert rendered.strip() == expected.strip()
+ 
+ 
++def test_prompt_from_file_with_custom_filter_and_template_loading(tmp_path):
++    (tmp_path / "base.txt").write_text(
++        "{% block content %}{% endblock %}", encoding="utf-8"
++    )
++    (tmp_path / "included.txt").write_text(
++        '{{ value | surround("<", ">") }}', encoding="utf-8"
++    )
++    child = tmp_path / "child.txt"
++    child.write_text(
++        '{% extends "base.txt" %}'
++        '{% block content %}{% include "included.txt" %}{% endblock %}',
++        encoding="utf-8",
++    )
++
++    def surround(value, left, right):
++        return f"{left}{value}{right}"
++
++    prompt = Prompt.from_file(child, filters={"surround": surround})
++
++    assert prompt(value="example") == "<example>"
++
++
+ def test_prompt_from_str():
+     content = """
+     Hello, {{ name }}!
+@@ -395,6 +449,123 @@ def test_prompt_from_str():
+     assert prompt(name="World") == "Hello, World!"
+ 
+ 
++def test_prompt_from_str_without_custom_filters():
++    assert Prompt.from_str("{{ value | upper }}", filters=None)(value="text") == "TEXT"
++    assert Prompt.from_str("{{ value | upper }}", filters={})(value="text") == "TEXT"
++
++
++@pytest.mark.parametrize("entrypoint", ["decorator", "from_str", "from_file"])
++def test_custom_filter_prompts_preserve_undefined_errors(entrypoint, tmp_path):
++    import jinja2
++
++    def build(body):
++        filters = {"tag": lambda value: "<" + value + ">"}
++        if entrypoint == "from_str":
++            return Prompt.from_str(body, filters=filters)
++        if entrypoint == "from_file":
++            (tmp_path / "body.txt").write_text(body, encoding="utf-8")
++            path = tmp_path / "prompt.txt"
++            path.write_text('{% include "body.txt" %}', encoding="utf-8")
++            return Prompt.from_file(path, filters=filters)
++        def template(value):
++            pass
++        template.__doc__ = body
++        return outlines.prompt(filters=filters)(template)
++
++    assert build("{{ value | tag }}")(value="snow") == "<snow>"
++    with pytest.raises(jinja2.UndefinedError):
++        build("{{ value | tag }} / {{ missing }}")(value="snow")
++    assert build('{{ value | tag }} / {{ missing | default("fallback") }}')(
++        value="snow"
++    ) == "<snow> / fallback"
++
++
++def test_with_filters_derives_independent_prompts():
++    original = Prompt.from_str(
++        '{{ "fixed" | upper }} / {{ value | tag("!") }}',
++        filters={"tag": lambda value, suffix: value + suffix},
++    )
++    overrides = {"upper": lambda value: "local:" + value}
++    derived = original.with_filters(overrides)
++    sibling = original.with_filters({"upper": lambda value: "other:" + value})
++    chained = derived.with_filters({"tag": lambda value, suffix: suffix + value})
++    overrides["upper"] = lambda value: "changed"
++    assert original(value="x") == "FIXED / x!"
++    assert derived(value="x") == "local:fixed / x!"
++    assert sibling(value="x") == "other:fixed / x!"
++    assert chained(value="x") == "local:fixed / !x"
++    assert isinstance(derived, Prompt)
++    assert derived is not original
++
++
++@pytest.mark.parametrize("filters", [None, {}])
++def test_with_filters_empty_retains_current_filters(filters):
++    original = Prompt.from_str("{{ value | upper }}", filters={"upper": lambda value: "<" + value + ">"})
++    derived = original.with_filters(filters)
++    assert derived(value="x") == original(value="x") == "<x>"
++    assert derived is not original
++
++
++def test_with_filters_preserves_decorated_signature_and_format():
++    @outlines.prompt
++    def original(value="snow", suffix="!"):
++        """
++        Heading
++            {{ value | upper }}{{ suffix }}
++
++        """
++
++    derived = original.with_filters({"upper": lambda value: "<" + value + ">"})
++    assert derived() == "Heading\n    <snow>!\n"
++    assert derived("rain", suffix="?") == "Heading\n    <rain>?\n"
++    assert original() == "Heading\n    SNOW!\n"
++    with pytest.raises(TypeError):
++        derived(unexpected="x")
++    from_str = Prompt.from_str("""
++        Heading
++            {{ value | upper }}
++
++        """).with_filters({"upper": lambda value: "<" + value + ">"})
++    assert from_str(value="snow") == "Heading\n    <snow>\n"
++
++
++def test_with_filters_preserves_file_includes_and_inheritance(tmp_path):
++    (tmp_path / "base.txt").write_text("{% block body %}{% endblock %}", encoding="utf-8")
++    (tmp_path / "body.txt").write_text('{{ "fixed" | upper }} / {{ value | upper }}', encoding="utf-8")
++    path = tmp_path / "child.txt"
++    path.write_text('{% extends "base.txt" %}{% block body %}{% include "body.txt" %}{% endblock %}', encoding="utf-8")
++    original = Prompt.from_file(path)
++    assert original(value="snow") == "FIXED / SNOW"
++    derived = original.with_filters({"upper": lambda value: "<" + value + ">"})
++    assert derived(value="snow") == "<fixed> / <snow>"
++    assert original(value="snow") == "FIXED / SNOW"
++
++
++@pytest.mark.parametrize("entrypoint", ["decorator", "from_str", "from_file"])
++def test_with_filters_preserves_missing_variable_behavior(entrypoint, tmp_path):
++    import jinja2
++
++    def build(body):
++        if entrypoint == "from_str":
++            original = Prompt.from_str(body)
++        elif entrypoint == "from_file":
++            (tmp_path / "body.txt").write_text(body, encoding="utf-8")
++            path = tmp_path / "child.txt"
++            path.write_text('{% include "body.txt" %}', encoding="utf-8")
++            original = Prompt.from_file(path)
++        else:
++            def template(value="snow"):
++                pass
++            template.__doc__ = body
++            original = outlines.prompt(template)
++        return original.with_filters({"upper": lambda value: "<" + value + ">"})
++
++    with pytest.raises(jinja2.UndefinedError):
++        build("{{ value | upper }} / {{ missing }}")(value="snow")
++    fallback = build('{{ value | upper }} / {{ missing | default("fallback") }}')
++    assert fallback(value="snow") == "<snow> / fallback"
++
++
+ def test_template_from_str_with_extra_linebreaks():
+     content = """
+     Hello, {{ name }}!

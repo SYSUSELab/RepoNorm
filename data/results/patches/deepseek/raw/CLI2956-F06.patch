@@ -1,0 +1,200 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..0ab0f73 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -139,6 +139,69 @@ def iter_params_for_processing(
+     return sorted(declaration_order, key=sort_key)
+ 
+ 
++
++def _is_dynamic_default(value: t.Any) -> bool:
++    """Check if a value is a dynamic default dictionary.
++
++    A dynamic default is a non-empty dictionary whose keys are full long
++    option names beginning ``--`` and whose values are dictionaries from
++    stringified dependency values to target defaults.
++    """
++    if not isinstance(value, dict) or not value:
++        return False
++    return all(isinstance(k, str) and k.startswith("--") for k in value)
++
++
++def _resolve_dynamic_default(
++    ctx: "Context", value: dict[str, t.Any]
++) -> t.Any:
++    """Resolve a dynamic default value.
++
++    :param ctx: The current context.
++    :param value: The dynamic default dictionary.
++    :return: The resolved default value.
++    """
++    result: t.Any = None
++
++    for dep_opt, mapping in value.items():
++        # dep_opt is like "--format"
++        dep_name = dep_opt[2:]  # strip "--" prefix
++
++        # Find the parameter with this name
++        dep_param = None
++        for param in ctx.command.get_params(ctx):
++            if param.name == dep_name:
++                dep_param = param
++                break
++
++        if dep_param is None:
++            raise UsageError(
++                f"Unknown option '{dep_opt}' referenced in dynamic default."
++            )
++
++        if not isinstance(mapping, dict):
++            raise TypeError(
++                f"Dynamic default mapping for '{dep_opt}' must be "
++                f"a dictionary, not {type(mapping).__name__}."
++            )
++
++        # Get the dependency value from ctx.params
++        dep_value = ctx.params.get(dep_name)
++
++        # For boolean values, convert to "True" or "False"
++        if isinstance(dep_value, bool):
++            dep_key = "True" if dep_value else "False"
++        else:
++            dep_key = str(dep_value) if dep_value is not None else "None"
++
++        if dep_key in mapping:
++            result = mapping[dep_key]
++        else:
++            result = None
++
++    return result
++
++
+ class ParameterSource(enum.Enum):
+     """This is an :class:`~enum.Enum` that indicates the source of a
+     parameter's value.
+@@ -1207,8 +1270,92 @@ class Command:
+ 
+         ctx.args = args
+         ctx._opt_prefixes.update(parser._opt_prefixes)
++
++        # Resolve dynamic defaults
++        self._resolve_dynamic_defaults(ctx)
++
+         return args
+ 
++    def _resolve_dynamic_defaults(self, ctx: Context) -> None:
++        """Resolve dynamic defaults for parameters whose source is DEFAULT.
++
++        After all explicit values, environment variables, default-map values,
++        and ordinary defaults have been parsed, resolve dynamic defaults whose
++        target source is still DEFAULT.
++        """
++        params = list(self.get_params(ctx))
++        
++        # Find parameters with dynamic defaults that still have DEFAULT source
++        dynamic_params = []
++        for param in params:
++            if _is_dynamic_default(param.default):
++                source = ctx.get_parameter_source(param.name)
++                if source == ParameterSource.DEFAULT:
++                    dynamic_params.append(param)
++
++        if not dynamic_params:
++            return
++
++        # Build dependency graph for topological sort
++        # Map param name -> set of dependency param names (within dynamic defaults)
++        deps: dict[str, set[str]] = {}
++        all_param_names = {p.name for p in params}
++        
++        for param in dynamic_params:
++            dep_names: set[str] = set()
++            for dep_opt in param.default:
++                dep_name = dep_opt[2:]  # strip "--"
++                if dep_name not in all_param_names:
++                    raise UsageError(
++                        f"Unknown option '{dep_opt}' referenced in dynamic default."
++                    )
++                dep_names.add(dep_name)
++            deps[param.name] = dep_names
++
++        # Topological sort using Kahn's algorithm
++        # Only consider edges between dynamic params for cycle detection
++        dynamic_names = {p.name for p in dynamic_params}
++        
++        # Build in-degree count considering only edges to other dynamic params
++        in_degree: dict[str, int] = {name: 0 for name in dynamic_names}
++        dep_graph: dict[str, list[str]] = {name: [] for name in dynamic_names}
++        
++        for param in dynamic_params:
++            for dep_name in deps[param.name]:
++                if dep_name in dynamic_names:
++                    # param depends on dep_name
++                    dep_graph.setdefault(dep_name, []).append(param.name)
++                    in_degree[param.name] = in_degree.get(param.name, 0) + 1
++
++        # Kahn's algorithm
++        queue = [name for name in dynamic_names if in_degree.get(name, 0) == 0]
++        topological_order = []
++        
++        while queue:
++            name = queue.pop(0)
++            topological_order.append(name)
++            for dependent in dep_graph.get(name, []):
++                in_degree[dependent] -= 1
++                if in_degree[dependent] == 0:
++                    queue.append(dependent)
++
++        if len(topological_order) != len(dynamic_names):
++            # There's a cycle
++            raise UsageError(
++                "A cyclic dependency was detected in dynamic defaults."
++            )
++
++        # Resolve dynamic defaults in topological order
++        for param_name in topological_order:
++            param = next(p for p in dynamic_params if p.name == param_name)
++            # Resolve the dynamic default
++            raw_value = _resolve_dynamic_default(ctx, param.default)
++            # Process the resolved value through the normal pipeline
++            with augment_usage_errors(ctx, param=param):
++                processed_value = param.process_value(ctx, raw_value)
++            ctx.params[param.name] = processed_value
++            ctx.set_parameter_source(param.name, ParameterSource.DEFAULT)
++
+     def invoke(self, ctx: Context) -> t.Any:
+         """Given a context, this invokes the attached callback (if it exists)
+         in the right way.
+@@ -2412,13 +2559,17 @@ class Parameter:
+ 
+             ctx.set_parameter_source(self.name, source)  # type: ignore
+ 
+-            try:
+-                value = self.process_value(ctx, value)
+-            except Exception:
+-                if not ctx.resilient_parsing:
+-                    raise
++            # Skip processing dynamic default dicts; they will be resolved later
++            if source == ParameterSource.DEFAULT and _is_dynamic_default(value):
++                pass  # Keep the raw dict, process later in _resolve_dynamic_defaults
++            else:
++                try:
++                    value = self.process_value(ctx, value)
++                except Exception:
++                    if not ctx.resilient_parsing:
++                        raise
+ 
+-                value = None
++                    value = None
+ 
+         if self.expose_value:
+             ctx.params[self.name] = value  # type: ignore
+@@ -2868,6 +3019,8 @@ class Option(Parameter):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):
+                 default_string = _("(dynamic)")
++            elif _is_dynamic_default(default_value):
++                default_string = _("(dynamic)")
+             elif self.is_bool_flag and self.secondary_opts:
+                 # For boolean flags that have distinct True/False opts,
+                 # use the opt without prefix instead of the value.

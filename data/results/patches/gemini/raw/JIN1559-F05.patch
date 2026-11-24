@@ -1,0 +1,336 @@
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..9197fce
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,23 @@
++from jinja2 import Environment
++from jinja2.ext import InternationalizationExtension
++from jinja2.exceptions import TemplateSyntaxError
++
++env = Environment(extensions=[InternationalizationExtension])
++
++# Test 1: Reserved name in trans header
++try:
++    env.from_string("{% trans gettext='foo' %}bar{% endtrans %}")
++    print("Test 1 failed: No error raised")
++except TemplateSyntaxError as e:
++    print(f"Caught expected error: {e}")
++except Exception as e:
++    print(f"Caught unexpected error: {type(e).__name__}: {e}")
++
++# Test 2: Invalid expression in trans header
++try:
++    env.from_string("{% trans x=a[0] %}bar{% endtrans %}")
++    print("Test 2 failed: No error raised")
++except TemplateSyntaxError as e:
++    print(f"Caught expected error: {e}")
++except Exception as e:
++    print(f"Caught unexpected error: {type(e).__name__}: {e}")
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..5254d26 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -242,6 +242,41 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++def _validate_expression(expr, lineno):
++    from jinja2 import nodes
++    from jinja2.exceptions import TemplateSyntaxError
++
++    if isinstance(expr, (nodes.Const, nodes.Name)):
++        return
++    if isinstance(expr, nodes.Getattr):
++        _validate_expression(expr.node, lineno)
++        return
++    if isinstance(expr, nodes.Filter):
++        _validate_expression(expr.node, lineno)
++        for arg in expr.args:
++            _validate_expression(arg, lineno)
++        for kw in expr.kwargs:
++            _validate_expression(kw.value, lineno)
++        return
++    if isinstance(expr, nodes.Test):
++        _validate_expression(expr.node, lineno)
++        for arg in expr.args:
++            _validate_expression(arg, lineno)
++        for kw in expr.kwargs:
++            _validate_expression(kw.value, lineno)
++        return
++    if isinstance(expr, nodes.Call):
++        if not isinstance(expr.node, nodes.Name):
++            raise TemplateSyntaxError("Only simple names allowed as callees", lineno)
++        for arg in expr.args:
++            _validate_expression(arg, lineno)
++        for kw in expr.kwargs:
++            _validate_expression(kw.value, lineno)
++        if expr.dyn_args or expr.dyn_kwargs:
++            raise TemplateSyntaxError("Dynamic args/kwargs not allowed", lineno)
++        return
++    raise TemplateSyntaxError(f"Invalid expression type: {type(expr).__name__}", lineno)
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -372,6 +407,11 @@ class InternationalizationExtension(Extension):
+                 break
+ 
+             token = parser.stream.expect("name")
++            if token.value in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++                parser.fail(
++                    f"variable {token.value!r} conflicts with translation function names",
++                    token.lineno,
++                )
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -382,7 +422,9 @@ class InternationalizationExtension(Extension):
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+-                variables[token.value] = var = parser.parse_expression()
++                var = parser.parse_expression()
++                _validate_expression(var, token.lineno)
++                variables[token.value] = var
+             elif trimmed is None and token.value in ("trimmed", "notrimmed"):
+                 trimmed = token.value == "trimmed"
+                 continue
+@@ -420,6 +462,11 @@ class InternationalizationExtension(Extension):
+             next(parser.stream)
+             if parser.stream.current.type != "block_end":
+                 token = parser.stream.expect("name")
++                if token.value in ("gettext", "ngettext", "pgettext", "npgettext", "_"):
++                    parser.fail(
++                        f"variable {token.value!r} conflicts with translation function names",
++                        token.lineno,
++                    )
+                 if token.value not in variables:
+                     parser.fail(
+                         f"unknown variable {token.value!r} for pluralization",
+@@ -428,6 +475,8 @@ class InternationalizationExtension(Extension):
+                     )
+                 plural_expr = variables[token.value]
+                 num_called_num = token.value == "num"
++                plural_expr = variables[token.value]
++                num_called_num = token.value == "num"
+             parser.stream.expect("block_end")
+             plural_names, plural = self._parse_block(parser, False)
+             next(parser.stream)
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000..cbfc4a6
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,33 @@
++from jinja2 import Environment
++from jinja2.ext import InternationalizationExtension
++from jinja2.exceptions import TemplateSyntaxError
++
++env = Environment(extensions=[InternationalizationExtension])
++
++# Test 3: Valid expression
++try:
++    env.from_string("{% trans x=a.b.c %}bar{% endtrans %}")
++    print("Test 3 passed")
++except Exception as e:
++    print(f"Test 3 failed: {e}")
++
++# Test 4: Valid call
++try:
++    env.from_string("{% trans x=f(a, b=c) %}bar{% endtrans %}")
++    print("Test 4 passed")
++except Exception as e:
++    print(f"Test 4 failed: {e}")
++
++# Test 5: Invalid call (nested expression)
++try:
++    env.from_string("{% trans x=f(a+b) %}bar{% endtrans %}")
++    print("Test 5 failed: No error raised")
++except TemplateSyntaxError as e:
++    print(f"Caught expected error: {e}")
++
++# Test 6: Invalid call (dynamic args)
++try:
++    env.from_string("{% trans x=f(*args) %}bar{% endtrans %}")
++    print("Test 6 failed: No error raised")
++except TemplateSyntaxError as e:
++    print(f"Caught expected error: {e}")
+diff --git a/test_reserved_non_assigned.py b/test_reserved_non_assigned.py
+new file mode 100644
+index 0000000..7529a8f
+--- /dev/null
++++ b/test_reserved_non_assigned.py
+@@ -0,0 +1,11 @@
++from jinja2 import Environment
++from jinja2.ext import InternationalizationExtension
++from jinja2.exceptions import TemplateSyntaxError
++
++env = Environment(extensions=[InternationalizationExtension])
++
++try:
++    env.from_string("{% trans gettext %}bar{% endtrans %}")
++    print("Test failed: No error raised")
++except TemplateSyntaxError as e:
++    print(f"Caught expected error: {e}")
+diff --git a/test_validator.py b/test_validator.py
+new file mode 100644
+index 0000000..97d4792
+--- /dev/null
++++ b/test_validator.py
+@@ -0,0 +1,41 @@
++from jinja2 import nodes
++from jinja2.exceptions import TemplateSyntaxError
++
++def validate_expression(expr):
++    if isinstance(expr, (nodes.Const, nodes.Name)):
++        return
++    if isinstance(expr, nodes.Getattr):
++        validate_expression(expr.node)
++        return
++    if isinstance(expr, nodes.Filter):
++        validate_expression(expr.node)
++        for arg in expr.args:
++            validate_expression(arg)
++        for kw in expr.kwargs:
++            validate_expression(kw.value)
++        return
++    if isinstance(expr, nodes.Test):
++        validate_expression(expr.node)
++        for arg in expr.args:
++            validate_expression(arg)
++        for kw in expr.kwargs:
++            validate_expression(kw.value)
++        return
++    if isinstance(expr, nodes.Call):
++        if not isinstance(expr.node, nodes.Name):
++            raise TemplateSyntaxError("Only simple names allowed as callees", expr.lineno)
++        for arg in expr.args:
++            validate_expression(arg)
++        for kw in expr.kwargs:
++            validate_expression(kw.value)
++        if expr.dyn_args or expr.dyn_kwargs:
++            raise TemplateSyntaxError("Dynamic args/kwargs not allowed", expr.lineno)
++        return
++    raise TemplateSyntaxError(f"Invalid expression type: {type(expr).__name__}", expr.lineno)
++
++# Test cases
++try:
++    validate_expression(nodes.Call(nodes.Name("f", "load"), [nodes.Name("x", "load")], [], nodes.Name("args", "load"), None))
++    print("Starargs: Failed (should have raised)")
++except TemplateSyntaxError as e:
++    print(f"Caught expected error: {e}")
+diff --git a/tests/test_trans_validation.py b/tests/test_trans_validation.py
+new file mode 100644
+index 0000000..6e064a1
+--- /dev/null
++++ b/tests/test_trans_validation.py
+@@ -0,0 +1,28 @@
++import pytest
++from jinja2 import Environment
++from jinja2.ext import InternationalizationExtension
++from jinja2.exceptions import TemplateSyntaxError
++
++@pytest.fixture
++def env():
++    return Environment(extensions=[InternationalizationExtension])
++
++def test_reserved_names(env):
++    with pytest.raises(TemplateSyntaxError, match="conflicts with translation function names"):
++        env.from_string("{% trans gettext='foo' %}bar{% endtrans %}")
++    with pytest.raises(TemplateSyntaxError, match="conflicts with translation function names"):
++        env.from_string("{% trans _='foo' %}bar{% endtrans %}")
++    with pytest.raises(TemplateSyntaxError, match="conflicts with translation function names"):
++        env.from_string("{% trans gettext %}bar{% endtrans %}")
++
++def test_invalid_expressions(env):
++    with pytest.raises(TemplateSyntaxError, match="Invalid expression type"):
++        env.from_string("{% trans x=a[0] %}bar{% endtrans %}")
++    with pytest.raises(TemplateSyntaxError, match="Invalid expression type"):
++        env.from_string("{% trans x=a+b %}bar{% endtrans %}")
++    with pytest.raises(TemplateSyntaxError, match="Dynamic args/kwargs not allowed"):
++        env.from_string("{% trans x=f(*args) %}bar{% endtrans %}")
++
++def test_valid_expressions(env):
++    env.from_string("{% trans x=a.b.c %}bar{% endtrans %}")
++    env.from_string("{% trans x=f(a, b=c) %}bar{% endtrans %}")
+diff --git a/validate_expr.py b/validate_expr.py
+new file mode 100644
+index 0000000..5292520
+--- /dev/null
++++ b/validate_expr.py
+@@ -0,0 +1,34 @@
++from jinja2 import nodes
++from jinja2.exceptions import TemplateSyntaxError
++
++def validate_expression(expr):
++    if isinstance(expr, (nodes.Const, nodes.Name)):
++        return
++    if isinstance(expr, nodes.Getattr):
++        validate_expression(expr.node)
++        return
++    if isinstance(expr, nodes.Filter):
++        validate_expression(expr.node)
++        for arg in expr.args:
++            validate_expression(arg)
++        for kw in expr.kwargs:
++            validate_expression(kw.value)
++        return
++    if isinstance(expr, nodes.Test):
++        validate_expression(expr.node)
++        for arg in expr.args:
++            validate_expression(arg)
++        for kw in expr.kwargs:
++            validate_expression(kw.value)
++        return
++    if isinstance(expr, nodes.Call):
++        if not isinstance(expr.node, nodes.Name):
++            raise TemplateSyntaxError("Only simple names allowed as callees", expr.lineno)
++        for arg in expr.args:
++            validate_expression(arg)
++        for kw in expr.kwargs:
++            validate_expression(kw.value)
++        if expr.dyn_args or expr.dyn_kwargs:
++            raise TemplateSyntaxError("Dynamic args/kwargs not allowed", expr.lineno)
++        return
++    raise TemplateSyntaxError(f"Invalid expression type: {type(expr).__name__}", expr.lineno)
+diff --git a/validate_expr_func.py b/validate_expr_func.py
+new file mode 100644
+index 0000000..cd30482
+--- /dev/null
++++ b/validate_expr_func.py
+@@ -0,0 +1,34 @@
++def _validate_expression(expr, lineno):
++    from jinja2 import nodes
++    from jinja2.exceptions import TemplateSyntaxError
++
++    if isinstance(expr, (nodes.Const, nodes.Name)):
++        return
++    if isinstance(expr, nodes.Getattr):
++        _validate_expression(expr.node, lineno)
++        return
++    if isinstance(expr, nodes.Filter):
++        _validate_expression(expr.node, lineno)
++        for arg in expr.args:
++            _validate_expression(arg, lineno)
++        for kw in expr.kwargs:
++            _validate_expression(kw.value, lineno)
++        return
++    if isinstance(expr, nodes.Test):
++        _validate_expression(expr.node, lineno)
++        for arg in expr.args:
++            _validate_expression(arg, lineno)
++        for kw in expr.kwargs:
++            _validate_expression(kw.value, lineno)
++        return
++    if isinstance(expr, nodes.Call):
++        if not isinstance(expr.node, nodes.Name):
++            raise TemplateSyntaxError("Only simple names allowed as callees", lineno)
++        for arg in expr.args:
++            _validate_expression(arg, lineno)
++        for kw in expr.kwargs:
++            _validate_expression(kw.value, lineno)
++        if expr.dyn_args or expr.dyn_kwargs:
++            raise TemplateSyntaxError("Dynamic args/kwargs not allowed", lineno)
++        return
++    raise TemplateSyntaxError(f"Invalid expression type: {type(expr).__name__}", lineno)

@@ -1,0 +1,192 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..2e468105 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -3,6 +3,8 @@ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
++import re
++import json_repair
+ from pydantic import BaseModel, TypeAdapter, create_model
+ 
+ from dspy.adapters.types.base_type import Type
+@@ -310,6 +312,109 @@ class ToolCalls(Type):
+         ]
+ 
+ 
++
++    @classmethod
++    def validate_input(cls, data: Any) -> Any:
++        """Extract and parse JSON from input, handling Markdown code fences."""
++        if not isinstance(data, str):
++            return data
++
++        # Try to extract JSON from Markdown code fence first
++        extracted = cls._extract_from_markdown_fence(data)
++        if extracted is not None:
++            try:
++                parsed = json_repair.loads(extracted)
++                return parsed
++            except Exception:
++                pass
++
++        # If no markdown fence found, try parsing directly
++        try:
++            parsed = json_repair.loads(data)
++            return parsed
++        except Exception:
++            return data
++
++    @classmethod
++    def _extract_from_markdown_fence(cls, text: str) -> str | None:
++        """Extract content from the first Markdown code fence block."""
++        # Match opening fence: optional whitespace, triple backticks, optional language, newline
++        opening_pattern = r"^\s*```(?:[a-zA-Z_]+)?\n"
++        match = re.match(opening_pattern, text)
++        if not match:
++            return None
++
++        rest = text[match.end():]
++        # Match closing fence: optional whitespace, triple backticks
++        closing_pattern = r"\n\s*```"
++        close_match = re.search(closing_pattern, rest)
++        if not close_match:
++            return None
++
++        content = rest[:close_match.start()].strip()
++        return content
++
++    @classmethod
++    def model_validate(cls, obj: Any, **kwargs) -> "ToolCalls":
++        """Validate and create a ToolCalls instance from various input formats.
++
++        Supports:
++        - Already validated ToolCalls instances
++        - Dicts with 'tool_calls' key
++        - Single tool call dicts (name + args)
++        - Lists of tool call dicts (including empty lists)
++        - JSON strings (plain or in Markdown code fences)
++        """
++        if isinstance(obj, cls):
++            return obj
++
++        if isinstance(obj, dict):
++            if "tool_calls" in obj:
++                return super().model_validate(obj, **kwargs)
++            if "name" in obj and "args" in obj:
++                return cls(tool_calls=[cls.ToolCall(**obj)])
++
++        if isinstance(obj, list):
++            if len(obj) == 0:
++                return cls(tool_calls=[])
++            first_item = obj[0]
++            if isinstance(first_item, dict) and "name" in first_item and "args" in first_item:
++                tool_calls = [cls.ToolCall(**item) for item in obj]
++                return cls(tool_calls=tool_calls)
++
++        if isinstance(obj, str):
++            # Try to extract from markdown fence first
++            extracted = cls._extract_from_markdown_fence(obj)
++            if extracted is not None:
++                try:
++                    parsed = json_repair.loads(extracted)
++                    return cls.model_validate(parsed, **kwargs)
++                except Exception:
++                    pass
++
++            # Try parsing directly
++            try:
++                parsed = json_repair.loads(obj)
++                return cls.model_validate(parsed, **kwargs)
++            except Exception:
++                pass
++
++        return super().model_validate(obj, **kwargs)
++
++    @classmethod
++    def model_validate_json(cls, json_data: str | bytes | bytearray, **kwargs) -> "ToolCalls":
++        """Validate JSON string, handling Markdown code fences."""
++        if isinstance(json_data, str):
++            extracted = cls._extract_from_markdown_fence(json_data)
++            if extracted is not None:
++                try:
++                    parsed = json_repair.loads(extracted)
++                    return cls.model_validate(parsed, **kwargs)
++                except Exception:
++                    pass
++
++        return super().model_validate_json(json_data, **kwargs)
++
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+ 
+diff --git a/dspy/adapters/utils.py b/dspy/adapters/utils.py
+index 2ce6de20..8f0ee04f 100644
+--- a/dspy/adapters/utils.py
++++ b/dspy/adapters/utils.py
+@@ -1,3 +1,4 @@
++import re
+ import ast
+ import enum
+ import inspect
+@@ -133,6 +134,30 @@ def find_enum_member(enum, identifier):
+     raise ValueError(f"{identifier} is not a valid name or value for the enum {enum.__name__}")
+ 
+ 
++
++def _extract_markdown_fence_content(text):
++    """
++    Extract JSON content from a Markdown code fence block.
++    
++    Supports:
++    - Triple backtick fences with optional language label (json, JSON, or no label)
++    - First fence block only; ignores surrounding prose
++    - Does not treat backticks inside JSON strings as fences
++    
++    Returns the extracted content if found, otherwise None.
++    """
++    if not isinstance(text, str):
++        return None
++    
++    # Pattern matches: opening fence (``` + optional label), newline, content, closing fence
++    # The label can be any characters except newline, followed by newline
++    pattern = r"^\s*```(?:json|JSON)?\s*\n(.*?)^\s*```\s*$"
++    match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
++    if match:
++        return match.group(1).strip()
++    return None
++
++
+ def parse_value(value, annotation):
+     if annotation is str:
+         return str(value)
+@@ -159,6 +184,20 @@ def parse_value(value, annotation):
+ 
+         raise ValueError(f"{value!r} is not one of {allowed!r}")
+ 
++    # For Type subclasses (like ToolCalls), use model_validate which handles various formats
++    if issubclass(annotation, Type):
++        if isinstance(value, str):
++            # Try to extract markdown fence content first
++            fence_content = _extract_markdown_fence_content(value)
++            if fence_content is not None:
++                value = fence_content
++        
++        # Use model_validate for Type subclasses to handle lists, dicts, and strings
++        try:
++            return annotation.model_validate(value)
++        except Exception:
++            pass
++    
+     if not isinstance(value, str):
+         return TypeAdapter(annotation).validate_python(value)
+ 
+@@ -184,6 +223,7 @@ def parse_value(value, annotation):
+         raise
+ 
+ 
++
+ def get_annotation_name(annotation):
+     origin = get_origin(annotation)
+     args = get_args(annotation)

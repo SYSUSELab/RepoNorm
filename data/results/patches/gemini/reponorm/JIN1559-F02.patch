@@ -1,0 +1,3117 @@
+diff --git a/add_aliases.py b/add_aliases.py
+new file mode 100644
+index 0000000..597b6ee
+--- /dev/null
++++ b/add_aliases.py
+@@ -0,0 +1,24 @@
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++aliases = """
++    def _gettext_alias(self, *args, **kwargs):
++        raise RuntimeError("gettext not installed")
++    def _ngettext_alias(self, *args, **kwargs):
++        raise RuntimeError("gettext not installed")
++"""
++
++# Insert after tags = {"trans"}
++content = content.replace('    tags = {"trans"}', '    tags = {"trans"}\n' + aliases)
++
++# Update __init__ to use self._gettext_alias
++content = content.replace('environment.globals["_"] = _gettext_alias', 'environment.globals["_"] = self._gettext_alias')
++
++# Update uninstall_gettext_translations to use aliases
++content = content.replace(
++    'self.environment.globals.pop(key, None)',
++    'self.environment.globals[key] = self._gettext_alias if "n" not in key else self._ngettext_alias'
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/add_dgettext_helpers.py b/add_dgettext_helpers.py
+new file mode 100644
+index 0000000..ae88db4
+--- /dev/null
++++ b/add_dgettext_helpers.py
+@@ -0,0 +1,30 @@
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++helpers = """
++def _make_new_dgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str]:
++    @pass_context
++    def dgettext(__context: Context, __domain: str, __string: str, **variables: t.Any) -> str:
++        rv = __context.call(func, __domain, __string)
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++    return dgettext
++
++
++def _make_new_dngettext(func: t.Callable[[str, str, str, int], str]) -> t.Callable[..., str]:
++    @pass_context
++    def dngettext(__context: Context, __domain: str, __singular: str, __plural: str, __num: int, **variables: t.Any) -> str:
++        variables.setdefault("num", __num)
++        rv = __context.call(func, __domain, __singular, __plural, __num)
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++    return dngettext
++"""
++
++# Insert before InternationalizationExtension
++content = content.replace('class InternationalizationExtension(Extension):', helpers + '\n\nclass InternationalizationExtension(Extension):')
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/apply_all_changes.py b/apply_all_changes.py
+new file mode 100644
+index 0000000..efdb825
+--- /dev/null
++++ b/apply_all_changes.py
+@@ -0,0 +1,118 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# 1. Add aliases to InternationalizationExtension
++content = content.replace(
++    'class InternationalizationExtension(Extension):',
++    'class InternationalizationExtension(Extension):\n    def _gettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n    def _ngettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n    def _pgettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n    def _npgettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")'
++)
++
++# 2. Update uninstall_gettext_translations
++pattern = re.compile(r'    def uninstall_gettext_translations\(self\) -> None:.*?self.environment.globals.pop\(key, None\)', re.DOTALL)
++new_uninstall = """    def uninstall_gettext_translations(self) -> None:
++        self.environment.globals.update(
++            gettext=self._gettext_alias, ngettext=self._ngettext_alias, pgettext=self._pgettext_alias, npgettext=self._npgettext_alias, dgettext=self._gettext_alias, dngettext=self._ngettext_alias
++        )"""
++content = pattern.sub(new_uninstall, content)
++
++# 3. Update parse
++pattern = re.compile(r'    def parse\(self, parser: "Parser"\) -> t.Union\[nodes.Node, t.List\[nodes.Node\]\]:.*?parser.stream.expect\("block_end"\)', re.DOTALL)
++new_parse = """    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        \"\"\"Parse a translatable tag.\"\"\"
++        lineno = next(parser.stream).lineno
++        domain = None
++        num_called_num = False
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if parser.stream.skip_if("comma"):
++                pass
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")"""
++content = pattern.sub(new_parse, content)
++
++# 4. Update _make_node signature
++content = content.replace(
++    '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,',
++    '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,\n        domain: t.Optional[str] = None,'
++)
++
++# 5. Update _make_node body
++pattern = re.compile(r'        # singular only:\n        if plural_expr is None:.*?node = nodes.Call\(ngettext, args, \[\], None, None\)', re.DOTALL)
++new_make_node_body = """        # singular only:
++        if plural_expr is None:
++            if domain is None:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            else:
++                gettext = nodes.Name("dgettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++        # singular and plural
++        else:
++            if domain is None:
++                ngettext = nodes.Name("ngettext", "load")
++                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++            else:
++                ngettext = nodes.Name("dngettext", "load")
++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++            node = nodes.Call(ngettext, args, [], None, None)"""
++content = pattern.sub(new_make_node_body, content)
++
++# 6. Update call to _make_node
++content = content.replace(
++    '            num_called_num and have_plural,\n        )',
++    '            num_called_num and have_plural,\n            domain=domain,\n        )'
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/apply_all_changes_v2.py b/apply_all_changes_v2.py
+new file mode 100644
+index 0000000..efdb825
+--- /dev/null
++++ b/apply_all_changes_v2.py
+@@ -0,0 +1,118 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# 1. Add aliases to InternationalizationExtension
++content = content.replace(
++    'class InternationalizationExtension(Extension):',
++    'class InternationalizationExtension(Extension):\n    def _gettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n    def _ngettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n    def _pgettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n    def _npgettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")'
++)
++
++# 2. Update uninstall_gettext_translations
++pattern = re.compile(r'    def uninstall_gettext_translations\(self\) -> None:.*?self.environment.globals.pop\(key, None\)', re.DOTALL)
++new_uninstall = """    def uninstall_gettext_translations(self) -> None:
++        self.environment.globals.update(
++            gettext=self._gettext_alias, ngettext=self._ngettext_alias, pgettext=self._pgettext_alias, npgettext=self._npgettext_alias, dgettext=self._gettext_alias, dngettext=self._ngettext_alias
++        )"""
++content = pattern.sub(new_uninstall, content)
++
++# 3. Update parse
++pattern = re.compile(r'    def parse\(self, parser: "Parser"\) -> t.Union\[nodes.Node, t.List\[nodes.Node\]\]:.*?parser.stream.expect\("block_end"\)', re.DOTALL)
++new_parse = """    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        \"\"\"Parse a translatable tag.\"\"\"
++        lineno = next(parser.stream).lineno
++        domain = None
++        num_called_num = False
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if parser.stream.skip_if("comma"):
++                pass
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")"""
++content = pattern.sub(new_parse, content)
++
++# 4. Update _make_node signature
++content = content.replace(
++    '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,',
++    '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,\n        domain: t.Optional[str] = None,'
++)
++
++# 5. Update _make_node body
++pattern = re.compile(r'        # singular only:\n        if plural_expr is None:.*?node = nodes.Call\(ngettext, args, \[\], None, None\)', re.DOTALL)
++new_make_node_body = """        # singular only:
++        if plural_expr is None:
++            if domain is None:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            else:
++                gettext = nodes.Name("dgettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++        # singular and plural
++        else:
++            if domain is None:
++                ngettext = nodes.Name("ngettext", "load")
++                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++            else:
++                ngettext = nodes.Name("dngettext", "load")
++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++            node = nodes.Call(ngettext, args, [], None, None)"""
++content = pattern.sub(new_make_node_body, content)
++
++# 6. Update call to _make_node
++content = content.replace(
++    '            num_called_num and have_plural,\n        )',
++    '            num_called_num and have_plural,\n            domain=domain,\n        )'
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/apply_changes.py b/apply_changes.py
+new file mode 100644
+index 0000000..9993057
+--- /dev/null
++++ b/apply_changes.py
+@@ -0,0 +1,27 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Add aliases to InternationalizationExtension
++for i in range(len(lines)):
++    if 'class InternationalizationExtension(Extension):' in lines[i]:
++        lines.insert(i+1, '    def _gettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n')
++        lines.insert(i+3, '    def _ngettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n')
++        lines.insert(i+5, '    def _pgettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n')
++        lines.insert(i+7, '    def _npgettext_alias(self, *args, **kwargs):\n        raise RuntimeError("gettext not installed")\n')
++        break
++
++# 2. Update uninstall_gettext_translations
++for i in range(len(lines)):
++    if 'def uninstall_gettext_translations(self) -> None:' in lines[i]:
++        lines[i+1] = '        self.environment.globals.update(\n'
++        lines.insert(i+2, '            gettext=self._gettext_alias, ngettext=self._ngettext_alias, pgettext=self._pgettext_alias, npgettext=self._npgettext_alias, dgettext=self._gettext_alias, dngettext=self._ngettext_alias\n')
++        lines.insert(i+3, '        )\n')
++        # Remove the old implementation
++        del lines[i+4:i+6]
++        break
++
++# 3. Update parse
++# I will just replace the whole parse method.
++# This is too complex. I will just edit the file manually.
+diff --git a/apply_changes_v3.py b/apply_changes_v3.py
+new file mode 100644
+index 0000000..94c78a0
+--- /dev/null
++++ b/apply_changes_v3.py
+@@ -0,0 +1,235 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Find `InternationalizationExtension` class
++class_start = 0
++for i, line in enumerate(lines):
++    if 'class InternationalizationExtension(Extension):' in line:
++        class_start = i
++        break
++
++# 2. Find `parse` method in `InternationalizationExtension`
++# It should be after `tags = {"trans"}`
++parse_start = 0
++parse_end = 0
++for i in range(class_start, len(lines)):
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        parse_start = i
++        # Find the end of parse method
++        for j in range(i + 1, len(lines)):
++            if 'def _trim_whitespace' in lines[j]:
++                parse_end = j
++                break
++        break
++
++# If `parse` method exists, remove it
++if parse_start != 0:
++    del lines[parse_start:parse_end]
++
++# 3. Find `_make_node` method
++make_node_start = 0
++make_node_end = 0
++for i in range(class_start, len(lines)):
++    if 'def _make_node(' in lines[i]:
++        make_node_start = i
++        # Find the end of _make_node method
++        for j in range(i + 1, len(lines)):
++            if 'def ' in lines[j] and lines[j].startswith('    def '):
++                make_node_end = j
++                break
++        break
++
++# 4. Insert `parse` method
++# I will insert it after `tags = {"trans"}`
++insert_pos = 0
++for i in range(class_start, len(lines)):
++    if 'tags = {"trans"}' in lines[i]:
++        insert_pos = i + 1
++        break
++
++new_parse = [
++    '    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:\n',
++    '        """Parse a translatable tag."""\n',
++    '        lineno = next(parser.stream).lineno\n',
++    '        num_called_num = False\n',
++    '        domain = None\n',
++    '\n',
++    '        # find all the variables referenced.  Additionally a variable can be\n',
++    '        # defined in the body of the trans block too, but this is checked at\n',
++    '        # a later state.\n',
++    '        plural_expr: t.Optional[nodes.Expr] = None\n',
++    '        plural_expr_assignment: t.Optional[nodes.Assign] = None\n',
++    '        variables: t.Dict[str, nodes.Expr] = {}\n',
++    '        trimmed = None\n',
++    '        while parser.stream.current.type != "block_end":\n',
++    '            if variables:\n',
++    '                parser.stream.expect("comma")\n',
++    '\n',
++    '            # skip colon for python compatibility\n',
++    '            if parser.stream.skip_if("colon"):\n',
++    '                break\n',
++    '\n',
++    '            token = parser.stream.expect("name")\n',
++    '            if token.value == "domain":\n',
++    '                if domain is not None:\n',
++    '                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n',
++    '                parser.stream.expect("assign")\n',
++    '                value = parser.parse_expression()\n',
++    '                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n',
++    '                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n',
++    '                domain = value.value\n',
++    '                continue\n',
++    '            \n',
++    '            if token.value in variables:\n',
++    '                parser.fail(\n',
++    '                    f"translatable variable {token.value!r} defined twice.",\n',
++    '                    token.lineno,\n',
++    '                    exc=TemplateAssertionError,\n',
++    '                )\n',
++    '\n',
++    '            # expressions\n',
++    '            if parser.stream.current.type == "assign":\n',
++    '                next(parser.stream)\n',
++    '                variables[token.value] = var = parser.parse_expression()\n',
++    '            elif trimmed is None and token.value in ("trimmed", "notrimmed"):\n',
++    '                trimmed = token.value == "trimmed"\n',
++    '                continue\n',
++    '            else:\n',
++    '                variables[token.value] = var = nodes.Name(token.value, "load")\n',
++    '\n',
++    '            if plural_expr is None:\n',
++    '                if isinstance(var, nodes.Call):\n',
++    '                    plural_expr = nodes.Name("_trans", "load")\n',
++    '                    variables[token.value] = plural_expr\n',
++    '                    plural_expr_assignment = nodes.Assign(\n',
++    '                        nodes.Name("_trans", "store"), var\n',
++    '                    )\n',
++    '                else:\n',
++    '                    plural_expr = var\n',
++    '                num_called_num = token.value == "num"\n',
++    '\n',
++    '        parser.stream.expect("block_end")\n',
++    '\n',
++    '        plural = None\n',
++    '        have_plural = False\n',
++    '        referenced = set()\n',
++    '\n',
++    '        # now parse until endtrans or pluralize\n',
++    '        singular_names, singular = self._parse_block(parser, True)\n',
++    '        if singular_names:\n',
++    '            referenced.update(singular_names)\n',
++    '            if plural_expr is None:\n',
++    '                plural_expr = nodes.Name(singular_names[0], "load")\n',
++    '                num_called_num = singular_names[0] == "num"\n',
++    '\n',
++    '        # if we have a pluralize block, we parse that too\n',
++    '        if parser.stream.current.test("name:pluralize"):\n',
++    '            have_plural = True\n',
++    '            next(parser.stream)\n',
++    '            if parser.stream.current.type != "block_end":\n',
++    '                token = parser.stream.expect("name")\n',
++    '                if token.value not in variables:\n',
++    '                    parser.fail(\n',
++    '                        f"unknown variable {token.value!r} for pluralization",\n',
++    '                        token.lineno,\n',
++    '                        exc=TemplateAssertionError,\n',
++    '                    )\n',
++    '                plural_expr = variables[token.value]\n',
++    '                num_called_num = token.value == "num"\n',
++    '            parser.stream.expect("block_end")\n',
++    '            plural_names, plural = self._parse_block(parser, False)\n',
++    '            next(parser.stream)\n',
++    '            referenced.update(plural_names)\n',
++    '        else:\n',
++    '            next(parser.stream)\n',
++    '\n',
++    '        # register free names as simple name expressions\n',
++    '        for name in referenced:\n',
++    '            if name not in variables:\n',
++    '                variables[name] = nodes.Name(name, "load")\n',
++    '\n',
++    '        if not have_plural:\n',
++    '            plural_expr = None\n',
++    '        elif plural_expr is None:\n',
++    '            parser.fail("pluralize without variables", lineno)\n',
++    '\n',
++    '        if trimmed is None:\n',
++    '            trimmed = self.environment.policies["ext.i18n.trimmed"]\n',
++    '        if trimmed:\n',
++    '            singular = self._trim_whitespace(singular)\n',
++    '            if plural:\n',
++    '                plural = self._trim_whitespace(plural)\n',
++    '\n',
++    '        node = self._make_node(\n',
++    '            singular,\n',
++    '            plural,\n',
++    '            variables,\n',
++    '            plural_expr,\n',
++    '            bool(referenced),\n',
++    '            num_called_num and have_plural,\n',
++    '            domain=domain,\n',
++    '        )\n',
++    '        node.set_lineno(lineno)\n',
++    '        if plural_expr_assignment is not None:\n',
++    '            return [plural_expr_assignment, node]\n',
++    '        else:\n',
++    '            return node\n'
++]
++lines[insert_pos:insert_pos] = new_parse
++
++# 5. Update `_make_node` method
++# I need to re-find `_make_node` because I modified the file
++make_node_start = 0
++make_node_end = 0
++for i in range(len(lines)):
++    if 'def _make_node(' in lines[i]:
++        make_node_start = i
++        # Find the end of _make_node method
++        for j in range(i + 1, len(lines)):
++            if 'def ' in lines[j] and lines[j].startswith('    def '):
++                make_node_end = j
++                break
++        break
++
++# Update signature
++lines[make_node_start] = '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,\n        domain: t.Optional[str] = None,\n    ) -> nodes.Expr:\n'
++
++# Replace the body
++new_body = [
++    '        """Generates a useful node from the data provided."""\n',
++    '        newstyle = self.environment.newstyle_gettext  # type: ignore\n',
++    '        node: nodes.Expr\n',
++    '\n',
++    '        # no variables referenced?  no need to escape for old style\n',
++    '        # gettext invocations only if there are vars.\n',
++    '        if not vars_referenced and not newstyle:\n',
++    '            singular = singular.replace("%%", "%")\n',
++    '            if plural:\n',
++    '                plural = plural.replace("%%", "%")\n',
++    '\n',
++    '        # singular only:\n',
++    '        if plural_expr is None:\n',
++    '            if domain is None:\n',
++    '                gettext = nodes.Name("gettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n',
++    '            else:\n',
++    '                gettext = nodes.Name("dgettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n',
++    '\n',
++    '        # singular and plural\n',
++    '        else:\n',
++    '            if domain is None:\n',
++    '                ngettext = nodes.Name("ngettext", "load")\n',
++    '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            else:\n',
++    '                ngettext = nodes.Name("dngettext", "load")\n',
++    '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            node = nodes.Call(ngettext, args, [], None, None)\n',
++    '\n'
++]
++lines[make_node_start+1:make_node_end] = new_body
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/apply_changes_v4.py b/apply_changes_v4.py
+new file mode 100644
+index 0000000..4409b1c
+--- /dev/null
++++ b/apply_changes_v4.py
+@@ -0,0 +1,116 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Update `parse` method
++# Find the `parse` method in `InternationalizationExtension`
++# It starts at line 354.
++# I will look for the `parse` method that contains `lineno = next(parser.stream).lineno`
++# and `num_called_num = False`
++parse_start = 0
++for i in range(len(lines)):
++    if 'def parse(self, parser: "Parser")' in lines[i] and 'lineno = next(parser.stream).lineno' in lines[i+1]:
++        parse_start = i
++        break
++
++# Insert `domain = None`
++lines.insert(parse_start + 2, '        domain = None\n')
++
++# Find where to insert the domain check in `parse`
++# It should be after `token = parser.stream.expect("name")`
++# Let me find that line.
++for i in range(parse_start, len(lines)):
++    if 'token = parser.stream.expect("name")' in lines[i]:
++        # Insert the domain check after this line
++        lines.insert(i + 1, '            if token.value == "domain":\n')
++        lines.insert(i + 2, '                if domain is not None:\n')
++        lines.insert(i + 3, '                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n')
++        lines.insert(i + 4, '                parser.stream.expect("assign")\n')
++        lines.insert(i + 5, '                value = parser.parse_expression()\n')
++        lines.insert(i + 6, '                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n')
++        lines.insert(i + 7, '                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n')
++        lines.insert(i + 8, '                domain = value.value\n')
++        lines.insert(i + 9, '                continue\n')
++        break
++
++# Find where to pass `domain` to `_make_node`
++# It should be in the call to `_make_node`
++for i in range(parse_start, len(lines)):
++    if 'node = self._make_node(' in lines[i]:
++        # Find the end of the call
++        for j in range(i, i + 10):
++            if ')' in lines[j]:
++                lines.insert(j, '            domain=domain,\n')
++                break
++        break
++
++# 2. Update `_make_node` method
++# Find `_make_node`
++make_node_start = 0
++for i in range(len(lines)):
++    if 'def _make_node(' in lines[i]:
++        make_node_start = i
++        break
++
++# Update signature
++# Find the line with `num_called_num: bool,`
++for i in range(make_node_start, make_node_start + 10):
++    if 'num_called_num: bool,' in lines[i]:
++        lines.insert(i + 1, '        domain: t.Optional[str] = None,\n')
++        break
++
++# Update body
++# Find `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'if plural_expr is None:' in lines[i]:
++        # Replace the body of `if plural_expr is None:`
++        # It currently has:
++        # gettext = nodes.Name("gettext", "load")
++        # node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++        
++        # I need to replace it with:
++        # if domain is None:
++        #     gettext = nodes.Name("gettext", "load")
++        #     node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++        # else:
++        #     gettext = nodes.Name("dgettext", "load")
++        #     node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++        
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                gettext = nodes.Name("gettext", "load")\n'
++        lines[i+3] = '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                gettext = nodes.Name("dgettext", "load")\n')
++        lines.insert(i+6, '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n')
++        break
++
++# Find `else:` for `if plural_expr is None:`
++# It should be after the `if` block
++for i in range(make_node_start, len(lines)):
++    if 'else:' in lines[i] and 'if plural_expr is None:' in lines[i-10:i]:
++        # Replace the body of `else:`
++        # It currently has:
++        # ngettext = nodes.Name("ngettext", "load")
++        # args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++        # node = nodes.Call(ngettext, args, [], None, None)
++        
++        # I need to replace it with:
++        # if domain is None:
++        #     ngettext = nodes.Name("ngettext", "load")
++        #     args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++        # else:
++        #     ngettext = nodes.Name("dngettext", "load")
++        #     args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++        # node = nodes.Call(ngettext, args, [], None, None)
++        
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                ngettext = nodes.Name("ngettext", "load")\n'
++        lines[i+3] = '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                ngettext = nodes.Name("dngettext", "load")\n')
++        lines.insert(i+6, '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n')
++        break
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/apply_changes_v5.py b/apply_changes_v5.py
+new file mode 100644
+index 0000000..c2527ac
+--- /dev/null
++++ b/apply_changes_v5.py
+@@ -0,0 +1,86 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Update `parse` method
++# Find `def parse(self, parser: "Parser")`
++parse_start = 0
++for i in range(len(lines)):
++    if 'def parse(self, parser: "Parser")' in lines[i]:
++        parse_start = i
++        break
++
++# Find `lineno = next(parser.stream).lineno`
++for i in range(parse_start, parse_start + 10):
++    if 'lineno = next(parser.stream).lineno' in lines[i]:
++        lines.insert(i + 1, '        domain = None\n')
++        break
++
++# Find `token = parser.stream.expect("name")`
++for i in range(parse_start, len(lines)):
++    if 'token = parser.stream.expect("name")' in lines[i]:
++        # Insert the domain check after this line
++        lines.insert(i + 1, '            if token.value == "domain":\n')
++        lines.insert(i + 2, '                if domain is not None:\n')
++        lines.insert(i + 3, '                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n')
++        lines.insert(i + 4, '                parser.stream.expect("assign")\n')
++        lines.insert(i + 5, '                value = parser.parse_expression()\n')
++        lines.insert(i + 6, '                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n')
++        lines.insert(i + 7, '                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n')
++        lines.insert(i + 8, '                domain = value.value\n')
++        lines.insert(i + 9, '                continue\n')
++        break
++
++# Find `node = self._make_node(`
++for i in range(parse_start, len(lines)):
++    if 'node = self._make_node(' in lines[i]:
++        # Find the end of the call
++        for j in range(i, i + 10):
++            if ')' in lines[j]:
++                # Insert `domain=domain` before the closing parenthesis
++                lines[j] = lines[j].replace(')', ', domain=domain)')
++                break
++        break
++
++# 2. Update `_make_node` method
++# Find `def _make_node(`
++make_node_start = 0
++for i in range(len(lines)):
++    if 'def _make_node(' in lines[i]:
++        make_node_start = i
++        break
++
++# Update signature
++for i in range(make_node_start, make_node_start + 10):
++    if 'num_called_num: bool,' in lines[i]:
++        lines[i] = lines[i].replace('num_called_num: bool,', 'num_called_num: bool, domain: t.Optional[str] = None,')
++        break
++
++# Update body
++# Find `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'if plural_expr is None:' in lines[i]:
++        # Replace the body of `if plural_expr is None:`
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                gettext = nodes.Name("gettext", "load")\n'
++        lines[i+3] = '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                gettext = nodes.Name("dgettext", "load")\n')
++        lines.insert(i+6, '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n')
++        break
++
++# Find `else:` for `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'else:' in lines[i] and 'if plural_expr is None:' in lines[i-10:i]:
++        # Replace the body of `else:`
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                ngettext = nodes.Name("ngettext", "load")\n'
++        lines[i+3] = '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                ngettext = nodes.Name("dngettext", "load")\n')
++        lines.insert(i+6, '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n')
++        break
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/apply_changes_v6.py b/apply_changes_v6.py
+new file mode 100644
+index 0000000..8f49338
+--- /dev/null
++++ b/apply_changes_v6.py
+@@ -0,0 +1,84 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Update `parse` method
++parse_start = 0
++for i in range(len(lines)):
++    if 'def parse(self, parser: "Parser")' in lines[i]:
++        parse_start = i
++        break
++
++# Insert `domain = None` right after `lineno = ...`
++for i in range(parse_start, parse_start + 10):
++    if 'lineno = next(parser.stream).lineno' in lines[i]:
++        lines.insert(i + 1, '        domain = None\n')
++        break
++
++# Find `token = parser.stream.expect("name")`
++for i in range(parse_start, len(lines)):
++    if 'token = parser.stream.expect("name")' in lines[i]:
++        # Insert the domain check after this line
++        lines.insert(i + 1, '            if token.value == "domain":\n')
++        lines.insert(i + 2, '                if domain is not None:\n')
++        lines.insert(i + 3, '                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n')
++        lines.insert(i + 4, '                parser.stream.expect("assign")\n')
++        lines.insert(i + 5, '                value = parser.parse_expression()\n')
++        lines.insert(i + 6, '                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n')
++        lines.insert(i + 7, '                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n')
++        lines.insert(i + 8, '                domain = value.value\n')
++        lines.insert(i + 9, '                continue\n')
++        break
++
++# Find `node = self._make_node(`
++for i in range(parse_start, len(lines)):
++    if 'node = self._make_node(' in lines[i]:
++        # Find the end of the call
++        for j in range(i, i + 10):
++            if ')' in lines[j]:
++                # Insert `domain=domain` before the closing parenthesis
++                lines[j] = lines[j].replace(')', ', domain=domain)')
++                break
++        break
++
++# 2. Update `_make_node` method
++make_node_start = 0
++for i in range(len(lines)):
++    if 'def _make_node(' in lines[i]:
++        make_node_start = i
++        break
++
++# Update signature
++for i in range(make_node_start, make_node_start + 10):
++    if 'num_called_num: bool,' in lines[i]:
++        lines[i] = lines[i].replace('num_called_num: bool,', 'num_called_num: bool, domain: t.Optional[str] = None,')
++        break
++
++# Update body
++# Find `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'if plural_expr is None:' in lines[i]:
++        # Replace the body of `if plural_expr is None:`
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                gettext = nodes.Name("gettext", "load")\n'
++        lines[i+3] = '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                gettext = nodes.Name("dgettext", "load")\n')
++        lines.insert(i+6, '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n')
++        break
++
++# Find `else:` for `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'else:' in lines[i] and 'if plural_expr is None:' in lines[i-10:i]:
++        # Replace the body of `else:`
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                ngettext = nodes.Name("ngettext", "load")\n'
++        lines[i+3] = '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                ngettext = nodes.Name("dngettext", "load")\n')
++        lines.insert(i+6, '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n')
++        break
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/body.txt b/body.txt
+new file mode 100644
+index 0000000..496c10b
+--- /dev/null
++++ b/body.txt
+@@ -0,0 +1,29 @@
++        """Generates a useful node from the data provided."""
++        newstyle = self.environment.newstyle_gettext  # type: ignore
++        node: nodes.Expr
++
++        # no variables referenced?  no need to escape for old style
++        # gettext invocations only if there are vars.
++        if not vars_referenced and not newstyle:
++            singular = singular.replace("%%", "%")
++            if plural:
++                plural = plural.replace("%%", "%")
++
++        # singular only:
++        if plural_expr is None:
++            if domain is None:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            else:
++                gettext = nodes.Name("dgettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++
++        # singular and plural
++        else:
++            if domain is None:
++                ngettext = nodes.Name("ngettext", "load")
++                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++            else:
++                ngettext = nodes.Name("dngettext", "load")
++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++            node = nodes.Call(ngettext, args, [], None, None)
+diff --git a/changes.patch b/changes.patch
+new file mode 100644
+index 0000000..aea7cd5
+--- /dev/null
++++ b/changes.patch
+@@ -0,0 +1,103 @@
++--- a/src/jinja2/ext.py
+++++ b/src/jinja2/ext.py
++@@ -245,6 +245,14 @@
++ class InternationalizationExtension(Extension):
+++    def _gettext_alias(self, *args, **kwargs):
+++        raise RuntimeError("gettext not installed")
+++    def _ngettext_alias(self, *args, **kwargs):
+++        raise RuntimeError("gettext not installed")
+++    def _pgettext_alias(self, *args, **kwargs):
+++        raise RuntimeError("gettext not installed")
+++    def _npgettext_alias(self, *args, **kwargs):
+++        raise RuntimeError("gettext not installed")
+++
++     tags = {"trans"}
++ 
++     def __init__(self, environment: Environment) -> None:
++@@ -339,8 +347,8 @@
++ 
++     def uninstall_gettext_translations(self) -> None:
++-        for key in ("gettext", "ngettext", "pgettext", "npgettext"):
++-            self.environment.globals.pop(key, None)
+++        self.environment.globals.update(
+++            gettext=self._gettext_alias, ngettext=self._ngettext_alias, pgettext=self._pgettext_alias, npgettext=self._npgettext_alias, dgettext=self._gettext_alias, dngettext=self._ngettext_alias
+++        )
++ 
++     def _extract(
++         self,
++@@ -354,6 +362,7 @@
++     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++         """Parse a translatable tag."""
++         lineno = next(parser.stream).lineno
+++        domain = None
++         num_called_num = False
++ 
++         # find all the variables referenced.  Additionally a variable can be
++@@ -371,6 +380,15 @@
++             if parser.stream.skip_if("colon"):
++                 break
++ 
++             token = parser.stream.expect("name")
+++            if token.value == "domain":
+++                if domain is not None:
+++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
+++                parser.stream.expect("assign")
+++                value = parser.parse_expression()
+++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
+++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
+++                domain = value.value
+++                continue
++             if token.value in variables:
++                 parser.fail(
++                     f"translatable variable {token.value!r} defined twice.",
++@@ -416,6 +434,7 @@
++             variables,
++             plural_expr,
++             bool(referenced),
++-            num_called_num and have_plural,
+++            num_called_num and have_plural,
+++            domain=domain,
++         )
++ 
++     def _parse_block(
++@@ -509,13 +528,14 @@
++         variables: t.Dict[str, nodes.Expr],
++         plural_expr: t.Optional[nodes.Expr],
++         vars_referenced: bool,
++-        num_called_num: bool,
+++        num_called_num: bool,
+++        domain: t.Optional[str] = None,
++     ) -> nodes.Output:
++         """Generates a useful node from the data provided."""
++         newstyle = self.environment.newstyle_gettext  # type: ignore
++         node: nodes.Expr
++ 
++         # no variables referenced?  no need to escape for old style
++         # gettext invocations only if there are vars.
++         if not vars_referenced and not newstyle:
++             singular = singular.replace("%%", "%")
++             if plural:
++                 plural = plural.replace("%%", "%")
++ 
++         # singular only:
++         if plural_expr is None:
++-            if domain is None:
+++            if domain is None:
++                 gettext = nodes.Name("gettext", "load")
++                 node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++-            else:
+++            else:
+++                gettext = nodes.Name("dgettext", "load")
+++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++         # singular and plural
++         else:
++-            if domain is None:
+++            if domain is None:
++                 ngettext = nodes.Name("ngettext", "load")
++                 args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++-            else:
+++            else:
+++                ngettext = nodes.Name("dngettext", "load")
+++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++             node = nodes.Call(ngettext, args, [], None, None)
++             # Removed old call
+diff --git a/domain_check.txt b/domain_check.txt
+new file mode 100644
+index 0000000..87c8c8c
+--- /dev/null
++++ b/domain_check.txt
+@@ -0,0 +1,9 @@
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
+diff --git a/edit_ext.py b/edit_ext.py
+new file mode 100644
+index 0000000..2825489
+--- /dev/null
++++ b/edit_ext.py
+@@ -0,0 +1,45 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++new_lines = []
++i = 0
++while i < len(lines):
++    line = lines[i]
++    
++    # Find the start of the parse method
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        new_lines.append(line)
++        new_lines.append('        """Parse a translatable tag."""\n')
++        new_lines.append('        lineno = next(parser.stream).lineno\n')
++        new_lines.append('        num_called_num = False\n')
++        new_lines.append('        domain = None\n')
++        i += 4
++        continue
++        
++    if 'token = parser.stream.expect("name")' in line:
++        # Check if we are in the first loop (variables parsing)
++        # The first loop is while parser.stream.current.type != "block_end":
++        # I can check if I am inside the loop by checking the indentation or context.
++        # Actually, I can just check if I've already added the domain logic.
++        # But I need to make sure I only add it in the first loop.
++        # The first loop is the only one that calls `parser.stream.expect("name")`
++        # for variables.
++        
++        # Let's check if we are in the first loop by looking at the previous lines.
++        # Actually, the `parse` method has two loops.
++        # The first one is for variables.
++        # The second one is in `_parse_block`.
++        # So I can just check if I am in the `parse` method.
++        
++        # Wait, the `parse` method is long.
++        # Let's just check if I am in the first loop.
++        # I can use a flag.
++        pass
++
++    new_lines.append(line)
++    i += 1
++
++# This is getting complicated. Let me use a simpler approach.
++# I will just use `sed` to insert the code.
+diff --git a/edit_ext_final.py b/edit_ext_final.py
+new file mode 100644
+index 0000000..4796ddb
+--- /dev/null
++++ b/edit_ext_final.py
+@@ -0,0 +1,76 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Replace _make_node
++new_lines = []
++i = 0
++while i < len(lines):
++    line = lines[i]
++    if 'def _make_node(' in line:
++        new_lines.append('    def _make_node(\n')
++        new_lines.append('        self,\n')
++        new_lines.append('        singular: str,\n')
++        new_lines.append('        plural: t.Optional[str],\n')
++        new_lines.append('        variables: t.Dict[str, nodes.Expr],\n')
++        new_lines.append('        plural_expr: t.Optional[nodes.Expr],\n')
++        new_lines.append('        vars_referenced: bool,\n')
++        new_lines.append('        num_called_num: bool,\n')
++        new_lines.append('        domain: t.Optional[str] = None,\n')
++        new_lines.append('    ) -> nodes.Output:\n')
++        i += 8 # Skip old definition
++        continue
++    
++    if 'if plural_expr is None:' in line:
++        new_lines.append(line)
++        new_lines.append('            if domain is None:\n')
++        new_lines.append('                gettext = nodes.Name("gettext", "load")\n')
++        new_lines.append('            else:\n')
++        new_lines.append('                gettext = nodes.Name("dgettext", "load")\n')
++        new_lines.append('                args = [nodes.Const(domain)]\n')
++        new_lines.append('            \n')
++        new_lines.append('            if domain is None:\n')
++        new_lines.append('                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n')
++        new_lines.append('            else:\n')
++        new_lines.append('                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n')
++        i += 2 # Skip old gettext call
++        continue
++        
++    if 'ngettext = nodes.Name("ngettext", "load")' in line:
++        new_lines.append('            if domain is None:\n')
++        new_lines.append('                ngettext = nodes.Name("ngettext", "load")\n')
++        new_lines.append('                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n')
++        new_lines.append('            else:\n')
++        new_lines.append('                ngettext = nodes.Name("dngettext", "load")\n')
++        new_lines.append('                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n')
++        new_lines.append('            node = nodes.Call(ngettext, args, [], None, None)\n')
++        i += 7 # Skip old ngettext call
++        continue
++        
++    new_lines.append(line)
++    i += 1
++
++# Now replace the parse method
++# I will use the content from parse_method_new.py
++with open('parse_method_new.py', 'r') as f:
++    parse_method = f.readlines()
++
++# Find the start of parse method
++start_parse = 0
++for i, line in enumerate(new_lines):
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        start_parse = i
++        break
++
++# Find the end of parse method
++end_parse = 0
++for i in range(start_parse, len(new_lines)):
++    if 'def _trim_whitespace' in new_lines[i]:
++        end_parse = i
++        break
++
++new_lines = new_lines[:start_parse] + parse_method + new_lines[end_parse:]
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/edit_ext_v2.py b/edit_ext_v2.py
+new file mode 100644
+index 0000000..3b78725
+--- /dev/null
++++ b/edit_ext_v2.py
+@@ -0,0 +1,96 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Update _make_node signature
++for i, line in enumerate(lines):
++    if 'def _make_node(' in line:
++        lines[i] = '    def _make_node(\n'
++        lines.insert(i+1, '        self,\n')
++        lines.insert(i+2, '        singular: str,\n')
++        lines.insert(i+3, '        plural: t.Optional[str],\n')
++        lines.insert(i+4, '        variables: t.Dict[str, nodes.Expr],\n')
++        lines.insert(i+5, '        plural_expr: t.Optional[nodes.Expr],\n')
++        lines.insert(i+6, '        vars_referenced: bool,\n')
++        lines.insert(i+7, '        num_called_num: bool,\n')
++        lines.insert(i+8, '        domain: t.Optional[str] = None,\n')
++        lines.insert(i+9, '    ) -> nodes.Output:\n')
++        # Remove the old signature lines
++        del lines[i+10:i+16]
++        break
++
++# 2. Update _make_node body
++# Find the start of _make_node body
++start_body = 0
++for i, line in enumerate(lines):
++    if 'def _make_node(' in line:
++        start_body = i + 10
++        break
++
++# Find the end of _make_node body
++end_body = 0
++for i in range(start_body, len(lines)):
++    if 'if newstyle:' in lines[i]:
++        end_body = i
++        break
++
++# Replace the body
++new_body = [
++    '        """Generates a useful node from the data provided."""\n',
++    '        newstyle = self.environment.newstyle_gettext  # type: ignore\n',
++    '        node: nodes.Expr\n',
++    '\n',
++    '        # no variables referenced?  no need to escape for old style\n',
++    '        # gettext invocations only if there are vars.\n',
++    '        if not vars_referenced and not newstyle:\n',
++    '            singular = singular.replace("%%", "%")\n',
++    '            if plural:\n',
++    '                plural = plural.replace("%%", "%")\n',
++    '\n',
++    '        # singular only:\n',
++    '        if plural_expr is None:\n',
++    '            if domain is None:\n',
++    '                gettext = nodes.Name("gettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n',
++    '            else:\n',
++    '                gettext = nodes.Name("dgettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n',
++    '\n',
++    '        # singular and plural\n',
++    '        else:\n',
++    '            if domain is None:\n',
++    '                ngettext = nodes.Name("ngettext", "load")\n',
++    '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            else:\n',
++    '                ngettext = nodes.Name("dngettext", "load")\n',
++    '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            node = nodes.Call(ngettext, args, [], None, None)\n',
++    '\n'
++]
++lines[start_body:end_body] = new_body
++
++# 3. Update parse method
++# I will use the same logic as before but with a more robust replacement.
++# Find the start of parse method
++start_parse = 0
++for i, line in enumerate(lines):
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        start_parse = i
++        break
++
++# Find the end of parse method
++end_parse = 0
++for i in range(start_parse, len(lines)):
++    if 'def _trim_whitespace' in lines[i]:
++        end_parse = i
++        break
++
++# Use the content from parse_method_new.py
++with open('parse_method_new.py', 'r') as f:
++    parse_method = f.readlines()
++
++lines[start_parse:end_parse] = parse_method
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_ext_v3.py b/edit_ext_v3.py
+new file mode 100644
+index 0000000..f891da0
+--- /dev/null
++++ b/edit_ext_v3.py
+@@ -0,0 +1,77 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find _make_node
++start_node = 0
++for i, line in enumerate(lines):
++    if 'def _make_node(' in line:
++        start_node = i
++        break
++
++# Find end of _make_node
++end_node = 0
++for i in range(start_node, len(lines)):
++    if 'if newstyle:' in lines[i]:
++        end_node = i
++        break
++
++# Replace body
++new_body = [
++    '        """Generates a useful node from the data provided."""\n',
++    '        newstyle = self.environment.newstyle_gettext  # type: ignore\n',
++    '        node: nodes.Expr\n',
++    '\n',
++    '        # no variables referenced?  no need to escape for old style\n',
++    '        # gettext invocations only if there are vars.\n',
++    '        if not vars_referenced and not newstyle:\n',
++    '            singular = singular.replace("%%", "%")\n',
++    '            if plural:\n',
++    '                plural = plural.replace("%%", "%")\n',
++    '\n',
++    '        # singular only:\n',
++    '        if plural_expr is None:\n',
++    '            if domain is None:\n',
++    '                gettext = nodes.Name("gettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n',
++    '            else:\n',
++    '                gettext = nodes.Name("dgettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n',
++    '\n',
++    '        # singular and plural\n',
++    '        else:\n',
++    '            if domain is None:\n',
++    '                ngettext = nodes.Name("ngettext", "load")\n',
++    '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            else:\n',
++    '                ngettext = nodes.Name("dngettext", "load")\n',
++    '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            node = nodes.Call(ngettext, args, [], None, None)\n',
++    '\n'
++]
++lines[start_node+8:end_node] = new_body
++
++# 3. Update parse method
++# Find start of parse
++start_parse = 0
++for i, line in enumerate(lines):
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        start_parse = i
++        break
++
++# Find end of parse
++end_parse = 0
++for i in range(start_parse, len(lines)):
++    if 'def _trim_whitespace' in lines[i]:
++        end_parse = i
++        break
++
++# Use the content from parse_method_new.py
++with open('parse_method_new.py', 'r') as f:
++    parse_method = f.readlines()
++
++lines[start_parse:end_parse] = parse_method
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_make_node.py b/edit_make_node.py
+new file mode 100644
+index 0000000..7627c45
+--- /dev/null
++++ b/edit_make_node.py
+@@ -0,0 +1,57 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++start_node = 0
++for i, line in enumerate(lines):
++    if 'def _make_node(' in line:
++        start_node = i
++        break
++
++# Find the end of the function body
++end_node = 0
++for i in range(start_node, len(lines)):
++    if 'if newstyle:' in lines[i]:
++        end_node = i
++        break
++
++# Replace the body
++new_body = [
++    '        """Generates a useful node from the data provided."""\n',
++    '        newstyle = self.environment.newstyle_gettext  # type: ignore\n',
++    '        node: nodes.Expr\n',
++    '\n',
++    '        # no variables referenced?  no need to escape for old style\n',
++    '        # gettext invocations only if there are vars.\n',
++    '        if not vars_referenced and not newstyle:\n',
++    '            singular = singular.replace("%%", "%")\n',
++    '            if plural:\n',
++    '                plural = plural.replace("%%", "%")\n',
++    '\n',
++    '        # singular only:\n',
++    '        if plural_expr is None:\n',
++    '            if domain is None:\n',
++    '                gettext = nodes.Name("gettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n',
++    '            else:\n',
++    '                gettext = nodes.Name("dgettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n',
++    '\n',
++    '        # singular and plural\n',
++    '        else:\n',
++    '            if domain is None:\n',
++    '                ngettext = nodes.Name("ngettext", "load")\n',
++    '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            else:\n',
++    '                ngettext = nodes.Name("dngettext", "load")\n',
++    '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            node = nodes.Call(ngettext, args, [], None, None)\n',
++    '\n'
++]
++# I need to find the start of the body.
++# The signature is 8 lines long.
++lines[start_node+9:end_node] = new_body
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_make_node_v2.py b/edit_make_node_v2.py
+new file mode 100644
+index 0000000..832c109
+--- /dev/null
++++ b/edit_make_node_v2.py
+@@ -0,0 +1,55 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++start_node = 0
++for i, line in enumerate(lines):
++    if 'def _make_node(' in line:
++        start_node = i
++        break
++
++# Find the end of the function body
++end_node = 0
++for i in range(start_node, len(lines)):
++    if 'if newstyle:' in lines[i]:
++        end_node = i
++        break
++
++# Replace the body
++new_body = [
++    '        """Generates a useful node from the data provided."""\n',
++    '        newstyle = self.environment.newstyle_gettext  # type: ignore\n',
++    '        node: nodes.Expr\n',
++    '\n',
++    '        # no variables referenced?  no need to escape for old style\n',
++    '        # gettext invocations only if there are vars.\n',
++    '        if not vars_referenced and not newstyle:\n',
++    '            singular = singular.replace("%%", "%")\n',
++    '            if plural:\n',
++    '                plural = plural.replace("%%", "%")\n',
++    '\n',
++    '        # singular only:\n',
++    '        if plural_expr is None:\n',
++    '            if domain is None:\n',
++    '                gettext = nodes.Name("gettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n',
++    '            else:\n',
++    '                gettext = nodes.Name("dgettext", "load")\n',
++    '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n',
++    '\n',
++    '        # singular and plural\n',
++    '        else:\n',
++    '            if domain is None:\n',
++    '                ngettext = nodes.Name("ngettext", "load")\n',
++    '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            else:\n',
++    '                ngettext = nodes.Name("dngettext", "load")\n',
++    '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n',
++    '            node = nodes.Call(ngettext, args, [], None, None)\n',
++    '\n'
++]
++lines[start_node+9:end_node] = new_body
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_parse.py b/edit_parse.py
+new file mode 100644
+index 0000000..95bff9a
+--- /dev/null
++++ b/edit_parse.py
+@@ -0,0 +1,24 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++start_parse = 0
++for i, line in enumerate(lines):
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        start_parse = i
++        break
++
++end_parse = 0
++for i in range(start_parse, len(lines)):
++    if 'def _trim_whitespace' in lines[i]:
++        end_parse = i
++        break
++
++with open('parse_method_new.py', 'r') as f:
++    parse_method = f.readlines()
++
++lines[start_parse:end_parse] = parse_method
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_parse_v2.py b/edit_parse_v2.py
+new file mode 100644
+index 0000000..5f1f0ce
+--- /dev/null
++++ b/edit_parse_v2.py
+@@ -0,0 +1,30 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start of parse method
++start_parse = 0
++for i, line in enumerate(lines):
++    if 'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:' in line:
++        start_parse = i
++        break
++
++# Find the end of parse method
++end_parse = 0
++for i in range(start_parse, len(lines)):
++    if 'def _trim_whitespace' in lines[i]:
++        end_parse = i
++        break
++
++# Use the content from parse_method_new.py
++with open('parse_method_new.py', 'r') as f:
++    parse_method = f.readlines()
++
++# I need to make sure I don't delete the class definition.
++# The `parse` method is inside the class.
++# So replacing it should be fine.
++lines[start_parse:end_parse] = parse_method
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/i18n_domain.patch b/i18n_domain.patch
+new file mode 100644
+index 0000000..6edff7f
+--- /dev/null
++++ b/i18n_domain.patch
+@@ -0,0 +1,87 @@
++--- a/src/jinja2/ext.py
+++++ b/src/jinja2/ext.py
++@@ -354,6 +354,7 @@
++     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++         """Parse a translatable tag."""
++         lineno = next(parser.stream).lineno
+++        domain = None
++         num_called_num = False
++ 
++         # find all the variables referenced.  Additionally a variable can be
++@@ -373,6 +374,14 @@
++             if parser.stream.skip_if("colon"):
++                 break
++ 
++             token = parser.stream.expect("name")
+++            if token.value == "domain":
+++                if domain is not None:
+++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
+++                parser.stream.expect("assign")
+++                value = parser.parse_expression()
+++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
+++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
+++                domain = value.value
+++                continue
+++
++             if token.value in variables:
++                 parser.fail(
++                     f"translatable variable {token.value!r} defined twice.",
++@@ -446,13 +455,14 @@
++             singular = self._trim_whitespace(singular)
++             if plural:
++                 plural = self._trim_whitespace(plural)
++ 
++         node = self._make_node(
++             singular,
++             plural,
++             variables,
++             plural_expr,
++             bool(referenced),
++             num_called_num and have_plural,
+++            domain=domain,
++         )
++         node.set_lineno(lineno)
++         if plural_expr_assignment is not None:
++@@ -509,13 +519,15 @@
++         plural: t.Optional[str],
++         variables: t.Dict[str, nodes.Expr],
++         plural_expr: t.Optional[nodes.Expr],
++         vars_referenced: bool,
++         num_called_num: bool,
+++        domain: t.Optional[str] = None,
++     ) -> nodes.Expr:
++         """Generates a useful node from the data provided."""
++         newstyle = self.environment.newstyle_gettext  # type: ignore
++         node: nodes.Expr
++ 
++         # no variables referenced?  no need to escape for old style
++         # gettext invocations only if there are vars.
++         if not vars_referenced and not newstyle:
++             singular = singular.replace("%%", "%")
++             if plural:
++                 plural = plural.replace("%%", "%")
++ 
++         # singular only:
++         if plural_expr is None:
++-            gettext = nodes.Name("gettext", "load")
++-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+++            if domain is None:
+++                gettext = nodes.Name("gettext", "load")
+++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+++            else:
+++                gettext = nodes.Name("dgettext", "load")
+++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++ 
++         # singular and plural
++         else:
++-            ngettext = nodes.Name("ngettext", "load")
++-            args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
+++            if domain is None:
+++                ngettext = nodes.Name("ngettext", "load")
+++                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
+++            else:
+++                ngettext = nodes.Name("dngettext", "load")
+++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++             node = nodes.Call(ngettext, args, [], None, None)
++ 
++         return node
+diff --git a/insert_parse.py b/insert_parse.py
+new file mode 100644
+index 0000000..ca47ea2
+--- /dev/null
++++ b/insert_parse.py
+@@ -0,0 +1,145 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the line after `tags = {"trans"}`
++insert_pos = 0
++for i, line in enumerate(lines):
++    if 'tags = {"trans"}' in line:
++        insert_pos = i + 1
++        break
++
++# New parse method content
++new_parse = [
++    '    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:\n',
++    '        """Parse a translatable tag."""\n',
++    '        lineno = next(parser.stream).lineno\n',
++    '        num_called_num = False\n',
++    '        domain = None\n',
++    '\n',
++    '        # find all the variables referenced.  Additionally a variable can be\n',
++    '        # defined in the body of the trans block too, but this is checked at\n',
++    '        # a later state.\n',
++    '        plural_expr: t.Optional[nodes.Expr] = None\n',
++    '        plural_expr_assignment: t.Optional[nodes.Assign] = None\n',
++    '        variables: t.Dict[str, nodes.Expr] = {}\n',
++    '        trimmed = None\n',
++    '        while parser.stream.current.type != "block_end":\n',
++    '            if variables:\n',
++    '                parser.stream.expect("comma")\n',
++    '\n',
++    '            # skip colon for python compatibility\n',
++    '            if parser.stream.skip_if("colon"):\n',
++    '                break\n',
++    '\n',
++    '            token = parser.stream.expect("name")\n',
++    '            if token.value == "domain":\n',
++    '                if domain is not None:\n',
++    '                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n',
++    '                parser.stream.expect("assign")\n',
++    '                value = parser.parse_expression()\n',
++    '                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n',
++    '                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n',
++    '                domain = value.value\n',
++    '                continue\n',
++    '            \n',
++    '            if token.value in variables:\n',
++    '                parser.fail(\n',
++    '                    f"translatable variable {token.value!r} defined twice.",\n',
++    '                    token.lineno,\n',
++    '                    exc=TemplateAssertionError,\n',
++    '                )\n',
++    '\n',
++    '            # expressions\n',
++    '            if parser.stream.current.type == "assign":\n',
++    '                next(parser.stream)\n',
++    '                variables[token.value] = var = parser.parse_expression()\n',
++    '            elif trimmed is None and token.value in ("trimmed", "notrimmed"):\n',
++    '                trimmed = token.value == "trimmed"\n',
++    '                continue\n',
++    '            else:\n',
++    '                variables[token.value] = var = nodes.Name(token.value, "load")\n',
++    '\n',
++    '            if plural_expr is None:\n',
++    '                if isinstance(var, nodes.Call):\n',
++    '                    plural_expr = nodes.Name("_trans", "load")\n',
++    '                    variables[token.value] = plural_expr\n',
++    '                    plural_expr_assignment = nodes.Assign(\n',
++    '                        nodes.Name("_trans", "store"), var\n',
++    '                    )\n',
++    '                else:\n',
++    '                    plural_expr = var\n',
++    '                num_called_num = token.value == "num"\n',
++    '\n',
++    '        parser.stream.expect("block_end")\n',
++    '\n',
++    '        plural = None\n',
++    '        have_plural = False\n',
++    '        referenced = set()\n',
++    '\n',
++    '        # now parse until endtrans or pluralize\n',
++    '        singular_names, singular = self._parse_block(parser, True)\n',
++    '        if singular_names:\n',
++    '            referenced.update(singular_names)\n',
++    '            if plural_expr is None:\n',
++    '                plural_expr = nodes.Name(singular_names[0], "load")\n',
++    '                num_called_num = singular_names[0] == "num"\n',
++    '\n',
++    '        # if we have a pluralize block, we parse that too\n',
++    '        if parser.stream.current.test("name:pluralize"):\n',
++    '            have_plural = True\n',
++    '            next(parser.stream)\n',
++    '            if parser.stream.current.type != "block_end":\n',
++    '                token = parser.stream.expect("name")\n',
++    '                if token.value not in variables:\n',
++    '                    parser.fail(\n',
++    '                        f"unknown variable {token.value!r} for pluralization",\n',
++    '                        token.lineno,\n',
++    '                        exc=TemplateAssertionError,\n',
++    '                    )\n',
++    '                plural_expr = variables[token.value]\n',
++    '                num_called_num = token.value == "num"\n',
++    '            parser.stream.expect("block_end")\n',
++    '            plural_names, plural = self._parse_block(parser, False)\n',
++    '            next(parser.stream)\n',
++    '            referenced.update(plural_names)\n',
++    '        else:\n',
++    '            next(parser.stream)\n',
++    '\n',
++    '        # register free names as simple name expressions\n',
++    '        for name in referenced:\n',
++    '            if name not in variables:\n',
++    '                variables[name] = nodes.Name(name, "load")\n',
++    '\n',
++    '        if not have_plural:\n',
++    '            plural_expr = None\n',
++    '        elif plural_expr is None:\n',
++    '            parser.fail("pluralize without variables", lineno)\n',
++    '\n',
++    '        if trimmed is None:\n',
++    '            trimmed = self.environment.policies["ext.i18n.trimmed"]\n',
++    '        if trimmed:\n',
++    '            singular = self._trim_whitespace(singular)\n',
++    '            if plural:\n',
++    '                plural = self._trim_whitespace(plural)\n',
++    '\n',
++    '        node = self._make_node(\n',
++    '            singular,\n',
++    '            plural,\n',
++    '            variables,\n',
++    '            plural_expr,\n',
++    '            bool(referenced),\n',
++    '            num_called_num and have_plural,\n',
++    '            domain=domain,\n',
++    '        )\n',
++    '        node.set_lineno(lineno)\n',
++    '        if plural_expr_assignment is not None:\n',
++    '            return [plural_expr_assignment, node]\n',
++    '        else:\n',
++    '            return node\n'
++]
++lines[insert_pos:insert_pos] = new_parse
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/insert_parse_v2.py b/insert_parse_v2.py
+new file mode 100644
+index 0000000..ca47ea2
+--- /dev/null
++++ b/insert_parse_v2.py
+@@ -0,0 +1,145 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the line after `tags = {"trans"}`
++insert_pos = 0
++for i, line in enumerate(lines):
++    if 'tags = {"trans"}' in line:
++        insert_pos = i + 1
++        break
++
++# New parse method content
++new_parse = [
++    '    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:\n',
++    '        """Parse a translatable tag."""\n',
++    '        lineno = next(parser.stream).lineno\n',
++    '        num_called_num = False\n',
++    '        domain = None\n',
++    '\n',
++    '        # find all the variables referenced.  Additionally a variable can be\n',
++    '        # defined in the body of the trans block too, but this is checked at\n',
++    '        # a later state.\n',
++    '        plural_expr: t.Optional[nodes.Expr] = None\n',
++    '        plural_expr_assignment: t.Optional[nodes.Assign] = None\n',
++    '        variables: t.Dict[str, nodes.Expr] = {}\n',
++    '        trimmed = None\n',
++    '        while parser.stream.current.type != "block_end":\n',
++    '            if variables:\n',
++    '                parser.stream.expect("comma")\n',
++    '\n',
++    '            # skip colon for python compatibility\n',
++    '            if parser.stream.skip_if("colon"):\n',
++    '                break\n',
++    '\n',
++    '            token = parser.stream.expect("name")\n',
++    '            if token.value == "domain":\n',
++    '                if domain is not None:\n',
++    '                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n',
++    '                parser.stream.expect("assign")\n',
++    '                value = parser.parse_expression()\n',
++    '                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n',
++    '                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n',
++    '                domain = value.value\n',
++    '                continue\n',
++    '            \n',
++    '            if token.value in variables:\n',
++    '                parser.fail(\n',
++    '                    f"translatable variable {token.value!r} defined twice.",\n',
++    '                    token.lineno,\n',
++    '                    exc=TemplateAssertionError,\n',
++    '                )\n',
++    '\n',
++    '            # expressions\n',
++    '            if parser.stream.current.type == "assign":\n',
++    '                next(parser.stream)\n',
++    '                variables[token.value] = var = parser.parse_expression()\n',
++    '            elif trimmed is None and token.value in ("trimmed", "notrimmed"):\n',
++    '                trimmed = token.value == "trimmed"\n',
++    '                continue\n',
++    '            else:\n',
++    '                variables[token.value] = var = nodes.Name(token.value, "load")\n',
++    '\n',
++    '            if plural_expr is None:\n',
++    '                if isinstance(var, nodes.Call):\n',
++    '                    plural_expr = nodes.Name("_trans", "load")\n',
++    '                    variables[token.value] = plural_expr\n',
++    '                    plural_expr_assignment = nodes.Assign(\n',
++    '                        nodes.Name("_trans", "store"), var\n',
++    '                    )\n',
++    '                else:\n',
++    '                    plural_expr = var\n',
++    '                num_called_num = token.value == "num"\n',
++    '\n',
++    '        parser.stream.expect("block_end")\n',
++    '\n',
++    '        plural = None\n',
++    '        have_plural = False\n',
++    '        referenced = set()\n',
++    '\n',
++    '        # now parse until endtrans or pluralize\n',
++    '        singular_names, singular = self._parse_block(parser, True)\n',
++    '        if singular_names:\n',
++    '            referenced.update(singular_names)\n',
++    '            if plural_expr is None:\n',
++    '                plural_expr = nodes.Name(singular_names[0], "load")\n',
++    '                num_called_num = singular_names[0] == "num"\n',
++    '\n',
++    '        # if we have a pluralize block, we parse that too\n',
++    '        if parser.stream.current.test("name:pluralize"):\n',
++    '            have_plural = True\n',
++    '            next(parser.stream)\n',
++    '            if parser.stream.current.type != "block_end":\n',
++    '                token = parser.stream.expect("name")\n',
++    '                if token.value not in variables:\n',
++    '                    parser.fail(\n',
++    '                        f"unknown variable {token.value!r} for pluralization",\n',
++    '                        token.lineno,\n',
++    '                        exc=TemplateAssertionError,\n',
++    '                    )\n',
++    '                plural_expr = variables[token.value]\n',
++    '                num_called_num = token.value == "num"\n',
++    '            parser.stream.expect("block_end")\n',
++    '            plural_names, plural = self._parse_block(parser, False)\n',
++    '            next(parser.stream)\n',
++    '            referenced.update(plural_names)\n',
++    '        else:\n',
++    '            next(parser.stream)\n',
++    '\n',
++    '        # register free names as simple name expressions\n',
++    '        for name in referenced:\n',
++    '            if name not in variables:\n',
++    '                variables[name] = nodes.Name(name, "load")\n',
++    '\n',
++    '        if not have_plural:\n',
++    '            plural_expr = None\n',
++    '        elif plural_expr is None:\n',
++    '            parser.fail("pluralize without variables", lineno)\n',
++    '\n',
++    '        if trimmed is None:\n',
++    '            trimmed = self.environment.policies["ext.i18n.trimmed"]\n',
++    '        if trimmed:\n',
++    '            singular = self._trim_whitespace(singular)\n',
++    '            if plural:\n',
++    '                plural = self._trim_whitespace(plural)\n',
++    '\n',
++    '        node = self._make_node(\n',
++    '            singular,\n',
++    '            plural,\n',
++    '            variables,\n',
++    '            plural_expr,\n',
++    '            bool(referenced),\n',
++    '            num_called_num and have_plural,\n',
++    '            domain=domain,\n',
++    '        )\n',
++    '        node.set_lineno(lineno)\n',
++    '        if plural_expr_assignment is not None:\n',
++    '            return [plural_expr_assignment, node]\n',
++    '        else:\n',
++    '            return node\n'
++]
++lines[insert_pos:insert_pos] = new_parse
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/new_parse.py b/new_parse.py
+new file mode 100644
+index 0000000..8d07264
+--- /dev/null
++++ b/new_parse.py
+@@ -0,0 +1,60 @@
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse a translatable tag."""
++        lineno = next(parser.stream).lineno
++        domain = None
++        num_called_num = False
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if parser.stream.skip_if("comma"):
++                pass
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")
+diff --git a/parse_method.py b/parse_method.py
+new file mode 100644
+index 0000000..e1ae220
+--- /dev/null
++++ b/parse_method.py
+@@ -0,0 +1,115 @@
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse a translatable tag."""
++        lineno = next(parser.stream).lineno
++        num_called_num = False
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if variables:
++                parser.stream.expect("comma")
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")
++
++        plural = None
++        have_plural = False
++        referenced = set()
++
++        # now parse until endtrans or pluralize
++        singular_names, singular = self._parse_block(parser, True)
++        if singular_names:
++            referenced.update(singular_names)
++            if plural_expr is None:
++                plural_expr = nodes.Name(singular_names[0], "load")
++                num_called_num = singular_names[0] == "num"
++
++        # if we have a pluralize block, we parse that too
++        if parser.stream.current.test("name:pluralize"):
++            have_plural = True
++            next(parser.stream)
++            if parser.stream.current.type != "block_end":
++                token = parser.stream.expect("name")
++                if token.value not in variables:
++                    parser.fail(
++                        f"unknown variable {token.value!r} for pluralization",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                plural_expr = variables[token.value]
++                num_called_num = token.value == "num"
++            parser.stream.expect("block_end")
++            plural_names, plural = self._parse_block(parser, False)
++            next(parser.stream)
++            referenced.update(plural_names)
++        else:
++            next(parser.stream)
++
++        # register free names as simple name expressions
++        for name in referenced:
++            if name not in variables:
++                variables[name] = nodes.Name(name, "load")
++
++        if not have_plural:
++            plural_expr = None
++        elif plural_expr is None:
++            parser.fail("pluralize without variables", lineno)
++
++        if trimmed is None:
++            trimmed = self.environment.policies["ext.i18n.trimmed"]
++        if trimmed:
++            singular = self._trim_whitespace(singular)
++            if plural:
++                plural = self._trim_whitespace(plural)
++
++        node = self._make_node(
++            singular,
++            plural,
++            variables,
++            plural_expr,
++            bool(referenced),
++            num_called_num and have_plural,
++        )
++        node.set_lineno(lineno)
++        if plural_expr_assignment is not None:
++            return [plural_expr_assignment, node]
++        else:
++            return node
++
+diff --git a/parse_method.txt b/parse_method.txt
+new file mode 100644
+index 0000000..145c717
+--- /dev/null
++++ b/parse_method.txt
+@@ -0,0 +1,126 @@
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse a translatable tag."""
++        lineno = next(parser.stream).lineno
++        num_called_num = False
++        domain = None
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if variables:
++                parser.stream.expect("comma")
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
++            
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")
++
++        plural = None
++        have_plural = False
++        referenced = set()
++
++        # now parse until endtrans or pluralize
++        singular_names, singular = self._parse_block(parser, True)
++        if singular_names:
++            referenced.update(singular_names)
++            if plural_expr is None:
++                plural_expr = nodes.Name(singular_names[0], "load")
++                num_called_num = singular_names[0] == "num"
++
++        # if we have a pluralize block, we parse that too
++        if parser.stream.current.test("name:pluralize"):\n
++            have_plural = True
++            next(parser.stream)
++            if parser.stream.current.type != "block_end":
++                token = parser.stream.expect("name")
++                if token.value not in variables:
++                    parser.fail(
++                        f"unknown variable {token.value!r} for pluralization",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                plural_expr = variables[token.value]
++                num_called_num = token.value == "num"
++            parser.stream.expect("block_end")
++            plural_names, plural = self._parse_block(parser, False)
++            next(parser.stream)
++            referenced.update(plural_names)
++        else:
++            next(parser.stream)
++
++        # register free names as simple name expressions
++        for name in referenced:
++            if name not in variables:
++                variables[name] = nodes.Name(name, "load")
++
++        if not have_plural:
++            plural_expr = None
++        elif plural_expr is None:
++            parser.fail("pluralize without variables", lineno)
++
++        if trimmed is None:
++            trimmed = self.environment.policies["ext.i18n.trimmed"]
++        if trimmed:
++            singular = self._trim_whitespace(singular)
++            if plural:
++                plural = self._trim_whitespace(plural)
++
++        node = self._make_node(
++            singular,
++            plural,
++            variables,
++            plural_expr,
++            bool(referenced),
++            num_called_num and have_plural,
++            domain=domain,
++        )
++        node.set_lineno(lineno)
++        if plural_expr_assignment is not None:
++            return [plural_expr_assignment, node]
++        else:
++            return node
+diff --git a/parse_method_new.py b/parse_method_new.py
+new file mode 100644
+index 0000000..3f3fec8
+--- /dev/null
++++ b/parse_method_new.py
+@@ -0,0 +1,126 @@
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse a translatable tag."""
++        lineno = next(parser.stream).lineno
++        num_called_num = False
++        domain = None
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if variables:
++                parser.stream.expect("comma")
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
++            
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")
++
++        plural = None
++        have_plural = False
++        referenced = set()
++
++        # now parse until endtrans or pluralize
++        singular_names, singular = self._parse_block(parser, True)
++        if singular_names:
++            referenced.update(singular_names)
++            if plural_expr is None:
++                plural_expr = nodes.Name(singular_names[0], "load")
++                num_called_num = singular_names[0] == "num"
++
++        # if we have a pluralize block, we parse that too
++        if parser.stream.current.test("name:pluralize"):
++            have_plural = True
++            next(parser.stream)
++            if parser.stream.current.type != "block_end":
++                token = parser.stream.expect("name")
++                if token.value not in variables:
++                    parser.fail(
++                        f"unknown variable {token.value!r} for pluralization",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                plural_expr = variables[token.value]
++                num_called_num = token.value == "num"
++            parser.stream.expect("block_end")
++            plural_names, plural = self._parse_block(parser, False)
++            next(parser.stream)
++            referenced.update(plural_names)
++        else:
++            next(parser.stream)
++
++        # register free names as simple name expressions
++        for name in referenced:
++            if name not in variables:
++                variables[name] = nodes.Name(name, "load")
++
++        if not have_plural:
++            plural_expr = None
++        elif plural_expr is None:
++            parser.fail("pluralize without variables", lineno)
++
++        if trimmed is None:
++            trimmed = self.environment.policies["ext.i18n.trimmed"]
++        if trimmed:
++            singular = self._trim_whitespace(singular)
++            if plural:
++                plural = self._trim_whitespace(plural)
++
++        node = self._make_node(
++            singular,
++            plural,
++            variables,
++            plural_expr,
++            bool(referenced),
++            num_called_num and have_plural,
++            domain=domain,
++        )
++        node.set_lineno(lineno)
++        if plural_expr_assignment is not None:
++            return [plural_expr_assignment, node]
++        else:
++            return node
+diff --git a/restore_aliases.py b/restore_aliases.py
+new file mode 100644
+index 0000000..9b5146d
+--- /dev/null
++++ b/restore_aliases.py
+@@ -0,0 +1,21 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find `InternationalizationExtension`
++for i in range(len(lines)):
++    if 'class InternationalizationExtension(Extension):' in lines[i]:
++        # Insert aliases
++        lines.insert(i+1, '    def _gettext_alias(self, *args, **kwargs):\n')
++        lines.insert(i+2, '        raise RuntimeError("gettext not installed")\n')
++        lines.insert(i+3, '    def _ngettext_alias(self, *args, **kwargs):\n')
++        lines.insert(i+4, '        raise RuntimeError("gettext not installed")\n')
++        lines.insert(i+5, '    def _pgettext_alias(self, *args, **kwargs):\n')
++        lines.insert(i+6, '        raise RuntimeError("gettext not installed")\n')
++        lines.insert(i+7, '    def _npgettext_alias(self, *args, **kwargs):\n')
++        lines.insert(i+8, '        raise RuntimeError("gettext not installed")\n')
++        break
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/signature.txt b/signature.txt
+new file mode 100644
+index 0000000..970d533
+--- /dev/null
++++ b/signature.txt
+@@ -0,0 +1,10 @@
++    def _make_node(
++        self,
++        singular: str,
++        plural: t.Optional[str],
++        variables: t.Dict[str, nodes.Expr],
++        plural_expr: t.Optional[nodes.Expr],
++        vars_referenced: bool,
++        num_called_num: bool,
++        domain: t.Optional[str] = None,
++    ) -> nodes.Output:
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..f8db050 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -242,11 +242,39 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++
++def _make_new_dgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str]:
++    @pass_context
++    def dgettext(__context: Context, __domain: str, __string: str, **variables: t.Any) -> str:
++        rv = __context.call(func, __domain, __string)
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++    return dgettext
++
++
++def _make_new_dngettext(func: t.Callable[[str, str, str, int], str]) -> t.Callable[..., str]:
++    @pass_context
++    def dngettext(__context: Context, __domain: str, __singular: str, __plural: str, __num: int, **variables: t.Any) -> str:
++        variables.setdefault("num", __num)
++        rv = __context.call(func, __domain, __singular, __plural, __num)
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++    return dngettext
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+     tags = {"trans"}
+ 
++    def _gettext_alias(self, *args, **kwargs):
++        raise RuntimeError("gettext not installed")
++    def _ngettext_alias(self, *args, **kwargs):
++        raise RuntimeError("gettext not installed")
++
++
+     # TODO: the i18n extension is currently reevaluating values in a few
+     # situations.  Take this example:
+     #   {% trans count=something() %}{{ count }} foo{% pluralize
+@@ -256,12 +284,12 @@ class InternationalizationExtension(Extension):
+ 
+     def __init__(self, environment: Environment) -> None:
+         super().__init__(environment)
+-        environment.globals["_"] = _gettext_alias
++        environment.globals["_"] = self._gettext_alias
+         environment.extend(
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+             install_gettext_callables=self._install_callables,
+-            uninstall_gettext_translations=self._uninstall,
++            uninstall_gettext_translations=self.uninstall_gettext_translations,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
+         )
+@@ -319,6 +347,8 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        dgettext: t.Optional[t.Callable[[str, str], str]] = None,
++        dngettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -332,13 +362,28 @@ class InternationalizationExtension(Extension):
+             if npgettext is not None:
+                 npgettext = _make_new_npgettext(npgettext)
+ 
++            if dgettext is not None:
++                dgettext = _make_new_dgettext(dgettext)
++
++            if dngettext is not None:
++                dngettext = _make_new_dngettext(dngettext)
++
+         self.environment.globals.update(
+-            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
++            gettext=gettext,
++            ngettext=ngettext,
++            pgettext=pgettext,
++            npgettext=npgettext,
++            dgettext=dgettext,
++            dngettext=dngettext,
+         )
+ 
++    def uninstall_gettext_translations(self) -> None:
++        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):
++            self.environment.globals[key] = self._gettext_alias if "n" not in key else self._ngettext_alias
++
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+-        for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+-            self.environment.globals.pop(key, None)
++        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):
++            self.environment.globals[key] = self._gettext_alias if "n" not in key else self._ngettext_alias
+ 
+     def _extract(
+         self,
+@@ -354,6 +399,7 @@ class InternationalizationExtension(Extension):
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
++        domain = None
+         num_called_num = False
+ 
+         # find all the variables referenced.  Additionally a variable can be
+@@ -364,7 +410,7 @@ class InternationalizationExtension(Extension):
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if variables or domain is not None:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -372,6 +418,15 @@ class InternationalizationExtension(Extension):
+                 break
+ 
+             token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -459,6 +514,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            domain=domain,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +570,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        domain: t.Optional[str] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -528,19 +585,22 @@ class InternationalizationExtension(Extension):
+ 
+         # singular only:
+         if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            if domain is None:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            else:
++                gettext = nodes.Name("dgettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
+ 
+         # singular and plural
+         else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
++            if domain is None:
++                ngettext = nodes.Name("ngettext", "load")
++                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++            else:
++                ngettext = nodes.Name("dngettext", "load")
++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++            node = nodes.Call(ngettext, args, [], None, None)
+ 
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+diff --git a/tests/test_i18n_domain.py b/tests/test_i18n_domain.py
+new file mode 100644
+index 0000000..9b00417
+--- /dev/null
++++ b/tests/test_i18n_domain.py
+@@ -0,0 +1,64 @@
++from jinja2 import Environment
++from jinja2.ext import InternationalizationExtension
++import pytest
++
++def test_domain_support():
++    def dgettext(domain, message):
++        return f"[{domain}] {message}"
++
++    def dngettext(domain, singular, plural, n):
++        return f"[{domain}] {singular if n == 1 else plural}"
++
++    env = Environment(extensions=[InternationalizationExtension])
++    env.install_gettext_callables(
++        gettext=lambda x: x,
++        ngettext=lambda s, p, n: s if n == 1 else p,
++        dgettext=dgettext,
++        dngettext=dngettext,
++    )
++
++    # Test simple domain
++    tmpl = env.from_string('{% trans domain="admin" %}Hello{% endtrans %}')
++    assert tmpl.render() == "[admin] Hello"
++
++    # Test plural domain
++    tmpl = env.from_string('{% trans domain="admin", count=n %}Hello{% pluralize %}Hellos{% endtrans %}')
++    assert tmpl.render(n=1) == "[admin] Hello"
++    assert tmpl.render(n=2) == "[admin] Hellos"
++
++def test_domain_newstyle():
++    def dgettext(domain, message, **kwargs):
++        return f"[{domain}] {message % kwargs}"
++
++    env = Environment(extensions=[InternationalizationExtension])
++    env.newstyle_gettext = True
++    env.install_gettext_callables(
++        gettext=lambda x: x,
++        ngettext=lambda s, p, n: s if n == 1 else p,
++        dgettext=dgettext,
++        dngettext=lambda d, s, p, n, **kwargs: f"[{d}] {(s if n == 1 else p) % kwargs}",
++    )
++
++    tmpl = env.from_string('{% trans domain="admin", name="World" %}Hello %(name)s{% endtrans %}')
++    assert tmpl.render() == "[admin] Hello World"
++
++def test_uninstall_domain():
++    env = Environment(extensions=[InternationalizationExtension])
++    env.install_gettext_callables(
++        gettext=lambda x: x,
++        ngettext=lambda s, p, n: s if n == 1 else p,
++        dgettext=lambda d, m: m,
++        dngettext=lambda d, s, p, n: s if n == 1 else p,
++    )
++    ext = None
++    for e in env.extensions.values():
++        if isinstance(e, InternationalizationExtension):
++            ext = e
++            break
++    
++    ext.uninstall_gettext_translations()
++    
++    with pytest.raises(RuntimeError, match="gettext not installed"):
++        env.globals["dgettext"]("admin", "Hello")
++    with pytest.raises(RuntimeError, match="gettext not installed"):
++        env.globals["dngettext"]("admin", "Hello", "Hellos", 1)
+diff --git a/tests/test_path.py b/tests/test_path.py
+new file mode 100644
+index 0000000..54f1c0f
+--- /dev/null
++++ b/tests/test_path.py
+@@ -0,0 +1,3 @@
++import sys
++import jinja2.ext
++print(jinja2.ext.__file__)
+diff --git a/update_ext.py b/update_ext.py
+new file mode 100644
+index 0000000..5132835
+--- /dev/null
++++ b/update_ext.py
+@@ -0,0 +1,70 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Update _install_callables
++content = re.sub(
++    r'def _install_callables\(\n\s+self,\n\s+gettext: t\.Callable\[\[str\], str\],\n\s+ngettext: t\.Callable\[\[str, str, int\], str\],\n\s+newstyle: t\.Optional\[bool\] = None,\n\s+pgettext: t\.Optional\[t\.Callable\[\[str, str\], str\]\] = None,\n\s+npgettext: t\.Optional\[t\.Callable\[\[str, str, str, int\], str\]\] = None,\n\s+\) -> None:',
++    r'def _install_callables(\n        self,\n        gettext: t.Callable[[str], str],\n        ngettext: t.Callable[[str, str, int], str],\n        newstyle: t.Optional[bool] = None,\n        pgettext: t.Optional[t.Callable[[str, str], str]] = None,\n        npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,\n        dgettext: t.Optional[t.Callable[[str, str], str]] = None,\n        dngettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,\n    ) -> None:',
++    content
++)
++
++# Update _install_callables body
++content = re.sub(
++    r'self\.environment\.globals\.update\(\n\s+gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext\n\s+\)',
++    r'self.environment.globals.update(\n            gettext=gettext,\n            ngettext=ngettext,\n            pgettext=pgettext,\n            npgettext=npgettext,\n            dgettext=dgettext,\n            dngettext=dngettext,\n        )',
++    content
++)
++
++# Update _uninstall
++content = re.sub(
++    r'def _uninstall\(self, translations: "_SupportedTranslations"\) -> None:\n\s+for key in \("gettext", "ngettext", "pgettext", "npgettext"\):',
++    r'def _uninstall(self, translations: "_SupportedTranslations") -> None:\n        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):',
++    content
++)
++
++# Update uninstall_gettext_translations
++content = re.sub(
++    r'def uninstall_gettext_translations\(self\) -> None:\n\s+for key in \("gettext", "ngettext", "pgettext", "npgettext"\):\n\s+self\.environment\.globals\.pop\(key, None\)',
++    r'def uninstall_gettext_translations(self) -> None:\n        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):\n            self.environment.globals.pop(key, None)',
++    content
++)
++
++# Update parse
++content = re.sub(
++    r'def parse\(self, parser: "Parser"\) -> t\.Union\[nodes\.Node, t\.List\[nodes\.Node\]\]:\n\s+"""Parse a translatable tag\."""\n\s+lineno = next\(parser\.stream\)\.lineno\n\s+num_called_num = False',
++    r'def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:\n        """Parse a translatable tag."""\n        lineno = next(parser.stream).lineno\n        domain = None\n        num_called_num = False',
++    content
++)
++
++# Update parse loop
++content = re.sub(
++    r'token = parser\.stream\.expect\("name"\)\n\s+if token\.value in variables:',
++    r'token = parser.stream.expect("name")\n            if token.value == "domain":\n                if domain is not None:\n                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)\n                parser.stream.expect("assign")\n                value = parser.parse_expression()\n                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):\n                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)\n                domain = value.value\n                continue\n            if token.value in variables:',
++    content
++)
++
++# Update _make_node signature
++content = re.sub(
++    r'def _make_node\(\n\s+self,\n\s+singular: str,\n\s+plural: t\.Optional\[str\],\n\s+variables: t\.Dict\[str, nodes\.Expr\],\n\s+plural_expr: t\.Optional\[nodes\.Expr\],\n\s+vars_referenced: bool,\n\s+num_called_num: bool,\n\s+\) -> nodes\.Output:',
++    r'def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,\n        domain: t.Optional[str] = None,\n    ) -> nodes.Output:',
++    content
++)
++
++# Update _make_node body
++content = re.sub(
++    r'if plural_expr is None:\n\s+if domain is None:\n\s+gettext = nodes\.Name\("gettext", "load"\)\n\s+node = nodes\.Call\(gettext, \[nodes\.Const\(singular\)\], \[\], None, None\)\n\s+else:\n\s+gettext = nodes\.Name\("dgettext", "load"\)\n\s+node = nodes\.Call\(gettext, \[nodes\.Const\(domain\), nodes\.Const\(singular\)\], \[\], None, None\)',
++    r'if plural_expr is None:\n            if domain is None:\n                gettext = nodes.Name("gettext", "load")\n                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n            else:\n                gettext = nodes.Name("dgettext", "load")\n                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)',
++    content
++)
++
++# Update _make_node body (plural)
++content = re.sub(
++    r'else:\n\s+if domain is None:\n\s+ngettext = nodes\.Name\("ngettext", "load"\)\n\s+args = \[nodes\.Const\(singular\), nodes\.Const\(plural\), plural_expr\]\n\s+else:\n\s+ngettext = nodes\.Name\("dngettext", "load"\)\n\s+args = \[nodes\.Const\(domain\), nodes\.Const\(singular\), nodes\.Const\(plural\), plural_expr\]',
++    r'else:\n            if domain is None:\n                ngettext = nodes.Name("ngettext", "load")\n                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n            else:\n                ngettext = nodes.Name("dngettext", "load")\n                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_ext_v2.py b/update_ext_v2.py
+new file mode 100644
+index 0000000..d029a8d
+--- /dev/null
++++ b/update_ext_v2.py
+@@ -0,0 +1,14 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Fix the parse loop
++content = re.sub(
++    r'while parser\.stream\.current\.type != "block_end":\n\s+if variables:\n\s+parser\.stream\.expect\("comma"\)',
++    r'while parser.stream.current.type != "block_end":\n            if variables or domain is not None:\n                parser.stream.expect("comma")',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_ext_v3.py b/update_ext_v3.py
+new file mode 100644
+index 0000000..e1ba7f0
+--- /dev/null
++++ b/update_ext_v3.py
+@@ -0,0 +1,21 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Add uninstall_gettext_translations method
++content = re.sub(
++    r'def _uninstall\(self, translations: "_SupportedTranslations"\) -> None:\n\s+for key in \("gettext", "ngettext", "pgettext", "npgettext"\):',
++    r'def uninstall_gettext_translations(self) -> None:\n        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):\n            self.environment.globals.pop(key, None)\n\n    def _uninstall(self, translations: "_SupportedTranslations") -> None:\n        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):',
++    content
++)
++
++# Update environment.extend
++content = re.sub(
++    r'uninstall_gettext_translations=self._uninstall,',
++    r'uninstall_gettext_translations=self.uninstall_gettext_translations,',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_ext_v4.py b/update_ext_v4.py
+new file mode 100644
+index 0000000..636ef86
+--- /dev/null
++++ b/update_ext_v4.py
+@@ -0,0 +1,15 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Add uninstall_gettext_translations method
++# I will add it before _uninstall
++content = re.sub(
++    r'def _uninstall\(self, translations: "_SupportedTranslations"\) -> None:',
++    r'def uninstall_gettext_translations(self) -> None:\n        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):\n            self.environment.globals.pop(key, None)\n\n    def _uninstall(self, translations: "_SupportedTranslations") -> None:',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_ext_v5.py b/update_ext_v5.py
+new file mode 100644
+index 0000000..0bbe9e2
+--- /dev/null
++++ b/update_ext_v5.py
+@@ -0,0 +1,21 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Update _make_node
++content = re.sub(
++    r'def _make_node\(\n\s+self,\n\s+singular: str,\n\s+plural: t\.Optional\[str\],\n\s+variables: t\.Dict\[str, nodes\.Expr\],\n\s+plural_expr: t\.Optional\[nodes\.Expr\],\n\s+vars_referenced: bool,\n\s+num_called_num: bool,\n\s+\) -> nodes\.Output:',
++    r'def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,\n        domain: t.Optional[str] = None,\n    ) -> nodes.Output:',
++    content
++)
++
++# Update _make_node body
++content = re.sub(
++    r'# singular only:\n\s+if plural_expr is None:\n\s+gettext = nodes\.Name\("gettext", "load"\)\n\s+node = nodes\.Call\(gettext, \[nodes\.Const\(singular\)\], \[\], None, None\)\n\n\s+# singular and plural\n\s+else:\n\s+ngettext = nodes\.Name\("ngettext", "load"\)\n\s+node = nodes\.Call\(\n\s+ngettext,\n\s+\[nodes\.Const\(singular\), nodes\.Const\(plural\), plural_expr\],\n\s+\[\],\n\s+None,\n\s+None,\n\s+\)',
++    r'# singular only:\n        if plural_expr is None:\n            if domain is None:\n                gettext = nodes.Name("gettext", "load")\n                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n            else:\n                gettext = nodes.Name("dgettext", "load")\n                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n\n        # singular and plural\n        else:\n            if domain is None:\n                ngettext = nodes.Name("ngettext", "load")\n                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n            else:\n                ngettext = nodes.Name("dngettext", "load")\n                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n            node = nodes.Call(ngettext, args, [], None, None)',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_ext_v6.py b/update_ext_v6.py
+new file mode 100644
+index 0000000..869aac2
+--- /dev/null
++++ b/update_ext_v6.py
+@@ -0,0 +1,14 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Update the call to _make_node
++content = re.sub(
++    r'node = self\._make_node\(\n\s+singular,\n\s+plural,\n\s+variables,\n\s+plural_expr,\n\s+bool\(referenced\),\n\s+num_called_num and have_plural,\n\s+\)',
++    r'node = self._make_node(\n            singular,\n            plural,\n            variables,\n            plural_expr,\n            bool(referenced),\n            num_called_num and have_plural,\n            domain=domain,\n        )',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_ext_v7.py b/update_ext_v7.py
+new file mode 100644
+index 0000000..184ae65
+--- /dev/null
++++ b/update_ext_v7.py
+@@ -0,0 +1,21 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Add _make_new_dgettext and _make_new_dngettext
++content = re.sub(
++    r'def _make_new_npgettext\(func: t\.Callable\[\[str, str, str, int\], str\]\) -> t\.Callable\[\.\.\., str\]:\n\s+@pass_context\n\s+def npgettext\(__context: Context, __context_string: str, __singular: str, __plural: str, __num: int, \*\*variables: t\.Any\) -> str:\n\s+rv = __context\.call\(func, __context_string, __singular, __plural, __num\)\n\s+if __context\.eval_ctx\.autoescape:\n\s+rv = Markup\(rv\)\n\s+return rv % variables  # type: ignore',
++    r'def _make_new_npgettext(func: t.Callable[[str, str, str, int], str]) -> t.Callable[..., str]:\n    @pass_context\n    def npgettext(__context: Context, __context_string: str, __singular: str, __plural: str, __num: int, **variables: t.Any) -> str:\n        rv = __context.call(func, __context_string, __singular, __plural, __num)\n        if __context.eval_ctx.autoescape:\n            rv = Markup(rv)\n        return rv % variables  # type: ignore\n\n\ndef _make_new_dgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str]:\n    @pass_context\n    def dgettext(__context: Context, __domain: str, __string: str, **variables: t.Any) -> str:\n        rv = __context.call(func, __domain, __string)\n        if __context.eval_ctx.autoescape:\n            rv = Markup(rv)\n        return rv % variables  # type: ignore\n\n\ndef _make_new_dngettext(func: t.Callable[[str, str, str, int], str]) -> t.Callable[..., str]:\n    @pass_context\n    def dngettext(__context: Context, __domain: str, __singular: str, __plural: str, __num: int, **variables: t.Any) -> str:\n        rv = __context.call(func, __domain, __singular, __plural, __num)\n        if __context.eval_ctx.autoescape:\n            rv = Markup(rv)\n        return rv % variables  # type: ignore',
++    content
++)
++
++# Update _install_callables
++content = re.sub(
++    r'if npgettext is not None:\n\s+npgettext = _make_new_npgettext\(npgettext\)',
++    r'if npgettext is not None:\n                npgettext = _make_new_npgettext(npgettext)\n\n            if dgettext is not None:\n                dgettext = _make_new_dgettext(dgettext)\n\n            if dngettext is not None:\n                dngettext = _make_new_dngettext(dngettext)',
++    content
++)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_make_node.py b/update_make_node.py
+new file mode 100644
+index 0000000..3fe48fd
+--- /dev/null
++++ b/update_make_node.py
+@@ -0,0 +1,36 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Update _make_node signature
++content = content.replace(
++    '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,',
++    '    def _make_node(\n        self,\n        singular: str,\n        plural: t.Optional[str],\n        variables: t.Dict[str, nodes.Expr],\n        plural_expr: t.Optional[nodes.Expr],\n        vars_referenced: bool,\n        num_called_num: bool,\n        domain: t.Optional[str] = None,'
++)
++
++# Update _make_node body
++# I will replace the `if plural_expr is None:` block.
++pattern = re.compile(r'        # singular only:\n        if plural_expr is None:.*?node = nodes.Call\(ngettext, args, \[\], None, None\)', re.DOTALL)
++new_make_node_body = """        # singular only:
++        if plural_expr is None:
++            if domain is None:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            else:
++                gettext = nodes.Name("dgettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)
++        # singular and plural
++        else:
++            if domain is None:
++                ngettext = nodes.Name("ngettext", "load")
++                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]
++            else:
++                ngettext = nodes.Name("dngettext", "load")
++                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]
++            node = nodes.Call(ngettext, args, [], None, None)"""
++
++content = pattern.sub(new_make_node_body, content)
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_make_node_body.py b/update_make_node_body.py
+new file mode 100644
+index 0000000..168ccf3
+--- /dev/null
++++ b/update_make_node_body.py
+@@ -0,0 +1,38 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find `_make_node`
++make_node_start = 0
++for i in range(len(lines)):
++    if 'def _make_node(' in lines[i]:
++        make_node_start = i
++        break
++
++# Find `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'if plural_expr is None:' in lines[i]:
++        # Replace the body of `if plural_expr is None:`
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                gettext = nodes.Name("gettext", "load")\n'
++        lines[i+3] = '                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                gettext = nodes.Name("dgettext", "load")\n')
++        lines.insert(i+6, '                node = nodes.Call(gettext, [nodes.Const(domain), nodes.Const(singular)], [], None, None)\n')
++        break
++
++# Find `else:` for `if plural_expr is None:`
++for i in range(make_node_start, len(lines)):
++    if 'else:' in lines[i] and 'if plural_expr is None:' in lines[i-10:i]:
++        # Replace the body of `else:`
++        lines[i+1] = '            if domain is None:\n'
++        lines[i+2] = '                ngettext = nodes.Name("ngettext", "load")\n'
++        lines[i+3] = '                args = [nodes.Const(singular), nodes.Const(plural), plural_expr]\n'
++        lines.insert(i+4, '            else:\n')
++        lines.insert(i+5, '                ngettext = nodes.Name("dngettext", "load")\n')
++        lines.insert(i+6, '                args = [nodes.Const(domain), nodes.Const(singular), nodes.Const(plural), plural_expr]\n')
++        break
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/update_parse.py b/update_parse.py
+new file mode 100644
+index 0000000..65feb29
+--- /dev/null
++++ b/update_parse.py
+@@ -0,0 +1,75 @@
++import re
++
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++# Replace parse method
++pattern = re.compile(r'    def parse\(self, parser: "Parser"\) -> t.Union\[nodes.Node, t.List\[nodes.Node\]\]:.*?parser.stream.expect\("block_end"\)', re.DOTALL)
++new_parse = """    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        \"\"\"Parse a translatable tag.\"\"\"
++        lineno = next(parser.stream).lineno
++        domain = None
++        num_called_num = False
++
++        # find all the variables referenced.  Additionally a variable can be
++        # defined in the body of the trans block too, but this is checked at
++        # a later state.
++        plural_expr: t.Optional[nodes.Expr] = None
++        plural_expr_assignment: t.Optional[nodes.Assign] = None
++        variables: t.Dict[str, nodes.Expr] = {}
++        trimmed = None
++        while parser.stream.current.type != "block_end":
++            if parser.stream.skip_if("comma"):
++                pass
++
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++
++            token = parser.stream.expect("name")
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail("domain defined twice", token.lineno, exc=TemplateAssertionError)
++                parser.stream.expect("assign")
++                value = parser.parse_expression()
++                if not isinstance(value, nodes.Const) or not isinstance(value.value, str):
++                    parser.fail("domain must be a string literal", token.lineno, exc=TemplateAssertionError)
++                domain = value.value
++                continue
++            if token.value in variables:
++                parser.fail(
++                    f"translatable variable {token.value!r} defined twice.",
++                    token.lineno,
++                    exc=TemplateAssertionError,
++                )
++
++            # expressions
++            if parser.stream.current.type == "assign":
++                next(parser.stream)
++                variables[token.value] = var = parser.parse_expression()
++            elif trimmed is None and token.value in ("trimmed", "notrimmed"):
++                trimmed = token.value == "trimmed"
++                continue
++            else:
++                variables[token.value] = var = nodes.Name(token.value, "load")
++
++            if plural_expr is None:
++                if isinstance(var, nodes.Call):
++                    plural_expr = nodes.Name("_trans", "load")
++                    variables[token.value] = plural_expr
++                    plural_expr_assignment = nodes.Assign(
++                        nodes.Name("_trans", "store"), var
++                    )
++                else:
++                    plural_expr = var
++                num_called_num = token.value == "num"
++
++        parser.stream.expect("block_end")"""
++
++content = pattern.sub(new_parse, content)
++
++# 4. Update _make_node
++pattern = re.compile(r'    def _make_node\(.*?\) -> nodes.Output:.*?node = nodes.Call\(gettext, \[nodes.Const\(singular\)\], \[\], None, None\)', re.DOTALL)
++# This is too complex. I will just edit the file manually.
++with open('src/jinja2/ext.py', 'w') as f:
++    f.write(content)
+diff --git a/update_uninstall.py b/update_uninstall.py
+new file mode 100644
+index 0000000..b840f6f
+--- /dev/null
++++ b/update_uninstall.py
+@@ -0,0 +1,17 @@
++import sys
++
++with open('src/jinja2/ext.py', 'r') as f:
++    lines = f.readlines()
++
++# Find `uninstall_gettext_translations`
++for i in range(len(lines)):
++    if 'def uninstall_gettext_translations(self) -> None:' in lines[i]:
++        # Update the `update` call
++        for j in range(i, i + 10):
++            if 'self.environment.globals.update(' in lines[j]:
++                lines[j+1] = '            gettext=self._gettext_alias, ngettext=self._ngettext_alias, pgettext=self._pgettext_alias, npgettext=self._npgettext_alias, dgettext=self._gettext_alias, dngettext=self._ngettext_alias\n'
++                break
++        break
++
++with open('src/jinja2/ext.py', 'w') as f:
++    f.writelines(lines)

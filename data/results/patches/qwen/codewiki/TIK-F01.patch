@@ -1,0 +1,86 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..cff368b 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        max_tokens: int | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -121,7 +122,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +131,15 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if max_tokens is not None:
++            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
++                raise ValueError(f"max_tokens must be a positive integer, got {max_tokens!r}")
++            if len(tokens) > max_tokens:
++                raise ValueError(f"Encoded {len(tokens)} tokens, exceeding max_tokens={max_tokens}")
++
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,6 +188,8 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        max_tokens: int | None = None,
++        max_total_tokens: int | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -196,11 +207,33 @@ class Encoding:
+         if not isinstance(disallowed_special, frozenset):
+             disallowed_special = frozenset(disallowed_special)
+ 
+-        encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
+-        )
+-        with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++        # Validate max_tokens and max_total_tokens upfront
++        if max_tokens is not None:
++            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
++                raise ValueError(f"max_tokens must be a positive integer, got {max_tokens!r}")
++        if max_total_tokens is not None:
++            if isinstance(max_total_tokens, bool) or not isinstance(max_total_tokens, int) or max_total_tokens < 1:
++                raise ValueError(f"max_total_tokens must be a positive integer, got {max_total_tokens!r}")
++
++        # Encode documents one by one to check per-document limits and report indices
++        results = []
++        for i, doc in enumerate(text):
++            try:
++                result = self.encode(doc, allowed_special=allowed_special, disallowed_special=disallowed_special, max_tokens=max_tokens)
++                results.append(result)
++            except ValueError as e:
++                # If it's a max_tokens error, add the document index
++                if "exceeding max_tokens" in str(e):
++                    raise ValueError(f"Document {i}: {e}") from None
++                raise
++
++        # Check max_total_tokens
++        if max_total_tokens is not None:
++            total_tokens = sum(len(tokens) for tokens in results)
++            if total_tokens > max_total_tokens:
++                raise ValueError(f"Total encoded {total_tokens} tokens, exceeding max_total_tokens={max_total_tokens}")
++
++        return results
+ 
+     def encode_with_unstable(
+         self,

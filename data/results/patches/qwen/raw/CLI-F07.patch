@@ -1,0 +1,103 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..b77f118 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,10 +428,22 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        #: If True, validate that nested contexts are closed in proper order.
++        #: Child contexts must be closed before their parent. This validation
++        #: is inherited by descendant contexts.
++        #:
++        #: .. versionadded:: 8.3
++        if validate_nesting is None and parent is not None:
++            validate_nesting = parent.validate_nesting
++        self.validate_nesting: bool = validate_nesting
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        
++        # Track open child contexts for nesting validation
++        self._children: set[Context] = set()
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -478,7 +491,12 @@ class Context:
+     ) -> None:
+         self._depth -= 1
+         if self._depth == 0:
+-            self.close()
++            # Only close if no open children or validation disabled
++            if not (self.validate_nesting and self._children):
++                self.close()
++            else:
++                # Don't close parent with open children, but still pop from stack
++                pass
+         pop_context()
+ 
+     @contextmanager
+@@ -607,6 +625,18 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        # Validate nesting: parent cannot be closed while children are open
++        if self.validate_nesting and self._children:
++            child_names = [child.info_name or child.command.name for child in self._children]
++            raise RuntimeError(
++                f"Cannot close context {self.info_name!r} while child contexts "
++                f"{child_names!r} are still open. Close children first."
++            )
++        
++        # Remove self from parent's children set
++        if self.parent is not None and self.parent.validate_nesting:
++            self.parent._children.discard(self)
++        
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+@@ -728,7 +758,11 @@ class Context:
+ 
+         :meta private:
+         """
+-        return type(self)(command, info_name=command.name, parent=self)
++        ctx = type(self)(command, info_name=command.name, parent=self)
++        # Register child with parent for nesting validation
++        if self.validate_nesting:
++            self._children.add(ctx)
++        return ctx
+ 
+     @t.overload
+     def invoke(
+@@ -1150,9 +1184,19 @@ class Command:
+                 extra[key] = value
+ 
+         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
++        
++        # Register child with parent for nesting validation
++        if parent is not None and parent.validate_nesting:
++            parent._children.add(ctx)
+ 
+-        with ctx.scope(cleanup=False):
+-            self.parse_args(ctx, args)
++        try:
++            with ctx.scope(cleanup=False):
++                self.parse_args(ctx, args)
++        except Exception:
++            # On parsing failure, remove child from parent's tracking
++            if parent is not None and parent.validate_nesting:
++                parent._children.discard(ctx)
++            raise
+         return ctx
+ 
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:

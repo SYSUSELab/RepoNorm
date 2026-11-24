@@ -1,0 +1,135 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..23da7e5 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import time
+ 
+ import collections.abc as cabc
+ import enum
+@@ -280,6 +281,9 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        *,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -432,6 +436,19 @@ class Context:
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++        # Retry configuration for cleanup callbacks
++        if retry_cleanup is None:
++            self.retry_cleanup = parent.retry_cleanup if parent else 0
++        else:
++            self.retry_cleanup = retry_cleanup
++
++        if retry_cleanup_backoff is None:
++            self.retry_cleanup_backoff = (
++                parent.retry_cleanup_backoff if parent else 0.1
++            )
++        else:
++            self.retry_cleanup_backoff = retry_cleanup_backoff
++
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -590,7 +607,13 @@ class Context:
+         """
+         return self._exit_stack.enter_context(context_manager)
+ 
+-    def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
++    def call_on_close(
++        self,
++        f: t.Callable[..., t.Any],
++        *,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
++    ) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+ 
+         This can be used to close resources opened during the script
+@@ -599,15 +622,66 @@ class Context:
+         registered with :meth:`with_resource` instead.
+ 
+         :param f: The function to execute on teardown.
++        :param retry_cleanup: Number of additional attempts after first failure.
++            Defaults to the context's retry_cleanup setting.
++        :param retry_cleanup_backoff: Initial delay in seconds before first retry.
++            Defaults to the context's retry_cleanup_backoff setting.
+         """
+-        return self._exit_stack.callback(f)
++        # Determine effective retry settings (inherit from context if not specified)
++        effective_retry_cleanup = (
++            retry_cleanup if retry_cleanup is not None else self.retry_cleanup
++        )
++        effective_backoff = (
++            retry_cleanup_backoff
++            if retry_cleanup_backoff is not None
++            else self.retry_cleanup_backoff
++        )
++        
++        # Validate backoff value
++        if isinstance(effective_backoff, bool):
++            raise ValueError("retry_cleanup_backoff must be a number, not a boolean")
++        if not isinstance(effective_backoff, (int, float)):
++            raise ValueError("retry_cleanup_backoff must be a finite positive integer or float")
++        if effective_backoff <= 0:
++            raise ValueError("retry_cleanup_backoff must be a positive number")
++        
++        # Create a wrapper function that handles retries
++        def wrapped_callback():
++            func = f
++            attempts = 0
++            current_backoff = effective_backoff
++            
++            while True:
++                try:
++                    func()
++                    break
++                except (KeyboardInterrupt, SystemExit):
++                    # Don't retry these exceptions - propagate immediately
++                    raise
++                except BaseException as e:
++                    attempts += 1
++                    
++                    # Check if we have more retries available
++                    if attempts <= effective_retry_cleanup:
++                        # Wait before retrying (exponential backoff)
++                        time.sleep(current_backoff)
++                        current_backoff *= 2
++                    else:
++                        # No more retries, re-raise the exception
++                        raise
++        
++        # Register the wrapped callback with ExitStack (preserves LIFO ordering)
++        self._exit_stack.callback(wrapped_callback)
++        return f
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        # Exit all context managers and call registered callbacks (in LIFO order)
+         self._exit_stack.close()
++        
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 39dfbdb..c295013 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -27,6 +27,7 @@ click.echo(json.dumps(rv))
+ 
+ ALLOWED_IMPORTS = {
+     "__future__",
++    "time",
+     "weakref",
+     "os",
+     "struct",

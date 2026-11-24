@@ -1,0 +1,292 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..d890d124 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add string-literal metadata to translation blocks and an extraction API
++    that reports metadata together with the block's messages.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b7..f714bf0b 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -105,6 +105,15 @@ additional methods:
+     If `Babel`_ is installed, see :ref:`babel-integration` to extract
+     the strings.
+ 
++.. method:: jinja2.Environment.extract_translations_with_metadata(source, source_name=None)
++
++    Iterate over translation blocks that declare ``note``, ``created``,
++    or ``modified`` metadata. Each result contains the optional source
++    name, the block line number, a copied metadata mapping, and the
++    messages that the ordinary extractor finds in that block. Returned
++    records are independent, so callers may modify them without
++    affecting later extractions.
++
+ For a web application that is available in multiple languages but gives
+ all the users the same language (for example, multilingual forum
+ software installed for a French community), the translation may be
+diff --git a/docs/templates.rst b/docs/templates.rst
+index 89958b86..1084224e 100644
+--- a/docs/templates.rst
++++ b/docs/templates.rst
+@@ -1732,6 +1732,20 @@ to disable it for a block.
+ .. versionadded:: 2.10
+    The ``trimmed`` and ``notrimmed`` modifiers have been added.
+ 
++Translation metadata
++~~~~~~~~~~~~~~~~~~~~
++
++Translation blocks can carry string-literal ``note``, ``created``, and
++``modified`` metadata. These keys may be mixed with variables and
++whitespace modifiers, but each key may occur only once::
++
++    {% trans note="Shown on the account page", created="2024-01-01", user=user, trimmed %}
++      Hello, {{ user }}!
++    {% endtrans %}
++
++Metadata is intended for extraction tools. It does not affect rendering
++or the messages returned by the ordinary translation extractor.
++
+ It's possible to translate strings in expressions with these functions:
+ 
+ -   ``gettext``: translate a single string
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..0e6cf97e 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -263,6 +263,7 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            extract_translations_with_metadata=self._extract_with_metadata,
+             newstyle_gettext=False,
+         )
+ 
+@@ -351,6 +352,28 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++    def _extract_with_metadata(
++        self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        if isinstance(source, str):
++            source = self.environment.parse(source)
++        for output in source.find_all(nodes.Output):
++            metadata = getattr(output, "trans_metadata", None)
++            if metadata is None:
++                continue
++            messages = [
++                {"lineno": lineno, "function": function, "message": message}
++                for lineno, function, message in extract_from_ast(
++                    t.cast(nodes.Template, output)
++                )
++            ]
++            yield {
++                "source": source_name,
++                "lineno": output.lineno,
++                "metadata": dict(metadata),
++                "messages": messages,
++            }
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+@@ -362,9 +385,10 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        metadata: t.Dict[str, str] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if variables or metadata:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -379,6 +403,35 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            # Check for metadata parameters
++            if token.value in ("note", "created", "modified"):
++                if token.value in metadata:
++                    parser.fail(
++                        f"metadata parameter {token.value!r} defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                if parser.stream.current.type == "assign":
++                    next(parser.stream)
++                    expr = parser.parse_expression()
++                    if isinstance(expr, nodes.Const) and isinstance(expr.value, str):
++                        metadata[token.value] = expr.value
++                    else:
++                        parser.fail(
++                            f"metadata parameter {token.value!r} must be a string "
++                            "literal.",
++                            token.lineno,
++                            exc=TemplateAssertionError,
++                        )
++                else:
++                    parser.fail(
++                        f"metadata parameter {token.value!r} requires a value "
++                        "assignment.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                continue
++
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+@@ -459,6 +512,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            metadata,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +568,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        metadata: t.Dict[str, str],
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -568,7 +623,11 @@ class InternationalizationExtension(Extension):
+                         ]
+                     ),
+                 )
+-        return nodes.Output([node])
++        # Store metadata as node attributes for translation tools to access
++        output_node = nodes.Output([node])
++        if metadata:
++            output_node.trans_metadata = metadata  # type: ignore
++        return output_node
+ 
+ 
+ class ExprStmtExtension(Extension):
+@@ -852,3 +911,5 @@ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+ loopcontrols = LoopControlExtension
+ debug = DebugExtension
++
++_N4C_STYLE_SENTINEL=  1  
+diff --git a/tests/test_n4c_author_translation_metadata.py b/tests/test_n4c_author_translation_metadata.py
+new file mode 100644
+index 00000000..70474b6c
+--- /dev/null
++++ b/tests/test_n4c_author_translation_metadata.py
+@@ -0,0 +1,104 @@
++import pytest
++
++from jinja2 import Environment
++from jinja2 import pass_context
++from jinja2 import TemplateAssertionError
++
++
++def test_metadata_records_are_complete_and_independent():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    source = (
++        '{% trans note="提示", created="", n=2, trimmed %}\n'
++        "one {{ n }}\n{% pluralize %}\nmany {{ n }}{% endtrans %}"
++    )
++    expected_message = ("one %(n)s", "many %(n)s", None)
++    first = list(env.extract_translations_with_metadata(source, "page.html"))
++    assert first == [
++        {
++            "source": "page.html",
++            "lineno": 1,
++            "metadata": {"note": "提示", "created": ""},
++            "messages": [
++                {"lineno": 1, "function": "ngettext", "message": expected_message}
++            ],
++        }
++    ]
++    first[0]["metadata"]["note"] = "changed"
++    first[0]["messages"].clear()
++    assert list(env.extract_translations_with_metadata(source, "page.html"))[0] == {
++        "source": "page.html",
++        "lineno": 1,
++        "metadata": {"note": "提示", "created": ""},
++        "messages": [
++            {"lineno": 1, "function": "ngettext", "message": expected_message}
++        ],
++    }
++
++
++def test_metadata_does_not_change_rendering_or_ordinary_extraction():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    env.install_null_translations()
++    plain = "{% trans name=name %}Hello {{ name }}{% endtrans %}"
++    annotated = (
++        '{% trans modified="2024-02-03", note="Greeting", name=name %}'
++        "Hello {{ name }}{% endtrans %}"
++    )
++    assert env.from_string(annotated).render(name="World") == "Hello World"
++    assert list(env.extract_translations(plain)) == list(
++        env.extract_translations(annotated)
++    )
++    assert list(env.extract_translations_with_metadata(plain)) == []
++
++
++@pytest.mark.parametrize(
++    ("source", "key", "reason"),
++    [
++        ("{% trans note %}x{% endtrans %}", "note", "requires"),
++        ("{% trans created=value %}x{% endtrans %}", "created", "string literal"),
++        ('{% trans modified="a", modified="b" %}x{% endtrans %}', "modified", "twice"),
++    ],
++)
++def test_metadata_rejects_invalid_declarations(source, key, reason):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    with pytest.raises(TemplateAssertionError, match=rf"{key}.*{reason}"):
++        env.from_string(source)
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++@pytest.mark.parametrize("escape", [False, True])
++def test_metadata_preserves_decorated_provider_and_dynamic_escape(newstyle, escape):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    @pass_context
++    def gettext(context, message):
++        seen.append(context.environment)
++        return "<b>%(name)s</b>"
++
++    env.install_gettext_callables(
++        gettext, lambda singular, plural, count: plural, newstyle=newstyle
++    )
++    source = (
++        '{% autoescape escape %}{% trans note="compile", name=name %}'
++        "Hello {{ name }}{% endtrans %}{% endautoescape %}"
++    )
++    assert env.from_string(source).render(name="<x>", escape=escape) == (
++        env.from_string(source.replace('note="compile", ', "")).render(
++            name="<x>", escape=escape
++        )
++    )
++    assert seen == [env, env]
++
++
++def test_metadata_accepts_each_key_and_a_parsed_template():
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    source = (
++        '{% trans modified="m", value=value, note="n", created="c", notrimmed %}'
++        "{{ value }}{% endtrans %}"
++    )
++    parsed = env.parse(source)
++    assert list(env.extract_translations_with_metadata(parsed))[0]["metadata"] == {
++        "modified": "m",
++        "note": "n",
++        "created": "c",
++    }

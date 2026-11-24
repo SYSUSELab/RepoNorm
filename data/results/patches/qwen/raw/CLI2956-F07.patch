@@ -1,0 +1,162 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..6c4f7d3 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1222,9 +1222,63 @@ class Command:
+             ).format(name=self.name, extra_message=extra_message)
+             echo(style(message, fg="red"), err=True)
+ 
++        # Check for conflicting options before invoking callback
++        self._check_conflicts(ctx)
++
+         if self.callback is not None:
+             return ctx.invoke(self.callback, **ctx.params)
+ 
++    def _check_conflicts(self, ctx: Context) -> None:
++        """Check for conflicting options that were both explicitly provided."""
++        # Build a mapping of param names to their sources
++        explicit_sources: dict[str, ParameterSource] = {}
++        for name, source in ctx._parameter_source.items():
++            if source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):
++                explicit_sources[name] = source
++
++        # Find all Option params with conflicts_with defined
++        for param in self.get_params(ctx):
++            if not isinstance(param, Option):
++                continue
++            if not param._conflicts_with:
++                continue
++
++            # Check each conflicting option
++            for conflict_name in param._conflicts_with:
++                # Normalize conflict name: replace dashes with underscores and lowercase
++                normalized_conflict = conflict_name.replace("-", "_").lower()
++                
++                # First, check if the conflict name is unknown (not defined as any option)
++                conflict_param = None
++                for p in self.get_params(ctx):
++                    if isinstance(p, Option) and p.name == normalized_conflict:
++                        conflict_param = p
++                        break
++
++                if conflict_param is None:
++                    # Unknown option name - raise error if the referencing option is provided
++                    if param.name in explicit_sources:
++                        raise UsageError(
++                            f"Option {param.opts[0]!r} cannot be used together with "
++                            f"unknown option {conflict_name!r}."
++                        )
++                    continue
++
++                # Now check if both options were explicitly provided
++                if param.name not in explicit_sources:
++                    continue
++                if normalized_conflict not in explicit_sources:
++                    continue
++                # Both options were explicitly provided - raise error
++                # Get the actual option strings for the error message
++                first_opt = param.opts[0] if param.opts else f"--{param.name}"
++                second_opt = conflict_param.opts[0] if conflict_param.opts else f"--{normalized_conflict}"
++
++                raise UsageError(
++                    f"Option {first_opt!r} cannot be used together with "
++                    f"{second_opt!r}."
++                )
++
+     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
+         """Return a list of completions for the incomplete value. Looks
+         at the names of options and chained multi-commands.
+@@ -2549,8 +2603,11 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        conflicts_with: cabc.Sequence[str] | str | None = None,
+         **attrs: t.Any,
+     ) -> None:
++        # Save built-in type function before it might be shadowed by parameter
++        _builtin_type = object.__class__
+         if help:
+             help = inspect.cleandoc(help)
+ 
+@@ -2637,6 +2694,20 @@ class Option(Parameter):
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
+ 
++        # Handle conflicts_with
++        if conflicts_with is None:
++            self._conflicts_with: list[str] = []
++        elif isinstance(conflicts_with, str):
++            self._conflicts_with = [conflicts_with]
++        else:
++            try:
++                self._conflicts_with = list(conflicts_with)
++            except TypeError:
++                raise TypeError(
++                    f"conflicts_with must be a string or sequence of strings, "
++                    f"not {_builtin_type(conflicts_with).__name__}"
++                )
++
+         if __debug__:
+             if deprecated and prompt:
+                 raise ValueError("`deprecated` options cannot use `prompt`.")
+@@ -2662,6 +2733,24 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++            # Validate conflicts_with for self-reference
++            if self.name is not None and self.name in self._conflicts_with:
++                raise UsageError(
++                    f"Option {self.opts[0]!r} cannot conflict with itself."
++                )
++
++        # Validate each conflict name is a string
++        for conflict_name in self._conflicts_with:
++            if not isinstance(conflict_name, str):
++                raise TypeError(
++                    f"conflicts_with must contain strings, not {_builtin_type(conflict_name).__name__}"
++                )
++
++    @property
++    def conflicts_with(self) -> list[str]:
++        """List of option names that this option conflicts with."""
++        return self._conflicts_with
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+@@ -2671,6 +2760,7 @@ class Option(Parameter):
+             flag_value=self.flag_value,
+             count=self.count,
+             hidden=self.hidden,
++            conflicts_with=self._conflicts_with,
+         )
+         return info_dict
+ 
+diff --git a/tests/test_info_dict.py b/tests/test_info_dict.py
+index 20fe68c..a62646f 100644
+--- a/tests/test_info_dict.py
++++ b/tests/test_info_dict.py
+@@ -25,6 +25,7 @@ HELP_OPTION = (
+         "flag_value": True,
+         "count": False,
+         "hidden": False,
++        "conflicts_with": [],
+     },
+ )
+ NAME_ARGUMENT = (
+@@ -61,6 +62,7 @@ NUMBER_OPTION = (
+         "flag_value": None,
+         "count": False,
+         "hidden": False,
++        "conflicts_with": [],
+     },
+ )
+ HELLO_COMMAND = (
+@@ -202,6 +204,7 @@ HELLO_GROUP = (
+                 "flag_value": True,
+                 "count": False,
+                 "hidden": False,
++                "conflicts_with": [],
+             },
+             id="Flag Option",
+         ),

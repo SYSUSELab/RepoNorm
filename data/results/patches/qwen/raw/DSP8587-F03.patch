@@ -1,0 +1,109 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..16352e90 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,4 +1,5 @@
+ import re
++import time
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
+@@ -48,6 +49,12 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Stats tracking variables
++        self._chunk_count = 0
++        self._char_count = 0
++        self._first_ts: float | None = None
++        self._last_ts: float | None = None
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -91,6 +98,11 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                # Reset stats for reused stream
++                self._chunk_count = 0
++                self._char_count = 0
++                self._first_ts = None
++                self._last_ts = None
+             else:
+                 return
+ 
+@@ -166,7 +178,23 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++                # Update stats before returning the response
++                if self._first_ts is None:
++                    self._first_ts = time.time()
++                self._last_ts = time.time()
++                self._chunk_count += 1
++                self._char_count += len(token)
++                
++                response = StreamResponse(self.predict_name, self.signature_field_name, token)
++                
++                # Reset stats immediately when stream ends (after returning final response)
++                if self.stream_end:
++                    self._chunk_count = 0
++                    self._char_count = 0
++                    self._first_ts = None
++                    self._last_ts = None
++                
++                return response
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+@@ -198,6 +226,48 @@ class StreamListener:
+                 f"{', '.join([a.__name__ for a in ADAPTER_SUPPORT_STREAMING])}"
+             )
+ 
++    def stats(self) -> dict[str, Any]:
++        """Return statistics about the currently active field stream.
++
++        Returns a serialization-friendly dictionary with exactly these keys:
++        - `predict_name` and `field`
++        - `chunk_count` and `char_count`
++        - `first_ts` and `last_ts`
++        - `duration_s` and `avg_chunk_chars`
++
++        The counts describe responses emitted by `receive()` for the currently active
++        field stream. `char_count` is the sum of emitted `chunk` lengths. The first and
++        last timestamps use seconds; duration is their difference. Before an emission,
++        all counters are zero, timestamps and duration are `None`, and the average is
++        zero.
++
++        When the listener enters its ended state, all active-stream counters and
++        timestamps reset immediately, independently of `allow_reuse`. A final response
++        may still be returned, but `stats()` already reports the zeroed state after
++        that transition. Starting a reused stream also begins from zero. Metrics do
++        not alter buffering, boundary detection, response content, or LM usage
++        accounting.
++        """
++        duration_s = None
++        avg_chunk_chars = 0.0
++
++        if self._first_ts is not None and self._last_ts is not None:
++            duration_s = self._last_ts - self._first_ts
++
++        if self._chunk_count > 0:
++            avg_chunk_chars = self._char_count / self._chunk_count
++
++        return {
++            "predict_name": self.predict_name,
++            "field": self.signature_field_name,
++            "chunk_count": self._chunk_count,
++            "char_count": self._char_count,
++            "first_ts": self._first_ts,
++            "last_ts": self._last_ts,
++            "duration_s": duration_s,
++            "avg_chunk_chars": avg_chunk_chars,
++        }
++
+ 
+ def find_predictor_for_stream_listeners(program: "Module", stream_listeners: list[StreamListener]):
+     """Find the predictor for each stream listener.

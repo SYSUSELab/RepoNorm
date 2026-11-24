@@ -1,0 +1,267 @@
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..5b4a045 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,262 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++class TestPathTransformation:
++    def test_filesystem_loader(self, tmp_path):
++        (tmp_path / "index.html").write_text("filesystem")
++        calls = []
++
++        def transform(name):
++            calls.append(name)
++            return {"home": "index.html"}.get(name, name)
++
++        env = Environment(
++            loader=loaders.FileSystemLoader(tmp_path, path_transform=transform)
++        )
++        assert env.get_template("home").render() == "filesystem"
++        assert calls == ["home"]
++
++    def test_package_loader(self, monkeypatch):
++        monkeypatch.syspath_prepend(Path(__file__).parent)
++        loader = PackageLoader(
++            "res", path_transform=lambda name: {"home": "test.html"}.get(name, name)
++        )
++        env = Environment(loader=loader)
++        assert env.get_template("home").render().strip() == "BAR"
++
++    def test_dict_and_function_loaders(self):
++        transform = lambda name: {"home": "index.html"}.get(name, name)
++        dict_env = Environment(
++            loader=loaders.DictLoader(
++                {"index.html": "dictionary"}, path_transform=transform
++            )
++        )
++        seen = []
++
++        def load(name):
++            seen.append(name)
++            return {"index.html": "function"}.get(name)
++
++        function_env = Environment(
++            loader=loaders.FunctionLoader(load, path_transform=transform)
++        )
++
++        assert dict_env.get_template("home").render() == "dictionary"
++        assert function_env.get_template("home").render() == "function"
++        assert seen == ["index.html"]
++
++    def test_prefix_transforms_before_routing_and_child_transform(self):
++        calls = []
++
++        def outer(name):
++            calls.append(("outer", name))
++            return {"shortcut": "site/local"}.get(name, name)
++
++        def inner(name):
++            calls.append(("inner", name))
++            return {"local": "actual"}.get(name, name)
++
++        loader = loaders.PrefixLoader(
++            {"site": loaders.DictLoader({"actual": "prefix"}, inner)},
++            path_transform=outer,
++        )
++        env = Environment(loader=loader)
++
++        assert env.get_template("shortcut").render() == "prefix"
++        assert calls == [("outer", "shortcut"), ("inner", "local")]
++
++    def test_choice_transforms_once_before_trying_children(self):
++        calls = []
++
++        def transform(name):
++            calls.append(name)
++            return {"home": "index.html"}.get(name, name)
++
++        loader = loaders.ChoiceLoader(
++            [loaders.DictLoader({}), loaders.DictLoader({"index.html": "choice"})],
++            path_transform=transform,
++        )
++        env = Environment(loader=loader)
++
++        assert env.get_template("home").render() == "choice"
++        assert calls == ["home"]
++
++    @pytest.mark.parametrize("loader_kind", ["prefix", "choice"])
++    def test_composite_get_source_applies_transform(self, loader_kind):
++        calls = []
++
++        def transform(name):
++            calls.append(name)
++            return "site/actual" if loader_kind == "prefix" else "actual"
++
++        if loader_kind == "prefix":
++            loader = loaders.PrefixLoader(
++                {"site": loaders.DictLoader({"actual": "source"})},
++                path_transform=transform,
++            )
++        else:
++            loader = loaders.ChoiceLoader(
++                [loaders.DictLoader({"actual": "source"})],
++                path_transform=transform,
++            )
++
++        source, _, _ = loader.get_source(Environment(), "alias")
++        assert source == "source"
++        assert calls == ["alias"]
++
++    @pytest.mark.parametrize(
++        "loader_kind", ["dict", "function", "prefix", "choice"]
++    )
++    def test_not_found_reports_original_name(self, loader_kind):
++        transform = lambda name: "site/missing"
++
++        if loader_kind == "dict":
++            loader = loaders.DictLoader({}, path_transform=transform)
++        elif loader_kind == "function":
++            loader = loaders.FunctionLoader(
++                lambda name: None, path_transform=transform
++            )
++        elif loader_kind == "prefix":
++            loader = loaders.PrefixLoader(
++                {"site": loaders.DictLoader({})}, path_transform=transform
++            )
++        else:
++            loader = loaders.ChoiceLoader(
++                [loaders.DictLoader({})], path_transform=transform
++            )
++
++        env = Environment(loader=loader)
++
++        with pytest.raises(TemplateNotFound) as exc_info:
++            env.get_template("alias")
++
++        assert exc_info.value.name == "alias"
++
++    def test_transform_exception_propagates(self):
++        def transform(name):
++            raise LookupError("rewrite failed")
++
++        env = Environment(
++            loader=loaders.DictLoader({}, path_transform=transform)
++        )
++        with pytest.raises(LookupError, match="rewrite failed"):
++            env.get_template("page")
++
++    @pytest.mark.parametrize("value", [None, 42, ["index.html"]])
++    def test_transform_must_return_string(self, value):
++        env = Environment(
++            loader=loaders.DictLoader(
++                {"index.html": "source"}, path_transform=lambda name: value
++            )
++        )
++        with pytest.raises(TypeError, match="path_transform must return a string"):
++            env.get_template("page")
++
++    def test_empty_name_can_be_transformed(self):
++        env = Environment(
++            loader=loaders.DictLoader(
++                {"default.html": "default"},
++                path_transform=lambda name: "default.html" if name == "" else name,
++            )
++        )
++        assert env.get_template("").render() == "default"
++
++    def test_none_is_backward_compatible_and_listing_is_physical(self):
++        loader = loaders.DictLoader(
++            {"index.html": "source"}, path_transform=None
++        )
++        env = Environment(loader=loader)
++
++        assert env.get_template("index.html").render() == "source"
++        assert loader.list_templates() == ["index.html"]
++
++    def test_transformed_filesystem_name_still_uses_path_safety(self, tmp_path):
++        (tmp_path.parent / "outside.html").write_text("outside")
++        loader = loaders.FileSystemLoader(
++            tmp_path, path_transform=lambda name: "../outside.html"
++        )
++
++        with pytest.raises(TemplateNotFound) as exc_info:
++            Environment(loader=loader).get_template("alias")
++
++        assert exc_info.value.name == "alias"
++
++
++class TestModuleLoaderPathTransformation:
++    def test_module_loader_transforms_before_module_lookup(self, tmp_path):
++        source_env = Environment(
++            loader=loaders.DictLoader({"actual.html": "module source"})
++        )
++        source_env.compile_templates(str(tmp_path), zip=None)
++        calls = []
++
++        def transform(name):
++            calls.append(name)
++            return {"alias": "actual.html"}.get(name, name)
++
++        env = Environment(
++            loader=loaders.ModuleLoader(tmp_path, path_transform=transform)
++        )
++        assert env.get_template("alias").render() == "module source"
++        assert calls == ["alias"]
++
++    def test_module_loader_not_found_uses_original_name(self, tmp_path):
++        source_env = Environment(loader=loaders.DictLoader({"known": "source"}))
++        source_env.compile_templates(str(tmp_path), zip=None)
++        loader = loaders.ModuleLoader(
++            tmp_path, path_transform=lambda name: "missing"
++        )
++
++        with pytest.raises(TemplateNotFound) as exc_info:
++            Environment(loader=loader).get_template("alias")
++
++        assert exc_info.value.name == "alias"
++
++
++@pytest.mark.parametrize("composite_kind", ["prefix", "choice"])
++@pytest.mark.parametrize("child_kind", ["custom", "function"])
++@pytest.mark.parametrize("auto_reload", [True, False])
++def test_transformed_composite_preserves_source_reload_contract(
++    composite_kind, child_kind, auto_reload
++):
++    state = {"source": "first {{ label }}"}
++
++    def source_for(name):
++        if name != "actual":
++            raise TemplateNotFound(name)
++        source = state["source"]
++        return source, None, lambda: state["source"] == source
++
++    class CustomLoader(loaders.BaseLoader):
++        def __init__(self, provide):
++            self.provide = provide
++
++        def get_source(self, environment, template):
++            return self.provide(template)
++
++    if child_kind == "custom":
++        child = CustomLoader(source_for)
++    else:
++        child = loaders.FunctionLoader(source_for)
++
++    if composite_kind == "prefix":
++        loader = loaders.PrefixLoader(
++            {"site": child}, path_transform=lambda name: "site/actual"
++        )
++    else:
++        loader = loaders.ChoiceLoader(
++            [loaders.DictLoader({}), child], path_transform=lambda name: "actual"
++        )
++
++    env = Environment(loader=loader, auto_reload=auto_reload)
++    first = env.get_template("alias")
++    assert first.render(label="page") == "first page"
++    assert env.get_template("alias") is first
++    state["source"] = "second {{ label }}"
++    latest = env.get_template("alias")
++    assert latest.render(label="page") == (
++        "second page" if auto_reload else "first page"
++    )
++    assert (latest is first) is (not auto_reload)

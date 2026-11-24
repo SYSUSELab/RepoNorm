@@ -1,0 +1,187 @@
+diff --git a/fix_init_final.py b/fix_init_final.py
+new file mode 100644
+index 0000000..b987e95
+--- /dev/null
++++ b/fix_init_final.py
+@@ -0,0 +1,27 @@
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the line `cleanup_timeout: float | None = None,`
++# And the next line `self.parent = parent`
++# I need to move `self.parent = parent` to after `) -> None:`
++
++# Let's find the index of `cleanup_timeout: float | None = None,`
++start_index = -1
++for i, line in enumerate(lines):
++    if 'cleanup_timeout: float | None = None,' in line:
++        start_index = i
++        break
++
++# The lines are:
++# 283:        cleanup_timeout: float | None = None,
++# 284:        self.parent = parent
++# 285:        if cleanup_timeout is None and parent is not None:
++
++# I want to change it to:
++# 283:        cleanup_timeout: float | None = None,
++# 284:    ) -> None:
++# 285:        self.parent = parent
++# 286:        if cleanup_timeout is None and parent is not None:
++
++# Wait, I already have `) -> None:` in the file.
++# Let's check the file content again.
+diff --git a/new_init.py b/new_init.py
+new file mode 100644
+index 0000000..d79e844
+--- /dev/null
++++ b/new_init.py
+@@ -0,0 +1,25 @@
++    def __init__(
++        self,
++        command: Command,
++        parent: Context | None = None,
++        info_name: str | None = None,
++        obj: t.Any | None = None,
++        auto_envvar_prefix: str | None = None,
++        default_map: cabc.MutableMapping[str, t.Any] | None = None,
++        terminal_width: int | None = None,
++        max_content_width: int | None = None,
++        resilient_parsing: bool = False,
++        allow_extra_args: bool | None = None,
++        allow_interspersed_args: bool | None = None,
++        ignore_unknown_options: bool | None = None,
++        help_option_names: list[str] | None = None,
++        token_normalize_func: t.Callable[[str], str] | None = None,
++        color: bool | None = None,
++        show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
++    ) -> None:
++        #: the parent context or `None` if none exists.
++        self.parent = parent
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be positive")
++        self.cleanup_timeout = cleanup_timeout
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..b0da1a8 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,12 +280,16 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        cleanup_timeout: float | None = None,
+     ) -> None:
+-        #: the parent context or `None` if none exists.
+         self.parent = parent
++        if cleanup_timeout is None and parent is not None:
++            cleanup_timeout = parent.cleanup_timeout
++        if cleanup_timeout is not None and cleanup_timeout <= 0:
++            raise ValueError("cleanup_timeout must be positive")
++        self.cleanup_timeout = cleanup_timeout
+         #: the :class:`Command` for this context.
+         self.command = command
+-        #: the descriptive information name
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+@@ -607,10 +611,30 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+-        self._exit_stack.close()
+-        # In case the context is reused, create a new exit stack.
++        if self.cleanup_timeout is None:
++            self._exit_stack.close()
++            self._exit_stack = ExitStack()
++            return
++
++        import threading
++        import warnings
++
++        to_close = self._exit_stack.pop_all()
+         self._exit_stack = ExitStack()
+ 
++        def run_close():
++            try:
++                to_close.close()
++            except Exception as e:
++                warnings.warn(f"Error during cleanup: {e}")
++
++        t = threading.Thread(target=run_close)
++        t.start()
++        t.join(timeout=self.cleanup_timeout)
++
++        if t.is_alive():
++            warnings.warn("Cleanup timed out")
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+diff --git a/tests/test_context_timeout.py b/tests/test_context_timeout.py
+new file mode 100644
+index 0000000..f5cab78
+--- /dev/null
++++ b/tests/test_context_timeout.py
+@@ -0,0 +1,61 @@
++import click
++import time
++import warnings
++import pytest
++
++def test_cleanup_timeout():
++    def slow_cleanup():
++        time.sleep(0.2)
++    
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.1)
++    ctx.call_on_close(slow_cleanup)
++    
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        ctx.close()
++        assert len(w) == 1
++        assert "Cleanup timed out" in str(w[-1].message)
++
++def test_cleanup_no_timeout():
++    def fast_cleanup():
++        pass
++    
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.1)
++    ctx.call_on_close(fast_cleanup)
++    
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        ctx.close()
++        assert len(w) == 0
++
++def test_cleanup_inheritance():
++    ctx_parent = click.Context(click.Command("parent"), cleanup_timeout=0.1)
++    ctx_child = click.Context(click.Command("child"), parent=ctx_parent)
++    assert ctx_child.cleanup_timeout == 0.1
++
++def test_invalid_timeout():
++    with pytest.raises(ValueError, match="cleanup_timeout must be positive"):
++        click.Context(click.Command("test"), cleanup_timeout=-1)
++
++def test_later_registrations():
++    ctx = click.Context(click.Command("test"), cleanup_timeout=0.1)
++    
++    def slow_cleanup():
++        time.sleep(0.2)
++        
++    def register_more():
++        ctx.call_on_close(lambda: None)
++        
++    ctx.call_on_close(slow_cleanup)
++    ctx.call_on_close(register_more)
++    
++    with warnings.catch_warnings(record=True):
++        warnings.simplefilter("ignore")
++        ctx.close()
++    
++    # After timeout, the exit stack should be empty, and a new one should be created.
++    # The `register_more` should have been called, and its registration should be in the new stack.
++    assert len(ctx._exit_stack._exit_callbacks) == 1
++    
++    ctx.close()
++    assert len(ctx._exit_stack._exit_callbacks) == 0

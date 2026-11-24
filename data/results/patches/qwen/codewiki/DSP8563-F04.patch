@@ -1,0 +1,114 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..4a4e35f2 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -3,7 +3,9 @@ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, ConfigDict
++import hashlib
++import json
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -253,12 +255,98 @@ class Tool(Type):
+         arg_desc = f"It takes arguments {self.args}."
+         return f"{self.name}{desc} {arg_desc}"
+ 
++def canonicalize_args(args: Any) -> Any:
++    """Canonicalize args for fingerprinting.
++
++    Recursively sort dictionary keys, treat tuples as lists, and trim whitespace from strings.
++    Preserve numeric/boolean types and list order; do not trim dictionary keys or tool name.
++    """
++    if isinstance(args, dict):
++        return {k: canonicalize_args(v) for k, v in sorted(args.items())}
++    elif isinstance(args, tuple):
++        return [canonicalize_args(item) for item in args]
++    elif isinstance(args, str):
++        return args.strip()
++    else:
++        return args
++
++
++def validate_args(args: Any) -> None:
++    """Validate that args contains only JSON-compatible values.
++
++    Reject nonfinite numbers and non-JSON values with ValueError.
++    """
++    if isinstance(args, dict):
++        for k, v in args.items():
++            if not isinstance(k, str):
++                raise ValueError(f"Dictionary keys must be strings, got {type(k)}")
++            validate_args(v)
++    elif isinstance(args, (tuple, list)):
++        for item in args:
++            validate_args(item)
++    elif isinstance(args, float):
++        if not (args == args and abs(args) != float('inf')):  # Check for NaN and inf
++            raise ValueError("Non-finite numbers are not allowed")
++    elif isinstance(args, bool):
++        pass  # booleans are valid
++    elif isinstance(args, int):
++        pass  # integers are valid
++    elif isinstance(args, str):
++        pass  # strings are valid
++    elif args is None:
++        pass  # null is valid
++    else:
++        raise ValueError(f"Unsupported type: {type(args)}")
++
++
+ 
+ class ToolCalls(Type):
+     class ToolCall(BaseModel):
++        model_config = ConfigDict(frozen=True)
++
+         name: str
+         args: dict[str, Any]
+ 
++        def __init__(self, **data):
++            super().__init__(**data)
++            self._compute_fingerprint_and_id()
++
++        def _compute_fingerprint_and_id(self):
++            """Compute fingerprint and id once at construction."""
++            # Validate args
++            validate_args(self.args)
++
++            # Canonicalize args
++            canonical_args = canonicalize_args(self.args)
++
++            # Create the canonical JSON object
++            obj = {"name": self.name, "args": canonical_args}
++
++            # Serialize with sorted keys and compact separators
++            json_str = json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
++
++            # Compute SHA-256
++            fingerprint = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
++
++            # Store as private attributes
++            object.__setattr__(self, '_fingerprint', fingerprint)
++            object.__setattr__(self, '_id', fingerprint[:8])
++
++        @property
++        def fingerprint(self) -> str:
++            return self._fingerprint
++
++        @property
++        def id(self) -> str:
++            return self._id
++
++        def model_dump(self, *args, **kwargs):
++            # Override to exclude fingerprint and id by default
++            result = super().model_dump(*args, **kwargs)
++            result.pop('_fingerprint', None)
++            result.pop('_id', None)
++            return result
++
+     tool_calls: list[ToolCall]
+ 
+     @classmethod

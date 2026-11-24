@@ -1,0 +1,375 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..832cba2 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -242,6 +242,38 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++def _make_new_dgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str]:
++    @pass_context
++    def dgettext(__context: Context, __domain: str, __string: str, **variables: t.Any) -> str:
++        rv = __context.call(func, __context, __domain, __string)
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++
++    return dgettext
++
++
++def _make_new_dngettext(
++    func: t.Callable[[str, str, str, int], str]
++) -> t.Callable[..., str]:
++    @pass_context
++    def dngettext(
++        __context: Context,
++        __domain: str,
++        __singular: str,
++        __plural: str,
++        __num: int,
++        **variables: t.Any,
++    ) -> str:
++        variables.setdefault("num", __num)
++        rv = __context.call(func, __context, __domain, __singular, __plural, __num)
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++
++    return dngettext
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -319,6 +351,8 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        dgettext: t.Optional[t.Callable[[str, str], str]] = None,
++        dngettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -332,12 +366,19 @@ class InternationalizationExtension(Extension):
+             if npgettext is not None:
+                 npgettext = _make_new_npgettext(npgettext)
+ 
++            if dgettext is not None:
++                dgettext = _make_new_dgettext(dgettext)
++
++            if dngettext is not None:
++                dngettext = _make_new_dngettext(dngettext)
++
+         self.environment.globals.update(
+-            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
++            gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext,
++            dgettext=dgettext, dngettext=dngettext,
+         )
+ 
+-    def _uninstall(self, translations: "_SupportedTranslations") -> None:
+-        for key in ("gettext", "ngettext", "pgettext", "npgettext"):
++    def _uninstall(self, translations: "_SupportedTranslations" = None) -> None:
++        for key in ("gettext", "ngettext", "pgettext", "npgettext", "dgettext", "dngettext"):
+             self.environment.globals.pop(key, None)
+ 
+     def _extract(
+@@ -355,6 +396,7 @@ class InternationalizationExtension(Extension):
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+         num_called_num = False
++        domain: t.Optional[nodes.Const] = None
+ 
+         # find all the variables referenced.  Additionally a variable can be
+         # defined in the body of the trans block too, but this is checked at
+@@ -364,7 +406,12 @@ class InternationalizationExtension(Extension):
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            # Check if we need a comma separator
++            # Don't require comma if next token is 'trimmed' or 'notrimmed'
++            if (variables or domain is not None) and parser.stream.current.value not in (
++                "trimmed",
++                "notrimmed",
++            ):
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -372,6 +419,33 @@ class InternationalizationExtension(Extension):
+                 break
+ 
+             token = parser.stream.expect("name")
++            
++            # Handle domain parameter
++            if token.value == "domain":
++                if domain is not None:
++                    parser.fail(
++                        "translatable domain defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                if parser.stream.current.type != "assign":
++                    parser.fail(
++                        "domain must be a string literal",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                next(parser.stream)
++                domain_value = parser.parse_expression()
++                # Domain must be a string literal
++                if not isinstance(domain_value, nodes.Const):
++                    parser.fail(
++                        "domain must be a string literal",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                domain = domain_value
++                continue
++            
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -459,6 +533,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            domain,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +589,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        domain: t.Optional[nodes.Const] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -528,19 +604,35 @@ class InternationalizationExtension(Extension):
+ 
+         # singular only:
+         if plural_expr is None:
+-            gettext = nodes.Name("gettext", "load")
+-            node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
++            if domain is not None:
++                gettext = nodes.Name("dgettext", "load")
++                node = nodes.Call(
++                    gettext, [domain, nodes.Const(singular)], [], None, None
++                )
++            else:
++                gettext = nodes.Name("gettext", "load")
++                node = nodes.Call(gettext, [nodes.Const(singular)], [], None, None)
+ 
+         # singular and plural
+         else:
+-            ngettext = nodes.Name("ngettext", "load")
+-            node = nodes.Call(
+-                ngettext,
+-                [nodes.Const(singular), nodes.Const(plural), plural_expr],
+-                [],
+-                None,
+-                None,
+-            )
++            if domain is not None:
++                ngettext = nodes.Name("dngettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [domain, nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
++            else:
++                ngettext = nodes.Name("ngettext", "load")
++                node = nodes.Call(
++                    ngettext,
++                    [nodes.Const(singular), nodes.Const(plural), plural_expr],
++                    [],
++                    None,
++                    None,
++                )
+ 
+         # in case newstyle gettext is used, the method is powerful
+         # enough to handle the variable expansion and autoescape
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..11646d8 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -712,3 +712,177 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++# Domain-specific gettext functions for testing
++def dgettext(domain, string):
++    return f"[{domain}] {string}"
++
++
++def dngettext(domain, singular, plural, n):
++    return f"[{domain}] {plural if n != 1 else singular}"
++
++
++class TestDomainInternationalization:
++    """Tests for translation domain support in trans blocks."""
++
++    def test_domain_basic(self):
++        """Test basic domain usage with trans block."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda s: s,
++            ngettext=lambda s, p, n: p if n != 1 else s,
++            dgettext=dgettext,
++            dngettext=dngettext,
++        )
++        
++        # Without domain - uses regular gettext
++        tmpl = env.from_string("{% trans %}Hello{% endtrans %}")
++        assert tmpl.render() == "Hello"
++        
++        # With domain - uses dgettext
++        tmpl = env.from_string('{% trans domain="admin" %}Hello{% endtrans %}')
++        assert tmpl.render() == "[admin] Hello"
++
++    def test_domain_plural(self):
++        """Test domain with pluralization."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda s: s,
++            ngettext=lambda s, p, n: p if n != 1 else s,
++            dgettext=dgettext,
++            dngettext=dngettext,
++        )
++        
++        # Without domain
++        tmpl = env.from_string(
++            "{% trans count=2 %}One item{% pluralize %}{{ count }} items{% endtrans %}"
++        )
++        assert tmpl.render() == "2 items"
++        
++        # With domain
++        tmpl = env.from_string(
++            '{% trans domain="admin", count=2 %}One item{% pluralize %}'
++            '{{ count }} items{% endtrans %}'
++        )
++        assert tmpl.render() == "[admin] 2 items"
++
++    def test_domain_with_variables(self):
++        """Test domain with variables in trans block."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda s: s,
++            ngettext=lambda s, p, n: p if n != 1 else s,
++            dgettext=dgettext,
++            dngettext=dngettext,
++        )
++        
++        tmpl = env.from_string(
++            '{% trans domain="admin", name="World" %}Hello {{ name }}{% endtrans %}'
++        )
++        assert tmpl.render() == "[admin] Hello World"
++
++    def test_domain_parameter_order(self):
++        """Test that domain can be specified in any position."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda s: s,
++            ngettext=lambda s, p, n: p if n != 1 else s,
++            dgettext=dgettext,
++            dngettext=dngettext,
++        )
++        
++        # Domain first
++        tmpl = env.from_string(
++            '{% trans domain="admin", count=2 %}One{% pluralize %}{{ count }}{% endtrans %}'
++        )
++        assert tmpl.render() == "[admin] 2"
++        
++        # Domain last
++        tmpl = env.from_string(
++            '{% trans count=2, domain="admin" %}One{% pluralize %}{{ count }}{% endtrans %}'
++        )
++        assert tmpl.render() == "[admin] 2"
++
++    def test_domain_whitespace_modifier(self):
++        """Test whitespace modifiers work with domain."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda s: s,
++            ngettext=lambda s, p, n: p if n != 1 else s,
++            dgettext=lambda d, s: f"[{d}] {s.strip()}",
++            dngettext=lambda d, s, p, n: f"[{d}] {p if n != 1 else s}",
++        )
++        
++        tmpl = env.from_string(
++            '{% trans domain="admin" trimmed %}  Hello  {% endtrans %}'
++        )
++        assert tmpl.render() == "[admin] Hello"
++
++    def test_duplicate_domain_error(self):
++        """Test that duplicate domain raises TemplateAssertionError."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            env.from_string('{% trans domain="admin", domain="other" %}Hello{% endtrans %}')
++        assert "defined twice" in str(excinfo.value).lower()
++
++    def test_non_literal_domain_error(self):
++        """Test that non-literal domain raises TemplateAssertionError."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        
++        with pytest.raises(TemplateAssertionError) as excinfo:
++            env.from_string('{% trans domain=some_var %}Hello{% endtrans %}')
++        error_msg = str(excinfo.value).lower()
++        assert "domain" in error_msg
++        assert "literal" in error_msg
++
++    def test_newstyle_domain(self):
++        """Test newstyle gettext with domain."""
++        from markupsafe import Markup
++        
++        def newstyle_dgettext(ctx, domain, string, **variables):
++            result = f"[{domain}] {string}"
++            if ctx.eval_ctx.autoescape:
++                result = Markup(result)
++            return result % variables
++        
++        def newstyle_dngettext(ctx, domain, singular, plural, num, **variables):
++            variables.setdefault("num", num)
++            result = f"[{domain}] {plural if num != 1 else singular}"
++            if ctx.eval_ctx.autoescape:
++                result = Markup(result)
++            return result % variables
++        
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda ctx, s: s,
++            ngettext=lambda ctx, s, p, n: p if n != 1 else s,
++            dgettext=newstyle_dgettext,
++            dngettext=newstyle_dngettext,
++            newstyle=True,
++        )
++        
++        tmpl = env.from_string('{% trans domain="admin" %}Hello{% endtrans %}')
++        assert tmpl.render() == "[admin] Hello"
++
++    def test_uninstall_removes_domain_globals(self):
++        """Test that uninstall_gettext_translations removes domain globals."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            gettext=lambda s: s,
++            ngettext=lambda s, p, n: p if n != 1 else s,
++            dgettext=dgettext,
++            dngettext=dngettext,
++        )
++        
++        # Check domain globals exist
++        assert "dgettext" in env.globals
++        assert "dngettext" in env.globals
++        
++        # Uninstall
++        env.uninstall_gettext_translations()
++        
++        # Check domain globals removed
++        assert "dgettext" not in env.globals
++        assert "dngettext" not in env.globals

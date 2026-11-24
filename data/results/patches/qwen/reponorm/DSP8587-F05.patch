@@ -1,0 +1,112 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..88c9eb4e 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,3 +1,4 @@
++import logging
+ import re
+ from collections import defaultdict
+ from queue import Queue
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        debug: bool = False,
++        debug_logger: logging.Logger | None = None,
+     ):
+         """
+         Args:
+@@ -36,6 +39,9 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            debug: If True, enable debug logging for trace events.
++            debug_logger: Optional custom logger for debug events. If None, uses the default logger
++                "dspy.streaming.listener".
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+@@ -47,6 +53,8 @@ class StreamListener:
+         self.stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
++        self.debug = debug
++        self.debug_logger = debug_logger or logging.getLogger("dspy.streaming.listener")
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -72,6 +80,19 @@ class StreamListener:
+                 return True
+         return False
+ 
++    def _get_preview(self, content: str) -> str:
++        """Get a preview of content with max 80 characters.
++        
++        Content of length 80 or less is unchanged; longer content uses first 77 chars + "...".
++        """
++        if len(content) <= 80:
++            return content
++        return content[:77] + "..."
++
++    def _is_debug_enabled(self) -> bool:
++        """Check if debug logging is enabled and logger accepts DEBUG level."""
++        return self.debug and self.debug_logger.isEnabledFor(logging.DEBUG)
++
+     def receive(self, chunk: ModelResponseStream):
+         adapter_name = settings.adapter.__class__.__name__ if settings.adapter else "ChatAdapter"
+         if adapter_name not in self.adapter_identifiers:
+@@ -91,6 +112,10 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                
++                if self._is_debug_enabled():
++                    msg = f"State reset for field '{self.signature_field_name}' (allow_reuse={self.allow_reuse})"
++                    self.debug_logger.debug(msg)
+             else:
+                 return
+ 
+@@ -131,6 +156,12 @@ class StreamListener:
+                 # We have a full identifier, we can start the stream.
+                 self.stream_start = True
+                 self.field_start_queue = []
++                
++                if self._is_debug_enabled():
++                    buffer_preview = self._get_preview(concat_message.strip())
++                    msg = f"Start detection: adapter={adapter_name}, field='{self.signature_field_name}', stream_start=True, buffer_preview='{buffer_preview}'"
++                    self.debug_logger.debug(msg)
++                
+                 # Keep the part after the start_identifier from the concat_message, we need to write it to the buffer.
+                 value_start_index = concat_message.find(start_identifier) + len(start_identifier)
+                 chunk_message = concat_message[value_start_index:].lstrip()
+@@ -161,11 +192,18 @@ class StreamListener:
+             if re.search(end_identifier, concat_message):
+                 # The next field is identified, we can end the stream and flush out all tokens in the buffer.
+                 self.stream_end = True
++                if self._is_debug_enabled():
++                    msg = f"Rolling end check: adapter={adapter_name}, field='{self.signature_field_name}', reason='regex_match', buffered_size={len(concat_message)}"
++                    self.debug_logger.debug(msg)
+                 last_token = self.flush()
+                 token = token + last_token if token else last_token
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                if self._is_debug_enabled():
++                    is_last_chunk = self.stream_end
++                    msg = f"Emit chunk: len(token)={len(token)}, queue_size={self.field_end_queue.qsize()}, is_last_chunk={is_last_chunk}"
++                    self.debug_logger.debug(msg)
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+@@ -177,6 +215,11 @@ class StreamListener:
+         """
+         last_tokens = "".join(self.field_end_queue.queue)
+         self.field_end_queue = Queue()
++        
++        if self._is_debug_enabled():
++            msg = f"Flush: adapter={settings.adapter.__class__.__name__ if settings.adapter else 'ChatAdapter'}, field='{self.signature_field_name}', truncated_buffer_length={len(last_tokens)}"
++            self.debug_logger.debug(msg)
++        
+         if isinstance(settings.adapter, JSONAdapter):
+             match = re.search(r'",|"\s*}', last_tokens)
+             if match:

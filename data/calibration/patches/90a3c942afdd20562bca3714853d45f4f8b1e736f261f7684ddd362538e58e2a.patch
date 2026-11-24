@@ -1,0 +1,200 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..3047891 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,13 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add conditional requirements based on mappings or predicates to
++    ``Option``.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/docs/options.md b/docs/options.md
+index c2dd2b6..85a1fc1 100644
+--- a/docs/options.md
++++ b/docs/options.md
+@@ -17,6 +17,12 @@ Useful and often used kwargs are:
+ - `required`: Makes option required.
+ - `type`: Sets {ref}`parameter type <parameter-types>`
+ 
++An option may use `required_if` with normalized parameter names and
++expected final values, or a predicate receiving the context and target
++option. The condition is evaluated after parameter processing; a true
++condition requires the target unless it already has a value from any
++supported source.
++
+ ```{contents}
+ :depth: 2
+ :local: true
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..577c8cc 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1196,6 +1196,9 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        # Validate conditional requirements after parameter processing.
++        self._validate_required_if(ctx)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -1209,6 +1212,33 @@ class Command:
+         ctx._opt_prefixes.update(parser._opt_prefixes)
+         return args
+ 
++    def _validate_required_if(self, ctx: Context) -> None:
++        """Validate requirements after parameter processing."""
++        params = self.get_params(ctx)
++        known_names = set(param.name for param in params if param.name is not None)
++        for param in params:
++            if not isinstance(param, Option) or not param.name:
++                continue
++            condition = param.required_if
++            if callable(condition):
++                required = condition(ctx, param)
++            else:
++                if not condition:
++                    continue
++                unknown = set(condition).difference(known_names)
++                if unknown:
++                    names = ", ".join(sorted(unknown))
++                    raise UsageError(
++                        f"Unknown parameter in required_if: {names}", ctx=ctx
++                    )
++                required = all(
++                    ctx.params.get(name) == expected
++                    for name, expected in condition.items()
++                )
++            if required:
++                if param.value_is_missing(ctx.params.get(param.name)):
++                    raise MissingParameter(ctx=ctx, param=param)
++
+     def invoke(self, ctx: Context) -> t.Any:
+         """Given a context, this invokes the attached callback (if it exists)
+         in the right way.
+@@ -2506,8 +2536,17 @@ class Option(Parameter):
+                                context.
+     :param help: the help string.
+     :param hidden: hide this option from help outputs.
++    :param required_if: A mapping of parameter names to expected values,
++                       or a predicate receiving ``(ctx, param)`` after
++                       parameter processing. A true predicate result or
++                       matching all entries requires this option.
++                       For example, ``{'auth_mode': 'basic'}`` requires
++                       this option when ``auth_mode`` is ``'basic'``.
+     :param attrs: Other command arguments described in :class:`Parameter`.
+ 
++    .. versionchanged:: 8.3.0
++        Added the ``required_if`` parameter.
++
+     .. versionchanged:: 8.2
+         ``envvar`` used with ``flag_value`` will always use the ``flag_value``,
+         previously it would use the value of the environment variable.
+@@ -2549,6 +2588,9 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        required_if: cabc.Mapping[str, t.Any]
++        | t.Callable[[Context, Option], bool]
++        | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2636,6 +2678,20 @@ class Option(Parameter):
+         self.show_default = show_default
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
++        if (
++            required_if is not None
++            and not isinstance(required_if, cabc.Mapping)
++            and not callable(required_if)
++        ):
++            raise TypeError("required_if must be a mapping or predicate")
++        self.required_if = (
++            required_if if callable(required_if) else dict(required_if or {})
++        )
++        if not callable(self.required_if) and any(
++            not isinstance(name, str) or name.startswith("-")
++            for name in self.required_if
++        ):
++            raise TypeError("required_if keys must be normalized parameter names")
+ 
+         if __debug__:
+             if deprecated and prompt:
+diff --git a/tests/test_n4c_author_required_if.py b/tests/test_n4c_author_required_if.py
+new file mode 100644
+index 0000000..aecd252
+--- /dev/null
++++ b/tests/test_n4c_author_required_if.py
+@@ -0,0 +1,62 @@
++import pytest
++
++import click
++
++
++def test_mapping_uses_final_converted_values_independent_of_order(runner):
++    @click.command()
++    @click.option("--token", required_if={"amount": 2})
++    @click.option("--amount", type=int)
++    def cli(token, amount):
++        click.echo(token or "none")
++
++    assert runner.invoke(cli, ["--amount", "2"]).exit_code == 2
++    assert runner.invoke(cli, ["--amount", "2", "--token", "ok"]).output == "ok\n"
++    assert runner.invoke(cli, ["--amount", "1"]).output == "none\n"
++
++
++def test_predicate_sees_processed_value(runner):
++    seen = []
++
++    def condition(ctx, param):
++        seen.append((param.name, ctx.params["amount"]))
++        return ctx.params["amount"] > 10
++
++    @click.command()
++    @click.option("--token", required_if=condition)
++    @click.option("--amount", type=int, callback=lambda c, p, value: value * 2)
++    def cli(token, amount):
++        pass
++
++    result = runner.invoke(cli, ["--amount", "6"], standalone_mode=False)
++    assert isinstance(result.exception, click.MissingParameter)
++    assert seen == [("token", 12)]
++
++
++def test_configuration_validation_and_unknown_name(runner):
++    for value in ("mode", [("mode", "x")]):
++        with pytest.raises(TypeError):
++            click.Option(["--target"], required_if=value)
++    for value in ({"--mode": "x"}, {1: "x"}):
++        with pytest.raises(TypeError):
++            click.Option(["--target"], required_if=value)
++
++    @click.command()
++    @click.option("--target", required_if={"missing": True})
++    def cli(target):
++        pass
++
++    result = runner.invoke(cli, standalone_mode=False)
++    assert isinstance(result.exception, click.UsageError)
++
++
++def test_none_empty_and_existing_required_behavior(runner):
++    @click.command()
++    @click.option("--optional", required_if=None)
++    @click.option("--empty", required_if={})
++    @click.option("--always", required=True)
++    def cli(optional, empty, always):
++        click.echo(always)
++
++    assert runner.invoke(cli).exit_code == 2
++    assert runner.invoke(cli, ["--always", "yes"]).output == "yes\n"

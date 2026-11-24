@@ -1,0 +1,112 @@
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..fd78edb 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -254,3 +254,47 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++
++
++def test_repeated_patterns_overlapping_from_helper():
++    """Overlapping counting: three copies of token A contribute two (A,A) occurrences."""
++    from tiktoken.core import _compute_repeated_patterns
++
++    assert _compute_repeated_patterns([1, 1, 1]) == {(1, 1): 2}
++    assert _compute_repeated_patterns([1, 1, 1, 1]) == {(1, 1): 3}
++    assert _compute_repeated_patterns([1, 2, 1, 2]) == {(1, 2): 2, (2, 1): 1}
++
++
++def test_repeated_patterns_fewer_than_three_helper():
++    """If fewer than three distinct pairs exist, all are returned."""
++    from tiktoken.core import _compute_repeated_patterns
++
++    assert len(_compute_repeated_patterns([1, 2])) == 1
++    assert len(_compute_repeated_patterns([1, 2, 3, 4])) == 3  # exactly 3
++    assert len(_compute_repeated_patterns([1, 2, 3])) == 2  # only 2 distinct
++
++
++def test_repeated_patterns_top_three_helper():
++    """At most three most frequent pairs are returned."""
++    from tiktoken.core import _compute_repeated_patterns
++
++    result = _compute_repeated_patterns([5, 5, 5, 5, 6, 7, 6, 7])
++    # pairs: (5,5):3, (5,6):1, (6,7):2, (7,6):1
++    # sorted: (5,5):3, (6,7):2, (5,6):1 (or (7,6):1)
++    assert len(result) <= 3
++    assert result[(5, 5)] == 3
++    assert result[(6, 7)] == 2
++
++
++def test_repeated_patterns_integration():
++    """Integration test using a real encoding produces correct types."""
++    enc = tiktoken.get_encoding("gpt2")
++
++    tokens, patterns = enc.encode("hello world", return_repeated_pattern=True)
++    assert isinstance(tokens, list)
++    assert isinstance(patterns, dict)
++    # The single pair should be present
++    assert len(patterns) <= 3
++    assert all(isinstance(k, tuple) and len(k) == 2 for k in patterns)
++    assert all(isinstance(v, int) for v in patterns.values())
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..1487470 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,8 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        return_repeated_pattern: bool = False,
++    ) -> list[int] | tuple[list[int], dict[tuple[int, int], int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -121,7 +122,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +131,11 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if return_repeated_pattern:
++            return tokens, _compute_repeated_patterns(tokens)
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -437,3 +442,23 @@ def raise_disallowed_special_token(token: str) -> NoReturn:
+         f"by passing `disallowed_special=(enc.special_tokens_set - {{{token!r}}})`.\n"
+         "To disable this check for all special tokens, pass `disallowed_special=()`.\n"
+     )
++
++
++def _compute_repeated_patterns(
++    tokens: list[int],
++) -> dict[tuple[int, int], int]:
++    """Compute up to three most frequent adjacent token-ID pairs with occurrence counts.
++
++    Overlapping pairs are counted. For example, three consecutive copies of token A
++    contribute two occurrences of (A, A). Empty or single-token sequences return an
++    empty dict. If fewer than three distinct pairs exist, all are returned.
++    """
++    if len(tokens) < 2:
++        return {}
++    counts: dict[tuple[int, int], int] = {}
++    for i in range(len(tokens) - 1):
++        pair = (tokens[i], tokens[i + 1])
++        counts[pair] = counts.get(pair, 0) + 1
++    # Sort by frequency descending, then by pair for determinism
++    sorted_pairs = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
++    return dict(sorted_pairs[:3])

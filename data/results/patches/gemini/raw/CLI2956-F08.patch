@@ -1,0 +1,1090 @@
+diff --git a/add_get_option_history.py b/add_get_option_history.py
+new file mode 100644
+index 0000000..139b801
+--- /dev/null
++++ b/add_get_option_history.py
+@@ -0,0 +1,41 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the end of __init__ method of Context
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def __init__(' in line and 'class Context:' in lines[i-10:i]:
++        start_line = i
++        break
++
++# Find the end of __init__
++end_line = 0
++for i in range(start_line, start_line + 100):
++    if '    ) -> None:' in lines[i]:
++        end_line = i + 1
++        break
++
++# Insert get_option_history method
++method = """
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        # Resolve the option name to the parameter name
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        return self._option_history.get(param.name, [])
++"""
++lines.insert(end_line, method)
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/apply_changes.py b/apply_changes.py
+new file mode 100644
+index 0000000..8526a64
+--- /dev/null
++++ b/apply_changes.py
+@@ -0,0 +1,86 @@
++import re
++
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# 1. Add `import time`
++content = content.replace('from __future__ import annotations', 'from __future__ import annotations\nimport time\nimport copy')
++
++# 2. Add `ParamsDict` before `Context` class
++params_dict = """
++class ParamsDict(dict):
++    def __init__(self, ctx, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.ctx = ctx
++
++    def __setitem__(self, key, value):
++        if self.ctx.command.track_changes and not getattr(self.ctx, "_is_parsing", False):
++            if key not in self.ctx._option_history:
++                self.ctx._option_history[key] = []
++            self.ctx._option_history[key].append({
++                "value": value,
++                "source": None,
++                "timestamp": time.time(),
++            })
++        super().__setitem__(key, value)
++"""
++content = re.sub(r'(class Context:)', params_dict + r'\n\1', content)
++
++# 3. Update `Context.__init__`
++content = content.replace(
++    'self.params: dict[str, t.Any] = {}',
++    'self.params: dict[str, t.Any] = ParamsDict(self)\n        self._option_history: dict[str, list[dict[str, t.Any]]] = {}\n        self._is_parsing: bool = False'
++)
++
++# 4. Add `get_option_history` to `Context`
++get_option_history = """
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        history = self._option_history.get(param.name, [])
++        return copy.deepcopy(history)
++"""
++content = re.sub(r'(    def make_formatter)', get_option_history + r'\n\1', content)
++
++# 5. Add `track_changes` to `Command.__init__`
++content = content.replace(
++    'no_args_is_help: bool = False,',
++    'no_args_is_help: bool = False,\n        track_changes: bool = False,'
++)
++content = re.sub(r'(self.deprecated = deprecated)', r'\1\n        self.track_changes = track_changes', content, count=1)
++
++# 6. Add recording logic to `Parameter.handle_parse_result`
++recording_logic = """
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
++"""
++content = content.replace('return value, args', recording_logic + '\n        return value, args')
++
++# 7. Set `ctx._is_parsing = True` in `Command.parse_args`
++content = content.replace(
++    'parser = self.make_parser(ctx)',
++    'ctx._is_parsing = True\n        parser = self.make_parser(ctx)'
++)
++content = content.replace(
++    'ctx._opt_prefixes.update(parser._opt_prefixes)\n        return args',
++    'ctx._opt_prefixes.update(parser._opt_prefixes)\n        ctx._is_parsing = False\n        return args'
++)
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/edit_context_init.py b/edit_context_init.py
+new file mode 100644
+index 0000000..26fb3e7
+--- /dev/null
++++ b/edit_context_init.py
+@@ -0,0 +1,24 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the __init__ method of Context
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def __init__(' in line and 'class Context:' in lines[i-10:i]:
++        start_line = i
++        break
++
++# Find where to insert self._option_history = {}
++# It should be after self.params = {}
++insert_pos = 0
++for i in range(start_line, start_line + 50):
++    if 'self.params: dict[str, t.Any] = {}' in lines[i]:
++        insert_pos = i + 1
++        break
++
++lines.insert(insert_pos, '        self._option_history: dict[str, list[dict[str, t.Any]]] = {}\n')
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_context_params.py b/edit_context_params.py
+new file mode 100644
+index 0000000..880cd53
+--- /dev/null
++++ b/edit_context_params.py
+@@ -0,0 +1,44 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the definition of Context
++# I need to add a custom dictionary class for params.
++# Let's add it before Context class.
++
++# Find where Context class starts
++start_line = 0
++for i, line in enumerate(lines):
++    if 'class Context:' in line:
++        start_line = i
++        break
++
++# Add ParamsDict class
++params_dict_class = """
++class ParamsDict(dict):
++    def __init__(self, ctx, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.ctx = ctx
++
++    def __setitem__(self, key, value):
++        if self.ctx.command.track_changes:
++            if key not in self.ctx._option_history:
++                self.ctx._option_history[key] = []
++            self.ctx._option_history[key].append({
++                "value": value,
++                "source": None,
++                "timestamp": time.time(),
++            })
++        super().__setitem__(key, value)
++"""
++lines.insert(start_line, params_dict_class)
++
++# Now update Context.__init__ to use ParamsDict
++for i in range(start_line, start_line + 100):
++    if 'self.params: dict[str, t.Any] = {}' in lines[i]:
++        lines[i] = '        self.params: dict[str, t.Any] = ParamsDict(self)\n'
++        break
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_core.py b/edit_core.py
+new file mode 100644
+index 0000000..692b44d
+--- /dev/null
++++ b/edit_core.py
+@@ -0,0 +1,100 @@
++import re
++
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# 1. Add `import time`
++content = content.replace('from __future__ import annotations', 'from __future__ import annotations\nimport time')
++
++# 2. Add `ParamsDict`
++params_dict = """
++class ParamsDict(dict):
++    def __init__(self, ctx, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.ctx = ctx
++
++    def __setitem__(self, key, value):
++        if self.ctx.command.track_changes and not getattr(self.ctx, "_is_parsing", False):
++            if key not in self.ctx._option_history:
++                self.ctx._option_history[key] = []
++            self.ctx._option_history[key].append({
++                "value": value,
++                "source": None,
++                "timestamp": time.time(),
++            })
++        super().__setitem__(key, value)
++"""
++# Insert before `class Context`
++content = re.sub(r'(class Context:)', params_dict + r'\n\1', content)
++
++# 3. Update `Context.__init__`
++content = content.replace(
++    'self.params: dict[str, t.Any] = {}',
++    'self.params: dict[str, t.Any] = ParamsDict(self)\n        self._option_history: dict[str, list[dict[str, t.Any]]] = {}\n        self._is_parsing: bool = False'
++)
++
++# 4. Add `get_option_history` to `Context`
++get_option_history = """
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        return self._option_history.get(param.name, [])
++"""
++# Insert before the end of `Context` class (find the next class definition)
++content = re.sub(r'(class Command:)', get_option_history + r'\n\1', content)
++
++# 5. Add `track_changes` to `Command.__init__`
++content = content.replace(
++    'def __init__(self, name: str | None,',
++    'def __init__(self, name: str | None, track_changes: bool = False,'
++)
++content = content.replace(
++    'self.name = name',
++    'self.name = name\n        self.track_changes = track_changes'
++)
++
++# 6. Add recording logic to `handle_parse_result`
++recording_logic = """
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
++"""
++# Find `handle_parse_result` and insert at the end of the method
++# It's a bit tricky to find the end of the method.
++# Let's look for `return value` in `handle_parse_result`
++content = content.replace(
++    'return value',
++    recording_logic + '\n        return value'
++)
++
++# 7. Set `_is_parsing` in `Command.parse_args`
++# Find `def parse_args(self, ctx: Context, args: list[str]) -> list[str]:`
++# and insert `ctx._is_parsing = True` at the beginning and `ctx._is_parsing = False` at the end.
++# This is tricky because there are multiple `parse_args` methods.
++# Let's use a more specific regex.
++def add_parsing_flags(match):
++    return match.group(0) + '\n        ctx._is_parsing = True\n        try:\n            ' + match.group(1) + '\n        finally:\n            ctx._is_parsing = False'
++
++# This is too complex for a simple regex. Let's just do it manually for `Command.parse_args`.
++# Actually, `Command.parse_args` is the one we want.
++# Let's just find the `parse_args` in `Command` class.
++# It's around line 1220.
++# Let's just use `sed` to insert the lines, but be very careful.
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/edit_handle_parse_result.py b/edit_handle_parse_result.py
+new file mode 100644
+index 0000000..a150565
+--- /dev/null
++++ b/edit_handle_parse_result.py
+@@ -0,0 +1,35 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find handle_parse_result
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def handle_parse_result(' in line:
++        start_line = i
++        break
++
++# Find where to insert the recording logic
++# It should be after `value = self.process_value(ctx, value)`
++insert_pos = 0
++for i in range(start_line, start_line + 50):
++    if 'value = self.process_value(ctx, value)' in lines[i]:
++        insert_pos = i + 1
++        break
++
++# Insert the recording logic
++recording_logic = """
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
++"""
++lines.insert(insert_pos, recording_logic)
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/fix_command_init.py b/fix_command_init.py
+new file mode 100644
+index 0000000..6966367
+--- /dev/null
++++ b/fix_command_init.py
+@@ -0,0 +1,24 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the __init__ method of Command
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def __init__(' in line and 'class Command' in lines[i-10:i]:
++        start_line = i
++        break
++
++# Find the end of the arguments list
++end_line = 0
++for i in range(start_line, start_line + 20):
++    if '    ) -> None:' in lines[i]:
++        end_line = i
++        break
++
++# Insert track_changes: bool = False
++lines.insert(end_line, '        track_changes: bool = False,\n')
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/fix_file.py b/fix_file.py
+new file mode 100644
+index 0000000..5a018ec
+--- /dev/null
++++ b/fix_file.py
+@@ -0,0 +1,40 @@
++import re
++
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# Remove the misplaced lines
++content = re.sub(r'    def get_option_history\(self, name: str\) -> list\[dict\[str, t\.Any\]\] \| None:.*?return self\._option_history\.get\(param\.name, \[\]\)', '', content, flags=re.DOTALL)
++content = re.sub(r'        self\._option_history: dict\[str, list\[dict\[str, t\.Any\]\]\] = \{\}', '', content)
++content = re.sub(r'        track_changes: bool = False,', '', content)
++
++# Ensure imports are at the top
++imports = "import time\nfrom __future__ import annotations\n"
++content = re.sub(r'from __future__ import annotations\nimport time\n', '', content)
++content = imports + content
++
++# Find the Context class and insert get_option_history
++context_class_match = re.search(r'class Context:', content)
++if context_class_match:
++    insert_pos = content.find('    #: The formatter class to create with :meth:`make_formatter`.', context_class_match.end())
++    method = """
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        # Resolve the option name to the parameter name
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        return self._option_history.get(param.name, [])
++"""
++    content = content[:insert_pos] + method + content[insert_pos:]
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_handle_parse_result.py b/fix_handle_parse_result.py
+new file mode 100644
+index 0000000..738bc83
+--- /dev/null
++++ b/fix_handle_parse_result.py
+@@ -0,0 +1,56 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find handle_parse_result
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def handle_parse_result(' in line:
++        start_line = i
++        break
++
++# Find the try block
++for i in range(start_line, start_line + 100):
++    if '            try:' in lines[i]:
++        # Find the end of the try block
++        # It should be after `value = self.process_value(ctx, value)`
++        # And before the `if ctx.command.track_changes:` block
++        # Wait, I need to close the try block before the `if` block.
++        # Let me see the lines again.
++        pass
++
++# Let's just rewrite the `handle_parse_result` method.
++# Actually, I can just fix the `try` block.
++# The `try` block should be:
++#             try:
++#                 value = self.process_value(ctx, value)
++#             except Exception:
++#                 if not ctx.resilient_parsing:
++#                     raise
++#
++#                 value = None
++#
++#             if ctx.command.track_changes:
++#                 ...
++
++# Let me find the `except Exception:` block.
++for i in range(start_line, start_line + 100):
++    if '            except Exception:' in lines[i]:
++        # The `if ctx.command.track_changes:` block is currently inside the `try` block?
++        # No, it's after `value = self.process_value(ctx, value)`.
++        # Let me check the lines again.
++        pass
++
++# Let's just use a python script to fix the structure.
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# Fix the try block
++content = content.replace(
++    '            try:\n                value = self.process_value(ctx, value)\n\n            if ctx.command.track_changes:',
++    '            try:\n                value = self.process_value(ctx, value)\n            except Exception:\n                if not ctx.resilient_parsing:\n                    raise\n\n                value = None\n\n            if ctx.command.track_changes:'
++)
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_handle_parse_result_2.py b/fix_handle_parse_result_2.py
+new file mode 100644
+index 0000000..3150356
+--- /dev/null
++++ b/fix_handle_parse_result_2.py
+@@ -0,0 +1,12 @@
++import re
++
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# Remove the extra except block
++content = re.sub(r'            if ctx\.command\.track_changes:.*?            except Exception:.*?value = None', 
++                 r'            if ctx.command.track_changes:\n                if self.name not in ctx._option_history:\n                    ctx._option_history[self.name] = []\n                ctx._option_history[self.name].append({\n                    "value": value,\n                    "source": source,\n                    "timestamp": time.time(),\n                })', 
++                 content, flags=re.DOTALL)
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_handle_parse_result_3.py b/fix_handle_parse_result_3.py
+new file mode 100644
+index 0000000..0dbc9fb
+--- /dev/null
++++ b/fix_handle_parse_result_3.py
+@@ -0,0 +1,53 @@
++import re
++
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# Move the if block after the except block
++# The current structure is:
++# try:
++#     value = self.process_value(ctx, value)
++#     if ctx.command.track_changes:
++#         ...
++# except Exception:
++#     ...
++
++# I want:
++# try:
++#     value = self.process_value(ctx, value)
++# except Exception:
++#     ...
++# if ctx.command.track_changes:
++#     ...
++
++# Let's use regex to fix it.
++pattern = r'(            try:\n                value = self\.process_value\(ctx, value\)\n\n            if ctx\.command\.track_changes:.*?                \}\n            \)\n\n            except Exception:)'
++# This is too complex. Let's just do it manually with string replacement.
++# I will first remove the if block from where it is.
++# And then add it after the except block.
++
++# Actually, I can just use a simpler regex.
++content = re.sub(r'            if ctx\.command\.track_changes:.*?                \}\n            \)\n', '', content, flags=re.DOTALL)
++
++# Now add it after the except block.
++# Find the end of the except block.
++# The except block ends with `value = None`.
++# Let's find the end of the except block.
++# It's `value = None`.
++# Let's insert the if block after `value = None`.
++
++recording_logic = """
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
++"""
++content = re.sub(r'                value = None', 
++                 r'                value = None\n' + recording_logic, content)
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_imports.py b/fix_imports.py
+new file mode 100644
+index 0000000..0627e71
+--- /dev/null
++++ b/fix_imports.py
+@@ -0,0 +1,35 @@
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Remove all imports
++new_lines = []
++for line in lines:
++    if not line.startswith('import ') and not line.startswith('from '):
++        new_lines.append(line)
++
++# Add imports at the top
++imports = [
++    'from __future__ import annotations\n',
++    'import time\n',
++    'import collections.abc as cabc\n',
++    'import enum\n',
++    'import errno\n',
++    'import inspect\n',
++    'import os\n',
++    'import sys\n',
++    'import typing as t\n',
++    'from collections import abc\n',
++    'from collections import Counter\n',
++    'from contextlib import AbstractContextManager\n',
++    'from contextlib import contextmanager\n',
++    'from contextlib import ExitStack\n',
++    'from functools import update_wrapper\n',
++    'from gettext import gettext as _\n',
++    'from gettext import ngettext\n',
++    'from itertools import repeat\n',
++    'from types import TracebackType\n',
++]
++new_lines = imports + new_lines
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/fix_imports_final.py b/fix_imports_final.py
+new file mode 100644
+index 0000000..0627e71
+--- /dev/null
++++ b/fix_imports_final.py
+@@ -0,0 +1,35 @@
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Remove all imports
++new_lines = []
++for line in lines:
++    if not line.startswith('import ') and not line.startswith('from '):
++        new_lines.append(line)
++
++# Add imports at the top
++imports = [
++    'from __future__ import annotations\n',
++    'import time\n',
++    'import collections.abc as cabc\n',
++    'import enum\n',
++    'import errno\n',
++    'import inspect\n',
++    'import os\n',
++    'import sys\n',
++    'import typing as t\n',
++    'from collections import abc\n',
++    'from collections import Counter\n',
++    'from contextlib import AbstractContextManager\n',
++    'from contextlib import contextmanager\n',
++    'from contextlib import ExitStack\n',
++    'from functools import update_wrapper\n',
++    'from gettext import gettext as _\n',
++    'from gettext import ngettext\n',
++    'from itertools import repeat\n',
++    'from types import TracebackType\n',
++]
++new_lines = imports + new_lines
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/fix_indentation.py b/fix_indentation.py
+new file mode 100644
+index 0000000..7dfe9ec
+--- /dev/null
++++ b/fix_indentation.py
+@@ -0,0 +1,28 @@
++import sys
++
++with open("src/click/core.py", "r") as f:
++    lines = f.readlines()
++
++new_lines = []
++in_try = False
++for line in lines:
++    if "ctx._is_parsing = True" in line:
++        new_lines.append(line)
++        new_lines.append("        try:\n")
++        in_try = True
++        continue
++    if "finally:" in line:
++        new_lines.append("        finally:\n")
++        new_lines.append("            ctx._is_parsing = False\n")
++        in_try = False
++        continue
++    if in_try:
++        if line.strip() and not line.startswith("            "):
++            new_lines.append("            " + line)
++        else:
++            new_lines.append(line)
++    else:
++        new_lines.append(line)
++
++with open("src/click/core.py", "w") as f:
++    f.writelines(new_lines)
+diff --git a/get_option_history.py b/get_option_history.py
+new file mode 100644
+index 0000000..7d76d55
+--- /dev/null
++++ b/get_option_history.py
+@@ -0,0 +1,16 @@
++
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        # Resolve the option name to the parameter name
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        return self._option_history.get(param.name, [])
+diff --git a/get_option_history_method.py b/get_option_history_method.py
+new file mode 100644
+index 0000000..7d76d55
+--- /dev/null
++++ b/get_option_history_method.py
+@@ -0,0 +1,16 @@
++
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        # Resolve the option name to the parameter name
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        return self._option_history.get(param.name, [])
+diff --git a/modify_parse_args.py b/modify_parse_args.py
+new file mode 100644
+index 0000000..6a12f37
+--- /dev/null
++++ b/modify_parse_args.py
+@@ -0,0 +1,25 @@
++with open("src/click/core.py", "r") as f:
++    lines = f.readlines()
++
++new_lines = []
++in_parse_args = False
++for line in lines:
++    if "def parse_args(self, ctx: Context, args: list[str]) -> list[str]:" in line:
++        new_lines.append(line)
++        new_lines.append("        ctx._is_parsing = True\n")
++        new_lines.append("        try:\n")
++        in_parse_args = True
++        continue
++    if in_parse_args and "return ctx" in line:
++        new_lines.append("        finally:\n")
++        new_lines.append("            ctx._is_parsing = False\n")
++        new_lines.append(line)
++        in_parse_args = False
++        continue
++    if in_parse_args:
++        new_lines.append("    " + line)
++    else:
++        new_lines.append(line)
++
++with open("src/click/core.py", "w") as f:
++    f.writelines(new_lines)
+diff --git a/params_dict.py b/params_dict.py
+new file mode 100644
+index 0000000..c3e299d
+--- /dev/null
++++ b/params_dict.py
+@@ -0,0 +1,15 @@
++class ParamsDict(dict):
++    def __init__(self, ctx, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.ctx = ctx
++
++    def __setitem__(self, key, value):
++        if self.ctx.command.track_changes and not getattr(self.ctx, "_is_parsing", False):
++            if key not in self.ctx._option_history:
++                self.ctx._option_history[key] = []
++            self.ctx._option_history[key].append({
++                "value": value,
++                "source": None,
++                "timestamp": time.time(),
++            })
++        super().__setitem__(key, value)
+diff --git a/recording_logic.py b/recording_logic.py
+new file mode 100644
+index 0000000..4dd1696
+--- /dev/null
++++ b/recording_logic.py
+@@ -0,0 +1,9 @@
++
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..af96a14
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,15 @@
++import click
++import time
++
++@click.command(track_changes=True)
++@click.option("--count", "-c", default=1)
++def cli(count):
++    ctx = click.get_current_context()
++    history = ctx.get_option_history("count")
++    print(f"History for count: {history}")
++
++if __name__ == "__main__":
++    try:
++        cli(["--count", "5"])
++    except Exception as e:
++        print(e)
+diff --git a/rewrite_handle_parse_result.py b/rewrite_handle_parse_result.py
+new file mode 100644
+index 0000000..2cf1bbe
+--- /dev/null
++++ b/rewrite_handle_parse_result.py
+@@ -0,0 +1,73 @@
++import re
++
++with open('src/click/core.py', 'r') as f:
++    content = f.read()
++
++# Define the new handle_parse_result method
++new_method = """
++    def handle_parse_result(
++        self, ctx: Context, opts: cabc.Mapping[str, t.Any], args: list[str]
++    ) -> tuple[t.Any, list[str]]:
++        with augment_usage_errors(ctx, param=self):
++            value, source = self.consume_value(ctx, opts)
++
++            if (
++                self.deprecated
++                and value is not None
++                and source
++                not in (
++                    ParameterSource.DEFAULT,
++                    ParameterSource.DEFAULT_MAP,
++                )
++            ):
++                extra_message = (
++                    f" {self.deprecated}" if isinstance(self.deprecated, str) else ""
++                )
++                message = _(
++                    "DeprecationWarning: The {param_type} {name!r} is deprecated."
++                    "{extra_message}"
++                ).format(
++                    param_type=self.param_type_name,
++                    name=self.human_readable_name,
++                    extra_message=extra_message,
++                )
++                echo(style(message, fg="red"), err=True)
++
++            ctx.set_parameter_source(self.name, source)  # type: ignore
++
++            try:
++                value = self.process_value(ctx, value)
++            except Exception:
++                if not ctx.resilient_parsing:
++                    raise
++
++                value = None
++
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
++
++        if self.expose_value:
++            ctx.params[self.name] = value  # type: ignore
++
++        return value, args
++"""
++
++# Replace the old method with the new one
++# Find the start and end of the old method
++start_pattern = r'    def handle_parse_result\(.*?\) -> tuple\[t\.Any, list\[str\]\]:'
++end_pattern = r'        return value, args'
++# This is tricky because of the indentation.
++# Let's just use a simpler approach.
++# I will find the start of the method and the end of the method.
++start_index = content.find('    def handle_parse_result(')
++end_index = content.find('        return value, args', start_index) + len('        return value, args')
++content = content[:start_index] + new_method + content[end_index:]
++
++with open('src/click/core.py', 'w') as f:
++    f.write(content)
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..bddb1e3 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++import time
++import copy
+ 
+ import collections.abc as cabc
+ import enum
+@@ -165,6 +167,23 @@ class ParameterSource(enum.Enum):
+     """Used a prompt to confirm a default or provide a value."""
+ 
+ 
++
++class ParamsDict(dict):
++    def __init__(self, ctx, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.ctx = ctx
++
++    def __setitem__(self, key, value):
++        if self.ctx.command.track_changes and not getattr(self.ctx, "_is_parsing", False):
++            if key not in self.ctx._option_history:
++                self.ctx._option_history[key] = []
++            self.ctx._option_history[key].append({
++                "value": value,
++                "source": None,
++                "timestamp": time.time(),
++            })
++        super().__setitem__(key, value)
++
+ class Context:
+     """The context is a special internal object that holds state relevant
+     for the script execution at every single level.  It's normally invisible
+@@ -296,7 +315,9 @@ class Context:
+         self.info_name = info_name
+         #: Map of parameter names to their parsed values. Parameters
+         #: with ``expose_value=False`` are not stored.
+-        self.params: dict[str, t.Any] = {}
++        self.params: dict[str, t.Any] = ParamsDict(self)
++        self._option_history: dict[str, list[dict[str, t.Any]]] = {}
++        self._is_parsing: bool = False
+         #: the leftover arguments.
+         self.args: list[str] = []
+         #: protected arguments.  These are arguments that are prepended
+@@ -554,6 +575,23 @@ class Context:
+         """
+         return self._meta
+ 
++
++    def get_option_history(self, name: str) -> list[dict[str, t.Any]] | None:
++        if not self.command.track_changes:
++            return None
++        
++        param = None
++        for p in self.command.get_params(self):
++            if p.name == name or name in p.opts:
++                param = p
++                break
++        
++        if param is None:
++            return []
++            
++        history = self._option_history.get(param.name, [])
++        return copy.deepcopy(history)
++
+     def make_formatter(self) -> HelpFormatter:
+         """Creates the :class:`~click.HelpFormatter` for the help and
+         usage output.
+@@ -914,6 +952,7 @@ class Command:
+         options_metavar: str | None = "[OPTIONS]",
+         add_help_option: bool = True,
+         no_args_is_help: bool = False,
++        track_changes: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
+     ) -> None:
+@@ -945,6 +984,7 @@ class Command:
+         self.no_args_is_help = no_args_is_help
+         self.hidden = hidden
+         self.deprecated = deprecated
++        self.track_changes = track_changes
+ 
+     def to_info_dict(self, ctx: Context) -> dict[str, t.Any]:
+         return {
+@@ -1190,6 +1230,7 @@ class Command:
+         if not args and self.no_args_is_help and not ctx.resilient_parsing:
+             raise NoArgsIsHelpError(ctx)
+ 
++        ctx._is_parsing = True
+         parser = self.make_parser(ctx)
+         opts, args, param_order = parser.parse_args(args=args)
+ 
+@@ -1207,6 +1248,7 @@ class Command:
+ 
+         ctx.args = args
+         ctx._opt_prefixes.update(parser._opt_prefixes)
++        ctx._is_parsing = False
+         return args
+ 
+     def invoke(self, ctx: Context) -> t.Any:
+@@ -2423,6 +2465,16 @@ class Parameter:
+         if self.expose_value:
+             ctx.params[self.name] = value  # type: ignore
+ 
++        
++            if ctx.command.track_changes:
++                if self.name not in ctx._option_history:
++                    ctx._option_history[self.name] = []
++                ctx._option_history[self.name].append({
++                    "value": value,
++                    "source": source,
++                    "timestamp": time.time(),
++                })
++
+         return value, args
+ 
+     def get_help_record(self, ctx: Context) -> tuple[str, str] | None:
+diff --git a/test_history.py b/test_history.py
+new file mode 100644
+index 0000000..6bc4542
+--- /dev/null
++++ b/test_history.py
+@@ -0,0 +1,27 @@
++import click
++import time
++
++@click.command(track_changes=True)
++@click.option("--count", "-c", default=1)
++def cli(count):
++    pass
++
++ctx = click.Context(cli)
++cli.parse_args(ctx, ["-c", "5"])
++
++# Test with parameter name
++history_name = ctx.get_option_history("count")
++print(f"History by name: {history_name}")
++
++# Test with long option
++history_long = ctx.get_option_history("--count")
++print(f"History by long option: {history_long}")
++
++# Test with short option
++history_short = ctx.get_option_history("-c")
++print(f"History by short option: {history_short}")
++
++# Test manual assignment
++ctx.params["count"] = 10
++history = ctx.get_option_history("count")
++print(f"History after manual assignment: {history}")
+diff --git a/wrap_parse_args.py b/wrap_parse_args.py
+new file mode 100644
+index 0000000..c9d5e4d
+--- /dev/null
++++ b/wrap_parse_args.py
+@@ -0,0 +1,24 @@
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the first `parse_args` in the file.
++start_line = 0
++for i, line in enumerate(lines):
++    if 'def parse_args(self, ctx: Context, args: list[str]) -> list[str]:' in line:
++        start_line = i
++        break
++
++# Find the `return args` in `parse_args`
++return_line = 0
++for i in range(start_line + 1, start_line + 20):
++    if 'return args' in lines[i]:
++        return_line = i
++        break
++
++# Insert `ctx._is_parsing = True` and `ctx._is_parsing = False`
++# Make sure the indentation is correct (8 spaces).
++lines.insert(start_line + 1, '        ctx._is_parsing = True\n')
++lines.insert(return_line + 1, '        ctx._is_parsing = False\n')
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)

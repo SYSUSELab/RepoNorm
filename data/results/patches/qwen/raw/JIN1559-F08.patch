@@ -1,0 +1,354 @@
+diff --git a/src/jinja2/compiler.py b/src/jinja2/compiler.py
+index dfea00a..3cddbca 100644
+--- a/src/jinja2/compiler.py
++++ b/src/jinja2/compiler.py
+@@ -1314,6 +1314,75 @@ class CodeGenerator(NodeVisitor):
+             self.blockvisit(node.else_, if_frame)
+             self.outdent()
+ 
++    def visit_ConditionalTranslation(
++        self, node: nodes.ConditionalTranslation, frame: Frame
++    ) -> None:
++        """Compile a conditional translation block."""
++        # Evaluate condition once
++        cond_frame = frame.soft()
++        self.writeline("if ", node)
++        self.visit(node.test, cond_frame)
++        self.write(":")
++        self.indent()
++
++        # Compile true branch (translation)
++        # Build gettext call based on context and pluralization
++        if node.context is not None:
++            if node.plural is not None:
++                # npgettext for context + plural
++                self.writeline("_trans = npgettext(")
++                self.write(f"{node.context!r}, {node.singular!r}, {node.plural!r}")
++                # Visit plural expression
++                self.write(", ")
++                self.visit(node.variables["num"], cond_frame)
++                self.write(")")
++            else:
++                # pgettext for context only
++                self.writeline("_trans = pgettext(")
++                self.write(f"{node.context!r}, {node.singular!r})")
++        else:
++            if node.plural is not None:
++                # ngettext for plural
++                self.writeline("_trans = ngettext(")
++                self.write(f"{node.singular!r}, {node.plural!r}")
++                # Visit plural expression
++                self.write(", ")
++                self.visit(node.variables["num"], cond_frame)
++                self.write(")")
++            else:
++                # gettext for singular
++                self.writeline("_trans = gettext(")
++                self.write(f"{node.singular!r})")
++
++        # Handle variable substitution for old-style gettext
++        if not self.environment.newstyle_gettext:
++            # Old-style: need to format the string with variables
++            if node.variables:
++                var_dict = {}
++                for key, expr in node.variables.items():
++                    if key != "num":
++                        var_dict[key] = expr
++                if var_dict:
++                    self.write(".format(")
++                    parts = []
++                    for key, expr in var_dict.items():
++                        parts.append(f"{key}={self.generate(expr, cond_frame)}")
++                    self.write(", ".join(parts))
++                    self.write(")")
++        else:
++            # New-style: gettext handles formatting
++            pass
++
++        # Output the translated string
++        self.writeline("yield _trans")
++        self.outdent()
++
++        # Compile false branch (fallback body)
++        self.writeline("else:")
++        self.indent()
++        self.blockvisit(node.fallback, frame)
++        self.outdent()
++
+     def visit_Macro(self, node: nodes.Macro, frame: Frame) -> None:
+         macro_frame, macro_ref = self.macro_body(node, frame)
+         self.newline()
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..d1e843f 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -50,6 +50,17 @@ GETTEXT_FUNCTIONS: t.Tuple[str, ...] = (
+ )
+ _ws_re = re.compile(r"\s*\n\s*")
+ 
++# Fallback implementations for pgettext and npgettext when not provided
++def pgettext_fallback(context: str, msgid: str) -> str:
++    return msgid
++
++
++def npgettext_fallback(
++    context: str, singular: str, plural: str, num: int
++) -> str:
++    return singular if num == 1 else plural
++
++
+ 
+ class Extension:
+     """Extensions can be used to add extra functionality to the Jinja template
+@@ -570,6 +581,227 @@ class InternationalizationExtension(Extension):
+                 )
+         return nodes.Output([node])
+ 
++class ConditionalI18nExtension(Extension):
++    """This extension adds conditional translation support to Jinja."""
++
++    tags = {"ctrans"}
++
++    def __init__(self, environment: Environment) -> None:
++        super().__init__(environment)
++        environment.extend(
++            install_gettext_translations=self._install,
++            install_null_translations=self._install_null,
++            install_gettext_callables=self._install_callables,
++            uninstall_gettext_translations=self._uninstall,
++            extract_translations=self._extract,
++            newstyle_gettext=False,
++        )
++        # Install null translations by default so gettext functions are available
++        self._install_null()
++
++    def _install(
++        self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
++    ) -> None:
++        gettext = getattr(translations, "ugettext", None)
++        if gettext is None:
++            gettext = translations.gettext
++        ngettext = getattr(translations, "ungettext", None)
++        if ngettext is None:
++            ngettext = translations.ngettext
++
++        pgettext = getattr(translations, "pgettext", None)
++        npgettext = getattr(translations, "npgettext", None)
++        self._install_callables(
++            gettext, ngettext, newstyle=newstyle, pgettext=pgettext, npgettext=npgettext
++        )
++
++    def _install_null(self, newstyle: t.Optional[bool] = None) -> None:
++        import gettext
++
++        self._install_callables(
++            gettext.gettext,
++            gettext.ngettext,
++            newstyle=newstyle,
++            pgettext=pgettext_fallback,
++            npgettext=npgettext_fallback,
++        )
++
++    def _install_callables(
++        self,
++        gettext: t.Callable[[str], str],
++        ngettext: t.Callable[[str, str, int], str],
++        newstyle: t.Optional[bool] = None,
++        pgettext: t.Optional[t.Callable[[str, str], str]] = None,
++        npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++    ) -> None:
++        if newstyle is None:
++            newstyle = getattr(self.environment, "newstyle_gettext", False)
++        if newstyle:
++            self.environment.globals["gettext"] = gettext
++            self.environment.globals["ngettext"] = ngettext
++            if pgettext is not None:
++                self.environment.globals["pgettext"] = pgettext
++            if npgettext is not None:
++                self.environment.globals["npgettext"] = npgettext
++        else:
++            self.environment.globals["_"] = _gettext_alias
++            self.environment.globals["gettext"] = gettext
++            self.environment.globals["ngettext"] = ngettext
++            if pgettext is not None:
++                self.environment.globals["pgettext"] = pgettext
++            if npgettext is not None:
++                self.environment.globals["npgettext"] = npgettext
++
++    def _uninstall(self) -> None:
++        self.environment.globals.pop("_", None)
++        self.environment.globals.pop("gettext", None)
++        self.environment.globals.pop("ngettext", None)
++        self.environment.globals.pop("pgettext", None)
++        self.environment.globals.pop("npgettext", None)
++
++    def _extract(
++        self,
++        data: str,
++        keywords: t.Optional[t.Sequence[str]] = None,
++        comment_tags: t.Optional[t.Sequence[str]] = None,
++    ) -> t.Iterator[t.Tuple[int, str, str, t.List[str]]]:
++        if keywords is None:
++            keywords = GETTEXT_FUNCTIONS
++        if comment_tags is None:
++            comment_tags = []
++
++        for lineno, funcname, message, comments in babel_extract(
++            io.BytesIO(data.encode("utf-8")),
++            keywords,
++            comment_tags,
++            {},
++        ):
++            yield lineno, funcname, message, comments
++
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse a conditional translatable tag."""
++        lineno = next(parser.stream).lineno
++        
++        # Parse condition and options
++        variables: t.Dict[str, nodes.Expr] = {}
++        context: t.Optional[str] = None
++        
++        # First token after ctrans should be the condition
++        token = parser.stream.expect("name")
++        condition_name = token.value
++        
++        # Check for additional variables or block_end
++        while True:
++            if parser.stream.current.type == "block_end":
++                break
++            if variables or context is not None:
++                parser.stream.expect("comma")
++            
++            # skip colon for python compatibility
++            if parser.stream.skip_if("colon"):
++                break
++            
++            token = parser.stream.expect("name")
++            if token.value == "context":
++                if context is not None:
++                    parser.fail("duplicate context value", lineno=lineno)
++                parser.stream.expect("assign")
++                context_token = parser.stream.expect("string")
++                context = context_token.value
++            else:
++                # It's a variable assignment or reference
++                var_name = token.value
++                if var_name in variables:
++                    parser.fail(f"variable {var_name!r} defined twice", lineno=lineno)
++                
++                if parser.stream.current.type == "assign":
++                    next(parser.stream)
++                    var_value = parser.parse_expression()
++                    variables[var_name] = var_value
++                else:
++                    # Just a variable reference
++                    variables[var_name] = nodes.Name(var_name, "load")
++        
++        # Expect block_end
++        parser.stream.expect("block_end")
++        
++        # Parse the true branch (translation message content)
++        buf: t.List[str] = []
++        
++        while True:
++            token = parser.stream.current
++            if token.type == "data":
++                buf.append(token.value.replace("%", "%%"))
++                next(parser.stream)
++            elif token.type == "variable_begin":
++                next(parser.stream)
++                name = parser.stream.expect("name").value
++                buf.append(f"%({name})s")
++                parser.stream.expect("variable_end")
++            elif token.type == "block_begin":
++                next(parser.stream)
++                if parser.stream.current.test("name:fallback"):
++                    # Found fallback block
++                    next(parser.stream)
++                    parser.stream.expect("block_end")
++                    break
++                elif parser.stream.current.test("name:endctrans"):
++                    # End without fallback
++                    next(parser.stream)
++                    # Create node with empty fallback
++                    test = nodes.Name(condition_name, "load")
++                    return nodes.ConditionalTranslation(
++                        test,
++                        "".join(buf),
++                        None,
++                        variables,
++                        context,
++                        [],
++                        lineno=lineno,
++                    )
++                else:
++                    parser.fail(
++                        "control structures in conditional translation true branch are not allowed",
++                        token.lineno,
++                    )
++            elif token.type == "eos":
++                parser.fail("unclosed conditional translation block")
++            else:
++                next(parser.stream)
++        
++        # Parse the fallback body (full Jinja body)
++        fallback_body: t.List[nodes.Node] = []
++        while parser.stream.current.type != "block_end":
++            if parser.stream.current.type == "block_begin":
++                next(parser.stream)
++                if parser.stream.current.test("name:endctrans"):
++                    next(parser.stream)
++                    break
++                else:
++                    stmt = parser.parse_statement()
++                    fallback_body.append(stmt)
++            else:
++                # Regular data in fallback
++                data_node = nodes.Output([nodes.Const(parser.stream.current.value)])
++                fallback_body.append(data_node)
++                next(parser.stream)
++        
++        # Build the ConditionalTranslation node
++        test = nodes.Name(condition_name, "load")
++        node = nodes.ConditionalTranslation(
++            test,
++            "".join(buf),
++            None,
++            variables,
++            context,
++            fallback_body,
++            lineno=lineno,
++        )
++        
++        return node
++
++
++
+ 
+ class ExprStmtExtension(Extension):
+     """Adds a `do` tag to Jinja that works like the print statement just
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index b2f88d9..341558b 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -1196,6 +1196,19 @@ class ScopedEvalContextModifier(EvalContextModifier):
+ 
+ 
+ # make sure nobody creates custom nodes
++
++
++class ConditionalTranslation(Stmt):
++    """A conditional translation block with a fallback body."""
++
++    fields = ("test", "singular", "plural", "variables", "context", "fallback")
++    test: Expr
++    singular: str
++    plural: t.Optional[str]
++    variables: t.Dict[str, Expr]
++    context: t.Optional[str]
++    fallback: t.List[Node]
++
+ def _failing_new(*args: t.Any, **kwargs: t.Any) -> "te.NoReturn":
+     raise TypeError("can't create custom node types")
+ 

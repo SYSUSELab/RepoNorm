@@ -1,0 +1,253 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 64dc6a1..b48c038 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -517,6 +517,65 @@ impl CoreBPE {
+         let allowed_special = self.special_tokens();
+         self.encode(text, &allowed_special).0
+     }
++    pub fn encode_with_positions(
++        &self,
++        text: &str,
++        allowed_special: &HashSet<&str>,
++    ) -> (Vec<Rank>, Vec<usize>) {
++        let special_regex = self._get_tl_special_regex();
++        let regex = self._get_tl_regex();
++        let mut ret = vec![];
++        let mut positions = vec![];
++
++        let mut start = 0;
++        loop {
++            let mut next_special;
++            let mut start_find = start;
++            loop {
++                next_special = special_regex.find_from_pos(text, start_find).unwrap();
++                match next_special {
++                    Some(m) => {
++                        if allowed_special.contains(&text[m.start()..m.end()]) {
++                            break;
++                        }
++                        start_find = m.start() + 1;
++                    }
++                    None => break,
++                }
++            }
++            let end = next_special.map_or(text.len(), |m| m.start());
++
++            for mat in regex.find_iter(&text[start..end]) {
++                let m = mat.unwrap();
++                let piece = m.as_str().as_bytes();
++                let piece_byte_start = start + m.start();
++
++                if let Some(token) = self.encoder.get(piece) {
++                    ret.push(*token);
++                    positions.push(piece_byte_start);
++                    continue;
++                }
++                let tokens_with_positions = byte_pair_encode_with_positions(piece, &self.encoder);
++                for (token, pos_in_piece) in tokens_with_positions {
++                    ret.push(token);
++                    positions.push(piece_byte_start + pos_in_piece);
++                }
++            }
++
++            match next_special {
++                Some(m) => {
++                    let piece = m.as_str();
++                    let token = self.special_tokens_encoder[piece];
++                    ret.push(token);
++                    positions.push(m.start());
++                    start = m.end();
++                }
++                None => break,
++            }
++        }
++
++        (ret, positions)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -544,3 +603,20 @@ mod tests {
+         assert_eq!(res, vec![b"ab", b"ab"]);
+     }
+ }
++
++pub fn byte_pair_encode_with_positions(
++    piece: &[u8],
++    ranks: &HashMap<Vec<u8>, Rank>,
++) -> Vec<(Rank, usize)> {
++    if piece.len() == 1 {
++        return vec![(ranks[piece], 0)];
++    }
++    _byte_pair_merge(ranks, piece)
++        .windows(2)
++        .map(|part| {
++            let rank = ranks[&piece[part[0].0..part[1].0]];
++            let position = part[0].0; // byte start offset within piece
++            (rank, position)
++        })
++        .collect()
++}
+diff --git a/src/py.rs b/src/py.rs
+index ed107b4..f3c6f60 100644
+--- a/src/py.rs
++++ b/src/py.rs
+@@ -50,6 +50,20 @@ impl CoreBPE {
+         })
+     }
+ 
++    #[pyo3(name = "encode_with_positions")]
++    fn py_encode_with_positions(
++        &self,
++        py: Python,
++        text: &str,
++        allowed_special: HashSet<PyBackedStr>,
++    ) -> (Vec<Rank>, Vec<usize>) {
++        py.allow_threads(|| {
++            let allowed_special: HashSet<&str> =
++                allowed_special.iter().map(|s| s.as_ref()).collect();
++            self.encode_with_positions(text, &allowed_special)
++        })
++    }
++
+     fn encode_to_tiktoken_buffer(
+         &self,
+         py: Python,
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..c3f406c 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -8,6 +8,58 @@ import regex
+ 
+ from tiktoken import _tiktoken
+ 
++def _byte_to_char_offsets(text: str, byte_positions: list[int]) -> list[int]:
++    """Convert byte positions to zero-based character indices.
++
++    If a token starts inside a multibyte character, use the index of that
++    containing character.
++    """
++    if not byte_positions:
++        return []
++
++    encoded = text.encode("utf-8")
++
++    # Build byte-to-character index mapping
++    byte_to_char = []
++    i = 0
++    char_idx = 0
++    while i < len(encoded):
++        b = encoded[i]
++        if b < 0x80:
++            # 1-byte character
++            byte_to_char.append(char_idx)
++            i += 1
++            char_idx += 1
++        elif b < 0xC0:
++            # Continuation byte - not a start byte
++            byte_to_char.append(char_idx - 1 if char_idx > 0 else 0)
++            i += 1
++        elif b < 0xE0:
++            # 2-byte character
++            for _ in range(2):
++                byte_to_char.append(char_idx)
++            i += 2
++            char_idx += 1
++        elif b < 0xF0:
++            # 3-byte character
++            for _ in range(3):
++                byte_to_char.append(char_idx)
++            i += 3
++            char_idx += 1
++        elif b < 0xF8:
++            # 4-byte character
++            for _ in range(4):
++                byte_to_char.append(char_idx)
++            i += 4
++            char_idx += 1
++        else:
++            byte_to_char.append(char_idx)
++            i += 1
++            char_idx += 1
++
++    return [byte_to_char[bp] for bp in byte_positions]
++
++
+ if TYPE_CHECKING:
+     import numpy as np
+     import numpy.typing as npt
+@@ -82,7 +134,8 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        return_positions: bool = False,
++    ) -> list[int] | tuple[list[int], list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -120,17 +173,32 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        try:
+-            return self._core_bpe.encode(text, allowed_special)
+-        except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+-            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++        if return_positions:
++            try:
++                tokens, byte_positions = self._core_bpe.encode_with_positions(text, allowed_special)
++            except UnicodeEncodeError:
++                # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++                # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++                # fixup for any surrogate pairs that may have sneaked their way into the text.
++                # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++                # string, but given that this is input we want to support, maybe that's okay.
++                # Also we use errors="replace" to handle weird things like lone surrogates.
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                tokens, byte_positions = self._core_bpe.encode_with_positions(text, allowed_special)
++            char_positions = _byte_to_char_offsets(text, byte_positions)
++            return tokens, char_positions
++        else:
++            try:
++                return self._core_bpe.encode(text, allowed_special)
++            except UnicodeEncodeError:
++                # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++                # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++                # fixup for any surrogate pairs that may have sneaked their way into the text.
++                # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++                # string, but given that this is input we want to support, maybe that's okay.
++                # Also we use errors="replace" to handle weird things like lone surrogates.
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                return self._core_bpe.encode(text, allowed_special)
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,7 +247,8 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[list[int]]:
++        return_positions: bool = False,
++    ) -> list[list[int]] | list[tuple[list[int], list[int]]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+@@ -197,7 +266,8 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special,
++            return_positions=return_positions,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

@@ -1,0 +1,333 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..ee51a3e 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -1092,6 +1092,97 @@ class Environment:
+         cls = template_class or self.template_class
+         return cls.from_code(self, self.compile(source), gs, None)
+ 
++
++    def extract_translations_with_metadata(
++        self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Extract translations with metadata from the given template source.
++        
++        This method returns an iterator of independent record mappings for 
++        metadata-bearing translation blocks. Each record contains:
++        
++        - ``source``: The source name if provided, otherwise None
++        - ``lineno``: The line number of the trans block start
++        - ``metadata``: A copy of the metadata mapping (note, created, modified)
++        - ``messages``: List of message records containing lineno, function, and message
++        
++        Each message record contains:
++        - ``lineno``: The line number of the message
++        - ``function``: The gettext function used (gettext, ngettext, etc.)
++        - ``message``: The extracted message value (string or tuple for plural forms)
++        
++        Repeated extraction is stable and has no retained Environment state;
++        callers may modify returned records without affecting later results.
++        
++        :param source: Jinja source string or parsed AST node.
++        :param source_name: Optional name for the source being extracted.
++        :return: Iterator of translation records with metadata.
++        
++        .. versionadded:: 3.1.0
++        """
++        if isinstance(source, str):
++            ast = self.parse(source)
++        else:
++            ast = source
++            
++        # Get all translation blocks with their metadata
++        trans_blocks = []
++        for node in ast.find_all(nodes.Output):
++            if node.metadata:
++                trans_blocks.append((node, node.metadata))
++        
++        # Extract messages from each trans block
++        for block_node, block_metadata in trans_blocks:
++            messages = []
++            
++            # Find gettext calls within this specific trans block
++            for child in block_node.nodes:
++                self._extract_messages_from_node(child, messages)
++            
++            yield {
++                'source': source_name,
++                'lineno': block_node.lineno,
++                'metadata': dict(block_metadata),  # Copy to prevent mutation
++                'messages': messages,
++            }
++    
++    def _extract_messages_from_node(self, node: nodes.Node, messages: list) -> None:
++        """Recursively extract gettext messages from a node tree."""
++        if isinstance(node, nodes.Call):
++            if isinstance(node.node, nodes.Name) and node.node.name in ('gettext', 'ngettext', 'pgettext', 'npgettext'):
++                strings = []
++                for arg in node.args:
++                    if isinstance(arg, nodes.Const) and isinstance(arg.value, str):
++                        strings.append(arg.value)
++                    else:
++                        strings.append(None)
++                
++                for _ in node.kwargs:
++                    strings.append(None)
++                if node.dyn_args is not None:
++                    strings.append(None)
++                if node.dyn_kwargs is not None:
++                    strings.append(None)
++                
++                # Determine output format
++                out = tuple(x for x in strings if x is not None) if len(strings) != 1 else strings[0]
++                
++                messages.append({
++                    'lineno': node.lineno,
++                    'function': node.node.name,
++                    'message': out,
++                })
++        
++        # Recurse into child nodes
++        for field_name in node.fields:
++            value = getattr(node, field_name)
++            if isinstance(value, list):
++                for item in value:
++                    if isinstance(item, nodes.Node):
++                        self._extract_messages_from_node(item, messages)
++            elif isinstance(value, nodes.Node):
++                self._extract_messages_from_node(value, messages)
++
+     def make_globals(
+         self, d: t.Optional[t.MutableMapping[str, t.Any]]
+     ) -> t.MutableMapping[str, t.Any]:
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..f3ddafc 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -362,9 +362,11 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        metadata: t.Dict[str, str] = {}
+         trimmed = None
++        valid_metadata_keys = {"note", "created", "modified"}
+         while parser.stream.current.type != "block_end":
+-            if variables:
++            if variables or metadata:
+                 parser.stream.expect("comma")
+ 
+             # skip colon for python compatibility
+@@ -372,6 +374,26 @@ class InternationalizationExtension(Extension):
+                 break
+ 
+             token = parser.stream.expect("name")
++            
++            # Check for metadata keys
++            if token.value in valid_metadata_keys:
++                if token.value in metadata:
++                    parser.fail(
++                        f"trans metadata key {token.value!r} specified twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                parser.stream.expect("assign")
++                value_node = parser.parse_expression()
++                if not isinstance(value_node, nodes.Const) or not isinstance(value_node.value, str):
++                    parser.fail(
++                        f"trans metadata key {token.value!r} must have a string literal value.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                metadata[token.value] = value_node.value
++                continue
++            
+             if token.value in variables:
+                 parser.fail(
+                     f"translatable variable {token.value!r} defined twice.",
+@@ -459,6 +481,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            metadata,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +537,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        metadata: t.Dict[str, str],
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -568,7 +592,7 @@ class InternationalizationExtension(Extension):
+                         ]
+                     ),
+                 )
+-        return nodes.Output([node])
++        return nodes.Output([node], metadata=metadata or None)
+ 
+ 
+ class ExprStmtExtension(Extension):
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index b2f88d9..c9beee9 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -304,7 +304,9 @@ class Output(Stmt):
+     """
+ 
+     fields = ("nodes",)
++    attributes = ("metadata",)
+     nodes: t.List["Expr"]
++    metadata: t.Optional[t.Dict[str, str]]
+ 
+ 
+ class Extends(Stmt):
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..98e7cde 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -712,3 +712,143 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestMetadataExtraction:
++    """Tests for translation metadata extraction with note, created, modified keys."""
++
++    def test_trans_with_note_metadata(self):
++        """Test trans tag with note metadata key."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Test note" %}Hello{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source))
++        assert len(records) == 1
++        assert records[0]['metadata'] == {'note': 'Test note'}
++        assert records[0]['messages'][0]['message'] == 'Hello'
++
++    def test_trans_with_all_metadata_keys(self):
++        """Test trans tag with all three metadata keys."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Note", created="2024-01-01", modified="2024-06-01" %}World{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source))
++        assert len(records) == 1
++        assert records[0]['metadata'] == {
++            'note': 'Note',
++            'created': '2024-01-01',
++            'modified': '2024-06-01'
++        }
++
++    def test_trans_with_unicode_metadata(self):
++        """Test trans tag with Unicode values in metadata."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="日本語のノート" %}Unicode{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source))
++        assert len(records) == 1
++        assert records[0]['metadata'] == {'note': '日本語のノート'}
++
++    def test_trans_with_empty_string_metadata(self):
++        """Test trans tag with empty string value in metadata."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="" %}Empty{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source))
++        assert len(records) == 1
++        assert records[0]['metadata'] == {'note': ''}
++
++    def test_trans_duplicate_metadata_key_error(self):
++        """Test that duplicate metadata keys raise TemplateAssertionError."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Note1", note="Note2" %}Hello{% endtrans %}"""
++        with pytest.raises(TemplateAssertionError) as exc_info:
++            env.parse(source)
++        assert "duplicate" in str(exc_info.value).lower() or "twice" in str(exc_info.value).lower()
++        assert "'note'" in str(exc_info.value)
++
++    def test_trans_non_string_metadata_value_error(self):
++        """Test that non-string metadata values raise TemplateAssertionError."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note=variable %}Hello{% endtrans %}"""
++        with pytest.raises(TemplateAssertionError) as exc_info:
++            env.parse(source)
++        assert "string literal" in str(exc_info.value).lower()
++        assert "'note'" in str(exc_info.value)
++
++    def test_trans_invalid_key_treated_as_variable(self):
++        """Test that invalid metadata keys are treated as variables."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans invalid_key="value" %}Hello{% endtrans %}"""
++        ast = env.parse(source)
++        # Should not have metadata on Output nodes
++        output_nodes = list(ast.find_all(nodes.Output))
++        assert all(node.metadata is None for node in output_nodes)
++
++    def test_extract_translations_with_metadata_stability(self):
++        """Test that returned records are independent and stable."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Test note" %}Hello World{% endtrans %}"""
++        
++        records1 = list(env.extract_translations_with_metadata(source, source_name="test.html"))
++        original_metadata = dict(records1[0]['metadata'])
++        
++        # Modify the returned record
++        records1[0]['metadata']['note'] = "MODIFIED"
++        
++        # Extract again - should be unchanged
++        records2 = list(env.extract_translations_with_metadata(source, source_name="test.html"))
++        assert records2[0]['metadata'] == original_metadata
++
++    def test_extract_translations_with_metadata_multiple_blocks(self):
++        """Test extraction from multiple trans blocks."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """
++{% trans note="First note" %}First message{% endtrans %}
++{% trans created="2024-01-01", modified="2024-06-01" %}Second message{% endtrans %}
++"""
++        records = list(env.extract_translations_with_metadata(source, source_name="multi.html"))
++        assert len(records) == 2
++        
++        # First block
++        assert records[0]['source'] == 'multi.html'
++        assert records[0]['lineno'] == 2
++        assert records[0]['metadata'] == {'note': 'First note'}
++        assert records[0]['messages'][0]['message'] == 'First message'
++        
++        # Second block
++        assert records[1]['source'] == 'multi.html'
++        assert records[1]['lineno'] == 3
++        assert records[1]['metadata'] == {'created': '2024-01-01', 'modified': '2024-06-01'}
++        assert records[1]['messages'][0]['message'] == 'Second message'
++
++    def test_extract_translations_with_metadata_plural_form(self):
++        """Test extraction with plural forms."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Plural note", count=n %}{{ n }} item{% pluralize %}{{ n }} items{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source, source_name="test.html"))
++        assert len(records) == 1
++        assert records[0]['metadata'] == {'note': 'Plural note'}
++        assert records[0]['messages'][0]['function'] == 'ngettext'
++        assert isinstance(records[0]['messages'][0]['message'], tuple)
++        assert len(records[0]['messages'][0]['message']) == 2
++
++    def test_extract_translations_with_metadata_source_name(self):
++        """Test that source_name parameter is correctly included."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Test" %}Hello{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source, source_name="my_template.html"))
++        assert len(records) == 1
++        assert records[0]['source'] == 'my_template.html'
++
++    def test_extract_translations_with_metadata_no_metadata(self):
++        """Test that templates without metadata don't produce records."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans %}Hello{% endtrans %}"""
++        records = list(env.extract_translations_with_metadata(source))
++        assert len(records) == 0
++
++    def test_extract_translations_with_metadata_ast_node_input(self):
++        """Test that AST node can be passed directly."""
++        env = Environment(extensions=['jinja2.ext.i18n'])
++        source = """{% trans note="Test" %}Hello{% endtrans %}"""
++        ast = env.parse(source)
++        records = list(env.extract_translations_with_metadata(ast, source_name="from_ast"))
++        assert len(records) == 1
++        assert records[0]['source'] == 'from_ast'

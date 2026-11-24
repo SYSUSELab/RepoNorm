@@ -1,0 +1,159 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..0199217 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -484,12 +484,13 @@ class Editor:
+         editor: str | None = None,
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+-        extension: str = ".txt",
++        extension: str = ".txt", lock_files: bool = False,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.lock_files = lock_files
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -507,26 +508,49 @@ class Editor:
+ 
+     def edit_file(self, filename: str) -> None:
+         import subprocess
++        import datetime
++        lock_path = None
++        if self.lock_files:
++            lock_path = os.path.join(os.path.dirname(filename), f'.{os.path.basename(filename)}.lock')
++            try:
++                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++                with os.fdopen(fd, 'w') as f:
++                    f.write(f'PID: {os.getpid()}\n')
++                    f.write(f'Time: {datetime.datetime.now().isoformat()}\n')
++            except OSError as e:
++                if e.errno == 17:
++                    msg = f'File is already locked: {lock_path}'
++                    if os.path.exists(lock_path):
++                        with open(lock_path, 'r') as f:
++                            msg += f'\nLock info:\n{f.read()}'
++                    raise ClickException(msg) from e
++                raise ClickException(f'Could not create lock file: {lock_path}') from e
+ 
+-        editor = self.get_editor()
+-        environ: dict[str, str] | None = None
++        try:
++            editor = self.get_editor()
++            environ: dict[str, str] | None = None
+ 
+-        if self.env:
+-            environ = os.environ.copy()
+-            environ.update(self.env)
++            if self.env:
++                environ = os.environ.copy()
++                environ.update(self.env)
+ 
+-        try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
+-            if exit_code != 0:
++            try:
++                c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++                exit_code = c.wait()
++                if exit_code != 0:
++                    raise ClickException(
++                        _("{editor}: Editing failed").format(editor=editor)
++                    )
++            except OSError as e:
+                 raise ClickException(
+-                    _("{editor}: Editing failed").format(editor=editor)
+-                )
+-        except OSError as e:
+-            raise ClickException(
+-                _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+-            ) from e
+-
++                    _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
++                ) from e
++        finally:
++            if lock_path and os.path.exists(lock_path):
++                try:
++                    os.remove(lock_path)
++                except OSError as e:
++                    raise ClickException(f'Could not remove lock file: {lock_path}') from e
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..9e0eaa6 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -648,7 +648,7 @@ def edit(
+     editor: str | None = None,
+     env: cabc.Mapping[str, str] | None = None,
+     require_save: bool = True,
+-    extension: str = ".txt",
++    extension: str = ".txt", lock_files: bool = False,
+     filename: str | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+@@ -677,10 +677,12 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param lock_files: if set to `True`, the file will be locked while
++                       being edited.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, lock_files=lock_files)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_lock.py b/tests/test_lock.py
+new file mode 100644
+index 0000000..6e80912
+--- /dev/null
++++ b/tests/test_lock.py
+@@ -0,0 +1,41 @@
++import os
++import pytest
++from click import edit, ClickException
++import subprocess
++import time
++import multiprocessing
++
++def test_lock_file_behavior():
++    filename = "test.txt"
++    with open(filename, "w") as f:
++        f.write("hello")
++    
++    # Use a command that ignores arguments and sleeps
++    os.environ["EDITOR"] = "sh -c 'sleep 1'"
++    
++    def run_edit():
++        edit(filename=filename, lock_files=True)
++        
++    p = multiprocessing.Process(target=run_edit)
++    p.start()
++    
++    # Wait for the lock file to be created
++    lock_filename = f".{filename}.lock"
++    for _ in range(20):
++        if os.path.exists(lock_filename):
++            break
++        time.sleep(0.1)
++    
++    assert os.path.exists(lock_filename), "Lock file should exist"
++    
++    # Second edit should fail
++    with pytest.raises(ClickException) as excinfo:
++        edit(filename=filename, lock_files=True)
++    assert "already locked" in str(excinfo.value).lower()
++    
++    p.join()
++    
++    assert not os.path.exists(lock_filename), "Lock file should be removed"
++    
++    if os.path.exists(filename):
++        os.remove(filename)

@@ -1,0 +1,181 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..aff5136f 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -5,6 +5,7 @@ import threading
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
++import contextlib
+ 
+ import cloudpickle
+ import pydantic
+@@ -58,6 +59,20 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._local = threading.local()
++
++    @contextlib.contextmanager
++    def bypass(self):
++        if not hasattr(self._local, "bypass_count"):
++            self._local.bypass_count = 0
++        self._local.bypass_count += 1
++        try:
++            yield
++        finally:
++            self._local.bypass_count -= 1
++
++    def is_bypassed(self) -> bool:
++        return getattr(self._local, "bypass_count", 0) > 0
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -97,6 +112,9 @@ class Cache:
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
++        if self.is_bypassed():
++            return None
++
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+diff --git a/dspy/clients/cache_bypass.py b/dspy/clients/cache_bypass.py
+new file mode 100644
+index 00000000..ef27d147
+--- /dev/null
++++ b/dspy/clients/cache_bypass.py
+@@ -0,0 +1,22 @@
++import contextlib
++import threading
++from typing import Generator
++
++class CacheBypass:
++    def __init__(self, cache):
++        self.cache = cache
++        self._local = threading.local()
++
++    @contextlib.contextmanager
++    def bypass(self) -> Generator[None, None, None]:
++        if not hasattr(self._local, "bypass_count"):
++            self._local.bypass_count = 0
++        
++        self._local.bypass_count += 1
++        try:
++            yield
++        finally:
++            self._local.bypass_count -= 1
++
++    def is_bypassed(self) -> bool:
++        return getattr(self._local, "bypass_count", 0) > 0
+diff --git a/test_bypass_thread_safety.py b/test_bypass_thread_safety.py
+new file mode 100644
+index 00000000..e6593b99
+--- /dev/null
++++ b/test_bypass_thread_safety.py
+@@ -0,0 +1,44 @@
++import dspy
++from dspy.clients.cache import Cache, request_cache
++import threading
++import time
++
++# Mocking dspy.cache
++dspy.cache = Cache(
++    enable_disk_cache=False,
++    enable_memory_cache=True,
++    disk_cache_dir="/tmp/dspy_cache_test",
++    memory_max_entries=1000,
++)
++
++@request_cache()
++def my_function(x):
++    print(f"Computing for {x}")
++    time.sleep(0.1)
++    return x * 2
++
++def thread_task(thread_id, use_bypass):
++    if use_bypass:
++        with dspy.cache.bypass():
++            my_function(x=10)
++    else:
++        my_function(x=10)
++
++def test_thread_safety():
++    # 1. Normal call
++    my_function(x=10)
++    
++    # 2. Run threads
++    t1 = threading.Thread(target=thread_task, args=(1, True)) # Bypass
++    t2 = threading.Thread(target=thread_task, args=(2, False)) # No bypass
++    
++    t1.start()
++    t2.start()
++    
++    t1.join()
++    t2.join()
++    
++    print("Thread safety test finished.")
++
++if __name__ == "__main__":
++    test_thread_safety()
+diff --git a/tests/caching/test_cache_bypass.py b/tests/caching/test_cache_bypass.py
+new file mode 100644
+index 00000000..4e64c0c9
+--- /dev/null
++++ b/tests/caching/test_cache_bypass.py
+@@ -0,0 +1,54 @@
++import pytest
++import dspy
++from dspy.clients.cache import Cache, request_cache
++
++@pytest.fixture
++def fresh_cache():
++    return Cache(
++        enable_disk_cache=False,
++        enable_memory_cache=True,
++        disk_cache_dir="/tmp/dspy_cache_test",
++        memory_max_entries=1000,
++    )
++
++def test_cache_bypass(fresh_cache):
++    # Temporarily replace dspy.cache
++    original_cache = dspy.cache
++    dspy.cache = fresh_cache
++    
++    @request_cache()
++    def my_function(x):
++        return x * 2
++    
++    # 1. Normal call
++    assert my_function(x=10) == 20
++    
++    # 2. Bypass call
++    with dspy.cache.bypass():
++        # We need to verify it recomputes.
++        # Since we can't easily mock the function to check call count,
++        # we can use a side effect.
++        class Counter:
++            count = 0
++        
++        counter = Counter()
++        
++        @request_cache()
++        def counted_function(x):
++            counter.count += 1
++            return x * 2
++            
++        assert counted_function(x=10) == 20
++        assert counter.count == 1
++        
++        with dspy.cache.bypass():
++            assert counted_function(x=10) == 20
++            assert counter.count == 2
++            
++    # 3. After bypass, should hit cache
++    assert counted_function(x=10) == 20
++    assert counter.count == 2
++    
++    # Restore original cache
++    dspy.cache = original_cache
++

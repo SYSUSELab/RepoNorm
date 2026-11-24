@@ -1,0 +1,446 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..cd00fba 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,41 +1,54 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Callable, Optional
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+-from outlines.models.transformers import Transformers
+-from outlines.processors.base_logits_processor import (
+-    OutlinesLogitsProcessor,
+-    TensorType
+-)
++from outlines.processors.base_logits_processor import OutlinesLogitsProcessor, TensorType
++
+ 
+ if TYPE_CHECKING:
+-    from xgrammar.contrib.hf import LogitsProcessor
++    import torch
+ 
+ 
+ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+     """Logits processor for XGrammar.
+ 
+     This class wraps the `xgr.contrib.hf.LogitsProcessor` class and adds
+-    a `reset` method to reset the logits processor for a new generation.
+-
++    support for tensor type conversion.
++
++    Parameters
++    ----------
++    compiled_grammar : str
++        The compiled grammar to use to create the logits processor.
++    tensor_library_name : str
++        The name of the tensor library used by the model.
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
+-        """
++    def __init__(
++        self,
++        compiled_grammar: "CompiledGrammar",
++        tensor_library_name: str = "torch",
++    ):
++        """Initialize the XGrammar logits processor.
++
+         Parameters
+         ----------
+-        compiled_grammar: str
++        compiled_grammar : CompiledGrammar
+             The compiled grammar to use to create the logits processor.
+-
++        tensor_library_name : str
++            The name of the tensor library used by the model. Defaults to "torch".
+         """
+         import xgrammar as xgr
+ 
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
+-        super().__init__("torch")
++        super().__init__(tensor_library_name)
++
++    @property
++    def supports_batched_generation(self) -> bool:
++        return True
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+@@ -47,46 +60,76 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++        return self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++
++
++# Sentinel value to distinguish between "not provided" and "explicitly None"
++_UNSET = object()
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
+-        """
++    def __init__(
++        self,
++        model: SteerableModel,
++        validate_grammar: Optional[Callable[[str], bool]] = None,
++    ):
++        """Initialize the XGrammar backend.
++
+         Parameters
+         ----------
+-        model
+-            The Outlines model of the user.
+-
++        model : SteerableModel
++            The model to use for generation. Only transformers models are
++            supported.
++        validate_grammar : Optional[Callable[[str], bool]]
++            An optional callable that takes a grammar string and returns True
++            if the grammar is valid. If provided, this callback will be called
++            before compiling any grammar. A normal return value (including False)
++            means validation completed successfully. If the callback raises an
++            exception, that exception will be propagated without compiling the
++            grammar. If None, no validation is performed.
+         """
+         import xgrammar as xgr
+         from transformers import AutoConfig
+ 
+-        if not isinstance(model, Transformers):
++        if not isinstance(model, SteerableModel):
+             raise ValueError(
+                 "The xgrammar backend only supports Transformers models"
+             )
+ 
++        self.model = model
++        self.validate_grammar = validate_grammar
++        self.tensor_library_name = model.tensor_library_name
++
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+             model.hf_tokenizer,
+-            vocab_size=vocab_size
++            vocab_size=vocab_size,
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self,
++        json_schema: str,
++        validate_grammar: Optional[Callable[[str], bool]] = _UNSET,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+         Parameters
+         ----------
+-        json_schema: str
++        json_schema : str
+             The JSON schema to create a logits processor from.
++        validate_grammar : Optional[Callable[[str], bool]]
++            An optional callable that takes a grammar string and returns True
++            if the grammar is valid. If provided, this callback will be called
++            before compiling the grammar. A normal return value (including False)
++            means validation completed successfully. If the callback raises an
++            exception, that exception will be propagated without compiling the
++            grammar. If None, the backend's default validation callback is used.
++            If explicitly set to None here, validation is disabled for this request.
+ 
+         Returns
+         -------
+@@ -94,18 +137,39 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
++        # Use the provided callback, fall back to backend default, or skip validation
++        validator = (
++            validate_grammar if validate_grammar is not _UNSET
++            else self.validate_grammar
++        )
++
++        if validator is not None:
++            validator(json_schema)
++
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, self.tensor_library_name)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
+-        """Create a logits processor from a regex.
++    def get_regex_logits_processor(
++        self,
++        regex_pattern: str,
++        validate_grammar: Optional[Callable[[str], bool]] = _UNSET,
++    ) -> "LogitsProcessor":
++        """Create a logits processor from a regex pattern.
+ 
+         Parameters
+         ----------
+-        regex: str
+-            The regex to create a logits processor from.
++        regex_pattern : str
++            The regex pattern to create a logits processor from.
++        validate_grammar : Optional[Callable[[str], bool]]
++            An optional callable that takes a grammar string and returns True
++            if the grammar is valid. If provided, this callback will be called
++            before compiling the grammar. A normal return value (including False)
++            means validation completed successfully. If the callback raises an
++            exception, that exception will be propagated without compiling the
++            grammar. If None, the backend's default validation callback is used.
++            If explicitly set to None here, validation is disabled for this request.
+ 
+         Returns
+         -------
+@@ -113,16 +177,37 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        # Use the provided callback, fall back to backend default, or skip validation
++        validator = (
++            validate_grammar if validate_grammar is not _UNSET
++            else self.validate_grammar
++        )
++
++        if validator is not None:
++            validator(regex_pattern)
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+-        """Create a logits processor from a context-free grammar.
++        compiled_grammar = self.grammar_compiler.compile_regex(regex_pattern)
++        return XGrammarLogitsProcessor(compiled_grammar, self.tensor_library_name)
++
++    def get_cfg_logits_processor(
++        self,
++        cfg: str,
++        validate_grammar: Optional[Callable[[str], bool]] = _UNSET,
++    ) -> "LogitsProcessor":
++        """Create a logits processor from a CFG grammar.
+ 
+         Parameters
+         ----------
+-        grammar: str
+-            The context-free grammar to create a logits processor from.
++        cfg : str
++            The CFG grammar to create a logits processor from.
++        validate_grammar : Optional[Callable[[str], bool]]
++            An optional callable that takes a grammar string and returns True
++            if the grammar is valid. If provided, this callback will be called
++            before compiling the grammar. A normal return value (including False)
++            means validation completed successfully. If the callback raises an
++            exception, that exception will be propagated without compiling the
++            grammar. If None, the backend's default validation callback is used.
++            If explicitly set to None here, validation is disabled for this request.
+ 
+         Returns
+         -------
+@@ -130,5 +215,14 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        # Use the provided callback, fall back to backend default, or skip validation
++        validator = (
++            validate_grammar if validate_grammar is not _UNSET
++            else self.validate_grammar
++        )
++
++        if validator is not None:
++            validator(cfg)
++
++        compiled_grammar = self.grammar_compiler.compile_grammar(cfg)
++        return XGrammarLogitsProcessor(compiled_grammar, self.tensor_library_name)
+diff --git a/test_validation.py b/test_validation.py
+new file mode 100644
+index 0000000..513ea31
+--- /dev/null
++++ b/test_validation.py
+@@ -0,0 +1,174 @@
++"""Test grammar validation policy for XGrammar backend."""
++import unittest
++from unittest.mock import MagicMock, patch
++import sys
++
++
++class TestGrammarValidationPolicy(unittest.TestCase):
++    """Test cases for grammar validation policy."""
++
++    def setUp(self):
++        """Set up test fixtures."""
++        # Create mock transformers model components
++        self.mock_transformers_model = MagicMock()
++        self.mock_transformers_model.config._name_or_path = "test-model"
++        
++        self.mock_tokenizer = MagicMock()
++        self.mock_tokenizer.padding_side = None
++        
++        # Import Transformers class and create mock instance
++        from outlines.models.transformers import Transformers
++        self.model = Transformers(self.mock_transformers_model, self.mock_tokenizer)
++        
++        # Mock xgrammar module - patch at the actual import location
++        self.mock_xgr = MagicMock()
++        self.mock_tokenizer_info = MagicMock()
++        self.mock_grammar_compiler = MagicMock()
++        
++        # Configure mock tokenizer info to have vocab_size attribute
++        type(self.mock_tokenizer_info).vocab_size = 1000
++        
++        self.mock_xgr.TokenizerInfo.from_huggingface.return_value = self.mock_tokenizer_info
++        self.mock_xgr.GrammarCompiler.return_value = self.mock_grammar_compiler
++        
++        # Setup compiler mocks
++        self.mock_json_schema = MagicMock()
++        self.mock_regex = MagicMock()
++        self.mock_cfg = MagicMock()
++        self.mock_grammar_compiler.compile_json_schema.return_value = self.mock_json_schema
++        self.mock_grammar_compiler.compile_regex.return_value = self.mock_regex
++        self.mock_grammar_compiler.compile_cfg.return_value = self.mock_cfg
++        
++        # Patch AutoConfig from_pretrained at transformers module level
++        self.patch_autocfg = patch('transformers.AutoConfig')
++        self.mock_autocfg = self.patch_autocfg.start()
++        self.mock_config = MagicMock()
++        self.mock_config.vocab_size = 1000
++        self.mock_autocfg.from_pretrained.return_value = self.mock_config
++        
++        # Replace xgrammar in sys.modules BEFORE importing XGrammarBackend
++        sys.modules['xgrammar'] = self.mock_xgr
++        
++        # Now import AFTER setting up patches
++        from outlines.backends.xgrammar import XGrammarBackend
++        self.XGrammarBackend = XGrammarBackend
++
++    def tearDown(self):
++        """Clean up patches."""
++        self.patch_autocfg.stop()
++        if 'xgrammar' in sys.modules:
++            del sys.modules['xgrammar']
++
++    def test_backend_without_validation(self):
++        """Test backend without validation callback."""
++        backend = self.XGrammarBackend(self.model)
++        self.assertIsNone(backend.validate_grammar)
++        
++        # Should be able to create processor without validation
++        processor = backend.get_json_schema_logits_processor('{"type": "object"}')
++        self.assertIsNotNone(processor)
++
++    def test_backend_with_validation_callback(self):
++        """Test backend with validation callback."""
++        my_validator = MagicMock(return_value=True)
++        backend = self.XGrammarBackend(self.model, validate_grammar=my_validator)
++        self.assertEqual(backend.validate_grammar, my_validator)
++        
++        # Should call validator when creating processor
++        processor = backend.get_json_schema_logits_processor('{"type": "object"}')
++        self.assertIsNotNone(processor)
++        my_validator.assert_called_once_with('{"type": "object"}')
++
++    def test_explicit_none_overrides_default(self):
++        """Test explicit None disables validation for specific request."""
++        my_validator = MagicMock(return_value=True)
++        backend = self.XGrammarBackend(self.model, validate_grammar=my_validator)
++        
++        # Without override, should use default
++        processor1 = backend.get_json_schema_logits_processor('{"type": "object"}')
++        my_validator.assert_called_once_with('{"type": "object"}')
++        
++        # With explicit None, should not call validator
++        my_validator.reset_mock()
++        processor2 = backend.get_json_schema_logits_processor(
++            '{"type": "string"}', 
++            validate_grammar=None
++        )
++        self.assertIsNotNone(processor2)
++        my_validator.assert_not_called()
++
++    def test_false_return_value(self):
++        """Test that False return value means validation completed."""
++        def my_validator(grammar: str) -> bool:
++            return False  # Invalid grammar but still completes
++        
++        backend = self.XGrammarBackend(self.model, validate_grammar=my_validator)
++        
++        # Should complete even with False return
++        processor = backend.get_json_schema_logits_processor('invalid')
++        self.assertIsNotNone(processor)
++
++    def test_exception_propagation(self):
++        """Test that exceptions during validation are propagated."""
++        def my_validator(grammar: str) -> bool:
++            raise ValueError("Invalid grammar")
++        
++        backend = self.XGrammarBackend(self.model, validate_grammar=my_validator)
++        
++        # Exception should propagate
++        with self.assertRaises(ValueError) as context:
++            backend.get_json_schema_logits_processor('invalid')
++        
++        self.assertIn("Invalid grammar", str(context.exception))
++        
++        # Backend should still work for other requests
++        def good_validator(grammar: str) -> bool:
++            return True
++        
++        backend.validate_grammar = good_validator
++        processor = backend.get_json_schema_logits_processor('{"type": "object"}')
++        self.assertIsNotNone(processor)
++
++    def test_independent_backend_instances(self):
++        """Test that different backend instances don't affect each other."""
++        validator_a = MagicMock(return_value=True)
++        validator_b = MagicMock(return_value=False)
++        
++        backend_a = self.XGrammarBackend(self.model, validate_grammar=validator_a)
++        backend_b = self.XGrammarBackend(self.model, validate_grammar=validator_b)
++        
++        # Each backend uses its own validator
++        processor_a = backend_a.get_json_schema_logits_processor('{"type": "object"}')
++        self.assertIsNotNone(processor_a)
++        validator_a.assert_called_once_with('{"type": "object"}')
++        validator_b.assert_not_called()
++        
++        processor_b = backend_b.get_json_schema_logits_processor('{"type": "string"}')
++        self.assertIsNotNone(processor_b)
++        validator_b.assert_called_once_with('{"type": "string"}')
++        validator_a.assert_called_once_with('{"type": "object"}')
++
++    def test_regex_processor_validation(self):
++        """Test validation works for regex processor."""
++        my_validator = MagicMock(return_value=True)
++        backend = self.XGrammarBackend(self.model, validate_grammar=my_validator)
++        
++        processor = backend.get_regex_logits_processor(r'^[a-z]+$')
++        self.assertIsNotNone(processor)
++        my_validator.assert_called_once_with(r'^[a-z]+$')
++
++    def test_cfg_processor_validation(self):
++        """Test validation works for CFG processor."""
++        my_validator = MagicMock(return_value=True)
++        backend = self.XGrammarBackend(self.model, validate_grammar=my_validator)
++        
++        cfg = '''
++        root ::= "hello"
++        '''
++        processor = backend.get_cfg_logits_processor(cfg)
++        self.assertIsNotNone(processor)
++        my_validator.assert_called_once_with(cfg)
++
++
++if __name__ == '__main__':
++    unittest.main()

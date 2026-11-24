@@ -1,0 +1,183 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..6f803522 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import inspect
++import re
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -15,6 +16,125 @@ if TYPE_CHECKING:
+ 
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
++# Duration units: ms, s, m, h -> seconds
++_DURATION_UNITS = {
++    "ms": 0.001,
++    "s": 1.0,
++    "m": 60.0,
++    "h": 3600.0,
++}
++
++# Size units: KB, MB, GB -> bytes (decimal factors)
++_SIZE_UNITS = {
++    "KB": 1000,
++    "MB": 1000000,
++    "GB": 1000000000,
++}
++
++# Regex patterns for parsing
++# Numeric pattern: optional sign, digits, optional decimal part, optional exponent
++_NUMERIC_PATTERN = re.compile(r'^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$')
++
++# Duration pattern: nonnegative number followed by optional whitespace and duration suffix (case-sensitive)
++_DURATION_PATTERN = re.compile(r'^(\d+\.?\d*)\s*(ms|s|m|h)$')
++
++# Size pattern: nonnegative number followed by optional whitespace and size suffix
++_SIZE_PATTERN = re.compile(r'^(\d+\.?\d*)\s*(KB|MB|GB)$')
++
++
++def _coerce_scalar(value: Any, type_str: str | None) -> Any:
++    """Coerce a scalar value based on its JSON schema type.
++    
++    Args:
++        value: The value to coerce.
++        type_str: The JSON schema type string (e.g., "integer", "number", "boolean").
++        
++    Returns:
++        The coerced value, or the original value if coercion is not applicable.
++    """
++    # Only coerce string values
++    if not isinstance(value, str):
++        return value
++    
++    # Trim surrounding whitespace
++    trimmed = value.strip()
++    
++    # Boolean coercion: case-insensitive "true" and "false"
++    if type_str == "boolean":
++        lower = trimmed.lower()
++        if lower == "true":
++            return True
++        elif lower == "false":
++            return False
++        # If it's not a valid boolean string, return original for validation error
++        return value
++    
++    # Integer and number coercion
++    if type_str in ("integer", "number"):
++        # Try to parse as duration first
++        duration_match = _DURATION_PATTERN.match(trimmed)
++        if duration_match:
++            magnitude_str = duration_match.group(1)
++            unit = duration_match.group(2).lower()
++            try:
++                magnitude = float(magnitude_str)
++                if magnitude < 0:
++                    return value  # Negative durations not allowed
++                return magnitude * _DURATION_UNITS[unit]
++            except ValueError:
++                return value
++        
++        # Try to parse as size
++        size_match = _SIZE_PATTERN.match(trimmed)
++        if size_match:
++            magnitude_str = size_match.group(1)
++            unit = size_match.group(2)
++            try:
++                magnitude = float(magnitude_str)
++                if magnitude < 0:
++                    return value  # Negative sizes not allowed
++                result = magnitude * _SIZE_UNITS[unit]
++                # Truncate toward zero for integer results
++                return int(result) if type_str == "integer" else result
++            except ValueError:
++                return value
++        
++        # Try to parse as numeric string
++        if _NUMERIC_PATTERN.match(trimmed):
++            try:
++                if type_str == "integer":
++                    # Check if it's a valid integer (no decimal point or exponent that would make it non-integer)
++                    # First try to parse as float and check if it's integral
++                    float_val = float(trimmed)
++                    if float_val != int(float_val):
++                        return value  # Non-integral value for integer schema
++                    # Use Decimal-like approach for large integers to preserve precision
++                    # Parse the string directly to avoid float precision issues
++                    if '.' in trimmed or 'e' in trimmed.lower():
++                        # Has decimal or exponent - check if it represents an integer
++                        if '.' in trimmed:
++                            parts = trimmed.split('.')
++                            decimal_part = parts[-1].rstrip('0')
++                            if decimal_part:
++                                return value  # Has non-zero decimal part
++                        # Try to convert via float and check if integral
++                        int_val = int(float_val)
++                        if float(int_val) == float_val:
++                            return int_val
++                        return value
++                    else:
++                        return int(trimmed)
++                else:  # number
++                    return float(trimmed)
++            except (ValueError, OverflowError):
++                return value
++        
++        # Failed to parse as numeric - return original for validation error
++        return value
++    
++    # For other types (string, array, object), return original
++    return value
++
+ 
+ class Tool(Type):
+     """Tool class.
+@@ -116,8 +236,25 @@ class Tool(Type):
+         self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+ 
+     def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
++        # Coerce scalar values before validation
++        coerced_kwargs = {}
+         for k, v in kwargs.items():
++            if k not in self.args:
++                if self.has_kwargs:
++                    coerced_kwargs[k] = v
++                    continue
++                else:
++                    raise ValueError(f"Arg {k} is not in the tool's args.")
++            
++            # Get the type from the schema
++            type_str = self.args[k].get("type")
++            
++            # Apply scalar coercion
++            coerced_kwargs[k] = _coerce_scalar(v, type_str)
++        
++        # Validate the coerced args comply to the json schema.
++        # Only validate values that were actually coerced from strings.
++        for k, v in coerced_kwargs.items():
+             if k not in self.args:
+                 if self.has_kwargs:
+                     continue
+@@ -127,13 +264,16 @@ class Tool(Type):
+                 instance = v.model_dump() if hasattr(v, "model_dump") else v
+                 type_str = self.args[k].get("type")
+                 if type_str is not None and type_str != "Any":
+-                    validate(instance=instance, schema=self.args[k])
++                    # Only validate if the value was originally a string (i.e., it was coerced)
++                    original_v = kwargs.get(k)
++                    if isinstance(original_v, str):
++                        validate(instance=instance, schema=self.args[k])
+             except ValidationError as e:
+                 raise ValueError(f"Arg {k} is invalid: {e.message}")
+ 
+         # Parse the args to the correct type.
+         parsed_kwargs = {}
+-        for k, v in kwargs.items():
++        for k, v in coerced_kwargs.items():
+             if k in self.arg_types and self.arg_types[k] != Any:
+                 # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+                 # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`

@@ -1,0 +1,200 @@
+diff --git a/docs/reference/prompting.md b/docs/reference/prompting.md
+index 8ea9c024..60ada1a4 100644
+--- a/docs/reference/prompting.md
++++ b/docs/reference/prompting.md
+@@ -186,6 +186,28 @@ information about the syntax of the templating language. The Jinja syntax is
+ powerful, and we recommend you take some time to read their documentation if you
+ are building complex prompts.
+ 
++### Global custom filters
++
++Use `outlines.prompts.register_filter` to make a Jinja filter available to
++prompts constructed afterwards with `@outlines.prompt`, `Prompt.from_str`, or
++`Prompt.from_file`. Remove it with `unregister_filter`; removing an unknown name
++does nothing.
++
++```python
++from outlines import prompts
++
++prompts.register_filter("surround", lambda value: f"<{value}>")
++prompt = prompts.Prompt.from_str("{{ value | surround }}")
++prompts.unregister_filter("surround")
++
++prompt(value="example")  # '<example>'
++```
++
++Registration is captured when a prompt is constructed, so changing or removing
++a registered filter does not alter existing prompts. Registered filters can
++replace Jinja defaults for future prompts. The Outlines filters `name`,
++`description`, `source`, `signature`, `schema`, and `args` remain protected.
++
+ 
+ ## Tools
+ 
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ada..af94d925 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -11,6 +11,33 @@ from typing import Any, Callable, Dict, Optional, Type, cast
+ import jinja2
+ import pydantic
+ 
++# Global filter registry
++_global_filters: Dict[str, Callable] = {}
++
++
++def register_filter(name: str, func: Callable) -> None:
++    """Register a custom filter globally for use in all prompt templates.
++
++    Parameters
++    ----------
++    name : str
++        The name of the filter to register.
++    func : Callable
++        The function to use as the filter.
++    """
++    _global_filters[name] = func
++
++
++def unregister_filter(name: str) -> None:
++    """Remove a custom filter from the global registry.
++
++    Parameters
++    ----------
++    name : str
++        The name of the filter to remove.
++    """
++    _global_filters.pop(name, None)
++
+ 
+ @dataclass
+ class Prompt:
+@@ -99,6 +126,9 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        # Add global filters first
++        env.filters.update(_global_filters)
++        # Add built-in filters (these take precedence over global filters)
+         env.filters["name"] = get_fn_name
+         env.filters["description"] = get_fn_description
+         env.filters["source"] = get_fn_source
+@@ -118,6 +148,15 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        # Add global filters first
++        env.filters.update(_global_filters)
++        # Add built-in filters (these take precedence over global filters)
++        env.filters["name"] = get_fn_name
++        env.filters["description"] = get_fn_description
++        env.filters["source"] = get_fn_source
++        env.filters["signature"] = get_fn_signature
++        env.filters["schema"] = get_schema
++        env.filters["args"] = get_fn_args
+         return env.get_template(os.path.basename(path))
+ 
+ 
+diff --git a/tests/test_prompt_global_registry.py b/tests/test_prompt_global_registry.py
+new file mode 100644
+index 00000000..09d52025
+--- /dev/null
++++ b/tests/test_prompt_global_registry.py
+@@ -0,0 +1,97 @@
++from pathlib import Path
++
++import jinja2
++import pytest
++
++import outlines
++from outlines import prompts
++from outlines.prompts import Prompt
++
++
++@pytest.fixture
++def registered_names():
++    names = []
++    yield names
++    unregister = getattr(prompts, "unregister_filter", None)
++    if unregister is not None:
++        for name in names:
++            unregister(name)
++
++
++def test_registry_applies_to_all_public_entrypoints(registered_names, tmp_path: Path):
++    name = "n4c_surround"
++    registered_names.append(name)
++    prompts.register_filter(name, lambda value: f"<{value}>")
++
++    @outlines.prompt
++    def decorated(value):
++        """{{ value | n4c_surround }}"""
++
++    include = tmp_path / "include.txt"
++    include.write_text("{{ value | n4c_surround }}", encoding="utf-8")
++    prompt_path = tmp_path / "prompt.txt"
++    prompt_path.write_text('{% include "include.txt" %}', encoding="utf-8")
++
++    assert decorated("decorator") == "<decorator>"
++    assert Prompt.from_str("{{ value | n4c_surround }}")(value="string") == "<string>"
++    assert Prompt.from_file(prompt_path)(value="file") == "<file>"
++
++
++def test_registry_changes_only_future_prompts(registered_names):
++    name = "n4c_versioned"
++    registered_names.append(name)
++    prompts.register_filter(name, lambda value: f"first:{value}")
++    first = Prompt.from_str("{{ value | n4c_versioned }}")
++
++    prompts.register_filter(name, lambda value: f"second:{value}")
++    second = Prompt.from_str("{{ value | n4c_versioned }}")
++    prompts.unregister_filter(name)
++
++    assert first(value="x") == "first:x"
++    assert second(value="x") == "second:x"
++    with pytest.raises(jinja2.TemplateAssertionError, match="No filter named"):
++        Prompt.from_str("{{ value | n4c_versioned }}")
++
++
++def test_outlines_filters_are_protected_and_unknown_unregister_is_safe(
++    registered_names,
++):
++    registered_names.append("name")
++    prompts.register_filter("name", lambda value: "wrong")
++    prompts.unregister_filter("n4c_never_registered")
++
++    def sample():
++        pass
++
++    assert Prompt.from_str("{{ fn | name }}")(fn=sample) == "sample"
++
++
++def test_registry_preserves_prompt_error_format_and_signature_contracts(
++    registered_names,
++):
++    name = "n4c_identity"
++    registered_names.append(name)
++    prompts.register_filter(name, lambda value: value)
++
++    @outlines.prompt
++    def formatted(value="snow"):
++        """
++        Heading
++            {{ value | n4c_identity }} / {{ missing }}
++
++        """
++
++    assert list(formatted.signature.parameters) == ["value"]
++    with pytest.raises(TypeError):
++        formatted(unexpected="x")
++    with pytest.raises(jinja2.UndefinedError):
++        formatted()
++
++    rendered = Prompt.from_str(
++        """
++        Heading
++            {{ value | n4c_identity }}
++
++        """
++    )
++    assert rendered(value="snow") == "Heading\n    snow\n"

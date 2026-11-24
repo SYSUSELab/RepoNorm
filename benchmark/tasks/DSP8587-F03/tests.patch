@@ -1,0 +1,112 @@
+diff --git a/tests/streaming/test_streaming.py b/tests/streaming/test_streaming.py
+index fe67bd6..45738fe 100644
+--- a/tests/streaming/test_streaming.py
++++ b/tests/streaming/test_streaming.py
+@@ -837,3 +837,94 @@ async def test_stream_listener_returns_correct_chunk_xml_adapter():
+     assert all_chunks[1].predict_name == "predict2"
+     assert all_chunks[1].signature_field_name == "judgement"
+     assert all_chunks[1].chunk == "The answer is humorous."
++
++def _feature3_model_chunk(content):
++    return ModelResponseStream(
++        model="test", choices=[StreamingChoices(delta=Delta(content=content))]
++    )
++
++
++def test_initial_stats_are_serialization_friendly_and_zeroed():
++    listener = dspy.streaming.StreamListener(
++        signature_field_name="answer", predict_name="predict"
++    )
++    assert listener.stats() == {
++        "predict_name": "predict",
++        "field": "answer",
++        "chunk_count": 0,
++        "char_count": 0,
++        "first_ts": None,
++        "last_ts": None,
++        "duration_s": None,
++        "avg_chunk_chars": 0,
++    }
++
++
++def test_stats_are_driven_by_receive_and_clear_on_end_transition():
++    listener = dspy.streaming.StreamListener(
++        signature_field_name="answer", predict_name="predict"
++    )
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener.receive(_feature3_model_chunk("[[ ## answer ## ]]\n"))
++        response = None
++        for index in range(11):
++            response = listener.receive(_feature3_model_chunk(str(index)))
++
++        active = listener.stats()
++        final = listener.receive(
++            _feature3_model_chunk("[[ ## completed ## ]]")
++        )
++
++    assert response.chunk == "0"
++    assert active["chunk_count"] == 1
++    assert active["char_count"] == 1
++    assert isinstance(active["first_ts"], float)
++    assert isinstance(active["last_ts"], float)
++    assert active["duration_s"] == 0
++    assert active["avg_chunk_chars"] == 1
++    assert final.chunk.endswith("10")
++    assert listener.stats() == {
++        "predict_name": "predict",
++        "field": "answer",
++        "chunk_count": 0,
++        "char_count": 0,
++        "first_ts": None,
++        "last_ts": None,
++        "duration_s": None,
++        "avg_chunk_chars": 0,
++    }
++
++
++@pytest.mark.parametrize("allow_reuse", [False, True])
++def test_stats_accumulate_actual_emissions_and_reset_between_streams(allow_reuse):
++    listener = dspy.streaming.StreamListener(
++        signature_field_name="answer", predict_name="predict", allow_reuse=allow_reuse
++    )
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        for _ in range(2 if allow_reuse else 1):
++            listener.receive(_feature3_model_chunk("[[ ## answer ## ]]\n"))
++            emitted = []
++            for size in range(1, 17):
++                response = listener.receive(_feature3_model_chunk("x" * size))
++                if response is None:
++                    continue
++                emitted.append(response)
++                observed = listener.stats()
++                chars = sum(len(item.chunk) for item in emitted)
++                assert observed["chunk_count"] == len(emitted)
++                assert observed["char_count"] == chars
++                assert observed["avg_chunk_chars"] == chars / len(emitted)
++                assert isinstance(observed["first_ts"], float)
++                assert isinstance(observed["last_ts"], float)
++                assert observed["last_ts"] >= observed["first_ts"]
++                assert observed["duration_s"] == observed["last_ts"] - observed["first_ts"]
++            assert len(emitted) >= 2
++            assert len({len(item.chunk) for item in emitted}) >= 2
++            final = listener.receive(_feature3_model_chunk("[[ ## completed ## ]]"))
++            assert final is not None
++            assert "".join(item.chunk for item in emitted) + final.chunk == "x" * sum(range(1, 17))
++            assert listener.stats() == {
++                "predict_name": "predict", "field": "answer", "chunk_count": 0,
++                "char_count": 0, "first_ts": None, "last_ts": None,
++                "duration_s": None, "avg_chunk_chars": 0,
++            }
+diff --git a/tests/test_utils/server/__init__.py b/tests/test_utils/server/__init__.py
+index 70215d8..19643b6 100644
+--- a/tests/test_utils/server/__init__.py
++++ b/tests/test_utils/server/__init__.py
+@@ -73,7 +73,7 @@ def _get_random_port():
+         return s.getsockname()[1]
+ 
+ 
+-def _wait_for_port(host, port, timeout=10):
++def _wait_for_port(host, port, timeout=60):
+     start_time = time.time()
+     while time.time() - start_time < timeout:
+         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

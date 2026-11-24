@@ -1,0 +1,388 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..7077709 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,6 +280,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool = False,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -432,6 +433,18 @@ class Context:
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++        #: Enables validation that prevents closing this context while children are open.
++        #: Enabled validation is inherited by children.
++        #:
++        #: .. versionadded:: 8.2
++        if parent is not None and parent.validate_nesting:
++            self.validate_nesting = True
++        else:
++            self.validate_nesting = validate_nesting
++        self._children: set[Context] = set()
++        if parent is not None:
++            parent._children.add(self)
++
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -468,8 +481,9 @@ class Context:
+     def __enter__(self) -> Context:
+         self._depth += 1
+         push_context(self)
++        if self.parent is not None:
++            self.parent._children.add(self)
+         return self
+-
+     def __exit__(
+         self,
+         exc_type: type[BaseException] | None,
+@@ -478,7 +492,13 @@ class Context:
+     ) -> None:
+         self._depth -= 1
+         if self._depth == 0:
+-            self.close()
++            try:
++                self.close()
++            except RuntimeError:
++                pop_context()
++                raise
++            if self.parent is not None:
++                self.parent._children.discard(self)
+         pop_context()
+ 
+     @contextmanager
+@@ -607,10 +627,17 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self._children:
++            names = sorted(ctx.command.name for ctx in self._children)
++            raise RuntimeError(
++                f"Cannot close context '{self.command.name}' while child"
++                f" command(s) {names} are still running."
++            )
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+-
++        if self.parent is not None:
++            self.parent._children.discard(self)
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``
+@@ -1151,8 +1178,13 @@ class Command:
+ 
+         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
+ 
+-        with ctx.scope(cleanup=False):
+-            self.parse_args(ctx, args)
++        try:
++            with ctx.scope(cleanup=False):
++                self.parse_args(ctx, args)
++        except BaseException:
++            if ctx.parent is not None:
++                ctx.parent._children.discard(ctx)
++            raise
+         return ctx
+ 
+     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..ae7034f 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,291 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++
++class TestValidateNesting:
++    """Tests for Context.validate_nesting feature."""
++
++    def test_validate_nesting_default_disabled(self):
++        """By default, validate_nesting is False and nesting is not validated."""
++        ctx = click.Context(click.Command("test"))
++        assert ctx.validate_nesting is False
++
++    def test_validate_nesting_inherited_from_parent(self):
++        """Children inherit validate_nesting from parent."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++        assert child.validate_nesting is True
++
++    def test_validate_nesting_not_inherited_when_parent_disabled(self):
++        """Children do not inherit validate_nesting when parent has it disabled."""
++        parent = click.Context(click.Command("parent"), validate_nesting=False)
++        child = click.Context(click.Command("child"), parent=parent)
++        assert child.validate_nesting is False
++
++    def test_validate_nesting_explicitly_set_on_child(self):
++        """A child can have validate_nesting even without parent having it."""
++        parent = click.Context(click.Command("parent"))
++        child = click.Context(click.Command("child"), parent=parent, validate_nesting=True)
++        assert child.validate_nesting is True
++        assert parent.validate_nesting is False
++
++    def test_parent_refuses_close_with_open_child(self):
++        """A validated parent context raises RuntimeError when closed with open children."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++
++        with pytest.raises(RuntimeError, match="child"):
++            parent.close()
++
++    def test_close_child_removes_from_parent(self):
++        """Closing a child removes it from parent's children tracking."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++
++        child.close()
++        assert len(parent._children) == 0
++
++        # Parent can now close without error
++        parent.close()
++
++    def test_error_message_contains_child_name(self):
++        """The RuntimeError message identifies the outstanding child command(s)."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child1 = click.Context(click.Command("child1"), parent=parent)
++        child2 = click.Context(click.Command("child2"), parent=parent)
++
++        with pytest.raises(RuntimeError) as exc_info:
++            parent.close()
++
++        msg = str(exc_info.value)
++        assert "child1" in msg
++        assert "child2" in msg
++        assert "parent" in msg
++
++    def test_parent_resources_available_after_rejected_close(self):
++        """After a rejected close, parent's resources remain available."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++
++        cleanup_called = []
++        @parent.call_on_close
++        def cleanup():
++            cleanup_called.append(True)
++
++        with pytest.raises(RuntimeError):
++            parent.close()
++
++        # Close should not have been called, so cleanup not yet run
++        assert not cleanup_called
++
++        # After closing child, parent can close normally
++        child.close()
++        parent.close()
++        assert cleanup_called == [True]
++
++    def test_multiple_children_block_parent_close(self):
++        """Multiple open children all block parent close."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child1 = click.Context(click.Command("child1"), parent=parent)
++        child2 = click.Context(click.Command("child2"), parent=parent)
++        child3 = click.Context(click.Command("child3"), parent=parent)
++
++        with pytest.raises(RuntimeError, match="child1.*child2.*child3"):
++            parent.close()
++
++    def test_close_partial_children_then_parent(self):
++        """Closing some but not all children still blocks parent close."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child1 = click.Context(click.Command("child1"), parent=parent)
++        child2 = click.Context(click.Command("child2"), parent=parent)
++
++        child1.close()
++        with pytest.raises(RuntimeError, match="child2"):
++            parent.close()
++
++        child2.close()
++        parent.close()
++
++    def test_nested_levels(self):
++        """Multiple levels of nesting are tracked correctly."""
++        root = click.Context(click.Command("root"), validate_nesting=True)
++        mid = click.Context(click.Command("middle"), parent=root)
++        leaf = click.Context(click.Command("leaf"), parent=mid)
++
++        # Root can't close while leaf is open (via mid)
++        with pytest.raises(RuntimeError, match="middle"):
++            root.close()
++
++        # Mid can't close while leaf is open
++        with pytest.raises(RuntimeError, match="leaf"):
++            mid.close()
++
++        # Close leaf, then mid, then root
++        leaf.close()
++        with pytest.raises(RuntimeError, match="middle"):
++            root.close()
++
++        mid.close()
++        root.close()
++
++    def test_re_enter_child_reregisters(self):
++        """Re-entering a context re-registers it as open child."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++
++        # Close child
++        child.close()
++        assert len(parent._children) == 0
++
++        # Re-enter child
++        child.__enter__()
++        assert child in parent._children
++
++        # Parent can't close
++        with pytest.raises(RuntimeError, match="child"):
++            parent.close()
++
++        # Exit child properly
++        child.__exit__(None, None, None)
++        assert len(parent._children) == 0
++        parent.close()
++
++    def test_failed_exit_restores_context_stack(self):
++        """When __exit__ raises RuntimeError from validation, the context stack
++        is still restored so recovery is possible.
++        After a failed parent exit, closing the child via close() and
++        retrying the parent via close() recovers successfully."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++
++        # Enter both contexts
++        parent.__enter__()
++        child.__enter__()
++
++        # Try to exit parent (should fail because child is open)
++        with pytest.raises(RuntimeError):
++            parent.__exit__(None, None, None)
++
++        # After failed exit, close child with close() (not __exit__)
++        child.close()
++
++        # Retry parent close with close() - should succeed now
++        parent.close()
++
++    def test_make_context_cleans_up_on_parse_failure(self):
++        """When make_context fails during parsing, the child is removed from parent."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++
++        # A command that fails during parsing
++        cmd = click.Command("failing", params=[click.Option(["--fail"], is_flag=True, expose_value=False,
++            callback=lambda ctx, param, value: (_ for _ in ()).throw(ValueError("parse failed")) if value else None)])
++
++        with pytest.raises(ValueError, match="parse failed"):
++            cmd.make_context("failing", ["--fail"], parent=parent)
++
++        # Child should not remain in parent's children
++        assert len(parent._children) == 0
++
++    def test_no_spurious_errors_during_normal_cli(self, runner):
++        """Normal CLI execution does not produce spurious nesting errors."""
++        @click.command()
++        @click.option("--name", default="world")
++        def hello(name):
++            click.echo(f"Hello {name}!")
++
++        result = runner.invoke(hello, ["--name=Click"])
++        assert result.exit_code == 0
++        assert result.output == "Hello Click!\n"
++
++    def test_validate_nesting_during_normal_cli(self, runner):
++        """CLI with validate_nesting still works without spurious errors."""
++        @click.command(context_settings={"validate_nesting": True})
++        @click.option("--name", default="world")
++        def hello(name):
++            click.echo(f"Hello {name}!")
++
++        result = runner.invoke(hello, ["--name=Click"])
++        assert result.exit_code == 0
++        assert result.output == "Hello Click!\n"
++
++
++    def test_chained_commands_no_spurious_errors(self, runner):
++        """Chained command execution does not produce spurious nesting errors."""
++        @click.group(chain=True)
++        def cli():
++            pass
++
++        @cli.command()
++        def a():
++            click.echo("a")
++
++        @cli.command()
++        def b():
++            click.echo("b")
++
++        result = runner.invoke(cli, ["a", "b"])
++        assert result.exit_code == 0
++        assert result.output == "a\nb\n"
++
++    def test_child_added_on_init(self):
++        """Child context is added to parent's _children on __init__."""
++        parent = click.Context(click.Command("parent"))
++        child = click.Context(click.Command("child"), parent=parent)
++        assert child in parent._children
++
++    def test_child_added_on_enter(self):
++        """Child context is re-added to parent's _children on __enter__."""
++        parent = click.Context(click.Command("parent"))
++        child = click.Context(click.Command("child"), parent=parent)
++
++        # Remove from parent (simulate close)
++        parent._children.discard(child)
++        assert child not in parent._children
++
++        # Entering re-adds it
++        child.__enter__()
++        assert child in parent._children
++        child.__exit__(None, None, None)
++
++    def test_context_manager_with_validate_nesting(self):
++        """Using context manager protocol with validate_nesting works correctly."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child = click.Context(click.Command("child"), parent=parent)
++
++        parent.__enter__()
++        child.__enter__()
++
++        # Cannot exit parent while child open
++        with pytest.raises(RuntimeError):
++            parent.__exit__(None, None, None)
++
++        # Child still open - exit it properly
++        child.__exit__(None, None, None)
++
++        # Now parent can exit
++        parent.__exit__(None, None, None)
++
++    def test_child_not_affected_by_unrelated_children(self):
++        """Closing one child doesn't affect tracking of other children."""
++        parent = click.Context(click.Command("parent"), validate_nesting=True)
++        child1 = click.Context(click.Command("child1"), parent=parent)
++        child2 = click.Context(click.Command("child2"), parent=parent)
++
++        child1.close()
++        assert child2 in parent._children
++        assert child1 not in parent._children
++
++        child2.close()
++        parent.close()
++
++    def test_resilient_parsing_no_spurious_errors(self, runner):
++        """Shell completion (resilient parsing) works without errors."""
++        @click.command()
++        @click.option("--name")
++        def cmd(name):
++            pass
++
++        # Simulate resilient parsing used by shell completion
++        ctx = cmd.make_context("cmd", ["--name"], resilient_parsing=True)
++        assert ctx.resilient_parsing
++        ctx.close()

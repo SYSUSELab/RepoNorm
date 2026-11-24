@@ -1,0 +1,266 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..228d40c9 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add optional filesystem polling with proactive cache invalidation,
++    synchronous scan and invalidation APIs, and monitor cleanup.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..e4da2d18 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -443,6 +443,22 @@ own loader, subclass :class:`BaseLoader` and override `get_source`.
+ Here a list of the builtin loaders Jinja provides:
+ 
+ .. autoclass:: jinja2.FileSystemLoader
++    :members: start_monitoring, scan_once, invalidate_changed, close
++
++Filesystem loaders can proactively invalidate template caches. The
++``auto_reload`` loader option defaults to true and starts polling at
++0.5-second intervals when an Environment first requests a source. It is
++independent of the Environment's lazy ``auto_reload`` freshness checks.
++Environments are tracked weakly; disabled loader monitoring does not
++register them or start a thread. Filesystem errors do not end polling.
++
++``scan_once`` compares snapshots synchronously. ``invalidate_changed``
++accepts absolute paths, ignores paths outside the roots, and returns
++canonical template names using ``/``. Unrelated cached names and other
++loaders remain untouched; an Environment without a cache is supported.
++Call ``close`` to stop polling, or use the loader as a context manager.
++Repeated lifecycle calls are safe and an explicit start can restart a
++closed monitor. Relative source paths retain their lookup rules.
+ 
+ .. autoclass:: jinja2.PackageLoader
+ 
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..d6979d62 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -4,6 +4,7 @@ sources.
+ import importlib.util
+ import os
+ import sys
++import threading
+ import typing as t
+ import weakref
+ import zipimport
+@@ -170,6 +171,11 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param auto_reload: Poll for changes after the first source request.
++        This is independent of the Environment's request-time checks.
++
++    .. versionchanged:: 3.1.0
++        Add optional proactive cache invalidation and monitor lifecycle.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
+@@ -180,6 +186,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        auto_reload: bool = True,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,10 +194,192 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        # Whether to run the background watcher for automatic cache invalidation
++        self.auto_reload = auto_reload
++
++        # Monitoring state
++        self._environments: "weakref.WeakSet[Environment]" = weakref.WeakSet()
++        self._searchpath_abs = [os.path.abspath(p) for p in self.searchpath]
++        self._snapshot: t.Dict[str, t.Tuple[int, int]] = {}
++        self._lock = threading.Lock()
++        self._stop_event = threading.Event()
++        self._poll_interval = 0.5
++        self._watcher_thread: t.Optional[threading.Thread] = None
++
++        # Monitoring begins when an environment first loads from this loader.
++        # Disabled loaders neither scan nor retain environments.
++
++    def _register_environment(self, environment: "Environment") -> None:
++        """Track using environments with weak references."""
++        if self.auto_reload:
++            self._environments.add(environment)
++            self.start_monitoring()
++
++    def _build_snapshot(self) -> t.Dict[str, t.Tuple[int, int]]:
++        """Map absolute file paths to nanosecond mtimes and sizes."""
++        snapshot: t.Dict[str, t.Tuple[int, int]] = {}
++        for root in self._searchpath_abs:
++            if not os.path.isdir(root):
++                continue
++            for dirpath, _, filenames in os.walk(root, followlinks=self.followlinks):
++                for fname in filenames:
++                    fpath = os.path.join(dirpath, fname)
++                    try:
++                        stat = os.stat(fpath)
++                        snapshot[fpath] = (stat.st_mtime_ns, stat.st_size)
++                    except OSError:
++                        # File might have been removed between list and stat
++                        continue
++        return snapshot
++
++    def _path_to_template_name(self, abs_path: str) -> t.Optional[str]:
++        for root in self._searchpath_abs:
++            # Ensure root ends with a path separator when comparing prefixes
++            root_prefix = root.rstrip(os.path.sep) + os.path.sep
++            if abs_path.startswith(root_prefix) or abs_path == root:
++                rel = os.path.relpath(abs_path, root)
++                template = rel.replace(os.path.sep, "/")
++                return template
++        return None
++
++    def _invalidate_names(self, names: t.Set[str]) -> None:
++        if not names:
++            return
++        # Iterate over a list copy to avoid issues if the WeakSet changes
++        for env in list(self._environments):
++            cache = getattr(env, "cache", None)
++            if not cache:
++                continue
++            to_delete: t.List[t.Tuple[weakref.ref, str]] = []
++            for key in list(cache.keys()):
++                try:
++                    loader_ref, name = key
++                except Exception:
++                    continue
++                if name in names:
++                    obj = loader_ref()
++                    if obj is self:
++                        to_delete.append(key)
++            for key in to_delete:
++                try:
++                    del cache[key]
++                except Exception:
++                    pass
++
++    def _on_template_changed(self, file_paths: t.List[str]) -> None:
++        """Manual cache invalidation method for testing purposes.
++
++        Takes a list of absolute file paths that have changed and
++        invalidates corresponding template cache entries.
++        """
++        self.invalidate_changed(file_paths)
++
++    def scan_once(self) -> t.Set[str]:
++        """Compare a filesystem snapshot and invalidate changed names.
++
++        Return canonical names for added, deleted or modified files.
++        This explicit synchronous operation does not start a thread.
++
++        .. versionadded:: 3.1.0
++        """
++        with self._lock:
++            new_snapshot = self._build_snapshot()
++            old_snapshot = self._snapshot
++            added_paths = set(new_snapshot) - set(old_snapshot)
++            removed_paths = set(old_snapshot) - set(new_snapshot)
++            modified_paths = {
++                p for p, m in new_snapshot.items() if old_snapshot.get(p) != m
++            }
++            self._snapshot = new_snapshot
++
++        changed_paths = added_paths | removed_paths | modified_paths
++        changed_names: t.Set[str] = set()
++        for p in changed_paths:
++            name = self._path_to_template_name(p)
++            if name:
++                changed_names.add(name)
++        if changed_names:
++            self._invalidate_names(changed_names)
++        return changed_names
++
++    def start_monitoring(self) -> None:
++        """Start polling after recording the current filesystem state.
++
++        Repeated calls are harmless. A closed monitor can restart.
++        A loader with ``auto_reload=False`` does not start monitoring.
++
++        .. versionadded:: 3.1.0
++        """
++        if not self.auto_reload:
++            return
++        current = self._watcher_thread
++        if current is not None and current.is_alive():
++            return
++        self._snapshot = self._build_snapshot()
++        self._stop_event = threading.Event()
++        stop_event = self._stop_event
++        loader_ref = weakref.ref(self)
++
++        def watch() -> None:
++            while not stop_event.wait(0.5):
++                loader = loader_ref()
++                if loader is None:
++                    return
++                try:
++                    loader.scan_once()
++                except OSError:
++                    pass
++                finally:
++                    del loader
++
++        self._watcher_thread = threading.Thread(
++            target=watch,
++            name=f"jinja2.FileSystemLoader.watch.{id(self):x}",
++            daemon=True,
++        )
++        self._watcher_thread.start()
++
++    def invalidate_changed(self, file_paths: t.Iterable[str]) -> t.Set[str]:
++        """Invalidate absolute paths inside the configured search roots.
++
++        Return their canonical template names. Ignore outside paths;
++        leave other names and other loaders' cache entries unchanged.
++
++        .. versionadded:: 3.1.0
++        """
++        names = set()
++        for path in file_paths:
++            name = self._path_to_template_name(os.path.abspath(path))
++            if name is not None:
++                names.add(name)
++        self._invalidate_names(names)
++        return names
++
++    def close(self) -> None:
++        """Stop polling, allowing repeated calls and later restart.
++
++        Context-manager exit also closes the monitor.
++
++        .. versionadded:: 3.1.0
++        """
++        self._stop_event.set()
++        current = self._watcher_thread
++        if current is not None and current.is_alive():
++            current.join(timeout=1.0)
++        self._watcher_thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, *args: t.Any) -> None:
++        self.close()
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        # Register this environment to enable cache invalidation across instances
++        self._register_environment(environment)
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)

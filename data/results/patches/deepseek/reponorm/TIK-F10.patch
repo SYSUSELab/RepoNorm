@@ -1,0 +1,228 @@
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..3f3b65d 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -254,3 +254,128 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++# ====================
++# Cache encoding
++# ====================
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_basic_hit(make_enc: Callable[[], tiktoken.Encoding]):
++    """Cache hit returns same result as cache miss."""
++    enc = make_enc()
++    text = "hello world"
++    expected = enc.encode(text)
++    cached = enc.encode(text, use_cache=True)
++    assert cached == expected
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_returns_copy(make_enc: Callable[[], tiktoken.Encoding]):
++    """Returned list must not allow mutation of cached value."""
++    enc = make_enc()
++    text = "hello world"
++    tokens = enc.encode(text, use_cache=True)
++    tokens.append(-1)
++    tokens2 = enc.encode(text, use_cache=True)
++    assert tokens2 == enc.encode(text), "Cache should return independent copy"
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_policies_independent(make_enc: Callable[[], tiktoken.Encoding]):
++    """Different special-token policies must not share cache entries."""
++    enc = make_enc()
++    text = "<|endoftext|> hello"
++    tokens_all = enc.encode(text, allowed_special="all", use_cache=True)
++    tokens_none = enc.encode(text, disallowed_special=(), use_cache=True)
++    assert tokens_all != tokens_none, "Different policies must yield different results"
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_raises_on_disallowed(make_enc: Callable[[], tiktoken.Encoding]):
++    """Disallowed-special validation must not be bypassed by earlier cached calls under a different policy."""
++    enc = make_enc()
++    text = "<|endoftext|>"
++    # Warm cache with allowed_special="all"
++    enc.encode(text, allowed_special="all", use_cache=True)
++    # Now call with default disallowed_special="all" — should still raise
++    with pytest.raises(ValueError):
++        enc.encode(text, use_cache=True)
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_batch(make_enc: Callable[[], tiktoken.Encoding]):
++    """encode_batch with use_cache preserves order and matches single encode."""
++    enc = make_enc()
++    texts = ["hello world", "goodbye world"]
++    expected = [enc.encode(t) for t in texts]
++    batch_result = enc.encode_batch(texts, use_cache=True)
++    assert batch_result == expected
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_isolated_instances(make_enc: Callable[[], tiktoken.Encoding]):
++    """Different Encoding instances must have isolated caches."""
++    enc1 = make_enc()
++    enc2 = make_enc()
++    text = "hello world"
++    enc1.encode(text, use_cache=True)
++    # enc2 starts with empty cache — should compute and not share state
++    result = enc2.encode(text, use_cache=True)
++    assert result == enc1.encode(text)
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_eviction(make_enc: Callable[[], tiktoken.Encoding]):
++    """LRU eviction must work — inserting beyond capacity evicts least recently used."""
++    enc = make_enc()
++    # Fill cache with distinct texts
++    texts = [f"unique text {i}" for i in range(130)]
++    for t in texts:
++        enc.encode(t, use_cache=True)
++    # The first few should have been evicted
++    # Verify the most recent 128 are still cached
++    for i in range(2, 130):
++        result = enc.encode(texts[i], use_cache=True)
++        assert result == enc.encode(texts[i]), f"Text {i} should be in cache"
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_special_policy_not_contaminated(make_enc: Callable[[], tiktoken.Encoding]):
++    """A cache entry created under one policy must not be returned for a different policy."""
++    enc = make_enc()
++    text = "<|endoftext|>"
++    # Policy 1: treat endoftext as a single special token
++    r1 = enc.encode(text, allowed_special={"<|endoftext|>"}, use_cache=True)
++    # Policy 2: don't allow any special tokens (encode as natural text)
++    r2 = enc.encode(text, allowed_special=set(), disallowed_special=(), use_cache=True)
++    assert r1 != r2, "Different policies must produce different results"
++    # Re-using policy 1 should return cached result
++    r3 = enc.encode(text, allowed_special={"<|endoftext|>"}, use_cache=True)
++    assert r3 == r1, "Same policy should produce cache hit"
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_cache_batch_use_cache_default(make_enc: Callable[[], tiktoken.Encoding]):
++    """encode_batch default use_cache=False must preserve existing behavior."""
++    enc = make_enc()
++    texts = ["hello world"]
++    # Should work the same as before (no TypeError about unexpected keyword)
++    result = enc.encode_batch(texts)
++    assert result == [enc.encode("hello world")]
++
++
++def test_cache_concurrent_safety():
++    """Concurrent cache hits, insertion, and eviction must not corrupt results or raise cache-race errors."""
++    import concurrent.futures
++    enc = tiktoken.get_encoding("cl100k_base")
++    texts = [f"thread test text {i}" for i in range(200)]
++
++    def encode_text(t):
++        return enc.encode(t, use_cache=True)
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
++        results = list(executor.map(encode_text, texts))
++    # Verify all results are correct
++    expected = [enc.encode(t) for t in texts]
++    assert results == expected
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..f611546 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ import functools
++import threading
++from collections import OrderedDict
+ from concurrent.futures import ThreadPoolExecutor
+ from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
+ 
+@@ -53,6 +55,11 @@ class Encoding:
+ 
+         self._core_bpe = _tiktoken.CoreBPE(mergeable_ranks, special_tokens, pat_str)
+ 
++        # Caching support
++        self._cache = OrderedDict()
++        self._cache_capacity = 128
++        self._cache_lock = threading.Lock()
++
+     def __repr__(self) -> str:
+         return f"<Encoding {self.name!r}>"
+ 
+@@ -82,6 +89,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -114,14 +122,23 @@ class Encoding:
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+             disallowed_special = self.special_tokens_set - allowed_special
++        if disallowed_special and not isinstance(disallowed_special, frozenset):
++            disallowed_special = frozenset(disallowed_special)
++
++        if use_cache:
++            key = (text, frozenset(allowed_special),
++                   disallowed_special if isinstance(disallowed_special, frozenset) else frozenset())
++            with self._cache_lock:
++                if key in self._cache:
++                    self._cache.move_to_end(key)
++                    return list(self._cache[key])
++
+         if disallowed_special:
+-            if not isinstance(disallowed_special, frozenset):
+-                disallowed_special = frozenset(disallowed_special)
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +147,16 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            result = self._core_bpe.encode(text, allowed_special)
++
++        if use_cache:
++            with self._cache_lock:
++                self._cache[key] = list(result)
++                if len(self._cache) > self._cache_capacity:
++                    self._cache.popitem(last=False)
++
++        return result
++
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,6 +205,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        use_cache: bool = False,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -197,7 +224,7 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, use_cache=use_cache
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

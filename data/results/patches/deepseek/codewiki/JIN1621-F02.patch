@@ -1,0 +1,123 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..ec4539b 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -22,20 +22,40 @@ if t.TYPE_CHECKING:
+ 
+ 
+ def split_template_path(template: str) -> t.List[str]:
+-    """Split a path into segments and perform a sanity check.  If it detects
+-    '..' in the path it will raise a `TemplateNotFound` error.
++    """Normalize a template path and reject dangerous ones.
++
++    Both ``/`` and ``\\`` are logical separators. Empty segments and ``.``
++    are removed. An internal ``..`` removes the preceding ordinary segment.
++
++    Preserves the loader root boundary by rejecting a leading ``..``, any
++    ``..`` that would pop beyond the logical root, names beginning with
++    ``/`` or ``\\``, UNC forms, and names beginning with an ASCII drive
++    prefix such as ``C:``.
++
++    Raises ``TemplateNotFound`` containing the original request name if
++    the path is invalid.
+     """
+-    pieces = []
+-    for piece in template.split("/"):
+-        if (
+-            os.path.sep in piece
+-            or (os.path.altsep and os.path.altsep in piece)
+-            or piece == os.path.pardir
+-        ):
+-            raise TemplateNotFound(template)
+-        elif piece and piece != ".":
+-            pieces.append(piece)
+-    return pieces
++    if template.startswith("/") or template.startswith("\\"):
++        raise TemplateNotFound(template)
++
++    if len(template) >= 2 and template[1] == ":" and template[0].isascii() and template[0].isalpha():
++        raise TemplateNotFound(template)
++
++    normalized = template.replace("\\", "/")
++    pieces = normalized.split("/")
++
++    result: t.List[str] = []
++    for piece in pieces:
++        if piece == "" or piece == ".":
++            continue
++        elif piece == "..":
++            if not result:
++                raise TemplateNotFound(template)
++            result.pop()
++        else:
++            result.append(piece)
++
++    return result
+ 
+ 
+ class BaseLoader:
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..6922dd4 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -112,9 +112,60 @@ class TestLoaders:
+         assert env.get_template("foo").render() == "two"
+ 
+     def test_split_template_path(self):
++        # Basic normalization
+         assert split_template_path("foo/bar") == ["foo", "bar"]
+         assert split_template_path("./foo/bar") == ["foo", "bar"]
++        assert split_template_path("foo/./bar") == ["foo", "bar"]
++        assert split_template_path("foo//bar") == ["foo", "bar"]
++
++        # Dot-dot resolution within root
++        assert split_template_path("foo/../bar") == ["bar"]
++        assert split_template_path("foo/bar/../baz") == ["foo", "baz"]
++        assert split_template_path("a/b/../c/../d") == ["a", "d"]
++        pytest.raises(TemplateNotFound, split_template_path, "a/../../b")
++
++        # Backslash normalization
++        assert split_template_path("foo\\bar") == ["foo", "bar"]
++        assert split_template_path("foo\\..\\bar") == ["bar"]
++        assert split_template_path("foo\\bar\\../baz") == ["foo", "baz"]
++
++        # Mixed separators
++        assert split_template_path("foo/bar\\baz") == ["foo", "bar", "baz"]
++        assert split_template_path("foo\\bar/baz") == ["foo", "bar", "baz"]
++
++        # Leading dot-dot rejection
+         pytest.raises(TemplateNotFound, split_template_path, "../foo")
++        pytest.raises(TemplateNotFound, split_template_path, "..")
++        pytest.raises(TemplateNotFound, split_template_path, "../..")
++
++        # Dot-dot beyond root rejection
++        pytest.raises(TemplateNotFound, split_template_path, "foo/../../..")
++        pytest.raises(TemplateNotFound, split_template_path, "foo/../..")
++
++        # Absolute path rejection
++        pytest.raises(TemplateNotFound, split_template_path, "/foo")
++        pytest.raises(TemplateNotFound, split_template_path, "/foo/bar")
++        pytest.raises(TemplateNotFound, split_template_path, "\\foo")
++        pytest.raises(TemplateNotFound, split_template_path, "\\foo\\bar")
++
++        # Drive prefix rejection
++        pytest.raises(TemplateNotFound, split_template_path, "C:foo")
++        pytest.raises(TemplateNotFound, split_template_path, "C:\\foo")
++        pytest.raises(TemplateNotFound, split_template_path, "D:foo\\bar")
++
++        # TemplateNotFound contains the original request name
++        try:
++            split_template_path("../foo")
++        except TemplateNotFound as e:
++            assert e.name == "../foo"
++        try:
++            split_template_path("/etc/passwd")
++        except TemplateNotFound as e:
++            assert e.name == "/etc/passwd"
++        try:
++            split_template_path("C:\\windows")
++        except TemplateNotFound as e:
++            assert e.name == "C:\\windows"
+ 
+ 
+ class TestFileSystemLoader:

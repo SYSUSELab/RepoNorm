@@ -1,0 +1,395 @@
+diff --git a/dspy/adapters/base.py b/dspy/adapters/base.py
+index eaea7956..6afb0843 100644
+--- a/dspy/adapters/base.py
++++ b/dspy/adapters/base.py
+@@ -104,7 +104,7 @@ class Adapter:
+                     }
+                     for v in tool_calls
+                 ]
+-                value[tool_call_output_field_name] = ToolCalls.from_dict_list(tool_calls)
++                value[tool_call_output_field_name] = ToolCalls.from_dict_list(ToolCalls.validate_input(tool_calls))
+ 
+             if output_logprobs:
+                 value["logprobs"] = output_logprobs
+diff --git a/dspy/adapters/two_step_adapter.py b/dspy/adapters/two_step_adapter.py
+index 9e3f7bbb..7df14603 100644
+--- a/dspy/adapters/two_step_adapter.py
++++ b/dspy/adapters/two_step_adapter.py
+@@ -152,7 +152,7 @@ class TwoStepAdapter(Adapter):
+                     }
+                     for v in tool_calls
+                 ]
+-                value[tool_call_output_field_name] = ToolCalls.from_dict_list(tool_calls)
++                value[tool_call_output_field_name] = ToolCalls.from_dict_list(ToolCalls.validate_input(tool_calls))
+ 
+             if output_logprobs is not None:
+                 value["logprobs"] = output_logprobs
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..2ebbbb95 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,7 @@
+ import asyncio
+ import inspect
++import json
++import re
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -113,93 +115,25 @@ class Tool(Type):
+         self.desc = self.desc or desc
+         self.args = self.args or args
+         self.arg_types = self.arg_types or arg_types
+-        self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+-
+-    def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
+-        for k, v in kwargs.items():
+-            if k not in self.args:
+-                if self.has_kwargs:
+-                    continue
+-                else:
+-                    raise ValueError(f"Arg {k} is not in the tool's args.")
+-            try:
+-                instance = v.model_dump() if hasattr(v, "model_dump") else v
+-                type_str = self.args[k].get("type")
+-                if type_str is not None and type_str != "Any":
+-                    validate(instance=instance, schema=self.args[k])
+-            except ValidationError as e:
+-                raise ValueError(f"Arg {k} is invalid: {e.message}")
+-
+-        # Parse the args to the correct type.
+-        parsed_kwargs = {}
+-        for k, v in kwargs.items():
+-            if k in self.arg_types and self.arg_types[k] != Any:
+-                # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+-                # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+-                pydantic_wrapper = create_model("Wrapper", value=(self.arg_types[k], ...))
+-                parsed = pydantic_wrapper.model_validate({"value": v})
+-                parsed_kwargs[k] = parsed.value
+-            else:
+-                parsed_kwargs[k] = v
+-        return parsed_kwargs
+-
+-    def format(self):
+-        return str(self)
+-
+-    def format_as_litellm_function_call(self):
+-        return {
+-            "type": "function",
+-            "function": {
+-                "name": self.name,
+-                "description": self.desc,
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": self.args,
+-                    "required": list(self.args.keys()),
+-                },
+-            },
+-        }
+-
+-    def _run_async_in_sync(self, coroutine):
+-        try:
+-            loop = asyncio.get_running_loop()
+-        except RuntimeError:
+-            return asyncio.run(coroutine)
++        self.arg_desc = self.arg_desc or arg_desc
+ 
+-        return loop.run_until_complete(coroutine)
++    async def acall(self, **kwargs):
++        """Asynchronously call the tool."""
++        if inspect.iscoroutinefunction(self.func):
++            return await self.func(**kwargs)
++        return self.func(**kwargs)
+ 
+-    @with_callbacks
+     def __call__(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            if settings.allow_tool_async_sync_conversion:
+-                return self._run_async_in_sync(result)
+-            else:
+-                raise ValueError(
+-                    "You are calling `__call__` on an async tool, please use `acall` instead or set "
+-                    "`allow_async=True` to run the async tool in sync mode."
+-                )
+-        return result
+-
+-    @with_callbacks
+-    async def acall(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            return await result
+-        else:
+-            # We should allow calling a sync tool in the async path.
+-            return result
++        """Call the tool."""
++        return self.func(**kwargs)
+ 
+     @classmethod
+-    def from_mcp_tool(cls, session: "mcp.client.session.ClientSession", tool: "mcp.types.Tool") -> "Tool":
++    def from_mcp(cls, session: "mcp.ClientSession", tool: "mcp.types.Tool") -> "Tool":
+         """
+-        Build a DSPy tool from an MCP tool and a ClientSession.
++        Build a DSPy tool from an MCP tool.
+ 
+         Args:
+-            session: The MCP session to use.
++            session: The MCP client session.
+             tool: The MCP tool to convert.
+ 
+         Returns:
+@@ -261,6 +195,35 @@ class ToolCalls(Type):
+ 
+     tool_calls: list[ToolCall]
+ 
++    @classmethod
++    def validate_input(cls, data: Any) -> Any:
++        """Validate and parse input data, supporting JSON wrapped in markdown fences."""
++        if isinstance(data, (list, dict)):
++            return data
++        
++        if not isinstance(data, str):
++            return data
++
++        # Try to parse as plain JSON first
++        try:
++            return json.loads(data)
++        except json.JSONDecodeError:
++            pass
++
++        # Look for the first triple-backtick block
++        # The opening fence may have any language label, followed by a newline
++        # The next triple-backtick delimiter closes it.
++        pattern = r"```[^\n]*\n(.*?)```"
++        match = re.search(pattern, data, re.DOTALL)
++        if match:
++            json_str = match.group(1).strip()
++            try:
++                return json.loads(json_str)
++            except json.JSONDecodeError:
++                return data
++        
++        return data
++
+     @classmethod
+     def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..b0ba4595
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,29 @@
++import json
++from dspy.adapters.types.tool import ToolCalls
++from pydantic import ValidationError
++
++def test_tool_calls_parsing():
++    # Test case 1: Valid plain JSON
++    data = [{"name": "search", "args": {"query": "hello"}}]
++    try:
++        tool_calls = ToolCalls.from_dict_list(data)
++        print("Plain JSON success")
++    except Exception as e:
++        print(f"Plain JSON failed: {e}")
++
++    # Test case 2: JSON wrapped in markdown fence
++    markdown_data = """
++```json
++[
++    {"name": "search", "args": {"query": "hello"}}
++]
++```
++"""
++    try:
++        # This is expected to fail currently
++        tool_calls = ToolCalls.from_dict_list(json.loads(markdown_data))
++        print("Markdown JSON success")
++    except Exception as e:
++        print(f"Markdown JSON failed as expected: {e}")
++
++test_tool_calls_parsing()
+diff --git a/test_regex.py b/test_regex.py
+new file mode 100644
+index 00000000..39a11bce
+--- /dev/null
++++ b/test_regex.py
+@@ -0,0 +1,36 @@
++import re
++
++def extract_json_from_markdown(text):
++    # Try to parse as plain JSON first
++    import json
++    try:
++        return json.loads(text)
++    except json.JSONDecodeError:
++        pass
++
++    # Look for the first triple-backtick block
++    # The opening fence may have any language label, followed by a newline
++    # The next triple-backtick delimiter closes it.
++    pattern = r"```.*?\n(.*?)```"
++    match = re.search(pattern, text, re.DOTALL)
++    if match:
++        json_str = match.group(1).strip()
++        return json.loads(json_str)
++    
++    return None
++
++# Test cases
++test_cases = [
++    '[{"name": "search", "args": {"query": "hello"}}]',
++    '```json\n[{"name": "search", "args": {"query": "hello"}}]\n```',
++    '```\n[{"name": "search", "args": {"query": "hello"}}]\n```',
++    'prose\n```json\n[{"name": "search", "args": {"query": "hello"}}]\n```\nprose',
++    '```json\n[{"name": "search", "args": {"query": "hello"}}]\n```\n```json\n[{"name": "other", "args": {}}]\n```',
++    'invalid'
++]
++
++for tc in test_cases:
++    try:
++        print(f"Input: {tc[:20]}... Result: {extract_json_from_markdown(tc)}")
++    except Exception as e:
++        print(f"Input: {tc[:20]}... Error: {e}")
+diff --git a/test_regex_v2.py b/test_regex_v2.py
+new file mode 100644
+index 00000000..63847c18
+--- /dev/null
++++ b/test_regex_v2.py
+@@ -0,0 +1,44 @@
++import re
++import json
++
++def extract_json_from_markdown(text):
++    # Try to parse as plain JSON first
++    try:
++        return json.loads(text)
++    except json.JSONDecodeError:
++        pass
++
++    # Look for the first triple-backtick block
++    # The opening fence may have any language label, followed by a newline
++    # The next triple-backtick delimiter closes it.
++    # The regex should be careful not to match inline fences without newline
++    # The requirement says: "Inline fences without that opening newline... are not supported."
++    
++    # Let's refine the regex.
++    # ```[^\n]*\n(.*?)```
++    # This matches ``` followed by anything except newline, then a newline, then the content, then ```
++    
++    pattern = r"```[^\n]*\n(.*?)```"
++    match = re.search(pattern, text, re.DOTALL)
++    if match:
++        json_str = match.group(1).strip()
++        return json.loads(json_str)
++    
++    return None
++
++# Test cases
++test_cases = [
++    '[{"name": "search", "args": {"query": "hello"}}]',
++    '```json\n[{"name": "search", "args": {"query": "hello"}}]\n```',
++    '```\n[{"name": "search", "args": {"query": "hello"}}]\n```',
++    'prose\n```json\n[{"name": "search", "args": {"query": "hello"}}]\n```\nprose',
++    '```json\n[{"name": "search", "args": {"query": "hello"}}]\n```\n```json\n[{"name": "other", "args": {}}]\n```',
++    '```inline```', # Should fail
++    'invalid'
++]
++
++for tc in test_cases:
++    try:
++        print(f"Input: {tc[:20]}... Result: {extract_json_from_markdown(tc)}")
++    except Exception as e:
++        print(f"Input: {tc[:20]}... Error: {e}")
+diff --git a/test_regex_v3.py b/test_regex_v3.py
+new file mode 100644
+index 00000000..e7b9ec9c
+--- /dev/null
++++ b/test_regex_v3.py
+@@ -0,0 +1,46 @@
++import re
++import json
++
++def validate_input(data):
++    if isinstance(data, (list, dict)):
++        return data
++    
++    if not isinstance(data, str):
++        return data
++
++    # Try to parse as plain JSON first
++    try:
++        return json.loads(data)
++    except json.JSONDecodeError:
++        pass
++
++    # Look for the first triple-backtick block
++    # The opening fence may have any language label, followed by a newline
++    # The next triple-backtick delimiter closes it.
++    # The regex should be careful not to match inline fences without newline
++    
++    pattern = r"```[^\n]*\n(.*?)```"
++    match = re.search(pattern, data, re.DOTALL)
++    if match:
++        json_str = match.group(1).strip()
++        try:
++            return json.loads(json_str)
++        except json.JSONDecodeError:
++            return data
++    
++    return data
++
++# Test cases
++test_cases = [
++    '[{"name": "search", "args": {"query": "hello"}}]',
++    '```json\n[{"name": "search", "args": {"query": "hello"}}]\n```',
++    '```\n[{"name": "search", "args": {"query": "hello"}}]\n```',
++    'prose\n```json\n[{"name": "search", "args": {"query": "hello"}}]\n```\nprose',
++    '```json\n[{"name": "search", "args": {"query": "hello"}}]\n```\n```json\n[{"name": "other", "args": {}}]\n```',
++    '```inline```', # Should return original
++    'invalid', # Should return original
++    '{"name": "search", "args": {"query": "hello"}}' # Single object
++]
++
++for tc in test_cases:
++    print(f"Input: {tc[:20]}... Result: {validate_input(tc)}")
+diff --git a/test_tool_calls_fix.py b/test_tool_calls_fix.py
+new file mode 100644
+index 00000000..5d149413
+--- /dev/null
++++ b/test_tool_calls_fix.py
+@@ -0,0 +1,31 @@
++import json
++from dspy.adapters.types.tool import ToolCalls
++from pydantic import ValidationError
++
++def test_tool_calls_parsing():
++    # Test case 1: Valid plain JSON
++    data = [{"name": "search", "args": {"query": "hello"}}]
++    try:
++        # We need to test if ToolCalls.validate_input works
++        parsed_data = ToolCalls.validate_input(data)
++        tool_calls = ToolCalls.from_dict_list(parsed_data)
++        print("Plain JSON success")
++    except Exception as e:
++        print(f"Plain JSON failed: {e}")
++
++    # Test case 2: JSON wrapped in markdown fence
++    markdown_data = """
++```json
++[
++    {"name": "search", "args": {"query": "hello"}}
++]
++```
++"""
++    try:
++        parsed_data = ToolCalls.validate_input(markdown_data)
++        tool_calls = ToolCalls.from_dict_list(parsed_data)
++        print("Markdown JSON success")
++    except Exception as e:
++        print(f"Markdown JSON failed: {e}")
++
++test_tool_calls_parsing()

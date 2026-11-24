@@ -1,0 +1,441 @@
+diff --git a/src/jinja2/compiler.py b/src/jinja2/compiler.py
+index dfea00a..02735fd 100644
+--- a/src/jinja2/compiler.py
++++ b/src/jinja2/compiler.py
+@@ -1917,6 +1917,11 @@ class CodeGenerator(NodeVisitor):
+         self.blockvisit(node.body, scope_frame)
+         self.leave_frame(scope_frame)
+ 
++
++    def visit_MarkedBlock(self, node: nodes.MarkedBlock, frame: Frame) -> None:
++        """Render the body of a marked block unchanged."""
++        self.blockvisit(node.body, frame)
++
+     def visit_OverlayScope(self, node: nodes.OverlayScope, frame: Frame) -> None:
+         ctx = self.temporary_identifier()
+         self.writeline(f"{ctx} = {self.derive_context(frame)}")
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..5c91c94 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -847,6 +847,144 @@ def babel_extract(
+         yield lineno, func, message, finder.find_comments(lineno)
+ 
+ 
++class TranslationExtractorExtension(Extension):
++    """Adds ``{% extract key=constant, ... %}...{% endextract %}`` tags.
++    Marker bodies are ordinary Jinja bodies and render unchanged.
++    Metadata values must be compile-time constants; duplicate or dynamic
++    keys raise :exc:`TemplateSyntaxError`.
++
++    .. versionadded:: 3.4
++    """
++
++    tags = {"extract"}
++
++    def __init__(self, environment: Environment) -> None:
++        super().__init__(environment)
++        environment.extend(
++            extract_marked_translations=self._extract_marked,
++            extract_marked_translations_from_templates=self._extract_marked_from_templates,
++        )
++
++    def _extract_marked(
++        self,
++        source: t.Union[str, nodes.Template],
++    ) -> "t.Iterator[t.Dict[str, t.Any]]":
++        """Extract marked translation records from *source*.
++
++        *source* is a template string or a parsed
++        :class:`~jinja2.nodes.Template`.  Each yielded record is a dict
++        with ``source`` (the string, or ``None`` if a parsed template was
++        provided), ``lineno`` (the marker start line), ``metadata`` (a
++        copy of the marker's compile-time constants), and ``messages``
++        (a list of dicts with ``lineno``, ``function``, and ``message``
++        for each gettext call in the marker body).
++
++        Extraction retains no state between calls.
++        """
++        if isinstance(source, str):
++            src: t.Optional[str] = source
++            ast = self.environment.parse(source)
++        else:
++            src = None
++            ast = source
++
++        return _extract_marked_from_ast(ast, src)
++
++    def _extract_marked_from_templates(
++        self,
++        names: t.Optional[t.Iterable[str]] = None,
++    ) -> "t.Iterator[t.Dict[str, t.Any]]":
++        """Extract marked translation records for templates from the
++        configured loader.
++
++        *names* is a finite iterable of logical template names, processed
++        in iteration order.  When omitted, all templates known to the
++        loader are processed.  Each record's ``source`` is the logical
++        name being processed.  Templates are parsed but not rendered, and
++        includes or inheritance are not followed.
++        """
++        loader = self.environment.loader
++        if loader is None:
++            return
++
++        if names is None:
++            names = list(self.environment.list_templates())
++
++        for name in names:
++            src, _, _ = loader.get_source(self.environment, name)
++            ast = self.environment.parse(src)
++            yield from _extract_marked_from_ast(ast, name)
++
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        """Parse ``{% extract key=value, ... %}...{% endextract %}``."""
++        lineno = next(parser.stream).lineno
++        metadata: t.Dict[str, t.Any] = {}
++
++        while parser.stream.current.type != "block_end":
++            if metadata:
++                parser.stream.expect("comma")
++
++            key_token = parser.stream.expect("name")
++            key = key_token.value
++
++            if key in metadata:
++                parser.fail(
++                    f"duplicate key {key!r} in extract marker",
++                    key_token.lineno,
++                    exc=TemplateSyntaxError,
++                )
++
++            parser.stream.expect("assign")
++            value_node = parser.parse_expression()
++
++            try:
++                value = value_node.as_const()
++            except nodes.Impossible:
++                parser.fail(
++                    f"value for key {key!r} in extract marker must be a "
++                    f"compile-time constant",
++                    value_node.lineno,
++                    exc=TemplateSyntaxError,
++                )
++
++            metadata[key] = value
++
++        body = parser.parse_statements(("name:endextract",), drop_needle=True)
++
++        return nodes.MarkedBlock(metadata, body, lineno=lineno)
++
++
++def _extract_marked_from_ast(
++    ast: nodes.Template,
++    source: t.Optional[str] = None,
++) -> "t.Iterator[t.Dict[str, t.Any]]":
++    """Yield marked translation records from AST nodes."""
++    for marker in ast.find_all(nodes.MarkedBlock):
++        messages: t.List[t.Dict[str, t.Any]] = []
++
++        # Reuse extract_from_ast on the marker body so that
++        # message extraction is consistent with normal extraction.
++        mini_ast = nodes.Template(
++            marker.body,
++            lineno=marker.lineno,
++        )
++        for lineno, func, message in extract_from_ast(mini_ast):
++            messages.append(
++                {
++                    "lineno": lineno,
++                    "function": func,
++                    "message": message,
++                }
++            )
++
++        yield {
++            "source": source,
++            "lineno": marker.lineno,
++            "metadata": dict(marker.metadata),
++            "messages": messages,
++        }
++
++
+ #: nicer import names
+ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index b2f88d9..c929736 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -1172,6 +1172,21 @@ class OverlayScope(Stmt):
+     body: t.List[Node]
+ 
+ 
++class MarkedBlock(Stmt):
++    """An AST node for the ``{% extract ... %}...{% endextract %}`` tag.
++
++    The rendered body is identical to the original template content.
++    The *metadata* dict holds compile-time constant keyword values
++    provided in the opening tag.
++
++    .. versionadded:: 3.4
++    """
++
++    fields = ("metadata", "body")
++    metadata: t.Dict[str, t.Any]
++    body: t.List[Node]
++
++
+ class EvalContextModifier(Stmt):
+     """Modifies the eval context.  For each option that should be modified,
+     a :class:`Keyword` has to be added to the :attr:`options` list.
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..a4cfe8e 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -712,3 +712,245 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestMarkedExtraction:
++    """Tests for ``TranslationExtractorExtension`` tag and extraction methods."""
++
++    def _env(self, **overrides):
++        from jinja2 import Environment
++        from jinja2.ext import TranslationExtractorExtension
++
++        return Environment(
++            extensions=[TranslationExtractorExtension], **overrides
++        )
++
++    def test_basic_extraction(self):
++        """Extract a simple marker with one gettext call."""
++        env = self._env()
++        records = list(
++            env.extract_marked_translations(
++                '{% extract key = "greeting" %}{{ gettext("Hello") }}{% endextract %}',
++            )
++        )
++        assert len(records) == 1
++        rec = records[0]
++        assert rec["source"] is not None
++        assert rec["lineno"] == 1
++        assert rec["metadata"] == {"key": "greeting"}
++        assert len(rec["messages"]) == 1
++        assert rec["messages"][0]["function"] == "gettext"
++        assert rec["messages"][0]["message"] == "Hello"
++
++    def test_multiple_markers(self):
++        """Multiple markers yield multiple records."""
++        env = self._env()
++        source = (
++            '{% extract a = 1 %}{{ gettext("A") }}{% endextract %}'
++            '{% extract b = 2 %}{{ gettext("B") }}{% endextract %}'
++        )
++        records = list(env.extract_marked_translations(source))
++        assert len(records) == 2
++        assert records[0]["metadata"] == {"a": 1}
++        assert records[1]["metadata"] == {"b": 2}
++        assert records[0]["messages"][0]["message"] == "A"
++        assert records[1]["messages"][0]["message"] == "B"
++
++    def test_empty_body(self):
++        """A marker with no gettext calls yields an empty messages list."""
++        env = self._env()
++        records = list(
++            env.extract_marked_translations(
++                '{% extract key = 1 %}{% endextract %}',
++            )
++        )
++        assert len(records) == 1
++        assert records[0]["messages"] == []
++
++    def test_no_markers(self):
++        """Source without markers yields no records."""
++        env = self._env()
++        records = list(env.extract_marked_translations("{{ 1 + 1 }}"))
++        assert records == []
++
++    def test_parse_from_ast(self):
++        """Accept a pre-parsed Template node."""
++        env = self._env()
++        ast = env.parse(
++            '{% extract key = 42 %}{{ gettext("hi") }}{% endextract %}',
++        )
++        records = list(env.extract_marked_translations(ast))
++        assert len(records) == 1
++        assert records[0]["metadata"] == {"key": 42}
++        assert records[0]["source"] is None  # no source string available
++
++    def test_compile_time_constant_metadata(self):
++        """Metadata values must be compile-time constants."""
++        env = self._env()
++        env.from_string('{% extract key = 42 %}{% endextract %}')
++
++    def test_dynamic_value_raises(self):
++        """Dynamic expressions in metadata raise TemplateSyntaxError."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        env = self._env()
++        try:
++            env.from_string(
++                '{% extract key = somevar %}body{% endextract %}',
++            )
++            assert False, "Expected TemplateSyntaxError"
++        except TemplateSyntaxError as e:
++            assert "compile-time constant" in str(e).lower()
++
++    def test_duplicate_key_raises(self):
++        """Duplicate keys in metadata raise TemplateSyntaxError."""
++        from jinja2.exceptions import TemplateSyntaxError
++
++        env = self._env()
++        try:
++            env.from_string(
++                '{% extract key = 1, key = 2 %}body{% endextract %}',
++            )
++            assert False, "Expected TemplateSyntaxError"
++        except TemplateSyntaxError as e:
++            assert "duplicate" in str(e).lower()
++
++    def test_multiple_gettext_functions(self):
++        """Nested gettext calls are all captured."""
++        env = self._env()
++        records = list(
++            env.extract_marked_translations(
++                '{% extract key = "x" %}'
++                '{{ gettext("Hello") }}{{ ngettext("item", "items", 1) }}'
++                '{% endextract %}',
++            )
++        )
++        assert len(records[0]["messages"]) == 2
++        funcs = {m["function"] for m in records[0]["messages"]}
++        assert funcs == {"gettext", "ngettext"}
++
++    def test_renders_unchanged(self):
++        """Marker body renders normally; markers leave no trace."""
++        env = self._env()
++        tmpl = env.from_string(
++            'before{% extract k = 1 %}inside{% endextract %}after',
++        )
++        assert tmpl.render() == "beforeinsideafter"
++
++    def test_renders_control_structures(self):
++        """Control structures inside markers render correctly."""
++        env = self._env()
++        tmpl = env.from_string(
++            '{% extract k = 1 %}'
++            '{% for x in [1, 2] %}{{ x }}{% endfor %}'
++            '{% endextract %}',
++        )
++        assert tmpl.render() == "12"
++
++    def test_stateless_between_calls(self):
++        """No stale records accumulate between extractions."""
++        env = self._env()
++
++        r1 = list(
++            env.extract_marked_translations(
++                '{% extract k = 1 %}a{% endextract %}',
++            )
++        )
++        assert len(r1) == 1
++
++        r2 = list(
++            env.extract_marked_translations(
++                '{% extract k = 2 %}b{% endextract %}',
++            )
++        )
++        assert len(r2) == 1
++        assert r2[0]["metadata"]["k"] == 2
++
++        r3 = list(env.extract_marked_translations("no markers"))
++        assert r3 == []
++
++    def test_callers_can_mutate_records(self):
++        """Callers may mutate returned record dicts without affecting others."""
++        env = self._env()
++        records = list(
++            env.extract_marked_translations(
++                '{% extract k = 1 %}{{ gettext("hi") }}{% endextract %}',
++            )
++        )
++        records[0]["metadata"]["k"] = 99
++        records[0]["messages"][0]["message"] = "modified"
++
++        # Subsequent call produces fresh copies
++        records2 = list(
++            env.extract_marked_translations(
++                '{% extract k = 1 %}{{ gettext("hi") }}{% endextract %}',
++            )
++        )
++        assert records2[0]["metadata"]["k"] == 1
++        assert records2[0]["messages"][0]["message"] == "hi"
++
++    def test_no_loader_from_templates(self):
++        """from_templates returns empty when no loader configured."""
++        env = self._env()
++        records = list(
++            env.extract_marked_translations_from_templates(names=["x.html"]),
++        )
++        assert records == []
++
++    def test_from_templates_explicit_names(self):
++        """Extract markers by explicit template names."""
++        from jinja2.loaders import DictLoader
++
++        env = self._env(
++            loader=DictLoader(
++                {
++                    "a.html": '{% extract k = 1 %}{{ gettext("A") }}{% endextract %}',
++                    "b.html": '{% extract k = 2 %}{{ gettext("B") }}{% endextract %}',
++                }
++            ),
++        )
++        records = list(
++            env.extract_marked_translations_from_templates(
++                names=["b.html", "a.html"],
++            )
++        )
++        assert len(records) == 2
++        assert [r["source"] for r in records] == ["b.html", "a.html"]
++        assert records[0]["metadata"]["k"] == 2
++        assert records[1]["metadata"]["k"] == 1
++
++    def test_from_templates_all(self):
++        """Omitting names processes all loader templates."""
++        from jinja2.loaders import DictLoader
++
++        env = self._env(
++            loader=DictLoader(
++                {
++                    "a.html": '{% extract k = 1 %}{% endextract %}',
++                    "b.html": '{% extract k = 2 %}{% endextract %}',
++                }
++            ),
++        )
++        records = list(env.extract_marked_translations_from_templates())
++        assert {r["source"] for r in records} == {"a.html", "b.html"}
++
++    def test_ordinary_extraction_independent(self):
++        """Ordinary extract_translations and Babel extraction continue to work."""
++        from jinja2.ext import InternationalizationExtension
++        from jinja2.ext import TranslationExtractorExtension
++
++        env = Environment(
++            extensions=[InternationalizationExtension, TranslationExtractorExtension],
++        )
++        records = list(env.extract_translations('{{ gettext("hello") }}'))
++        assert len(records) == 1
++        assert records[0][2] == "hello"
++
++        # marked extraction also works in the same environment
++        marked = list(
++            env.extract_marked_translations(
++                '{% extract k = 1 %}{{ gettext("world") }}{% endextract %}',
++            )
++        )
++        assert len(marked) == 1
++        assert marked[0]["messages"][0]["message"] == "world"

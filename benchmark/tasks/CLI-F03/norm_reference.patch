@@ -1,0 +1,180 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 540bbe2..c3dd48a 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 8.2.0
+ 
+ Unreleased
+ 
++-   Add a ``max_resources`` context limit that accounts for active resources
++    throughout a context hierarchy and safely reserves reentrant entries.
++
+ -   Drop support for Python 3.7. :pr:`2588`
+ -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
+     :pr:`326`
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..7dcdb30 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,12 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param max_resources: Optional non-negative limit for active resources
++        registered by this context and its descendants. A child inherits the
++        parent's numeric limit when this is omitted.
++
++    .. versionchanged:: 8.2
++        Added the ``max_resources`` parameter.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,9 +286,20 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
++        self.max_resources: int | None = (
++            parent.max_resources
++            if max_resources is None and parent is not None
++            else max_resources
++        )
++        if self.max_resources is not None and (
++            type(self.max_resources) is not int or self.max_resources < 0
++        ):
++            raise TypeError("max_resources must be a non-negative integer or None")
++        self._active_resources: int = 0
+         #: the :class:`Command` for this context.
+         self.command = command
+         #: the descriptive information name
+@@ -588,7 +605,29 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        ancestors = []
++        ctx: Context | None = self
++        while ctx is not None:
++            if (
++                ctx.max_resources is not None
++                and ctx._active_resources >= ctx.max_resources
++            ):
++                raise RuntimeError("Maximum number of resources exceeded.")
++            ancestors.append(ctx)
++            ctx = ctx.parent
++
++        @contextmanager
++        def counted() -> cabc.Iterator[V]:
++            for owner in ancestors:
++                owner._active_resources += 1
++            try:
++                with context_manager as value:
++                    yield value
++            finally:
++                for owner in ancestors:
++                    owner._active_resources -= 1
++
++        return self._exit_stack.enter_context(counted())
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+diff --git a/tests/test_resource_limit_contribution.py b/tests/test_resource_limit_contribution.py
+new file mode 100644
+index 0000000..9cd7b66
+--- /dev/null
++++ b/tests/test_resource_limit_contribution.py
+@@ -0,0 +1,91 @@
++from contextlib import contextmanager
++from contextlib import nullcontext
++
++import pytest
++
++import click
++
++
++def test_limit_rejects_before_entry_and_preserves_lifo_cleanup():
++    events = []
++
++    @contextmanager
++    def resource(name):
++        events.append(f"enter:{name}")
++        try:
++            yield name
++        finally:
++            events.append(f"exit:{name}")
++
++    ctx = click.Context(click.Command("cmd"), max_resources=2)
++    assert ctx.with_resource(resource("first")) == "first"
++    assert ctx.with_resource(resource("second")) == "second"
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(resource("rejected"))
++    assert "enter:rejected" not in events
++
++    ctx.close()
++
++    assert events == ["enter:first", "enter:second", "exit:second", "exit:first"]
++
++
++def test_hierarchy_limits_cover_descendants_and_siblings():
++    root = click.Context(click.Command("root"), max_resources=2)
++    left = click.Context(click.Command("left"), parent=root, max_resources=1)
++    right = click.Context(click.Command("right"), parent=root, max_resources=5)
++    left.with_resource(nullcontext("left"))
++    right.with_resource(nullcontext("right"))
++
++    with pytest.raises(RuntimeError):
++        right.with_resource(nullcontext())
++    with pytest.raises(RuntimeError):
++        left.with_resource(nullcontext())
++
++    left.close()
++    assert right.with_resource(nullcontext("released")) == "released"
++
++
++def test_failed_and_reentrant_entries_release_reservations():
++    ctx = click.Context(click.Command("cmd"), max_resources=1)
++
++    @contextmanager
++    def reentrant():
++        ctx.with_resource(nullcontext())
++        yield
++
++    with pytest.raises(RuntimeError):
++        ctx.with_resource(reentrant())
++
++    assert ctx.with_resource(nullcontext("after")) == "after"
++    ctx.close()
++
++
++def test_cleanup_failure_releases_only_the_closed_context():
++    @contextmanager
++    def failing():
++        try:
++            yield
++        finally:
++            raise ValueError("cleanup")
++
++    root = click.Context(click.Command("root"), max_resources=2)
++    child = click.Context(click.Command("child"), parent=root)
++    root.with_resource(nullcontext())
++    child.with_resource(failing())
++
++    with pytest.raises(ValueError, match="cleanup"):
++        child.close()
++
++    assert child.with_resource(nullcontext("reused")) == "reused"
++    with pytest.raises(RuntimeError):
++        root.with_resource(nullcontext())
++
++
++@pytest.mark.parametrize("value", [-1, True, 1.5, "1"])
++def test_limit_requires_a_non_negative_integer(value):
++    with pytest.raises(TypeError):
++        click.Context(click.Command("cmd"), max_resources=value)
++
++    zero = click.Context(click.Command("cmd"), max_resources=0)
++    with pytest.raises(RuntimeError):
++        zero.with_resource(nullcontext())

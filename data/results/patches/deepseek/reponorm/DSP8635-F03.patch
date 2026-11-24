@@ -1,0 +1,270 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..6e4fe7ac 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,3 +1,4 @@
++import math
+ import random
+ 
+ import dspy
+@@ -284,7 +285,8 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        tip_weights=None
+     ):
+         super().__init__()
+         self.program_aware = program_aware
+@@ -296,6 +298,7 @@ class GroundedProposer(Proposer):
+         self.set_tip_randomly=set_tip_randomly
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
++        self.tip_weights = tip_weights
+         self.rng = rng or random
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+@@ -323,6 +326,40 @@ class GroundedProposer(Proposer):
+                 self.use_dataset_summary = False
+                 print("")
+ 
++    def _select_tip_key(self):
++        """Select a tip key using tip_weights for weighted random selection."""
++        keys = list(TIPS.keys())
++
++        if self.tip_weights is None:
++            return self.rng.choice(keys)
++
++        # Build effective weights for each TIPS key
++        effective_weights = []
++
++        for key in keys:
++            if key in self.tip_weights:
++                w = self.tip_weights[key]
++                # Check if weight is usable (positive finite int/float, not bool)
++                if isinstance(w, bool):
++                    effective_weights.append(0)
++                elif isinstance(w, (int, float)):
++                    if w > 0 and math.isfinite(w):
++                        effective_weights.append(w)
++                    else:
++                        effective_weights.append(0)
++                else:
++                    # Non-numeric -> weight 0
++                    effective_weights.append(0)
++            else:
++                # Missing key -> weight 1
++                effective_weights.append(1)
++
++        # If all weights are zero, use uniform selection
++        if all(w == 0 for w in effective_weights):
++            return self.rng.choice(keys)
++
++        return self.rng.choices(keys, weights=effective_weights, k=1)[0]
++
+     def propose_instructions_for_program(
+         self,
+         trainset,
+@@ -361,8 +398,8 @@ class GroundedProposer(Proposer):
+                 if self.set_tip_randomly:
+                     if self.verbose:
+                         print("Using a randomly generated configuration for our grounded proposer.")
+-                    # Randomly select the tip
+-                    selected_tip_key = self.rng.choice(list(TIPS.keys()))
++                    # Randomly select the tip (with optional weights)
++                    selected_tip_key = self._select_tip_key()
+                     selected_tip = TIPS[selected_tip_key]
+                     self.use_tip = bool(
+                         selected_tip,
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..34256053 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -52,3 +52,186 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         tip=None,
+     )
+     assert result == "instruction"
++
++
++import random
++
++from dspy.propose.grounded_proposer import TIPS
++
++
++class TestGroundedProposerTipWeights:
++    """Test tip_weights parameter and _select_tip_key logic."""
++
++    def _make_proposer(self, tip_weights=None, seed=42):
++        """Helper to create a GroundedProposer with tip_weights set."""
++        return GroundedProposer(
++            prompt_model=None, program=None, trainset=[], verbose=False,
++            rng=random.Random(seed), tip_weights=tip_weights,
++        )
++
++    def test_none_weights_are_uniform(self):
++        """tip_weights=None should use uniform distribution (rng.choice)."""
++        p1 = self._make_proposer(tip_weights=None, seed=42)
++        p2 = self._make_proposer(tip_weights=None, seed=42)
++        assert p1._select_tip_key() == p2._select_tip_key()
++
++    def test_all_zero_weights_fallback_to_uniform(self):
++        """All-zero weights fall back to rng.choice (uniform)."""
++        all_zero = dict.fromkeys(TIPS.keys(), 0)
++        p1 = self._make_proposer(tip_weights=all_zero, seed=42)
++        p2 = self._make_proposer(tip_weights=all_zero, seed=42)
++        assert p1._select_tip_key() == p2._select_tip_key()
++
++    def test_zero_weight_never_selected_when_positive_exists(self):
++        """A key with zero weight should never be selected when any positive weight exists."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_missing_keys_have_weight_one(self):
++        """Keys not in tip_weights get weight 1."""
++        weights = {'simple': 100, 'creative': 0}
++        # 'none', 'description', 'high_stakes', 'persona' are missing -> weight 1
++        # creative is explicitly 0 -> should never be selected
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() != 'creative'
++
++    def test_unknown_keys_are_ignored(self):
++        """Keys not in TIPS should be ignored."""
++        weights = {'unknown_key': 100}
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        result = p._select_tip_key()
++        assert result in TIPS
++
++    def test_bool_weight_is_zero(self):
++        """Boolean weight values should be treated as zero."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = True
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_nan_weight_is_zero(self):
++        """NaN weight should be treated as zero."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = float('nan')
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_inf_weight_is_zero(self):
++        """Infinite weight should be treated as zero."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = float('inf')
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_negative_weight_is_zero(self):
++        """Negative weight should be treated as zero."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = -5
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_string_weight_is_zero(self):
++        """Non-numeric weight should be treated as zero."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = 'abc'
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_zero_float_weight_not_selected(self):
++        """Zero float (0.0) weight should behave like int zero."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = 0.0
++        weights['simple'] = 100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        for _ in range(200):
++            assert p._select_tip_key() == 'simple'
++
++    def test_positive_float_weight_works(self):
++        """Positive float weights should participate in selection."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = 0.5
++        weights['simple'] = 100.0
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        # With creative=0.5 and simple=100.0, creative has ~0.5% chance.
++        # Run enough trials that we observe it at least once.
++        results = set()
++        for _ in range(10000):
++            results.add(p._select_tip_key())
++        assert 'creative' in results
++        assert 'simple' in results
++
++    def test_large_finite_weights_no_overflow(self):
++        """Very large finite weights should not cause overflow errors."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['creative'] = 10**100
++        weights['simple'] = 10**100
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        result = p._select_tip_key()
++        assert result in ('creative', 'simple')
++
++    def test_none_tip_selectable(self):
++        """The 'none' tip (empty string) should be selectable with weights."""
++        weights = dict.fromkeys(TIPS.keys(), 0)
++        weights['none'] = 100
++        weights['simple'] = 1
++        p = self._make_proposer(tip_weights=weights, seed=42)
++        assert p._select_tip_key() == 'none'
++
++    def test_reproducibility_same_seed(self):
++        """Same seed and weights should produce same selection sequence."""
++        weights = {'creative': 10, 'simple': 1, 'persona': 5}
++        p1 = self._make_proposer(tip_weights=weights, seed=123)
++        p2 = self._make_proposer(tip_weights=weights, seed=123)
++        p3 = self._make_proposer(tip_weights=weights, seed=456)
++        seq1 = [p1._select_tip_key() for _ in range(10)]
++        seq2 = [p2._select_tip_key() for _ in range(10)]
++        assert seq1 == seq2
++        seq3 = [p3._select_tip_key() for _ in range(10)]
++        assert seq1 != seq3
++
++    def test_set_tip_randomly_false_unchanged(self):
++        """When set_tip_randomly=False, tip_weights should not affect behavior."""
++        prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++        program = Predict("question -> answer")
++
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, program=program, trainset=[],
++            verbose=False, set_tip_randomly=False,
++            tip_weights={'creative': 100},
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program, predictor=None, pred_i=0, T=0.5,
++            demo_candidates=None, demo_set_i=0, trial_logs={}, tip=None,
++        )
++        assert result == "instruction"
++
++    def test_set_tip_randomly_true_with_weights(self):
++        """When set_tip_randomly=True, tip_weights should not cause errors."""
++        prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++        program = Predict("question -> answer")
++
++        proposer = GroundedProposer(
++            prompt_model=prompt_model, program=program, trainset=[],
++            verbose=False, set_tip_randomly=True,
++            rng=random.Random(42),
++            tip_weights=dict.fromkeys(TIPS.keys(), 0) | {'simple': 100},
++        )
++        result = proposer.propose_instruction_for_predictor(
++            program=program, predictor=None, pred_i=0, T=0.5,
++            demo_candidates=None, demo_set_i=0, trial_logs={}, tip=None,
++        )
++        assert result == "instruction"

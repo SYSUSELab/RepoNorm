@@ -1,0 +1,208 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..f0a488c5 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -7,7 +7,7 @@ import litellm
+ from litellm.caching.caching import Cache as LitellmCache
+ 
+ from dspy.clients.base_lm import BaseLM, inspect_history
+-from dspy.clients.cache import Cache
++from dspy.clients.cache import Cache, set_ttl
+ from dspy.clients.embedding import Embedder
+ from dspy.clients.lm import LM
+ from dspy.clients.provider import Provider, TrainingJob
+@@ -33,6 +33,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    ttl: Optional[float] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +44,7 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        ttl: Time-to-live in seconds for cache entries. None means no expiration.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,6 +74,7 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        ttl,
+     )
+ 
+ 
+@@ -112,4 +115,5 @@ __all__ = [
+     "enable_litellm_logging",
+     "disable_litellm_logging",
+     "configure_cache",
++    "set_ttl",
+ ]
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..3f2a7177 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,10 +1,11 @@
+ import copy
+ import inspect
+ import logging
++import math
+ import threading
+ from functools import wraps
+ from hashlib import sha256
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, Optional, Tuple
+ 
+ import cloudpickle
+ import pydantic
+@@ -14,6 +15,67 @@ from diskcache import FanoutCache
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Global TTL state for the active global DSPy cache
++_global_ttl: Optional[float] = None
++_global_ttl_lock = threading.Lock()
++
++
++def set_ttl(seconds: Optional[float]) -> None:
++    global _global_ttl
++    """Set the TTL for the active global DSPy cache.
++    
++    Args:
++        seconds: Positive finite number of seconds for TTL, or None for no expiration.
++        
++    Raises:
++        ValueError: If seconds is zero, negative, nonfinite, boolean, or nonnumeric.
++    """
++    # Validate input: reject booleans first (before checking numeric type)
++    if isinstance(seconds, bool):
++        raise ValueError("TTL cannot be a boolean")
++    
++    if seconds is not None and not isinstance(seconds, (int, float)):
++        raise ValueError("TTL must be a positive finite number or None")
++    
++    if seconds is not None:
++        if seconds <= 0:
++            raise ValueError("TTL must be positive")
++        if not math.isfinite(seconds):
++            raise ValueError("TTL must be finite")
++    
++    with _global_ttl_lock:
++        _global_ttl = seconds
++
++
++def _get_global_ttl() -> Optional[float]:
++    """Get the current global TTL value."""
++    with _global_ttl_lock:
++        return _global_ttl
++
++
++def _wrap_value_with_expiry(value: Any, expiry_time: Optional[float]) -> Tuple[Any, Optional[float]]:
++    """Wrap a value with its expiry time for storage."""
++    return (value, expiry_time)
++
++
++def _unwrap_value_from_expiry(stored: Tuple[Any, Optional[float]]) -> Any:
++    """Unwrap a value from its stored format."""
++    return stored[0]
++
++
++def _is_expired(stored: Tuple[Any, Optional[float]]) -> bool:
++    """Check if a stored value has expired."""
++    _, expiry_time = stored
++    if expiry_time is None:
++        return False
++    return _get_current_time() > expiry_time
++
++
++def _get_current_time() -> float:
++    """Get the current time in seconds since epoch."""
++    import time
++    return time.time()
++
+ 
+ class Cache:
+     """DSPy Cache
+@@ -30,7 +92,7 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        ttl: Optional[float] = None,
+     ):
+         """
+         Args:
+@@ -39,8 +101,8 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            ttl: Time-to-live in seconds for cache entries. None means no expiration.
+         """
+-
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+         if self.enable_memory_cache:
+@@ -58,6 +120,7 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._ttl = ttl
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -104,14 +167,22 @@ class Cache:
+             return None
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+-            with self._lock:
+-                response = self.memory_cache[key]
++            stored = self.memory_cache[key]
++            if _is_expired(stored):
++                # Entry expired, remove from memory cache
++                del self.memory_cache[key]
++                return None
++            response = _unwrap_value_from_expiry(stored)
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
++            stored = self.disk_cache[key]
++            if _is_expired(stored):
++                # Entry expired, don't promote to memory
++                return None
++            response = _unwrap_value_from_expiry(stored)
+             if self.enable_memory_cache:
+                 with self._lock:
+-                    self.memory_cache[key] = response
++                    self.memory_cache[key] = stored
+         else:
+             return None
+ 
+@@ -134,13 +205,23 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return
+ 
++        # Determine effective TTL: instance-level takes precedence over global
++        effective_ttl = self._ttl if self._ttl is not None else _get_global_ttl()
++        
++        # Wrap value with expiry time
++        if effective_ttl is not None:
++            expiry_time = _get_current_time() + effective_ttl
++            wrapped_value = _wrap_value_with_expiry(value, expiry_time)
++        else:
++            wrapped_value = _wrap_value_with_expiry(value, None)
++
+         if self.enable_memory_cache and enable_memory_cache:
+             with self._lock:
+-                self.memory_cache[key] = value
++                self.memory_cache[key] = wrapped_value
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                self.disk_cache[key] = wrapped_value
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")

@@ -1,0 +1,166 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..a1f74831 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -27,6 +27,7 @@ litellm.success_callback = [_litellm_track_cache_hit_callback]
+ 
+ 
+ def configure_cache(
++    ttl: Optional[float] = None,
+     enable_disk_cache: Optional[bool] = True,
+     enable_memory_cache: Optional[bool] = True,
+     disk_cache_dir: Optional[str] = DISK_CACHE_DIR,
+@@ -37,6 +38,7 @@ def configure_cache(
+     """Configure the cache for DSPy.
+ 
+     Args:
++        ttl: Time-to-live for cache entries in seconds. None means no expiration.
+         enable_disk_cache: Whether to enable on-disk cache.
+         enable_memory_cache: Whether to enable in-memory cache.
+         disk_cache_dir: The directory to store the on-disk cache.
+@@ -72,6 +74,7 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        ttl,
+     )
+ 
+ 
+@@ -113,3 +116,12 @@ __all__ = [
+     "disable_litellm_logging",
+     "configure_cache",
+ ]
++
++def set_ttl(seconds: Optional[float]) -> None:
++    """Set the TTL for the active global DSPy cache.
++
++    Args:
++        seconds: The TTL in seconds. None means no expiration.
++    """
++    import dspy
++    dspy.cache.set_ttl(seconds)
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..b6a3a408 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,9 +2,10 @@ import copy
+ import inspect
+ import logging
+ import threading
++import time
+ from functools import wraps
+ from hashlib import sha256
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, Optional, Union
+ 
+ import cloudpickle
+ import pydantic
+@@ -30,7 +31,7 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        ttl: Optional[float] = None,
+     ):
+         """
+         Args:
+@@ -39,10 +40,13 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            ttl: Time-to-live for cache entries in seconds. None means no expiration.
+         """
+ 
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
++        self.set_ttl(ttl)
++        
+         if self.enable_memory_cache:
+             self.memory_cache = LRUCache(maxsize=memory_max_entries)
+         else:
+@@ -59,9 +63,38 @@ class Cache:
+ 
+         self._lock = threading.RLock()
+ 
+-    def __contains__(self, key: str) -> bool:
++    def set_ttl(self, ttl: Optional[float]) -> None:
++        if ttl is not None:
++            if not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
++                raise ValueError("TTL must be a positive finite number or None.")
++            if ttl <= 0 or not (float(ttl) < float('inf')) or (float(ttl) != float(ttl)):
++                raise ValueError("TTL must be a positive finite number or None.")
++        self._ttl = ttl
++
++    def get_ttl(self) -> Optional[float]:
++        return self._ttl
++
++    def __contains__(self, request: Dict[str, Any]) -> bool:
+         """Check if a key is in the cache."""
+-        return key in self.memory_cache or key in self.disk_cache
++        try:
++            key = self.cache_key(request)
++        except Exception:
++            return False
++        
++        if self.enable_memory_cache and key in self.memory_cache:
++            if self._is_expired(self.memory_cache[key]):
++                return False
++            return True
++        if self.enable_disk_cache and key in self.disk_cache:
++            if self._is_expired(self.disk_cache[key]):
++                return False
++            return True
++        return False
++
++    def _is_expired(self, entry: Any) -> bool:
++        if not isinstance(entry, dict) or "_dspy_cache_expiry" not in entry:
++            return False
++        return time.time() > entry["_dspy_cache_expiry"]
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+@@ -103,6 +136,7 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
++        response = None
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
+@@ -115,6 +149,13 @@ class Cache:
+         else:
+             return None
+ 
++        if self._is_expired(response):
++            return None
++
++        # Unwrap if it's a dict with expiry
++        if isinstance(response, dict) and "_dspy_cache_value" in response:
++            response = response["_dspy_cache_value"]
++
+         response = copy.deepcopy(response)
+         if hasattr(response, "usage"):
+             # Clear the usage data when cache is hit, because no LM call is made
+@@ -134,13 +175,20 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return
+ 
++        entry = value
++        if self._ttl is not None:
++            entry = {
++                "_dspy_cache_value": value,
++                "_dspy_cache_expiry": time.time() + self._ttl,
++            }
++
+         if self.enable_memory_cache and enable_memory_cache:
+             with self._lock:
+-                self.memory_cache[key] = value
++                self.memory_cache[key] = entry
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                self.disk_cache[key] = entry
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")

@@ -1,0 +1,171 @@
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 6fd9e54..73643cb 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -271,8 +271,18 @@ class ShellComplete:
+         :param incomplete: Value being completed. May be empty.
+         """
+         ctx = _resolve_context(self.cli, self.ctx_args, self.prog_name, args)
+-        obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
+-        return obj.shell_complete(ctx, incomplete)
++        try:
++            obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
++            return obj.shell_complete(ctx, incomplete)
++        finally:
++            # Close all contexts in the hierarchy to release resources
++            # opened during completion (e.g., files opened by click.File
++            # options) before the request finishes.
++            ctx_ = ctx
++
++            while ctx_ is not None:
++                ctx_.close()
++                ctx_ = ctx_.parent
+ 
+     def format_completion(self, item: CompletionItem) -> str:
+         """Format a completion item into the form recognized by the
+@@ -561,11 +571,17 @@ def _resolve_context(
+                 args = ctx._protected_args + ctx.args
+             else:
+                 sub_ctx = ctx
++                prev_sub_ctx = None
+ 
+                 while args:
+                     name, cmd, args = command.resolve_command(ctx, args)
+ 
+                     if cmd is None:
++                        # Close any remaining sub-context before
++                        # returning, to release resources opened
++                        # during its parsing.
++                        if prev_sub_ctx is not None:
++                            prev_sub_ctx.close()
+                         return ctx
+ 
+                     sub_ctx = cmd.make_context(
+@@ -578,6 +594,13 @@ def _resolve_context(
+                     )
+                     args = sub_ctx.args
+ 
++                    # Close the previous sub-context now that this
++                    # iteration has created a replacement. The final
++                    # sub-context will be closed by the caller.
++                    if prev_sub_ctx is not None:
++                        prev_sub_ctx.close()
++                    prev_sub_ctx = sub_ctx
++
+                 ctx = sub_ctx
+                 args = [*sub_ctx._protected_args, *sub_ctx.args]
+         else:
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index 3e7a2bd..4aa7db0 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -1,3 +1,8 @@
++import gc
++import os
++import tempfile
++import warnings
++
+ import pytest
+ 
+ import click.shell_completion
+@@ -163,6 +168,100 @@ def test_path_types(type, expect):
+     assert c.value == "ab"
+     assert c.type == expect
+ 
++def test_file_option_resources_closed():
++    """Completion for a command with a ``File`` option must not leave the
++    file unclosed, producing a ``ResourceWarning`` after garbage collection.
++
++    The fix covers top-level commands, nested subcommands, and chained
++    command groups.
++    """
++    warnings.filterwarnings("error", category=ResourceWarning)
++
++    # -- top-level command with File option ----------------------------
++    cli = Command("cli", params=[Option(["-f"], type=File())])
++    comp = ShellComplete(cli, {}, cli.name, "_CLI_COMPLETE")
++
++    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
++        tmp_path = f.name
++        f.write("content")
++
++    try:
++        comp.get_completions(["-f", tmp_path], "")
++        gc.collect()
++    except ResourceWarning as e:
++        raise AssertionError(
++            f"ResourceWarning raised for top-level File option: {e}"
++        )
++    finally:
++        os.unlink(tmp_path)
++
++    # -- nested subcommand with File option ---------------------------
++    cli2 = Group("cli", commands=[Command("show", params=[Option(["-f"], type=File())])])
++    comp2 = ShellComplete(cli2, {}, cli2.name, "_CLI_COMPLETE")
++
++    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
++        tmp_path = f.name
++        f.write("content")
++
++    try:
++        comp2.get_completions(["show", "-f", tmp_path], "")
++        gc.collect()
++    except ResourceWarning as e:
++        raise AssertionError(
++            f"ResourceWarning raised for nested File option: {e}"
++        )
++    finally:
++        os.unlink(tmp_path)
++
++    # -- chained group with File options ------------------------------
++    cli3 = Group(
++        "cli",
++        chain=True,
++        commands=[
++            Command("proc", params=[Option(["-f"], type=File())]),
++            Command("filter", params=[Option(["-o"], type=File())]),
++        ],
++    )
++    comp3 = ShellComplete(cli3, {}, cli3.name, "_CLI_COMPLETE")
++
++    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
++        tmp_path1 = f.name
++        f.write("a")
++
++    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
++        tmp_path2 = f.name
++        f.write("b")
++
++    try:
++        comp3.get_completions(["proc", "-f", tmp_path1, "filter", "-o", tmp_path2], "")
++        gc.collect()
++    except ResourceWarning as e:
++        raise AssertionError(
++            f"ResourceWarning raised for chained group File option: {e}"
++        )
++    finally:
++        os.unlink(tmp_path1)
++        os.unlink(tmp_path2)
++
++    # -- repeated requests --------------------------------------------
++    cli4 = Command("cli", params=[Option(["-f"], type=File())])
++    comp4 = ShellComplete(cli4, {}, cli4.name, "_CLI_COMPLETE")
++
++    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
++        tmp_path = f.name
++        f.write("content")
++
++    try:
++        for _ in range(3):
++            comp4.get_completions(["-f", tmp_path], "")
++            gc.collect()
++    except ResourceWarning as e:
++        raise AssertionError(
++            f"ResourceWarning raised on repeated completion: {e}"
++        )
++    finally:
++        os.unlink(tmp_path)
++
+ 
+ def test_absolute_path():
+     cli = Command("cli", params=[Option(["-f"], type=Path())])

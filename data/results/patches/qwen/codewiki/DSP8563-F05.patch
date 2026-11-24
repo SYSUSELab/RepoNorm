@@ -1,0 +1,255 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..05dd34db 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import inspect
++import json
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -258,15 +259,24 @@ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
++        note: str | None = None
++        comment: str | None = None
++        annotation: str | None = None
++        tags: list[str] | None = None
++        priority: str | int | None = None
++        meta: dict[str, Any] | None = None
+ 
+     tool_calls: list[ToolCall]
+ 
+     @classmethod
+-    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
++    def from_dict_list(
++        cls, tool_calls_dicts: list[dict[str, Any]], comments: list[str] | None = None
++    ) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+ 
+         Args:
+-            dict_list: A list of dictionaries, where each dictionary should have 'name' and 'args' keys.
++            tool_calls_dicts: A list of dictionaries, where each dictionary should have 'name' and 'args' keys.
++            comments: Optional list of comment strings to apply as document-level comments.
+ 
+         Returns:
+             A ToolCalls instance.
+@@ -281,9 +291,112 @@ class ToolCalls(Type):
+             tool_calls = ToolCalls.from_dict_list(tool_calls_dict)
+             ```
+         """
+-        tool_calls = [cls.ToolCall(**item) for item in tool_calls_dicts]
++        # Validate and combine comments
++        combined_comment = ""
++        if comments:
++            for c in comments:
++                if not isinstance(c, str):
++                    raise ValueError("Comment list members must be strings")
++            nonblank_comments = [c for c in comments if c.strip()]
++            if nonblank_comments:
++                combined_comment = "\n".join(c.strip() for c in nonblank_comments)
++        
++        valid_metadata_fields = {"note", "comment", "annotation", "tags", "priority", "meta"}
++        tool_calls = []
++        for item in tool_calls_dicts:
++            # Validate metadata fields
++            invalid_fields = set(item.keys()) - {"name", "args"} - valid_metadata_fields
++            if invalid_fields:
++                raise ValueError(f"Invalid metadata fields: {invalid_fields}")
++            
++            note = item.get("note")
++            comment = item.get("comment")
++            annotation = item.get("annotation")
++            tags = item.get("tags")
++            priority = item.get("priority")
++            meta = item.get("meta")
++            
++            # Document-level comment overrides per-call comment (but not empty string)
++            if combined_comment:
++                comment = combined_comment
++            
++            call_data = {
++                "name": item["name"],
++                "args": item["args"],
++            }
++            if note is not None:
++                call_data["note"] = note
++            if comment is not None:
++                call_data["comment"] = comment
++            if annotation is not None:
++                call_data["annotation"] = annotation
++            if tags is not None:
++                call_data["tags"] = tags
++            if priority is not None:
++                call_data["priority"] = priority
++            if meta is not None:
++                call_data["meta"] = meta
++            tool_calls.append(cls.ToolCall(**call_data))
+         return cls(tool_calls=tool_calls)
+ 
++    @classmethod
++    def from_string(cls, text: str) -> "ToolCalls":
++        """Parse tool calls from JSON text with optional Python-style # comments.
++
++        Supports single call, bare list, or canonical tool_calls container.
++        Combines nonblank comment bodies in source order, trim surrounding whitespace,
++        join with newlines. Document-level comment applies to every call and overrides
++        explicit comment fields; note remains independent.
++
++        Args:
++            text: JSON text with optional Python-style # comments outside quoted strings.
++
++        Returns:
++            A ToolCalls instance.
++
++        Raises:
++            ValueError: If JSON is invalid, required fields are missing, or metadata fields are invalid.
++
++        Example:
++
++            text = \'\'\'
++            {
++                "name": "search",
++                "args": {"query": "hello"}
++            }
++            # This is a comment
++            \'\'\'
++            tool_calls = ToolCalls.from_string(text)
++        """
++        comments = _extract_comments(text)
++        cleaned_text = _remove_comments_from_json(text)
++        try:
++            data = json.loads(cleaned_text)
++        except json.JSONDecodeError as e:
++            raise ValueError(f"Invalid JSON: {e}")
++        
++        if isinstance(data, dict):
++            if "tool_calls" in data:
++                items = data["tool_calls"]
++            elif "name" in data and "args" in data:
++                items = [data]
++            else:
++                raise ValueError("JSON object must have 'tool_calls' key or be a single call with 'name'/'args'")
++        elif isinstance(data, list):
++            items = data
++        else:
++            raise ValueError("JSON must be an object or array")
++        
++        for i, item in enumerate(items):
++            if not isinstance(item, dict):
++                raise ValueError(f"Item {i} is not a dictionary")
++            if "name" not in item:
++                raise ValueError(f"Item {i} missing 'name' field")
++            if "args" not in item:
++                raise ValueError(f"Item {i} missing 'args' field")
++        
++        return cls.from_dict_list(items, comments=comments)
++
+     @classmethod
+     def description(cls) -> str:
+         return (
+@@ -309,6 +422,102 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    def format_with_metadata(self) -> list[dict[str, Any]]:
++        """Format tool calls with metadata fields alongside execution fields.
++
++        Returns the same envelope as format() but includes non-None metadata fields
++        beside type/function fields, not inside arguments. Preserves explicit empty
++        strings/lists/dictionaries and zero priority. Omit unset metadata.
++
++        Returns:
++            List containing tool_calls envelope with metadata fields.
++        """
++        result = []
++        for tool_call in self.tool_calls:
++            call_entry = {
++                "type": "function",
++                "function": {
++                    "name": tool_call.name,
++                    "arguments": tool_call.args,
++                },
++            }
++            if tool_call.note is not None:
++                call_entry["note"] = tool_call.note
++            if tool_call.comment is not None:
++                call_entry["comment"] = tool_call.comment
++            if tool_call.annotation is not None:
++                call_entry["annotation"] = tool_call.annotation
++            if tool_call.tags is not None:
++                call_entry["tags"] = tool_call.tags
++            if tool_call.priority is not None:
++                call_entry["priority"] = tool_call.priority
++            if tool_call.meta is not None:
++                call_entry["meta"] = tool_call.meta
++            result.append(call_entry)
++        return [{"type": "tool_calls", "tool_calls": result}]
++
++
++def _remove_comments_from_json(text: str) -> str:
++    """Remove Python-style # comments from JSON text while preserving # inside strings."""
++    result = []
++    i = 0
++    n = len(text)
++    while i < n:
++        char = text[i]
++        if char == '"':
++            result.append(char)
++            i += 1
++            while i < n:
++                char = text[i]
++                result.append(char)
++                if char == '\\' and i + 1 < n:
++                    i += 1
++                    result.append(text[i])
++                    i += 1
++                    continue
++                elif char == '"':
++                    break
++                i += 1
++            i += 1
++        elif char == '#':
++            while i < n and text[i] != '\n':
++                i += 1
++        else:
++            result.append(char)
++            i += 1
++    return ''.join(result)
++
++
++def _extract_comments(text: str) -> list[str]:
++    """Extract Python-style # comments from text while preserving # inside strings."""
++    comments = []
++    i = 0
++    n = len(text)
++    while i < n:
++        char = text[i]
++        if char == '"':
++            i += 1
++            while i < n:
++                char = text[i]
++                if char == '\\' and i + 1 < n:
++                    i += 2
++                    continue
++                elif char == '"':
++                    break
++                i += 1
++            i += 1
++        elif char == '#':
++            i += 1
++            comment_start = i
++            while i < n and text[i] != '\n':
++                i += 1
++            comment_body = text[comment_start:i].strip()
++            if comment_body:
++                comments.append(comment_body)
++        else:
++            i += 1
++    return comments
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""

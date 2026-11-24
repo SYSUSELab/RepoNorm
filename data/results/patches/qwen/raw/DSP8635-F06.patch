@@ -1,0 +1,260 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..abbdc0c1 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,4 +1,5 @@
+ import random
++import re
+ 
+ import dspy
+ from dspy.propose.dataset_summary_generator import create_dataset_summary
+@@ -72,6 +73,22 @@ class DescribeModule(dspy.Signature):
+     )
+ 
+ 
++class ShortenInstruction(dspy.Signature):
++    """Shorten an instruction to fit within a maximum character limit while preserving its meaning."""
++    long_instruction = dspy.InputField(
++        desc="The original instruction that needs to be shortened.",
++        prefix="LONG INSTRUCTION:",
++    )
++    max_chars = dspy.InputField(
++        desc="The maximum number of characters allowed for the shortened instruction.",
++        prefix="MAX CHARACTERS:",
++    )
++    proposed_instruction = dspy.OutputField(
++        desc="A shortened version of the instruction that fits within the character limit.",
++        prefix="PROPOSED INSTRUCTION:",
++    )
++
++
+ def generate_instruction_class(
+     use_dataset_summary=True,
+     program_aware=True,
+@@ -284,9 +301,33 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        min_instr_chars=30,
++        max_instr_chars=600,
++        rephrase_when_too_long=False,
+     ):
+         super().__init__()
++        
++        # Validate min_instr_chars
++        if not isinstance(min_instr_chars, int) or isinstance(min_instr_chars, bool):
++            raise ValueError("min_instr_chars must be a nonnegative integer")
++        if min_instr_chars < 0:
++            raise ValueError("min_instr_chars must be nonnegative")
++        
++        # Validate max_instr_chars
++        if not isinstance(max_instr_chars, int) or isinstance(max_instr_chars, bool):
++            raise ValueError("max_instr_chars must be a nonnegative integer")
++        if max_instr_chars < 0:
++            raise ValueError("max_instr_chars must be nonnegative")
++        
++        # Validate min <= max (except when max is 0, which means empty string always)
++        if max_instr_chars != 0 and min_instr_chars > max_instr_chars:
++            raise ValueError("min_instr_chars must be less than or equal to max_instr_chars")
++        
++        # Validate rephrase_when_too_long
++        if not isinstance(rephrase_when_too_long, bool):
++            raise ValueError("rephrase_when_too_long must be a boolean")
++        
+         self.program_aware = program_aware
+         self.use_dataset_summary = use_dataset_summary
+         self.use_task_demos = use_task_demos
+@@ -297,6 +338,10 @@ class GroundedProposer(Proposer):
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        
++        self.min_instr_chars = min_instr_chars
++        self.max_instr_chars = max_instr_chars
++        self.rephrase_when_too_long = rephrase_when_too_long
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -323,6 +368,116 @@ class GroundedProposer(Proposer):
+                 self.use_dataset_summary = False
+                 print("")
+ 
++    def _truncate_to_max(self, text, max_chars):
++        """Hard-truncate text to max_chars."""
++        if max_chars == 0:
++            return ""
++        if len(text) <= max_chars:
++            return text
++        return text[:max_chars]
++
++    def _find_last_sentence_boundary(self, text, max_len):
++        """Find the last sentence boundary (. ! or ? followed by whitespace/end) that fits within max_len."""
++        if len(text) <= max_len:
++            return text
++        
++        # Try to find a sentence boundary within max_len - 1 (for the ellipsis)
++        search_limit = max_len - 1
++        if search_limit < 0:
++            return ""
++        
++        # Look for . ! or ? followed by whitespace or end of string
++        pattern = r'[.!?]\s*'
++        matches = list(re.finditer(pattern, text[:search_limit]))
++        
++        if matches:
++            # Get the last match position
++            last_match = matches[-1]
++            end_pos = last_match.end()
++            
++            # Make sure we have room for ellipsis
++            if end_pos + 1 <= max_len:
++                return text[:end_pos] + "…"
++        
++        # No suitable boundary found, hard truncate
++        return text[:max_len - 1] + "…"
++
++    def _shorten_instruction(self, long_instruction, max_chars):
++        """Call ShortenInstruction to shorten an instruction."""
++        try:
++            shorten_predictor = dspy.Predict(ShortenInstruction)
++            result = shorten_predictor(
++                long_instruction=long_instruction,
++                max_chars=max_chars,
++            )
++            shortened = strip_prefix(result.proposed_instruction)
++            return shortened
++        except Exception as e:
++            # If rephrasing fails, propagate the error
++            raise e
++
++    def _process_instruction_length(self, proposed_instruction, predictor, basic_instruction):
++        """Process instruction length according to min/max constraints."""
++        measured_len = len(proposed_instruction)
++        
++        # Handle zero cap case
++        if self.max_instr_chars == 0:
++            if self.verbose:
++                print(f"Zero max_instr_chars cap applied. Returning empty string.")
++            return ""
++        
++        # Check if shorter than min
++        if measured_len < self.min_instr_chars:
++            if self.verbose:
++                print(f"Generated instruction ({measured_len} chars) shorter than min ({self.min_instr_chars}). Falling back to canonical basic instruction.")
++            # If no basic instruction available (e.g., predictor is None), return truncated generated instruction
++            if not basic_instruction:
++                return self._truncate_to_max(proposed_instruction, self.max_instr_chars)
++            return self._truncate_to_max(basic_instruction, self.max_instr_chars)
++        
++        # Check if longer than max
++        if measured_len > self.max_instr_chars:
++            if self.rephrase_when_too_long:
++                if self.verbose:
++                    print(f"Generated instruction ({measured_len} chars) longer than max ({self.max_instr_chars}). Rephrasing...")
++                
++                # Make exactly one ShortenInstruction call
++                try:
++                    rephrased = self._shorten_instruction(proposed_instruction, self.max_instr_chars)
++                    rephrased_len = len(rephrased)
++                    
++                    # Strip output prefix (already done in _shorten_instruction)
++                    # Check if empty or still shorter than min
++                    if not rephrased or len(rephrased) < self.min_instr_chars:
++                        if self.verbose:
++                            print(f"Rephrased instruction ({rephrased_len} chars) empty or shorter than min ({self.min_instr_chars}). Falling back to canonical basic instruction.")
++                        return self._truncate_to_max(basic_instruction, self.max_instr_chars)
++                    
++                    # Hard-truncate if still overlong
++                    if len(rephrased) > self.max_instr_chars:
++                        if self.verbose:
++                            print(f"Rephrased instruction ({len(rephrased)} chars) still over max ({self.max_instr_chars}). Truncating.")
++                        return self._truncate_to_max(rephrased, self.max_instr_chars)
++                    
++                    if self.verbose:
++                        print(f"Rephrased instruction ({len(rephrased)} chars) within bounds.")
++                    return rephrased
++                except Exception as e:
++                    # Generation errors propagate
++                    raise e
++            else:
++                if self.verbose:
++                    print(f"Generated instruction ({measured_len} chars) longer than max ({self.max_instr_chars}). Truncating at sentence boundary...")
++                
++                # Retain the last sentence boundary that fits with one character reserved for …
++                truncated = self._find_last_sentence_boundary(proposed_instruction, self.max_instr_chars)
++                if self.verbose:
++                    print(f"Truncated instruction ({len(truncated)} chars)")
++                return truncated
++        
++        # Within bounds, return as-is
++        return proposed_instruction
++
+     def propose_instructions_for_program(
+         self,
+         trainset,
+@@ -403,6 +558,12 @@ class GroundedProposer(Proposer):
+             program, pred_i, trial_logs, MAX_INSTRUCT_IN_HISTORY,
+         )
+ 
++        # Get the basic/canonical instruction for this predictor (may be None if predictor is None)
++        try:
++            basic_instruction = get_signature(predictor).instructions
++        except (AttributeError, AssertionError):
++            basic_instruction = ""
++
+         # Create our instruction generator class (given specific criteria for this round of proposal)
+         instruction_generator = GenerateModuleInstruction(
+             program_code_string=self.program_code_string,
+@@ -439,4 +600,9 @@ class GroundedProposer(Proposer):
+             self.prompt_model.inspect_history(n=1)
+             print(f"PROPOSED INSTRUCTION: {proposed_instruction}")
+ 
+-        return strip_prefix(proposed_instruction)
++        # Process instruction length
++        processed_instruction = self._process_instruction_length(
++            proposed_instruction, predictor, basic_instruction
++        )
++        
++        return processed_instruction
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..9e5108bc 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -14,8 +14,8 @@ from dspy.utils.dummies import DummyLM
+     ],
+ )
+ def test_propose_instructions_for_program(demo_candidates):
+-    # Set large number here so that lm always returns the same response
+-    prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++    # Use a long enough instruction to exceed min_instr_chars (30)
++    prompt_model = DummyLM([{"proposed_instruction": "This is a proper instruction for testing."}] * 10)
+     program = Predict("question -> answer")
+     trainset = []
+ 
+@@ -26,7 +26,7 @@ def test_propose_instructions_for_program(demo_candidates):
+     assert isinstance(result, dict)
+     assert len(result) == len(program.predictors())
+     for pred_instructions in result.values():
+-        assert pred_instructions == ["instruction"]
++        assert pred_instructions == ["This is a proper instruction for testing."]
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -37,7 +37,8 @@ def test_propose_instructions_for_program(demo_candidates):
+     ],
+ )
+ def test_propose_instruction_for_predictor(demo_candidates):
+-    prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++    # Use a long enough instruction to exceed min_instr_chars (30)
++    prompt_model = DummyLM([{"proposed_instruction": "This is a proper instruction for testing."}] * 10)
+     program = Predict("question -> answer")
+ 
+     proposer = GroundedProposer(prompt_model=prompt_model, program=program, trainset=[], verbose=False)
+@@ -51,4 +52,4 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         trial_logs={},
+         tip=None,
+     )
+-    assert result == "instruction"
++    assert result == "This is a proper instruction for testing."

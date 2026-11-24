@@ -1,0 +1,202 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..f31912b9 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -84,6 +84,9 @@ DSPY_CACHE = Cache(
+     disk_cache_dir=DISK_CACHE_DIR,
+     disk_size_limit_bytes=DISK_CACHE_LIMIT,
+     memory_max_entries=1000000,
++    compress=None,
++    cull_limit=None,
++    eviction_policy=None,
+ )
+ 
+ # Turn off by default to avoid LiteLLM logging during every LM call.
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..cf6ced67 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,10 +1,17 @@
+ import copy
++import gzip
+ import inspect
+ import logging
+ import threading
+ from functools import wraps
+ from hashlib import sha256
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, Optional, Union
++
++import cloudpickle
++import pydantic
++import ujson
++from cachetools import LRUCache
++from diskcache import FanoutCache
+ 
+ import cloudpickle
+ import pydantic
+@@ -14,6 +21,17 @@ from diskcache import FanoutCache
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Compression codec constants
++_COMPRESSION_NONE = 0x00
++_COMPRESSION_GZIP = 0x01
++_COMPRESSION_ZLIB = 0x02
++
++# Magic header for compressed cache entries
++_CACHE_HEADER = b"DSPC"
++
++# Valid compression codecs
++_VALID_COMPRESSION_CODECS = {"gzip", "zlib", None}
++
+ 
+ class Cache:
+     """DSPy Cache
+@@ -30,7 +48,9 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        compress: Optional[str] = None,
++        cull_limit: Optional[int] = None,
++        eviction_policy: Optional[str] = None,
+     ):
+         """
+         Args:
+@@ -48,21 +68,108 @@ class Cache:
+         else:
+             self.memory_cache = {}
+         if self.enable_disk_cache:
+-            self.disk_cache = FanoutCache(
+-                shards=16,
+-                timeout=10,
+-                directory=disk_cache_dir,
+-                size_limit=disk_size_limit_bytes,
+-            )
++            # Build kwargs for FanoutCache, only including non-None values
++            fanout_kwargs = {
++                "shards": 16,
++                "timeout": 10,
++                "directory": disk_cache_dir,
++                "size_limit": disk_size_limit_bytes,
++            }
++            if cull_limit is not None:
++                fanout_kwargs["cull_limit"] = cull_limit
++            if eviction_policy is not None:
++                fanout_kwargs["eviction_policy"] = eviction_policy
++            
++            self.disk_cache = FanoutCache(**fanout_kwargs)
+         else:
+             self.disk_cache = {}
+ 
++        # Validate compression codec
++        if compress is not None and compress not in _VALID_COMPRESSION_CODECS:
++            raise ValueError(f"Invalid compression codec: {compress}. Must be one of {_VALID_COMPRESSION_CODECS}")
++        
++        self._compression_codec = compress
+         self._lock = threading.RLock()
+ 
++    def _compress_value(self, value: Any) -> bytes:
++        """Serialize a value with optional compression.
++        
++        When compression is enabled, returns bytes starting with b"DSPC" followed by a codec byte 
++        and the encoded pickle payload. When compression is None, returns plain pickled data
++        for backward compatibility with legacy entries.
++        
++        Args:
++            value: The value to serialize.
++            
++        Returns:
++            Serialized bytes.
++        """
++        pickled = cloudpickle.dumps(value)
++        
++        if self._compression_codec == "gzip":
++            compressed = gzip.compress(pickled)
++            return _CACHE_HEADER + bytes([_COMPRESSION_GZIP]) + compressed
++        elif self._compression_codec == "zlib":
++            compressed = zlib.compress(pickled)
++            return _CACHE_HEADER + bytes([_COMPRESSION_ZLIB]) + compressed
++        else:
++            # No compression - just return pickled data for backward compatibility
++            return pickled
++
++    def _decompress_value(self, data: bytes) -> Any:
++        """Deserialize a value from bytes, handling both compressed and legacy formats.
++        
++        Args:
++            data: Bytes to deserialize. Can be either:
++                - New format: b"DSPC" + codec_byte + compressed/pickled data
++                - Legacy format: plain pickled data (no header)
++                
++        Returns:
++            The deserialized Python value.
++            
++        Raises:
++            ValueError: If an unknown compression codec is encountered.
++        """
++        # Check for our magic header
++        if data.startswith(_CACHE_HEADER):
++            if len(data) < len(_CACHE_HEADER) + 1:
++                raise ValueError("Invalid cache entry: truncated header")
++            
++            codec_byte = data[len(_CACHE_HEADER)]
++            payload = data[len(_CACHE_HEADER) + 1:]
++            
++            if codec_byte == _COMPRESSION_NONE:
++                return cloudpickle.loads(payload)
++            elif codec_byte == _COMPRESSION_GZIP:
++                decompressed = gzip.decompress(payload)
++                return cloudpickle.loads(decompressed)
++            elif codec_byte == _COMPRESSION_ZLIB:
++                decompressed = zlib.decompress(payload)
++                return cloudpickle.loads(decompressed)
++            else:
++                raise ValueError(f"Unknown compression codec: {codec_byte:#x}")
++        else:
++            # Legacy format: plain pickled data without header
++            return cloudpickle.loads(data)
++
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+         return key in self.memory_cache or key in self.disk_cache
+ 
++    def set_compression(self, codec: Optional[str]) -> None:
++        """Set the compression codec for subsequent disk writes.
++        
++        Args:
++            codec: The compression codec to use ("gzip", "zlib", or None).
++            
++        Raises:
++            ValueError: If an invalid codec is provided.
++        """
++        if codec is not None and codec not in _VALID_COMPRESSION_CODECS:
++            raise ValueError(f"Invalid compression codec: {codec}. Must be one of {_VALID_COMPRESSION_CODECS}")
++        
++        self._compression_codec = codec
++
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+         Obtain a unique cache key for the given request dictionary by hashing its JSON
+@@ -108,7 +215,8 @@ class Cache:
+                 response = self.memory_cache[key]
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
++            raw_data = self.disk_cache[key]
++            response = self._decompress_value(raw_data)
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
+@@ -140,7 +248,9 @@ class Cache:
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                # Compress the value before storing
++                compressed_value = self._compress_value(value)
++                self.disk_cache[key] = compressed_value
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")

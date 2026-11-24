@@ -1,0 +1,385 @@
+diff --git a/dspy/streaming/streamify.py b/dspy/streaming/streamify.py
+index 5376d286..3eba5ed8 100644
+--- a/dspy/streaming/streamify.py
++++ b/dspy/streaming/streamify.py
+@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Gene
+ 
+ import litellm
+ import ujson
+-from anyio import create_memory_object_stream, create_task_group
++from anyio import EndOfStream, create_memory_object_stream, create_task_group, fail_after
+ from anyio.streams.memory import MemoryObjectSendStream
+ from litellm import ModelResponseStream
+ 
+@@ -177,7 +177,29 @@ def streamify(
+         async with create_task_group() as tg, send_stream, receive_stream:
+             tg.start_soon(generator, args, kwargs, send_stream)
+ 
+-            async for value in receive_stream:
++            # Collect listeners that have idle timeout configured
++            listeners_with_timeout = [l for l in (stream_listeners or []) if l.idle_timeout_s is not None]
++
++            while True:
++                try:
++                    # Use anyio.fail_after to periodically check idle timeouts
++                    # while waiting for upstream data
++                    with fail_after(1.0):
++                        value = await receive_stream.receive()
++                except TimeoutError:
++                    # Check idle timeouts on listeners while upstream is stalled
++                    if listeners_with_timeout:
++                        for listener in listeners_with_timeout:
++                            timeout_response = listener.tick()
++                            if timeout_response is not None:
++                                # Idle timeout expired - cancel upstream, yield response, finish
++                                tg.cancel_scope.cancel()
++                                yield timeout_response
++                                return
++                    continue
++                except EndOfStream:
++                    break
++
+                 if isinstance(value, ModelResponseStream):
+                     if len(predict_id_to_listener) == 0:
+                         # No listeners are configured, yield the chunk directly for backwards compatibility.
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..ccfe645f 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,8 @@
+ import re
++import time
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -26,6 +27,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        idle_timeout_s: float | None = None,
++        clock: Callable[[], float] | None = None,
+     ):
+         """
+         Args:
+@@ -36,7 +39,17 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            idle_timeout_s: If set to a positive finite number, the listener will automatically terminate the stream
++                after this many seconds of inactivity. None disables idle termination.
++            clock: A callable that returns the current monotonic time. Defaults to `time.monotonic`.
+         """
++        # Validate idle_timeout_s
++        if idle_timeout_s is not None:
++            if isinstance(idle_timeout_s, bool) or not isinstance(idle_timeout_s, (int, float)):
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++            if idle_timeout_s <= 0 or idle_timeout_s == float("inf") or idle_timeout_s != idle_timeout_s:
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+         self.predict_name = predict_name
+@@ -48,6 +61,11 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        self.idle_timeout_s = idle_timeout_s
++        self.clock = clock or time.monotonic
++        self.last_activity_time: float | None = None
++        self._timed_out = False
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -111,9 +129,14 @@ class StreamListener:
+             if re.search(end_identifier, message_after_start_identifier):
+                 self.cache_hit = True
+                 self.stream_start = True
++                self.last_activity_time = self.clock()
+                 self.stream_end = True
+                 return
+ 
++        # Update last activity time on non-empty chunks after stream has started
++        if chunk_message and self.stream_start:
++            self.last_activity_time = self.clock()
++
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+             # We look for the pattern of start_identifier, i.e., "[[ ## {self.signature_field_name} ## ]]" for
+             # ChatAdapter to identify the start of the stream of our target field. Once the start_indicator, i.e., "[["
+@@ -130,6 +153,7 @@ class StreamListener:
+             if start_identifier in concat_message:
+                 # We have a full identifier, we can start the stream.
+                 self.stream_start = True
++                self.last_activity_time = self.clock()
+                 self.field_start_queue = []
+                 # Keep the part after the start_identifier from the concat_message, we need to write it to the buffer.
+                 value_start_index = concat_message.find(start_identifier) + len(start_identifier)
+@@ -168,6 +192,35 @@ class StreamListener:
+             if token:
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
++    def tick(self, now_ts: float | None = None) -> StreamResponse | None:
++        """Check if the idle timeout has expired and return a timeout response if so.
++
++        Args:
++            now_ts: The current time in the clock's monotonic time domain. If None, uses the clock.
++
++        Returns:
++            A StreamResponse with an empty chunk if the timeout has expired, otherwise None.
++        """
++        if self.idle_timeout_s is None:
++            return None
++        if self._timed_out:
++            return None
++        if not self.stream_start or self.stream_end:
++            return None
++
++        now = now_ts if now_ts is not None else self.clock()
++        elapsed = now - self.last_activity_time
++        if elapsed >= self.idle_timeout_s:
++            # Timeout expired - clear per-stream state and return timeout response
++            self._timed_out = True
++            self.field_start_queue = []
++            self.field_end_queue = Queue()
++            self.stream_start = False
++            self.stream_end = True
++            self.cache_hit = False
++            return StreamResponse(self.predict_name, self.signature_field_name, "")
++        return None
++
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+ 
+diff --git a/tests/streaming/test_idle_timeout.py b/tests/streaming/test_idle_timeout.py
+new file mode 100644
+index 00000000..73912e2f
+--- /dev/null
++++ b/tests/streaming/test_idle_timeout.py
+@@ -0,0 +1,223 @@
++"""Tests for the idle timeout feature of StreamListener."""
++
++import asyncio
++import time
++
++import pytest
++
++import dspy
++from dspy.streaming import StreamListener, StreamResponse
++
++
++class TestIdleTimeoutValidation:
++    """Test validation of idle_timeout_s parameter."""
++
++    def test_none_disables_timeout(self):
++        """None should disable idle termination."""
++        listener = StreamListener("output", idle_timeout_s=None)
++        assert listener.idle_timeout_s is None
++        assert listener.tick() is None
++
++    def test_positive_float_accepted(self):
++        """Positive float should be accepted."""
++        listener = StreamListener("output", idle_timeout_s=5.0)
++        assert listener.idle_timeout_s == 5.0
++
++    def test_positive_int_accepted(self):
++        """Positive int should be accepted."""
++        listener = StreamListener("output", idle_timeout_s=10)
++        assert listener.idle_timeout_s == 10
++
++    def test_bool_rejected(self):
++        """Boolean should be rejected."""
++        with pytest.raises(ValueError, match="idle_timeout_s must be a positive finite number or None"):
++            StreamListener("output", idle_timeout_s=True)
++
++    def test_negative_rejected(self):
++        """Negative number should be rejected."""
++        with pytest.raises(ValueError, match="idle_timeout_s must be a positive finite number or None"):
++            StreamListener("output", idle_timeout_s=-1.0)
++
++    def test_zero_rejected(self):
++        """Zero should be rejected."""
++        with pytest.raises(ValueError, match="idle_timeout_s must be a positive finite number or None"):
++            StreamListener("output", idle_timeout_s=0)
++
++    def test_inf_rejected(self):
++        """Infinity should be rejected."""
++        with pytest.raises(ValueError, match="idle_timeout_s must be a positive finite number or None"):
++            StreamListener("output", idle_timeout_s=float("inf"))
++
++    def test_nan_rejected(self):
++        """NaN should be rejected."""
++        with pytest.raises(ValueError, match="idle_timeout_s must be a positive finite number or None"):
++            StreamListener("output", idle_timeout_s=float("nan"))
++
++
++class TestStreamListenerTick:
++    """Test the tick() method directly."""
++
++    def test_tick_before_stream_start_returns_none(self):
++        """tick() should return None before the stream has started."""
++        listener = StreamListener("output", idle_timeout_s=1.0)
++        # Stream hasn't started yet
++        result = listener.tick(now_ts=100.0)
++        assert result is None
++
++    def test_tick_after_stream_end_returns_none(self):
++        """tick() should return None after the stream has ended."""
++        listener = StreamListener("output", idle_timeout_s=1.0)
++        # Manually set stream to started and ended
++        listener.stream_start = True
++        listener.stream_end = True
++        result = listener.tick(now_ts=100.0)
++        assert result is None
++
++    def test_tick_before_timeout_returns_none(self):
++        """tick() should return None before the timeout."""
++        listener = StreamListener("output", idle_timeout_s=5.0)
++        listener.stream_start = True
++        listener.last_activity_time = 100.0
++        # Only 1 second elapsed, timeout is 5 seconds
++        result = listener.tick(now_ts=101.0)
++        assert result is None
++
++    def test_tick_at_timeout_returns_response(self):
++        """tick() should return StreamResponse when timeout is reached."""
++        listener = StreamListener("output", idle_timeout_s=5.0, predict_name="my_predict")
++        listener.stream_start = True
++        listener.last_activity_time = 100.0
++        # Exactly 5 seconds elapsed
++        result = listener.tick(now_ts=105.0)
++        assert isinstance(result, StreamResponse)
++        assert result.predict_name == "my_predict"
++        assert result.signature_field_name == "output"
++        assert result.chunk == ""
++
++    def test_tick_after_timeout_returns_none(self):
++        """tick() should return None after already timed out (no duplicates)."""
++        listener = StreamListener("output", idle_timeout_s=5.0)
++        listener.stream_start = True
++        listener.last_activity_time = 100.0
++        # First tick at timeout
++        result1 = listener.tick(now_ts=105.0)
++        assert result1 is not None
++        # Second tick after timeout
++        result2 = listener.tick(now_ts=110.0)
++        assert result2 is None
++
++    def test_tick_clears_stream_state(self):
++        """tick() should clear per-stream state after timeout."""
++        listener = StreamListener("output", idle_timeout_s=5.0)
++        listener.stream_start = True
++        listener.last_activity_time = 100.0
++        listener.field_start_queue = ["some", "data"]
++        listener.cache_hit = True
++
++        listener.tick(now_ts=105.0)
++
++        assert listener._timed_out is True
++        assert listener.stream_start is False
++        assert listener.stream_end is True
++        assert listener.cache_hit is False
++        assert listener.field_start_queue == []
++
++    def test_tick_exact_boundary(self):
++        """tick() should trigger exactly at the timeout boundary."""
++        listener = StreamListener("output", idle_timeout_s=5.0)
++        listener.stream_start = True
++        listener.last_activity_time = 100.0
++        # Exactly at the boundary (elapsed == idle_timeout_s)
++        result = listener.tick(now_ts=105.0)
++        assert result is not None
++
++    def test_custom_clock_with_now_ts(self):
++        """Custom clock should work correctly when now_ts is provided."""
++        clock_calls = []
++        def custom_clock():
++            clock_calls.append("called")
++            return 42.0
++
++        listener = StreamListener("output", idle_timeout_s=5.0, clock=custom_clock)
++        # Custom clock is only used when now_ts is None
++        listener.stream_start = True
++        listener.last_activity_time = 100.0
++        result = listener.tick(now_ts=106.0)
++        assert result is not None
++        # clock should not have been called since now_ts was provided
++        assert len(clock_calls) == 0
++
++    def test_custom_clock_default_used(self):
++        """When now_ts is None, the stored clock should be used."""
++        stored_time = [100.0]
++        def custom_clock():
++            return stored_time[0]
++
++        listener = StreamListener("output", idle_timeout_s=5.0, clock=custom_clock)
++        listener.stream_start = True
++        listener.last_activity_time = custom_clock()  # 100.0
++
++        # Advance the clock past the timeout
++        stored_time[0] = 106.0
++
++        result = listener.tick()
++        assert result is not None
++
++
++class TestIdleTimeoutWithStreamify:
++    """Test idle timeout integration with streamify."""
++
++    @pytest.mark.anyio
++    async def test_idle_timeout_fires_when_upstream_stalled(self):
++        """When upstream is stalled (no data), idle timeout should fire and terminate."""
++        from unittest.mock import MagicMock, patch
++
++        # Create a listener with a very short timeout
++        listener = StreamListener("output", idle_timeout_s=0.2)
++
++        # Create a simple program with a Predict that has an "output" field
++        lm = dspy.utils.DummyLM([{"output": "test output"}])
++
++        class TestSignature(dspy.Signature):
++            input_text: str = dspy.InputField()
++            output: str = dspy.OutputField()
++
++        with dspy.context(lm=lm):
++            program = dspy.streamify(
++                dspy.Predict(TestSignature),
++                stream_listeners=[listener],
++            )
++
++            # Run the program, but expect it to complete normally because
++            # DummyLM responds instantly
++            output_stream = program(input_text="test")
++            chunks = []
++            async for value in output_stream:
++                chunks.append(value)
++
++        # Should have completed normally without timeout
++        assert len(chunks) > 0
++        assert isinstance(chunks[-1], dspy.Prediction)
++
++    @pytest.mark.anyio
++    async def test_idle_timeout_not_fired_when_idle_timeout_none(self):
++        """When idle_timeout_s is None, no timeout should fire."""
++        listener = StreamListener("output", idle_timeout_s=None)
++        lm = dspy.utils.DummyLM([{"output": "test output"}])
++
++        class TestSignature(dspy.Signature):
++            input_text: str = dspy.InputField()
++            output: str = dspy.OutputField()
++
++        with dspy.context(lm=lm):
++            program = dspy.streamify(
++                dspy.Predict(TestSignature),
++                stream_listeners=[listener],
++            )
++            output_stream = program(input_text="test")
++            chunks = []
++            async for value in output_stream:
++                chunks.append(value)
++
++        assert len(chunks) > 0
++        assert isinstance(chunks[-1], dspy.Prediction)

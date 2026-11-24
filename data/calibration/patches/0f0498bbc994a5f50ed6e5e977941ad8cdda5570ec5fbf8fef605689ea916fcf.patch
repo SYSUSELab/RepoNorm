@@ -1,0 +1,307 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..d82354f3 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add optional bounded raw translation caching with partition, resize,
++    clear, and independent overlay state.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b7..3d9389a9 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -68,7 +68,7 @@ additional methods:
+ 
+     .. versionchanged:: 2.5 Added new-style gettext support.
+ 
+-.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None)
++.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None, cache_size=0, cache_partition=None)
+ 
+     Install the given ``gettext``, ``ngettext``, ``pgettext``, and
+     ``npgettext`` callables into the environment. They should behave
+@@ -84,6 +84,20 @@ additional methods:
+     .. versionadded:: 2.5
+         Added new-style gettext support.
+ 
++    Translation callables may use ``cache_size`` (default ``0``) and a
++    hashable ``cache_partition``. A positive capacity enables bounded
++    LRU caching.
++    Results are raw provider values, before formatting and autoescaping.
++    Context, messages, count, function kind, and partition distinguish
++    keys. Use a distinct partition for every locale or request state.
++    ``set_translation_cache_partition(value)`` changes the partition and
++    clears old entries; ``clear_translation_cache()`` clears entries;
++    ``resize_translation_cache(capacity)`` immediately applies a
++    non-negative bound, with zero clearing and disabling caching.
++    Invalid capacities raise ``ValueError``. Installation and
++    uninstallation clear old results.
++    Environments and overlays maintain independent cache state.
++
+ .. method:: jinja2.Environment.uninstall_gettext_translations()
+ 
+     Uninstall the environment's globally installed translation.
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..cb56734d 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -2,6 +2,7 @@
+ import pprint
+ import re
+ import typing as t
++from collections import OrderedDict
+ 
+ from markupsafe import Markup
+ 
+@@ -263,9 +264,85 @@ class InternationalizationExtension(Extension):
+             install_gettext_callables=self._install_callables,
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
++            clear_translation_cache=self._clear_translation_cache,
++            resize_translation_cache=self._resize_translation_cache,
++            set_translation_cache_partition=self._set_translation_cache_partition,
+             newstyle_gettext=False,
++            i18n_cache_size=0,
++            i18n_cache_partition=None,
++            i18n_translation_cache=OrderedDict(),
+         )
+ 
++    def bind(self, environment: Environment) -> "InternationalizationExtension":
++        """Bind independent translation cache state to an overlay.
++
++        .. versionchanged:: 3.1.0
++            Translation cache state is independent across overlays.
++        """
++        rv = t.cast("InternationalizationExtension", super().bind(environment))
++        environment.globals = environment.globals.copy()
++        environment.i18n_translation_cache = OrderedDict(  # type: ignore
++            self.environment.i18n_translation_cache  # type: ignore
++        )
++        for name, method in (
++            ("install_gettext_translations", rv._install),
++            ("install_null_translations", rv._install_null),
++            ("install_gettext_callables", rv._install_callables),
++            ("uninstall_gettext_translations", rv._uninstall),
++            ("extract_translations", rv._extract),
++            ("clear_translation_cache", rv._clear_translation_cache),
++            ("resize_translation_cache", rv._resize_translation_cache),
++            ("set_translation_cache_partition", rv._set_translation_cache_partition),
++        ):
++            setattr(environment, name, method)
++        return rv
++
++    def _clear_translation_cache(self) -> None:
++        """Clear this environment's application translation cache."""
++        self.environment.i18n_translation_cache.clear()  # type: ignore
++
++    def _resize_translation_cache(self, capacity: int) -> None:
++        """Set capacity, evict excess entries, and disable at zero."""
++        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
++            raise ValueError(
++                "translation cache capacity must be a non-negative integer"
++            )
++        self.environment.i18n_cache_size = capacity  # type: ignore
++        cache = self.environment.i18n_translation_cache  # type: ignore
++        while len(cache) > capacity:
++            cache.popitem(last=False)
++        if capacity == 0:
++            cache.clear()
++
++    def _set_translation_cache_partition(self, partition: t.Hashable) -> None:
++        """Change the cache partition and clear existing entries."""
++        hash(partition)
++        if partition != self.environment.i18n_cache_partition:  # type: ignore
++            self.environment.i18n_cache_partition = partition  # type: ignore
++            self._clear_translation_cache()
++
++    def _cache_callable(
++        self, kind: str, function: t.Callable[..., str]
++    ) -> t.Callable[..., str]:
++        @pass_context
++        def cached(context: Context, *args: t.Any) -> str:
++            environment = context.environment
++            capacity = environment.i18n_cache_size  # type: ignore
++            if capacity == 0:
++                return t.cast(str, context.call(function, *args))
++            key = (kind, environment.i18n_cache_partition, args)  # type: ignore
++            cache = environment.i18n_translation_cache  # type: ignore
++            try:
++                result = cache.pop(key)
++            except KeyError:
++                result = t.cast(str, context.call(function, *args))
++            cache[key] = result
++            while len(cache) > capacity:
++                cache.popitem(last=False)
++            return t.cast(str, result)
++
++        return cached
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -319,7 +396,23 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Hashable = None,
+     ) -> None:
++        """Install providers with optional raw translation caching.
++
++        .. versionchanged:: 3.1.0
++           Add cache size and application partition options.
++        """
++        self._clear_translation_cache()
++        self._resize_translation_cache(cache_size)
++        self._set_translation_cache_partition(cache_partition)
++        gettext = self._cache_callable("gettext", gettext)
++        ngettext = self._cache_callable("ngettext", ngettext)
++        if pgettext is not None:
++            pgettext = self._cache_callable("pgettext", pgettext)
++        if npgettext is not None:
++            npgettext = self._cache_callable("npgettext", npgettext)
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+         if self.environment.newstyle_gettext:  # type: ignore
+@@ -337,6 +430,12 @@ class InternationalizationExtension(Extension):
+         )
+ 
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
++        """Remove translation globals and clear cached provider results.
++
++        .. versionchanged:: 3.1.0
++           Clear the translation cache when uninstalling providers.
++        """
++        self._clear_translation_cache()
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+ 
+diff --git a/tests/test_n4c_author_translation_cache.py b/tests/test_n4c_author_translation_cache.py
+new file mode 100644
+index 00000000..8fc021b4
+--- /dev/null
++++ b/tests/test_n4c_author_translation_cache.py
+@@ -0,0 +1,119 @@
++import pytest
++
++from jinja2 import Environment
++
++
++def make_environment(capacity=2):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++
++    def gettext(message):
++        seen.append(message)
++        return message
++
++    env.install_gettext_callables(
++        gettext, lambda one, many, n: one if n == 1 else many, cache_size=capacity
++    )
++    return env, seen
++
++
++def test_cache_lru_and_immediate_resize():
++    env, seen = make_environment()
++    template = env.from_string("{{ gettext(message) }}")
++    for message in ("a", "b", "a", "c", "b"):
++        template.render(message=message)
++    assert seen == ["a", "b", "c", "b"]
++    env.resize_translation_cache(0)
++    template.render(message="b")
++    template.render(message="b")
++    assert seen[-2:] == ["b", "b"]
++
++
++@pytest.mark.parametrize("capacity", [-1, True, 1.5, "2"])
++def test_cache_rejects_invalid_capacity(capacity):
++    env, _ = make_environment()
++    with pytest.raises(ValueError):
++        env.resize_translation_cache(capacity)
++
++
++def test_cache_partition_and_provider_lifecycle():
++    env, seen = make_environment()
++    template = env.from_string('{{ gettext("x") }}')
++    template.render()
++    template.render()
++    env.set_translation_cache_partition("fr")
++    template.render()
++    assert seen == ["x", "x"]
++    env.install_gettext_callables(
++        lambda value: "new", lambda one, many, n: many, cache_size=2
++    )
++    assert template.render() == "new"
++    env.uninstall_gettext_translations(None)
++    assert "gettext" not in env.globals
++
++
++def test_overlay_render_and_reinstallation_are_independent():
++    env, seen = make_environment()
++    parent = env.from_string('{{ gettext("x") }}')
++    parent.render()
++    overlay = env.overlay()
++    overlay.clear_translation_cache()
++    assert overlay.from_string('{{ gettext("x") }}').render() == "x"
++    assert seen == ["x", "x"]
++    assert parent.render() == "x"
++    assert seen == ["x", "x"]
++    overlay.install_gettext_callables(
++        lambda value: "overlay", lambda one, many, n: many, cache_size=1
++    )
++    assert overlay.from_string('{{ gettext("x") }}').render() == "overlay"
++    assert parent.render() == "x"
++
++
++def test_raw_cache_preserves_each_render_formatting_and_escape():
++    env, seen = make_environment()
++    env.install_gettext_callables(
++        lambda value: seen.append(value) or "<b>%(name)s</b>",
++        lambda one, many, n: many,
++        newstyle=True,
++        cache_size=2,
++    )
++    template = env.from_string(
++        '{% autoescape escape %}{{ gettext("x", name=name) }}{% endautoescape %}'
++    )
++    assert template.render(name="<one>", escape=True) == "<b>&lt;one&gt;</b>"
++    assert template.render(name="<two>", escape=False) == "<b><two></b>"
++    assert seen == ["x"]
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++def test_all_provider_kinds_context_count_and_clear(newstyle):
++    env = Environment(extensions=["jinja2.ext.i18n"])
++    calls = {"g": 0, "n": 0, "p": 0, "np": 0}
++
++    def provider(kind):
++        def translate(*args):
++            calls[kind] += 1
++            return "translated"
++
++        return translate
++
++    env.install_gettext_callables(
++        provider("g"),
++        provider("n"),
++        pgettext=provider("p"),
++        npgettext=provider("np"),
++        cache_size=16,
++        newstyle=newstyle,
++    )
++    template = env.from_string(
++        '{{ gettext("x") }}{{ ngettext("x", "xs", n) }}'
++        '{{ pgettext(context, "x") }}{{ npgettext(context, "x", "xs", n) }}'
++    )
++    template.render(context="a", n=1)
++    template.render(context="a", n=1)
++    assert calls == {"g": 1, "n": 1, "p": 1, "np": 1}
++    template.render(context="b", n=2)
++    assert calls == {"g": 1, "n": 2, "p": 2, "np": 2}
++    env.clear_translation_cache()
++    template.render(context="b", n=2)
++    assert calls == {"g": 2, "n": 3, "p": 3, "np": 3}

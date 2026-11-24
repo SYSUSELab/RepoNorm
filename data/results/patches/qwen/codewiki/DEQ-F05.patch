@@ -1,0 +1,557 @@
+diff --git a/dirty_equals/__init__.py b/dirty_equals/__init__.py
+index ba8214e..c1cb2a9 100644
+--- a/dirty_equals/__init__.py
++++ b/dirty_equals/__init__.py
+@@ -19,6 +19,7 @@ from ._numeric import (
+     IsPositiveInt,
+ )
+ from ._other import FunctionCheck, IsJson, IsUUID
++from ._phonenumber import IsPhoneNumber
+ from ._sequence import Contains, HasLen, IsList, IsListOrTuple, IsTuple
+ from ._strings import IsAnyStr, IsBytes, IsStr
+ 
+@@ -70,6 +71,7 @@ __all__ = (
+     'IsJson',
+     'IsUUID',
+     # strings
++    'IsPhoneNumber',
+     'IsStr',
+     'IsBytes',
+     'IsAnyStr',
+diff --git a/dirty_equals/_phonenumber.py b/dirty_equals/_phonenumber.py
+new file mode 100644
+index 0000000..55e9649
+--- /dev/null
++++ b/dirty_equals/_phonenumber.py
+@@ -0,0 +1,215 @@
++import re
++from typing import Any, Optional, Union
++
++from ._base import DirtyEquals
++from ._utils import Omit, plain_repr
++
++try:
++    from typing import Literal
++except ImportError:
++    from typing_extensions import Literal  # type: ignore[misc]
++
++
++class IsPhoneNumber(DirtyEquals[str]):
++    """
++    A class that checks if a value is a valid phone number, optionally checking country-specific formatting.
++
++    This validator supports flexible phone number validation across different international formats
++    and country codes. It handles common phone number formats including international notation
++    (e.g., `+1-555-123-4567`), national formats (e.g., `555-123-4567`), and various delimiter styles
++    (spaces, dashes, parentheses, dots).
++
++    Args:
++        country: Optional country code ('US', 'GB', etc.) for country-specific validation.
++            If omitted, validates against generic international rules.
++            Country codes are matched case-insensitively.
++
++    Examples:
++        ```py title="IsPhoneNumber"
++        from dirty_equals import IsPhoneNumber
++
++        # Generic validation - accepts any valid phone number format
++        assert '+1-555-123-4567' == IsPhoneNumber()
++        assert '555-123-4567' == IsPhoneNumber()
++        assert '+44 20 7946 0958' == IsPhoneNumber()
++
++        # US-specific validation
++        assert '555-123-4567' == IsPhoneNumber('US')
++        assert '+1-555-123-4567' == IsPhoneNumber('US')
++        assert '555-xxx-xxxx' == IsPhoneNumber('US')  # placeholder format
++
++        # GB-specific validation
++        assert '020 7946 0958' == IsPhoneNumber('GB')
++        assert '+44 20 7946 0958' == IsPhoneNumber('GB')
++
++        # Case-insensitive country codes
++        assert '020 7946 0958' == IsPhoneNumber('gb')
++        assert '+44 20 7946 0958' == IsPhoneNumber('gb')
++
++        # Invalid examples
++        assert 123 != IsPhoneNumber()  # non-string rejected
++        assert '123-456-789' != IsPhoneNumber('US')  # wrong length for US
++        ```
++    """
++
++    # Supported countries with their specific validation rules
++    SUPPORTED_COUNTRIES = {'US', 'GB'}
++
++    def __init__(self, country: Optional[Union[str, Literal['*']]] = None):
++        """
++        Args:
++            country: Optional country code for country-specific validation.
++                If omitted, validates against generic international rules.
++                Country codes are matched case-insensitively.
++
++        Examples:
++            ```py title="IsPhoneNumber"
++            from dirty_equals import IsPhoneNumber
++
++            # Generic validation
++            assert '+1-555-123-4567' == IsPhoneNumber()
++
++            # US-specific validation
++            assert '555-123-4567' == IsPhoneNumber('US')
++
++            # GB-specific validation
++            assert '020 7946 0958' == IsPhoneNumber('GB')
++            ```
++        """
++        self.country = country.upper() if country else None
++        super().__init__(plain_repr('*') if country is None else country)
++
++    def equals(self, other: Any) -> bool:
++        """Check if the given value is a valid phone number."""
++        # Only accept string inputs
++        if not isinstance(other, str):
++            return False
++
++        # Validate syntax first
++        if not self._validate_syntax(other):
++            return False
++
++        # Extract digits and check based on country
++        digits = self._extract_digits(other)
++        has_plus = other.startswith('+')
++
++        if self.country:
++            return self._validate_country_format(digits, has_plus, other)
++        else:
++            return self._validate_generic_format(digits, has_plus)
++
++    def _validate_syntax(self, phone: str) -> bool:
++        """
++        Validate the basic syntax of the phone number.
++
++        Rules:
++        - Only ASCII digits, spaces, tabs, dashes, dots, plus sign, balanced non-nested parentheses,
++          and placeholder characters (x, X) are allowed
++        - At most one plus sign, which must be at the start
++        - No newlines or other characters
++        """
++        # Check for newlines or other invalid characters
++        if '\n' in phone or '\r' in phone:
++            return False
++
++        # Check for plus sign - must be at start if present
++        plus_count = phone.count('+')
++        if plus_count > 1:
++            return False
++        if plus_count == 1 and not phone.startswith('+'):
++            return False
++
++        # Valid separator characters (including +) and placeholder characters (x, X)
++        valid_chars = set('0123456789 \t-.()+xX')
++
++        # Check each character
++        for char in phone:
++            if char not in valid_chars:
++                return False
++
++        # Check for balanced parentheses (simple check - no nested, matching pairs)
++        paren_depth = 0
++        for char in phone:
++            if char == '(':
++                paren_depth += 1
++            elif char == ')':
++                paren_depth -= 1
++                if paren_depth < 0:
++                    return False
++        if paren_depth != 0:
++            return False
++
++        return True
++
++    def _extract_digits(self, phone: str) -> str:
++        """Extract only digits from the phone number string."""
++        return ''.join(c for c in phone if c.isdigit())
++
++    def _extract_alphanumeric(self, phone: str) -> str:
++        """Extract digits and placeholder characters (x, X) from the phone number string."""
++        return ''.join(c for c in phone if c.isalnum())
++
++    def _validate_generic_format(self, digits: str, has_plus: bool) -> bool:
++        """
++        Validate against generic international rules.
++
++        Rules:
++        - With +: 8-19 digits total (including country code)
++        - Without +: 7-15 digits (national format)
++        """
++        if has_plus:
++            # International format: + followed by 8-19 digits
++            return 8 <= len(digits) <= 19
++        else:
++            # National format: 7-15 digits
++            return 7 <= len(digits) <= 15
++
++    def _validate_country_format(self, digits: str, has_plus: bool, original: str) -> bool:
++        """
++        Validate against country-specific rules.
++
++        US:
++        - National: 10 digits
++        - International: +1 followed by 10 digits
++
++        GB:
++        - National: 10-11 digits starting with 0
++        - International: +44 followed by 10-11 digits
++        """
++        if self.country == 'US':
++            if has_plus:
++                # Must start with +1
++                if not original.startswith('+1'):
++                    return False
++                # After +1, must have exactly 10 digits
++                return len(digits) == 11  # 1 (country code) + 10 (number)
++            else:
++                # National format: exactly 10 digits
++                # Also accept placeholder formats like 555-xxx-xxxx (10 alphanumeric chars)
++                if len(digits) == 10:
++                    return True
++                # Check for placeholder format (alphanumeric chars = 10)
++                alnum = self._extract_alphanumeric(original)
++                return len(alnum) == 10
++
++        elif self.country == 'GB':
++            if has_plus:
++                # Must start with +44
++                if not original.startswith('+44'):
++                    return False
++                # After +44, must have 10-11 digits (total digits = 2 + 10-11 = 12-13)
++                return 12 <= len(digits) <= 13
++            else:
++                # National format: 10-11 digits starting with 0
++                if len(digits) < 10 or len(digits) > 11:
++                    return False
++                if not digits.startswith('0'):
++                    return False
++                return True
++
++        else:
++            # Unknown country - use generic international syntax
++            # Must have + and 8-19 digits total
++            if not has_plus:
++                return False
++            return 8 <= len(digits) <= 19
+diff --git a/test_phonenumber.py b/test_phonenumber.py
+new file mode 100644
+index 0000000..0f3889b
+--- /dev/null
++++ b/test_phonenumber.py
+@@ -0,0 +1,170 @@
++"""Test script for IsPhoneNumber validator"""
++from dirty_equals import IsPhoneNumber
++
++# Test basic functionality
++print("Testing IsPhoneNumber...")
++
++# Test 1: Basic phone number validation
++assert "555-123-4567" == IsPhoneNumber()
++print("✓ Basic US national format works")
++
++# Test 2: International format with +1
++assert "+1-555-123-4567" == IsPhoneNumber()
++print("✓ International format with +1 works")
++
++# Test 3: GB national format
++assert "020 7946 0958" == IsPhoneNumber()
++print("✓ GB national format works")
++
++# Test 4: GB international format
++assert "+44 20 7946 0958" == IsPhoneNumber()
++print("✓ GB international format works")
++
++# Test 5: Invalid - non-string
++try:
++    assert 123 != IsPhoneNumber()
++    print("✓ Non-string rejected")
++except AssertionError:
++    print("✗ Non-string should be rejected")
++
++# Test 6: US with country code
++assert "555-123-4567" == IsPhoneNumber("US")
++print("✓ US national format with country code works")
++
++# Test 7: US international with +1
++assert "+1-555-123-4567" == IsPhoneNumber("US")
++print("✓ US international format with +1 works")
++
++# Test 8: Invalid US format (wrong length)
++assert "123-456-789" != IsPhoneNumber("US")
++print("✓ Invalid US format rejected")
++
++# Test 9: GB national format with country code
++assert "020 7946 0958" == IsPhoneNumber("GB")
++print("✓ GB national format with country code works")
++
++# Test 10: GB international with +44
++assert "+44 20 7946 0958" == IsPhoneNumber("GB")
++print("✓ GB international format with +44 works")
++
++# Test 11: Case insensitive country code
++assert "020 7946 0958" == IsPhoneNumber("gb")
++print("✓ Case insensitive country code works")
++
++# Test 12: Unknown country - generic international
++assert "+33 6 12 34 56 78" == IsPhoneNumber("FR")
++print("✓ Unknown country generic international works")
++
++# Test 13: String representation
++repr_generic = repr(IsPhoneNumber())
++print(f"Generic repr: {repr_generic}")
++assert repr_generic == "IsPhoneNumber(*)", f"Expected 'IsPhoneNumber(*)', got '{repr_generic}'"
++print("✓ Generic string representation works")
++
++repr_us = repr(IsPhoneNumber("US"))
++print(f"US repr: {repr_us}")
++assert repr_us == "IsPhoneNumber('US')", f"Expected \"IsPhoneNumber('US')\", got '{repr_us}'"
++print("✓ Country-specific string representation works")
++
++print("\nAll tests passed!")
++
++# Additional edge case tests
++print("\nTesting additional edge cases...")
++
++# Test placeholder format (555-xxx-xxxx)
++assert "555-xxx-xxxx" == IsPhoneNumber('US')
++print("✓ Placeholder format works")
++
++# Test with parentheses
++assert "(555) 123-4567" == IsPhoneNumber()
++print("✓ Parentheses format works")
++
++# Test with dots
++assert "555.123.4567" == IsPhoneNumber()
++print("✓ Dots format works")
++
++# Test with tabs
++assert "555\t123\t4567" == IsPhoneNumber()
++print("✓ Tabs format works")
++
++# Test invalid - newline in phone number
++assert "+1-555\n123-4567" != IsPhoneNumber()
++print("✓ Newline rejected")
++
++# Test invalid - multiple plus signs
++assert "+1+1-555-123-4567" != IsPhoneNumber()
++print("✓ Multiple plus signs rejected")
++
++# Test invalid - plus not at start
++assert "1+1-555-123-4567" != IsPhoneNumber()
++print("✓ Plus not at start rejected")
++
++# Test invalid - unbalanced parentheses
++assert "(555) 123-4567)" != IsPhoneNumber()
++print("✓ Unbalanced parentheses rejected")
++
++# Test invalid - too many digits for US international
++assert "+1-555-123-4567-8901" != IsPhoneNumber('US')
++print("✓ Too many digits for US international rejected")
++
++# Test invalid - too few digits for GB national
++assert "020 7946" != IsPhoneNumber('GB')
++print("✓ Too few digits for GB national rejected")
++
++# Test unknown country without plus
++assert "555-123-4567" != IsPhoneNumber('FR')
++print("✓ Unknown country without plus rejected")
++
++# Test unknown country with valid format
++assert "+33 6 12 34 56 78" == IsPhoneNumber('FR')
++print("✓ Unknown country with valid format works")
++
++# Test generic validation - too few digits
++assert "123" != IsPhoneNumber()
++print("✓ Too few digits rejected")
++
++# Test generic validation - too many digits
++assert "12345678901234567890" != IsPhoneNumber()
++print("✓ Too many digits rejected")
++
++# Test generic validation - valid international
++assert "+123456789" == IsPhoneNumber()
++print("✓ Valid international format works")
++
++# Test generic validation - valid national
++assert "1234567" == IsPhoneNumber()
++print("✓ Valid national format works")
++
++# Test None input
++assert None != IsPhoneNumber()
++print("✓ None rejected")
++
++# Test list input
++assert [] != IsPhoneNumber()
++print("✓ List rejected")
++
++# Test integer input
++assert 1234567890 != IsPhoneNumber()
++print("✓ Integer rejected")
++
++# Test empty string
++assert "" != IsPhoneNumber()
++print("✓ Empty string rejected")
++
++# Test only separators
++assert "---..." != IsPhoneNumber()
++print("✓ Only separators rejected")
++
++# Test mixed valid/invalid characters
++assert "555-abc-1234" != IsPhoneNumber()
++print("✓ Invalid characters rejected")
++
++# Test GB with wrong country code
++assert "+1 20 7946 0958" != IsPhoneNumber('GB')
++print("✓ Wrong country code for GB rejected")
++
++# Test US with wrong country code
++assert "+44 555 123 4567" != IsPhoneNumber('US')
++print("✓ Wrong country code for US rejected")
++
++print("\nAll edge case tests passed!")
+diff --git a/tests/test_phonenumber.py b/tests/test_phonenumber.py
+new file mode 100644
+index 0000000..d38e2d5
+--- /dev/null
++++ b/tests/test_phonenumber.py
+@@ -0,0 +1,134 @@
++"""Tests for IsPhoneNumber validator."""
++import pytest
++
++from dirty_equals import IsPhoneNumber
++
++
++@pytest.mark.parametrize(
++    'value,dirty,match',
++    [
++        # Basic phone number validation (generic)
++        ('555-123-4567', IsPhoneNumber(), True),
++        ('+1-555-123-4567', IsPhoneNumber(), True),
++        ('020 7946 0958', IsPhoneNumber(), True),
++        ('+44 20 7946 0958', IsPhoneNumber(), True),
++        ('+33 6 12 34 56 78', IsPhoneNumber(), True),
++        
++        # Non-string types should be rejected
++        (123, IsPhoneNumber(), False),
++        ([], IsPhoneNumber(), False),
++        (None, IsPhoneNumber(), False),
++        
++        # US-specific validation
++        ('555-123-4567', IsPhoneNumber('US'), True),
++        ('+1-555-123-4567', IsPhoneNumber('US'), True),
++        ('555-xxx-xxxx', IsPhoneNumber('US'), True),  # Placeholder format
++        
++        # Invalid US formats
++        ('123', IsPhoneNumber('US'), False),
++        ('123-456-789', IsPhoneNumber('US'), False),
++        ('+1+1-555-123-4567', IsPhoneNumber('US'), False),  # Multiple plus signs
++        
++        # GB-specific validation
++        ('020 7946 0958', IsPhoneNumber('GB'), True),
++        ('+44 20 7946 0958', IsPhoneNumber('GB'), True),
++        
++        # Case insensitive country codes
++        ('020 7946 0958', IsPhoneNumber('gb'), True),
++        ('+44 20 7946 0958', IsPhoneNumber('gb'), True),
++        
++        # Unknown country - generic international format only
++        ('+33 6 12 34 56 78', IsPhoneNumber('FR'), True),
++        ('12345678', IsPhoneNumber('FR'), False),  # No plus sign
++        
++        # Edge cases
++        ('', IsPhoneNumber(), False),  # Empty string
++        ('---', IsPhoneNumber(), False),  # Only separators
++        ('123\n456', IsPhoneNumber(), False),  # Newline
++        ('123\t456', IsPhoneNumber(), False),  # Tab is valid char but too few digits
++        ('(123) 456-7890', IsPhoneNumber(), True),  # Parentheses
++        ('123-456-78901234567890', IsPhoneNumber(), False),  # Too many digits
++        ('123', IsPhoneNumber(), False),  # Too few digits
++    ],
++)
++def test_dirty_equals_true(value, dirty, match):
++    """Test that dirty equals works correctly."""
++    if match:
++        assert value == dirty
++    else:
++        assert value != dirty
++
++
++def test_string_representation():
++    """Test string representation of IsPhoneNumber."""
++    assert repr(IsPhoneNumber()) == "IsPhoneNumber(*)"
++    assert repr(IsPhoneNumber('US')) == "IsPhoneNumber('US')"
++    assert repr(IsPhoneNumber('gb')) == "IsPhoneNumber('gb')"  # Shows original case
++
++
++def test_syntax_validation():
++    """Test syntax validation rules."""
++    # Valid characters
++    assert '555-123-4567' == IsPhoneNumber()
++    assert '555.123.4567' == IsPhoneNumber()
++    assert '555 123 4567' == IsPhoneNumber()
++    assert '(555) 123-4567' == IsPhoneNumber()
++    
++    # Invalid characters
++    assert '555@123#4567' != IsPhoneNumber()
++    assert '555\x00123' != IsPhoneNumber()
++    
++    # Plus sign rules
++    assert '+1-555-123-4567' == IsPhoneNumber()
++    assert '555-123-4567+1' != IsPhoneNumber()  # Plus not at start
++    assert '+1+1-555-123-4567' != IsPhoneNumber()  # Multiple plus signs
++    
++    # Balanced parentheses
++    assert '(555) 123-4567' == IsPhoneNumber()
++    assert '((555)) 123-4567' == IsPhoneNumber()  # Nested but balanced
++    assert '(555 123-4567' != IsPhoneNumber()  # Unbalanced
++    assert '555) 123-4567' != IsPhoneNumber()  # Unbalanced
++
++
++def test_digit_lengths():
++    """Test digit length requirements."""
++    # Generic: 7-15 digits without +, 8-19 with +
++    assert '1234567' == IsPhoneNumber()  # Min national (7 digits)
++    assert '123456789012345' == IsPhoneNumber()  # Max national (15 digits)
++    assert '12345678' == IsPhoneNumber()  # Min international (8 digits with +)
++    assert '+1234567890123456789' == IsPhoneNumber()  # Max international (19 digits with +)
++    
++    # Too short
++    assert '123456' != IsPhoneNumber()
++    assert '12345678' != IsPhoneNumber('US')  # Too short for US
++    
++    # Too long
++    assert '1234567890123456' != IsPhoneNumber()  # Over 15 digits
++    assert '+12345678901234567890' != IsPhoneNumber()  # Over 19 digits
++
++
++def test_country_specific_formats():
++    """Test country-specific format validation."""
++    # US formats
++    assert '555-123-4567' == IsPhoneNumber('US')  # 10 digits national
++    assert '+1-555-123-4567' == IsPhoneNumber('US')  # +1 with 10 digits
++    assert '+15551234567' == IsPhoneNumber('US')  # +1 without separators
++    
++    # GB formats
++    assert '020 7946 0958' == IsPhoneNumber('GB')  # National starting with 0
++    assert '+44 20 7946 0958' == IsPhoneNumber('GB')  # +44 with 10-11 digits
++    assert '+442079460958' == IsPhoneNumber('GB')  # +44 without separators
++    
++    # Wrong country code
++    assert '+44 20 7946 0958' != IsPhoneNumber('US')  # UK number for US
++    assert '+1-555-123-4567' != IsPhoneNumber('GB')  # US number for GB
++
++
++def test_placeholder_formats():
++    """Test placeholder/example number formats."""
++    # US placeholder format
++    assert '555-xxx-xxxx' == IsPhoneNumber('US')
++    assert '555-XXX-XXXX' == IsPhoneNumber('US')
++    
++    # Without country code, placeholder doesn't meet min digit requirement
++    assert '555-xxx-xxxx' != IsPhoneNumber()  # Only 3 digits, need 7+

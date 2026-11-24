@@ -1,0 +1,119 @@
+diff --git a/tests/propose/test_grounded_proposer1.py b/tests/propose/test_grounded_proposer1.py
+new file mode 100644
+index 0000000..818b6b7
+--- /dev/null
++++ b/tests/propose/test_grounded_proposer1.py
+@@ -0,0 +1,113 @@
++import copy
++import random
++from types import SimpleNamespace
++
++import pytest
++import dspy
++from dspy.predict.predict import Predict as RealPredict
++from dspy.propose import grounded_proposer as gp
++
++
++class ExampleProgram(dspy.Module):
++    def __init__(self, two=False):
++        super().__init__()
++        self.first = RealPredict('question -> answer')
++        if two:
++            self.second = RealPredict('question -> answer')
++
++
++def recording_proposer(monkeypatch, *, outputs=None, program=None, rng=None, **options):
++    program = program or ExampleProgram()
++    outputs = outputs or {}
++    events = []
++    model = SimpleNamespace(kwargs={'temperature': 0.7, 'max_tokens': 500}, inspect_history=lambda **kw: None)
++    class Recorder:
++        def __init__(self, signature):
++            self.signature = signature
++        def __call__(self, **kwargs):
++            events.append({'signature': self.signature, 'kwargs': copy.deepcopy(kwargs),
++                           'model_kwargs': dict(model.kwargs)})
++            if outputs.get('raise_on') == self.signature.__name__:
++                raise RuntimeError('recorded generation failure')
++            values = {}
++            for field in self.signature.output_fields:
++                if self.signature.__name__ == 'ShortenInstruction':
++                    values[field] = outputs.get('shortened', 'A shortened instruction.')
++                else:
++                    values[field] = outputs.get(field, {
++                        'program_description': 'Program description. More details.',
++                        'module_description': 'Module description. More details.',
++                        'proposed_instruction': 'PROPOSED INSTRUCTION: A useful generated instruction.',
++                    }.get(field, 'value'))
++            return dspy.Prediction(**values)
++    monkeypatch.setattr(gp.dspy, 'Predict', Recorder)
++    monkeypatch.setattr(gp, 'get_prompt_model', lambda supplied: supplied)
++    monkeypatch.setattr(gp, 'get_dspy_source_code', lambda program: 'recorded program code')
++    monkeypatch.setattr(gp, 'create_dataset_summary', lambda **kwargs: 'recorded summary')
++    settings = dict(use_dataset_summary=False, program_aware=True, use_task_demos=False,
++                    set_tip_randomly=False, set_history_randomly=False, rng=rng or random.Random(17))
++    settings.update(options)
++    proposer = gp.GroundedProposer(prompt_model=model, program=program, trainset=[], **settings)
++    return proposer, program, model, events
++
++
++def propose(proposer, program, *, count=1, logs=None):
++    return proposer.propose_instructions_for_program([], program, None, logs or {}, count, 0.5)
++
++
++def generation_events(events):
++    return [event for event in events if event['signature'].__name__ == 'GenerateSingleModuleInstruction']
++
++
++def test_salt_binds_all_three_predictor_calls_without_mutating_lm(monkeypatch):
++    proposer, program, model, events = recording_proposer(monkeypatch)
++    before = dict(model.kwargs)
++    assert len(propose(proposer, program, count=2)[0]) == 2
++    assert len(events) == 6
++    groups = [events[:3], events[3:]]
++    salts = []
++    for group in groups:
++        values = [event['kwargs']['cache_salt'] for event in group]
++        assert len(set(values)) == 1
++        assert isinstance(values[0], str) and values[0].isascii() and values[0]
++        salts.append(values[0])
++        assert all(event['model_kwargs'] == before for event in group)
++        assert all('cache_salt' in event['signature'].input_fields for event in group)
++    assert salts[0] != salts[1]
++    assert model.kwargs == before
++
++
++def test_salt_seed_replay_and_rng_without_getrandbits(monkeypatch):
++    class SimpleRng:
++        def __init__(self):
++            self.value = .1
++        def random(self):
++            self.value += .1
++            return self.value
++    def run_once():
++        proposer, program, model, events = recording_proposer(monkeypatch, rng=SimpleRng())
++        propose(proposer, program, count=2)
++        return [event['kwargs']['cache_salt'] for event in generation_events(events)]
++    assert run_once() == run_once()
++
++
++@pytest.mark.parametrize('aware,summary', [(False, False), (False, True), (True, False), (True, True)])
++def test_salt_configuration_combinations(monkeypatch, aware, summary):
++    proposer, program, model, events = recording_proposer(monkeypatch, program_aware=aware, use_dataset_summary=summary)
++    propose(proposer, program)
++    assert len(events) == (3 if aware else 1)
++    assert generation_events(events)[0]['kwargs']['cache_salt']
++
++
++def test_direct_generator_default_salt_and_exception_lm_restoration(monkeypatch):
++    proposer, program, model, events = recording_proposer(monkeypatch)
++    direct = gp.GenerateModuleInstruction(program_aware=True, use_task_demos=False)
++    direct(demo_candidates=None, pred_i=0, demo_set_i=0, program=program,
++           previous_instructions='', data_summary=None)
++    assert len(events) == 3
++    assert len({event['kwargs']['cache_salt'] for event in events}) == 1
++    proposer, program, model, events = recording_proposer(monkeypatch, outputs={'raise_on': 'GenerateSingleModuleInstruction'})
++    before = dict(model.kwargs)
++    with pytest.raises(RuntimeError):
++        propose(proposer, program)
++    assert model.kwargs == before

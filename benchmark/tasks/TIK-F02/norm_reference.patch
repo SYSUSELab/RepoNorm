@@ -1,0 +1,137 @@
+diff --git a/tests/test_token_positions_contribution.py b/tests/test_token_positions_contribution.py
+new file mode 100644
+index 0000000..b98ba11
+--- /dev/null
++++ b/tests/test_token_positions_contribution.py
+@@ -0,0 +1,46 @@
++import pytest
++
++import tiktoken
++
++
++@pytest.fixture(scope="module")
++def encoding():
++    return tiktoken.get_encoding("cl100k_base")
++
++
++@pytest.mark.parametrize("text", ["", "hello world", "🙂 café", "e\u0301", "你好吗"])
++def test_positions_align_with_existing_decode_offsets(encoding, text) -> None:
++    expected = encoding.encode(text)
++    tokens, positions = encoding.encode(text, return_positions=True)
++    assert tokens == expected
++    assert positions == encoding.decode_with_offsets(expected)[1]
++    assert len(tokens) == len(positions)
++
++
++def test_special_token_position_uses_literal_character_index(encoding) -> None:
++    text = "🙂x<|endoftext|>"
++    tokens, positions = encoding.encode(
++        text, allowed_special="all", return_positions=True
++    )
++    assert tokens == encoding.encode(text, allowed_special="all")
++    assert positions[-1] == text.index("<|endoftext|>")
++    with pytest.raises(ValueError, match="disallowed special token"):
++        encoding.encode(text, return_positions=True)
++
++
++def test_batch_positions_preserve_input_order(encoding) -> None:
++    texts = ["🙂", "alpha beta", "", "e\u0301"]
++    result = encoding.encode_batch(texts, return_positions=True)
++    assert result == [encoding.encode(text, return_positions=True) for text in texts]
++
++
++def test_default_return_shapes_are_unchanged(encoding) -> None:
++    assert isinstance(encoding.encode("text"), list)
++    batch = encoding.encode_batch(["a", "b"])
++    assert isinstance(batch, list)
++    assert all(isinstance(tokens, list) for tokens in batch)
++
++
++def test_non_position_surrogate_fallback_is_unchanged(encoding) -> None:
++    text = "before \ud800 after"
++    assert encoding.encode(text) == encoding.encode_batch([text])[0]
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..391eed8 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -75,14 +75,14 @@ class Encoding:
+             # See comment in encode
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+             return self._core_bpe.encode_ordinary(text)
+-
+     def encode(
+         self,
+         text: str,
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        return_positions: bool = False,
++    ) -> list[int] | tuple[list[int], list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -96,6 +96,8 @@ class Encoding:
+           cause all text corresponding to special tokens to be encoded as natural text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
++        - Setting `return_positions` to True will return a tuple of (tokens, positions) where
++          positions are the character indices in the original text where each token starts.
+ 
+         ```
+         >>> enc.encode("hello world")
+@@ -108,6 +110,8 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> enc.encode("hello world", return_positions=True)
++        ([31373, 995], [0, 5])
+         ```
+         """
+         if allowed_special == "all":
+@@ -120,6 +124,15 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if return_positions:
++            tokens = self.encode(
++                text,
++                allowed_special=allowed_special,
++                disallowed_special=disallowed_special,
++            )
++            return tokens, self.decode_with_offsets(tokens)[1]
++
++        # Otherwise, use the standard implementation
+         try:
+             return self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+@@ -179,11 +192,16 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[list[int]]:
++        return_positions: bool = False,
++    ) -> list[list[int]] | list[tuple[list[int], list[int]]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+ 
++        Set `return_positions=True` to return a `(tokens, positions)` pair for
++        each input document, in input order. Positions are zero-based Python
++        character indices into the corresponding original document.
++
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
+@@ -197,7 +215,10 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode,
++            allowed_special=allowed_special,
++            disallowed_special=disallowed_special,
++            return_positions=return_positions,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

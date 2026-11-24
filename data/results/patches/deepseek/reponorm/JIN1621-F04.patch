@@ -1,0 +1,243 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..66b39a1 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -173,18 +173,72 @@ class FileSystemLoader(BaseLoader):
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++
++    .. versionchanged:: 3.1
++        Added support for ``(path, priority)`` tuples in the search
++        path. Items with higher priority are searched first.
+     """
+ 
+     def __init__(
+         self,
+-        searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        searchpath: t.Union[
++            str,
++            os.PathLike,
++            t.Sequence[
++                t.Union[
++                    str,
++                    os.PathLike,
++                    t.Tuple[t.Union[str, os.PathLike], int],
++                ]
++            ],
++        ],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+-        self.searchpath = [os.fspath(p) for p in searchpath]
++        paths: t.List[t.Tuple[str, int]] = []
++
++        for item in searchpath:
++            if isinstance(item, tuple):
++                if len(item) != 2:
++                    raise TypeError(
++                        "Expected a tuple of the form (path, priority), "
++                        f"got {len(item)} elements"
++                    )
++
++                path, priority = item
++
++                if isinstance(priority, bool):
++                    raise TypeError(
++                        "Priority must be an integer, not bool"
++                    )
++
++                if not isinstance(priority, int):
++                    raise TypeError(
++                        "Priority must be an integer, "
++                        f"got {type(priority).__name__}"
++                    )
++
++                if not isinstance(path, (str, os.PathLike)):
++                    raise TypeError(
++                        "Path must be a string or os.PathLike, "
++                        f"got {type(path).__name__}"
++                    )
++
++                paths.append((os.fspath(path), priority))
++            elif isinstance(item, (str, os.PathLike)):
++                paths.append((os.fspath(item), 0))
++            else:
++                raise TypeError(
++                    "Expected a string, os.PathLike, or tuple of "
++                    "(path, priority), got "
++                    f"{type(item).__name__}"
++                )
++
++        paths.sort(key=lambda x: x[1], reverse=True)
++        self.searchpath = [p for p, _ in paths]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..3bd0d70 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -172,6 +172,154 @@ class TestFileSystemLoader:
+         assert t.render() == expect
+ 
+ 
++    def test_searchpath_priority_sorting(self):
++        """Items with higher priority are searched first."""
++        loader = loaders.FileSystemLoader(
++            [
++                ("/path/low", -10),
++                ("/path/medium", 0),
++                ("/path/high", 10),
++            ]
++        )
++        assert loader.searchpath == ["/path/high", "/path/medium", "/path/low"]
++
++    def test_searchpath_priority_stable_order(self):
++        """Same priority retains input order."""
++        loader = loaders.FileSystemLoader(
++            [
++                ("/path/a", 0),
++                ("/path/b", 0),
++                ("/path/c", 0),
++            ]
++        )
++        assert loader.searchpath == ["/path/a", "/path/b", "/path/c"]
++
++    def test_searchpath_priority_mixed_ordinary_and_tuples(self):
++        """Ordinary items have priority 0 and interleave with priority 0 tuples."""
++        loader = loaders.FileSystemLoader(
++            [
++                "/path/ordinary",
++                ("/path/tuple_high", 5),
++                ("/path/tuple_zero", 0),
++                "/path/ordinary2",
++                ("/path/tuple_neg", -3),
++            ]
++        )
++        assert loader.searchpath == [
++            "/path/tuple_high",
++            "/path/ordinary",
++            "/path/tuple_zero",
++            "/path/ordinary2",
++            "/path/tuple_neg",
++        ]
++
++    def test_searchpath_priority_negative_values(self):
++        """Negative priorities are valid."""
++        loader = loaders.FileSystemLoader(
++            [
++                ("/path/low", -100),
++                ("/path/medium", -50),
++                ("/path/high", -1),
++            ]
++        )
++        assert loader.searchpath == ["/path/high", "/path/medium", "/path/low"]
++
++    def test_searchpath_priority_duplicate_paths(self):
++        """Duplicate paths with different priorities remain duplicates."""
++        loader = loaders.FileSystemLoader(
++            [
++                ("/path/same", 0),
++                "/path/same",
++                ("/path/same", 1),
++            ]
++        )
++        # Sorted by priority descending: priority 1, 0 (tuple), 0 (ordinary)
++        assert loader.searchpath == [
++            "/path/same",
++            "/path/same",
++            "/path/same",
++        ]
++
++    def test_searchpath_priority_wrong_tuple_length(self):
++        """Tuples of length != 2 raise TypeError."""
++        with pytest.raises(TypeError, match="Expected a tuple"):
++            loaders.FileSystemLoader([("/path",)])
++
++        with pytest.raises(TypeError, match="Expected a tuple"):
++            loaders.FileSystemLoader([("/path", 0, "extra")])
++
++    def test_searchpath_priority_bool_rejected(self):
++        """Booleans are not accepted as priority."""
++        with pytest.raises(TypeError, match="int"):
++            loaders.FileSystemLoader([("/path", True)])
++
++        with pytest.raises(TypeError, match="int"):
++            loaders.FileSystemLoader([("/path", False)])
++
++    def test_searchpath_priority_non_int_rejected(self):
++        """Non-integer priorities raise TypeError."""
++        with pytest.raises(TypeError, match="int"):
++            loaders.FileSystemLoader([("/path", "high")])
++
++        with pytest.raises(TypeError, match="int"):
++            loaders.FileSystemLoader([("/path", 3.14)])
++
++    def test_searchpath_priority_invalid_path_in_tuple(self):
++        """Non-path values in tuples raise TypeError."""
++        with pytest.raises(TypeError, match="Path"):
++            loaders.FileSystemLoader([(42, 0)])
++
++    def test_searchpath_priority_invalid_item(self):
++        """Items that are not str, PathLike, or tuple raise TypeError."""
++        with pytest.raises(TypeError, match="Expected"):
++            loaders.FileSystemLoader([12345])
++
++        with pytest.raises(TypeError, match="Expected"):
++            loaders.FileSystemLoader([None])
++
++    def test_searchpath_priority_template_lookup(self):
++        """Template lookup uses the priority-sorted searchpath."""
++        with tempfile.TemporaryDirectory() as tmpdir:
++            high_dir = os.path.join(tmpdir, "high")
++            low_dir = os.path.join(tmpdir, "low")
++            os.mkdir(high_dir)
++            os.mkdir(low_dir)
++
++            # Same template name, different content
++            with open(os.path.join(high_dir, "shared.html"), "w") as f:
++                f.write("HIGH")
++            with open(os.path.join(low_dir, "shared.html"), "w") as f:
++                f.write("LOW")
++
++            loader = loaders.FileSystemLoader(
++                [
++                    (low_dir, -10),
++                    (high_dir, 10),
++                ]
++            )
++            env = Environment(loader=loader)
++            tmpl = env.get_template("shared.html")
++            assert tmpl.render() == "HIGH"
++
++            # When high_dir is not present, low_dir should be used
++            os.unlink(os.path.join(high_dir, "shared.html"))
++            tmpl2 = env.get_template("shared.html")
++            assert tmpl2.render() == "LOW"
++
++    def test_searchpath_priority_backward_compatible(self):
++        """Ordinary search paths work exactly as before."""
++        loader = loaders.FileSystemLoader("/tmp")
++        assert loader.searchpath == ["/tmp"]
++
++        loader2 = loaders.FileSystemLoader(["/tmp/a", "/tmp/b"])
++        assert loader2.searchpath == ["/tmp/a", "/tmp/b"]
++
++        # Same priority means same order
++        loader3 = loaders.FileSystemLoader(
++            [("/tmp/a", 0), "/tmp/b", ("/tmp/c", 0)]
++        )
++        assert loader3.searchpath == ["/tmp/a", "/tmp/b", "/tmp/c"]
++
+ class TestModuleLoader:
+     archive = None
+ 
+@@ -401,3 +549,4 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++

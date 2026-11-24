@@ -1,0 +1,259 @@
+diff --git a/dirty_equals/__init__.py b/dirty_equals/__init__.py
+index ba8214e..acab0fd 100644
+--- a/dirty_equals/__init__.py
++++ b/dirty_equals/__init__.py
+@@ -1,4 +1,5 @@
+ from ._base import AnyThing, DirtyEquals, IsOneOf
++from ._ip import IsIP
+ from ._boolean import IsFalseLike, IsTrueLike
+ from ._datetime import IsDate, IsDatetime, IsNow, IsToday
+ from ._dict import IsDict, IsIgnoreDict, IsPartialDict, IsStrictDict
+@@ -69,6 +70,7 @@ __all__ = (
+     'FunctionCheck',
+     'IsJson',
+     'IsUUID',
++    'IsIP',
+     # strings
+     'IsStr',
+     'IsBytes',
+diff --git a/dirty_equals/_ip.py b/dirty_equals/_ip.py
+new file mode 100644
+index 0000000..54e7a60
+--- /dev/null
++++ b/dirty_equals/_ip.py
+@@ -0,0 +1,116 @@
++import ipaddress
++from typing import Any, Optional, Union, Tuple, List
++from ._base import DirtyEquals
++
++class IsIP(DirtyEquals[Union[ipaddress.IPv4Address, ipaddress.IPv6Address, ipaddress.IPv4Network, ipaddress.IPv6Network]]):
++    def __init__(self, version: Optional[int] = None, *, netmask: Any = None, within: Any = None):
++        self.version = version
++        self.netmask = netmask
++        self.within = within
++        
++        if self.netmask is not None and self.version is None:
++            raise TypeError('To check the netmask you must specify the IP version')
++            
++        # Validate within configuration
++        self.within_networks = []
++        if self.within is not None:
++            if isinstance(self.within, (str, ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                networks = [self.within]
++            elif isinstance(self.within, (list, tuple)):
++                networks = list(self.within)
++            else:
++                raise ValueError('within must be a string, network object, or list/tuple of these')
++            
++            if not networks:
++                raise ValueError('within cannot be empty')
++                
++            for net in networks:
++                if isinstance(net, str):
++                    try:
++                        net_obj = ipaddress.ip_network(net, strict=True)
++                    except ValueError:
++                        raise ValueError(f'Invalid network: {net}')
++                elif isinstance(net, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                    net_obj = net
++                else:
++                    raise ValueError(f'Invalid network type: {type(net)}')
++                self.within_networks.append(net_obj)
++        
++        super().__init__(version=version, netmask=netmask, within=within)
++
++    def equals(self, other: Any) -> bool:
++        # Try to parse as address or network
++        try:
++            if isinstance(other, (int)):
++                if 0 <= other < 2**32:
++                    val = ipaddress.IPv4Address(other)
++                elif 2**32 <= other < 2**128:
++                    val = ipaddress.IPv6Address(other)
++                else:
++                    return False
++            elif isinstance(other, (ipaddress.IPv4Address, ipaddress.IPv6Address, 
++                                    ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                val = other
++            elif isinstance(other, (str, bytes)):
++                try:
++                    val = ipaddress.ip_network(other, strict=False)
++                except ValueError:
++                    val = ipaddress.ip_address(other)
++            else:
++                return False
++        except (ValueError, TypeError):
++            return False
++            
++        # Check version
++        if self.version is not None:
++            if val.version != self.version:
++                return False
++                
++        # Check netmask
++        if self.netmask is not None:
++            if not isinstance(val, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                return False
++            
++            # Handle netmask
++            if isinstance(self.netmask, int):
++                mask = self.netmask
++            else:
++                # Try to parse as address
++                try:
++                    mask = int(ipaddress.ip_address(self.netmask))
++                except ValueError:
++                    return False
++            
++            if int(val.netmask) != mask:
++                return False
++                
++        # Check within
++        if self.within_networks:
++            # If it's an address, check if it's in any network
++            # If it's a network, check if it's wholly contained
++            for net in self.within_networks:
++                if net.version != val.version:
++                    continue
++                
++                if isinstance(val, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
++                    if val in net:
++                        return True
++                elif isinstance(val, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
++                    if val.subnet_of(net):
++                        return True
++            return False
++            
++        return True
++
++    def __repr__(self) -> str:
++        args = []
++        if self.version:
++            args.append(f'version={self.version}')
++        if self.netmask:
++            args.append(f'netmask={self.netmask!r}')
++        if self.within:
++            args.append(f'within={self.within!r}')
++        
++        if not args:
++            return 'IsIP()'
++        return f'IsIP({", ".join(args)})'
+diff --git a/reproduce_isip.py b/reproduce_isip.py
+new file mode 100644
+index 0000000..2c10ef2
+--- /dev/null
++++ b/reproduce_isip.py
+@@ -0,0 +1,31 @@
++import ipaddress
++from dirty_equals import IsIP
++
++# Test basic functionality
++assert '192.168.1.1' == IsIP()
++assert '2001:db8::1' == IsIP()
++assert 0x7f000001 == IsIP() # 127.0.0.1
++
++# Test version
++assert '192.168.1.1' == IsIP(4)
++assert '2001:db8::1' == IsIP(6)
++assert '192.168.1.1' != IsIP(6)
++assert '2001:db8::1' != IsIP(4)
++
++# Test netmask
++assert '192.168.1.0/24' == IsIP(4, netmask='255.255.255.0')
++try:
++    IsIP(netmask='255.255.255.0')
++except TypeError as e:
++    print(f"Caught expected error: {e}")
++else:
++    print("Failed to catch expected error for netmask without version")
++
++# Test within
++# This will fail until implemented
++try:
++    assert '192.168.1.5' == IsIP(within='192.168.1.0/24')
++except Exception as e:
++    print(f"Caught expected error for within: {e}")
++
++print("Tests finished")
+diff --git a/test_isip_edge_cases.py b/test_isip_edge_cases.py
+new file mode 100644
+index 0000000..c3ad924
+--- /dev/null
++++ b/test_isip_edge_cases.py
+@@ -0,0 +1,40 @@
++import ipaddress
++import pytest
++from dirty_equals import IsIP
++
++def test_invalid_values():
++    assert 'not-an-ip' != IsIP()
++    assert 1234567890123456789012345678901234567890 != IsIP() # Too large for IPv6
++
++def test_within_configuration():
++    # Invalid within
++    try:
++        IsIP(within='not-a-network')
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("Should have raised ValueError for invalid within")
++
++    # Empty within
++    try:
++        IsIP(within=[])
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("Should have raised ValueError for empty within")
++
++def test_netmask_without_version():
++    try:
++        IsIP(netmask='255.255.255.0')
++    except TypeError as e:
++        assert str(e) == 'To check the netmask you must specify the IP version'
++    else:
++        raise AssertionError("Should have raised TypeError")
++
++def test_within_version_mismatch():
++    # IPv4 address in IPv6 network
++    assert '192.168.1.1' != IsIP(within='2001:db8::/32')
++    # IPv6 address in IPv4 network
++    assert '2001:db8::1' != IsIP(within='192.168.1.0/24')
++
++print("Edge case tests passed!")
+diff --git a/test_isip_extended.py b/test_isip_extended.py
+new file mode 100644
+index 0000000..9835364
+--- /dev/null
++++ b/test_isip_extended.py
+@@ -0,0 +1,30 @@
++import ipaddress
++from dirty_equals import IsIP
++
++# Test basic functionality
++assert '192.168.1.1' == IsIP()
++assert '2001:db8::1' == IsIP()
++assert 0x7f000001 == IsIP() # 127.0.0.1
++
++# Test version
++assert '192.168.1.1' == IsIP(4)
++assert '2001:db8::1' == IsIP(6)
++assert '192.168.1.1' != IsIP(6)
++assert '2001:db8::1' != IsIP(4)
++
++# Test netmask
++assert '192.168.1.0/24' == IsIP(4, netmask='255.255.255.0')
++assert '192.168.1.0/24' == IsIP(4, netmask=0xffffff00)
++assert '192.168.1.0/25' != IsIP(4, netmask='255.255.255.0')
++
++# Test within
++assert '192.168.1.5' == IsIP(within='192.168.1.0/24')
++assert '192.168.1.5' != IsIP(within='192.168.2.0/24')
++assert '192.168.1.0/25' == IsIP(within='192.168.1.0/24')
++assert '192.168.1.0/24' != IsIP(within='192.168.1.0/25')
++
++# Test repr
++assert repr(IsIP()) == 'IsIP()'
++assert 'version=4' in repr(IsIP(4))
++
++print("All tests passed!")

@@ -1,0 +1,254 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..c7e5de7c 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,8 +1,10 @@
+ import asyncio
++import re
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
++import pydantic
+ from pydantic import BaseModel, TypeAdapter, create_model
+ 
+ from dspy.adapters.types.base_type import Type
+@@ -253,6 +255,30 @@ class Tool(Type):
+         arg_desc = f"It takes arguments {self.args}."
+         return f"{self.name}{desc} {arg_desc}"
+ 
++def _extract_json_from_markdown(text: str) -> str | None:
++    """Extract JSON from markdown code fence.
++
++    Accepts:
++    - First triple-backtick block with any language label (including json, JSON, or no label)
++    - Followed by a newline
++    - Next triple-backtick delimiter closes it
++
++    Returns the trimmed body as string, or None if no valid fence found.
++
++    Does NOT support:
++    - Inline fences without opening newline
++    - Missing closures
++    - Malformed JSON (JSON parsing is done separately)
++    """
++    # Pattern for markdown code fence: ``` followed by optional language, newline, content, closing ```
++    # The opening fence may have any language label (including json, JSON, or no label), followed by a newline
++    pattern = r"^\s*```(?:[a-zA-Z]+)?\n(.*?)^\s*```"
++    match = re.search(pattern, text, re.DOTALL | re.MULTILINE)
++    if match:
++        return match.group(1).strip()
++    return None
++
++
+ 
+ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+@@ -261,6 +287,71 @@ class ToolCalls(Type):
+ 
+     tool_calls: list[ToolCall]
+ 
++    @pydantic.model_validator(mode="before")
++    @classmethod
++    def validate_input(cls, data: Any):
++        """Validate and preprocess input for ToolCalls.
++
++        Accepts:
++        - Canonical container: {"tool_calls": [...]}
++        - Bare list: [{"name": "...", "args": {...}}, ...]
++        - Single object: {"name": "...", "args": {...}}
++        - JSON string wrapped in markdown code fence: ```json
++{json}
++```
++        - Plain JSON string: "[...]" or "{"tool_calls": [...]}"
++
++        Returns the processed data or raises validation error.
++        """
++        if isinstance(data, cls):
++            return data
++
++        # Handle string input (JSON or markdown-wrapped JSON)
++        if isinstance(data, str):
++            # Try to extract JSON from markdown code fence
++            extracted = _extract_json_from_markdown(data)
++            if extracted is not None:
++                data = extracted
++
++            # Parse JSON string
++            try:
++                import json
++                data = json.loads(data)
++            except (json.JSONDecodeError, ValueError):
++                # If JSON parsing fails, let pydantic handle it
++                pass
++
++        # Handle bare list: convert to canonical format
++        if isinstance(data, list):
++            return {"tool_calls": data}
++
++        # Handle single object: wrap in list
++        if isinstance(data, dict):
++            # Check if this looks like a single tool call (has name and args keys)
++            if "name" in data and "args" in data:
++                return {"tool_calls": [data]}
++
++        return data
++
++    @classmethod
++    def model_validate_json(cls, json_str: str, *, strict: bool | None = None, context: dict[str, Any] | None = None) -> "ToolCalls":
++        """Validate JSON string, supporting markdown code fence wrapped JSON.
++
++        Args:
++            json_str: JSON string, optionally wrapped in markdown code fence
++            strict: Whether to use strict validation mode
++            context: Additional context for validation
++
++        Returns:
++            A ToolCalls instance validated from the JSON string.
++        """
++        # Try to extract JSON from markdown code fence first
++        extracted = _extract_json_from_markdown(json_str)
++        if extracted is not None:
++            json_str = extracted
++
++        return super().model_validate_json(json_str, strict=strict, context=context)
++
+     @classmethod
+     def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..3065420c 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,131 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# Tests for markdown code fence support in ToolCalls
++def test_tool_calls_model_validate_markdown_fence():
++    """Test that ToolCalls.model_validate accepts JSON wrapped in markdown code fence."""
++    from dspy.adapters.types.tool import ToolCalls
++    
++    # Test with json label
++    text = """```json
++[{"name": "test", "args": {"x": 1}}]
++```"""
++    result = ToolCalls.model_validate(text)
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0].name == "test"
++    
++    # Test without label
++    text2 = """```
++[{"name": "test2", "args": {"y": 2}}]
++```"""
++    result2 = ToolCalls.model_validate(text2)
++    assert len(result2.tool_calls) == 1
++    assert result2.tool_calls[0].name == "test2"
++    
++    # Test with JSON uppercase label
++    text3 = """```JSON
++[{"name": "test3", "args": {"z": 3}}]
++```"""
++    result3 = ToolCalls.model_validate(text3)
++    assert len(result3.tool_calls) == 1
++    assert result3.tool_calls[0].name == "test3"
++
++
++def test_tool_calls_model_validate_json_markdown_fence():
++    """Test that ToolCalls.model_validate_json accepts JSON wrapped in markdown code fence."""
++    from dspy.adapters.types.tool import ToolCalls
++    
++    # Test with json label
++    text = """```json
++[{"name": "test", "args": {"x": 1}}]
++```"""
++    result = ToolCalls.model_validate_json(text)
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0].name == "test"
++    
++    # Test empty list
++    text2 = """```json
++[]
++```"""
++    result2 = ToolCalls.model_validate_json(text2)
++    assert len(result2.tool_calls) == 0
++
++
++def test_tool_calls_parse_value_markdown_fence():
++    """Test that parse_value handles markdown-wrapped JSON for ToolCalls."""
++    from dspy.adapters.utils import parse_value
++    from dspy.adapters.types.tool import ToolCalls
++    
++    text = """```json
++[{"name": "test", "args": {"x": 1}}]
++```"""
++    result = parse_value(text, ToolCalls)
++    assert isinstance(result, ToolCalls)
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0].name == "test"
++
++
++def test_tool_calls_single_object_in_fence():
++    """Test that single tool call object in markdown fence is accepted."""
++    from dspy.adapters.types.tool import ToolCalls
++    
++    text = """```json
++{"name": "single", "args": {"value": 42}}
++```"""
++    result = ToolCalls.model_validate(text)
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0].name == "single"
++    assert result.tool_calls[0].args["value"] == 42
++
++
++def test_tool_calls_multiple_calls_in_fence():
++    """Test that multiple tool calls in markdown fence are accepted."""
++    from dspy.adapters.types.tool import ToolCalls
++    
++    text = """```json
++[{"name": "call1", "args": {"a": 1}}, {"name": "call2", "args": {"b": 2}}]
++```"""
++    result = ToolCalls.model_validate(text)
++    assert len(result.tool_calls) == 2
++    assert result.tool_calls[0].name == "call1"
++    assert result.tool_calls[1].name == "call2"
++
++
++def test_tool_calls_backticks_in_string_not_fences():
++    """Test that backticks inside JSON strings are not treated as fences."""
++    from dspy.adapters.types.tool import ToolCalls
++    
++    # Backticks inside the string value should be preserved
++    text = r"""```json
++[{"name": "code", "args": {"cmd": "echo ```"}}]
++```"""
++    result = ToolCalls.model_validate(text)
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0].args["cmd"] == "echo ```"
++
++
++def test_tool_calls_plain_json_still_works():
++    """Test that plain JSON strings still work after adding markdown support."""
++    from dspy.adapters.types.tool import ToolCalls
++    
++    # Plain JSON string
++    text = '[{"name": "test", "args": {"x": 1}}]'
++    result = ToolCalls.model_validate(text)
++    assert len(result.tool_calls) == 1
++    
++    # Canonical container
++    data = {"tool_calls": [{"name": "test", "args": {"x": 1}}]}
++    result2 = ToolCalls.model_validate(data)
++    assert len(result2.tool_calls) == 1
++    
++    # Bare list
++    data2 = [{"name": "test", "args": {"x": 1}}]
++    result3 = ToolCalls.model_validate(data2)
++    assert len(result3.tool_calls) == 1
++    
++    # Single object
++    data3 = {"name": "test", "args": {"x": 1}}
++    result4 = ToolCalls.model_validate(data3)
++    assert len(result4.tool_calls) == 1

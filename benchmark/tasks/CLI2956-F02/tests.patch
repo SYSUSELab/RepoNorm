@@ -1,0 +1,154 @@
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..b363233 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,149 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++def test_option_validators_run_after_callback_in_order(runner):
++    events = []
++
++    def callback(ctx, param, value):
++        events.append(("callback", value))
++        return value + 1
++
++    def double(ctx, param, value):
++        events.append(("double", value))
++        return value * 2
++
++    def stringify(ctx, param, value):
++        events.append(("stringify", value))
++        return f"value={value}"
++
++    @click.command()
++    @click.option("--number", type=int, callback=callback, validators=[double, stringify])
++    def cli(number):
++        click.echo(number)
++
++    result = runner.invoke(cli, ["--number", "3"])
++    assert result.exit_code == 0
++    assert result.output == "value=8\n"
++    assert events == [("callback", 3), ("double", 4), ("stringify", 8)]
++
++
++@pytest.mark.parametrize("validators", ["validator", [lambda c, p, v: v, None], [object()]])
++def test_option_validators_reject_invalid_sequences(validators):
++    with pytest.raises(TypeError, match="sequence of callables"):
++        click.Option(["--value"], validators=validators)
++
++
++def test_option_validators_bad_parameter_retries_prompt(runner):
++    calls = []
++
++    def positive(ctx, param, value):
++        calls.append(value)
++        if value <= 0:
++            raise click.BadParameter("must be positive")
++        return value
++
++    @click.command()
++    @click.option("--number", type=int, prompt=True, validators=[positive])
++    def cli(number):
++        click.echo(number)
++
++    result = runner.invoke(cli, input="-1\n2\n")
++    assert result.exit_code == 0
++    assert "must be positive" in result.output
++    assert result.output.endswith("2\n")
++    assert calls == [-1, 2]
++
++
++def test_option_validators_short_circuit(runner):
++    called = []
++
++    def fail(ctx, param, value):
++        raise click.BadParameter("no")
++
++    def later(ctx, param, value):
++        called.append(value)
++        return value
++
++    @click.command()
++    @click.option("--value", validators=[fail, later])
++    def cli(value):
++        pass
++
++    result = runner.invoke(cli, ["--value", "x"])
++    assert result.exit_code == 2
++    assert called == []
++
++
++def test_option_validators_receive_multiple_tuple(runner):
++    seen = []
++
++    def join(ctx, param, value):
++        seen.append(value)
++        return ":".join(value)
++
++    @click.command()
++    @click.option("--item", multiple=True, validators=[join])
++    def cli(item):
++        click.echo(item)
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b"])
++    assert result.exit_code == 0
++    assert result.output == "a:b\n"
++    assert seen == [("a", "b")]
++
++
++def test_option_validators_none_and_empty_are_disabled(runner):
++    for validators in (None, []):
++        seen = []
++
++        def callback(ctx, param, value):
++            seen.append(value)
++            return value * 2
++
++        @click.command()
++        @click.option("--value", type=int, validators=validators, callback=callback)
++        def cli(value):
++            click.echo(value)
++
++        result = runner.invoke(cli, ["--value", "4"])
++        assert result.exit_code == 0, (result.output, result.exception)
++        assert result.output == "8\n"
++        assert seen == [4]
++
++
++@pytest.mark.parametrize("source", ["commandline", "environment", "default_map"])
++def test_option_validators_bad_parameter_keeps_option_context(runner, source):
++    seen = []
++
++    def reject(ctx, param, value):
++        seen.append((ctx, param, value))
++        raise click.BadParameter("must be positive")
++
++    @click.command()
++    @click.option("-n", "--number", type=int, envvar="CLICK_VALIDATOR_NUMBER",
++                  validators=[reject])
++    def cli(number):
++        pytest.fail("invalid option must not reach the command")
++
++    kwargs = {
++        "commandline": {"args": ["--number", "-2"]},
++        "environment": {"env": {"CLICK_VALIDATOR_NUMBER": "-2"}},
++        "default_map": {"default_map": {"number": "-2"}},
++    }[source]
++    result = runner.invoke(cli, standalone_mode=False, **kwargs)
++    assert isinstance(result.exception, click.BadParameter)
++    assert len(seen) == 1
++    ctx, option, value = seen[0]
++    assert value == -2
++    assert result.exception.ctx is ctx
++    assert result.exception.param is option
++    assert "--number" in result.exception.format_message()
++    assert "must be positive" in result.exception.format_message()
++
++    result = runner.invoke(cli, **kwargs)
++    assert result.exit_code == 2
++    assert "Invalid value for" in result.output
++    assert "--number" in result.output
++    assert "must be positive" in result.output

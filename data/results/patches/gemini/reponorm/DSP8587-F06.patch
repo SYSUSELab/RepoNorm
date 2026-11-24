@@ -1,0 +1,105 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..a8b7855f 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,7 @@
+ import re
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -25,7 +25,7 @@ class StreamListener:
+         signature_field_name: str,
+         predict: Any = None,
+         predict_name: str | None = None,
+-        allow_reuse: bool = False,
++        allow_reuse: bool = False, on_chunk: Callable[[StreamResponse], None] | None = None,
+     ):
+         """
+         Args:
+@@ -47,6 +47,7 @@ class StreamListener:
+         self.stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
++        self.on_chunk = on_chunk
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -166,7 +167,10 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
+-                return StreamResponse(self.predict_name, self.signature_field_name, token)
++                response = StreamResponse(self.predict_name, self.signature_field_name, token)
++                if self.on_chunk:
++                    self.on_chunk(response)
++                return response
+ 
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+diff --git a/tests/streaming/test_stream_listener_callback.py b/tests/streaming/test_stream_listener_callback.py
+new file mode 100644
+index 00000000..a4547ec4
+--- /dev/null
++++ b/tests/streaming/test_stream_listener_callback.py
+@@ -0,0 +1,57 @@
++import pytest
++from unittest.mock import MagicMock
++from dspy.streaming.streaming_listener import StreamListener
++from dspy.streaming.messages import StreamResponse
++from litellm import ModelResponseStream
++
++# Mocking the necessary structure for ModelResponseStream
++class MockDelta:
++    def __init__(self, content):
++        self.content = content
++
++class MockChoice:
++    def __init__(self, content):
++        self.delta = MockDelta(content)
++
++class MockModelResponseStream:
++    def __init__(self, content):
++        self.choices = [MockChoice(content)]
++
++def test_stream_listener_on_chunk_callback():
++    # Mocking the callback
++    on_chunk_mock = MagicMock()
++    
++    # Initialize StreamListener with the callback
++    listener = StreamListener(
++        signature_field_name="answer",
++        on_chunk=on_chunk_mock
++    )
++    
++    # Simulate receiving chunks
++    # 1. Start identifier
++    chunk1 = MockModelResponseStream("[[ ## answer ## ]]")
++    # 2. Content
++    chunk2 = MockModelResponseStream("Hello")
++    # 3. End identifier
++    chunk3 = MockModelResponseStream("[[ ## next ## ]]")
++    
++    # We need to set up the adapter to ChatAdapter
++    from dspy.dsp.utils.settings import settings
++    from dspy.adapters.chat_adapter import ChatAdapter
++    settings.adapter = ChatAdapter()
++    
++    # Receive chunks
++    listener.receive(chunk1)
++    listener.receive(chunk2)
++    listener.receive(chunk3)
++    
++    # Check if the callback was called
++    # The listener should have called on_chunk for "Hello"
++    assert on_chunk_mock.called
++    
++    # Verify the argument
++    args, _ = on_chunk_mock.call_args
++    response = args[0]
++    assert isinstance(response, StreamResponse)
++    assert response.signature_field_name == "answer"
++    assert response.chunk == "Hello"

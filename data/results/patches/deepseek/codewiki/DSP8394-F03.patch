@@ -1,0 +1,256 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..ce8cac4f 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -7,7 +7,7 @@ import litellm
+ from litellm.caching.caching import Cache as LitellmCache
+ 
+ from dspy.clients.base_lm import BaseLM, inspect_history
+-from dspy.clients.cache import Cache
++from dspy.clients.cache import Cache, _validate_ttl
+ from dspy.clients.embedding import Embedder
+ from dspy.clients.lm import LM
+ from dspy.clients.provider import Provider, TrainingJob
+@@ -33,6 +33,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    ttl: Optional[float] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +44,7 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        ttl: Time-to-live in seconds for cache entries. None means no expiration.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,9 +74,43 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        ttl=ttl,
+     )
+ 
+ 
++def set_ttl(seconds: Optional[float] = None):
++    """Set the default TTL (time-to-live) for the active global DSPy cache.
++
++    This changes the lifetime used by subsequent writes without:
++        - clearing existing entries
++        - extending their existing deadlines
++        - changing the active cache's enabled layers, location or capacity
++
++    Setting it back to None makes new writes nonexpiring;
++    already expiring entries still expire.
++
++    Args:
++        seconds: Time-to-live in seconds for new cache entries.
++                 None means no expiration for new entries.
++
++    Raises:
++        ValueError: If seconds is not None and not a positive finite number.
++    """
++    _validate_ttl(seconds)
++
++    import dspy
++
++    try:
++        cache = dspy.cache
++    except AttributeError:
++        # If dspy.cache is not configured yet, update the default DSPY_CACHE
++        # and set dspy.cache to it
++        cache = DSPY_CACHE
++        dspy.cache = cache
++
++    cache.set_ttl(seconds)
++
++
+ litellm.telemetry = False
+ litellm.cache = None  # By default we disable litellm cache and use DSPy on-disk cache.
+ 
+@@ -112,4 +148,5 @@ __all__ = [
+     "enable_litellm_logging",
+     "disable_litellm_logging",
+     "configure_cache",
++    "set_ttl",
+ ]
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..7ad5bfd4 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,7 +1,9 @@
+ import copy
+ import inspect
+ import logging
++import math
+ import threading
++import time
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -15,12 +17,34 @@ from diskcache import FanoutCache
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _validate_ttl(ttl):
++    """Validate TTL value. Returns None if valid, raises ValueError otherwise."""
++    if ttl is None:
++        return
++    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
++        raise ValueError(
++            f"TTL must be a positive finite number or None, got {ttl}"
++        )
++    if ttl <= 0 or not math.isfinite(ttl):
++        raise ValueError(
++            f"TTL must be a positive finite number or None, got {ttl}"
++        )
++
++
+ class Cache:
+     """DSPy Cache
+ 
+     `Cache` provides 2 levels of caching (in the given order):
+         1. In-memory cache - implemented with cachetools.LRUCache
+         2. On-disk cache - implemented with diskcache.FanoutCache
++
++    TTL (time-to-live) support:
++        - ttl=None means no expiration
++        - ttl is a positive finite number of seconds
++        - Each successful write starts that entry's lifetime
++        - Reads, including promotion from disk into memory, must not restart it
++        - Once the deadline passes, reads must miss in every enabled layer
++        - Overwriting an entry starts a new lifetime
+     """
+ 
+     def __init__(
+@@ -30,7 +54,7 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        ttl: Optional[float] = None,
+     ):
+         """
+         Args:
+@@ -39,7 +63,10 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            ttl: Time-to-live in seconds for cache entries. None means no expiration.
+         """
++        _validate_ttl(ttl)
++        self.ttl = ttl
+ 
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+@@ -59,9 +86,53 @@ class Cache:
+ 
+         self._lock = threading.RLock()
+ 
++    def _is_expired_entry(self, entry):
++        """Check if a memory cache entry (value, expiry_time) is expired."""
++        if not isinstance(entry, tuple) or len(entry) != 2:
++            return False  # Old format without expiry info
++        value, expiry_time = entry
++        if expiry_time is None:
++            return False
++        return time.time() > expiry_time
++
++    def _unwrap_entry(self, entry):
++        """Extract the value from a memory cache entry, handling both old and new formats."""
++        if isinstance(entry, tuple) and len(entry) == 2:
++            return entry[0]
++        return entry
++
++    def _wrap_value(self, value):
++        """Wrap a value with expiry info for storage in memory cache."""
++        if self.ttl is not None:
++            return (value, time.time() + self.ttl)
++        return (value, None)
++
++    def set_ttl(self, ttl):
++        """Update the TTL used by subsequent writes.
++
++        Args:
++            ttl: Time-to-live in seconds, or None for no expiration.
++
++        Raises:
++            ValueError: If ttl is not None and not a positive finite number.
++        """
++        _validate_ttl(ttl)
++        self.ttl = ttl
++
+     def __contains__(self, key: str) -> bool:
+-        """Check if a key is in the cache."""
+-        return key in self.memory_cache or key in self.disk_cache
++        """Check if a key is in the cache (considering expiration)."""
++        if self.enable_memory_cache and key in self.memory_cache:
++            entry = self.memory_cache[key]
++            if self._is_expired_entry(entry):
++                with self._lock:
++                    # Remove expired entry from memory
++                    try:
++                        del self.memory_cache[key]
++                    except KeyError:
++                        pass
++                return False
++            return True
++        return key in self.disk_cache
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+@@ -105,16 +176,33 @@ class Cache:
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+-                response = self.memory_cache[key]
++                entry = self.memory_cache[key]
++                if self._is_expired_entry(entry):
++                    # Expired - remove and treat as miss
++                    try:
++                        del self.memory_cache[key]
++                    except KeyError:
++                        pass
++                    response = None
++                else:
++                    response = self._unwrap_entry(entry)
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
+-            if self.enable_memory_cache:
++            # Use expire_time=True to get the original expiry time
++            disk_result = self.disk_cache.get(key, expire_time=True)
++            if disk_result is None:
++                return None
++            response, expiry_time = disk_result
++            if response is not None and self.enable_memory_cache:
+                 with self._lock:
+-                    self.memory_cache[key] = response
++                    # Store with the original expiry time (donu0027t renew the deadline)
++                    self.memory_cache[key] = (response, expiry_time)
+         else:
+             return None
+ 
++        if response is None:
++            return None
++
+         response = copy.deepcopy(response)
+         if hasattr(response, "usage"):
+             # Clear the usage data when cache is hit, because no LM call is made
+@@ -136,11 +224,11 @@ class Cache:
+ 
+         if self.enable_memory_cache and enable_memory_cache:
+             with self._lock:
+-                self.memory_cache[key] = value
++                self.memory_cache[key] = self._wrap_value(value)
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                self.disk_cache.set(key, value, expire=self.ttl)
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")

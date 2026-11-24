@@ -1,0 +1,1241 @@
+diff --git a/apply_changes.py b/apply_changes.py
+new file mode 100644
+index 0000000..24c41ca
+--- /dev/null
++++ b/apply_changes.py
+@@ -0,0 +1,73 @@
++import sys
++
++with open("src/jinja2/filters.py", "r") as f:
++    lines = f.readlines()
++
++# Add _Missing class and helper functions
++new_lines = []
++for line in lines:
++    if line.startswith("def ignore_case"):
++        new_lines.append("class _Missing:\n")
++        new_lines.append("    def __repr__(self):\n")
++        new_lines.append("        return 'missing'\n")
++        new_lines.append("    def __eq__(self, other):\n")
++        new_lines.append("        return isinstance(other, _Missing)\n")
++        new_lines.append("    def __hash__(self):\n")
++        new_lines.append("        return hash(_Missing)\n\n")
++        new_lines.append("_missing = _Missing()\n\n")
++        new_lines.append("def _get_sort_key(key):\n")
++        new_lines.append("    if isinstance(key, Undefined):\n")
++        new_lines.append("        return (2, 0)\n")
++        new_lines.append("    if key is None:\n")
++        new_lines.append("        return (1, 0)\n")
++        new_lines.append("    return (0, key)\n\n")
++        new_lines.append("def _get_group_key(key):\n")
++        new_lines.append("    if isinstance(key, Undefined):\n")
++        new_lines.append("        return _missing\n")
++        new_lines.append("    return key\n\n")
++        new_lines.append(line)
++    else:
++        new_lines.append(line)
++
++# Modify sync_do_groupby
++final_lines = []
++in_sync_do_groupby = False
++for line in new_lines:
++    if "def sync_do_groupby(" in line:
++        in_sync_do_groupby = True
++        final_lines.append(line.replace("default: t.Optional[t.Any] = None,", "default: t.Optional[t.Any] = None, include_empty: bool = False,"))
++    elif in_sync_do_groupby and "    expr = make_attrgetter(environment, attribute, default=default)" in line:
++        final_lines.append(line)
++        final_lines.append("    if not include_empty:\n")
++        final_lines.append("        value = [item for item in value if expr(item)]\n")
++    elif in_sync_do_groupby and "    return [" in line:
++        final_lines.append("    return [\n")
++        final_lines.append("        _GroupTuple(key if key is not _missing else None, list(values))\n")
++        final_lines.append("        for key, values in groupby(sorted(value, key=lambda x: _get_sort_key(expr(x))), lambda x: _get_group_key(expr(x)))\n")
++        final_lines.append("    ]\n")
++        # Skip the original return
++        # We need to skip the next few lines until the end of the function
++        # The original function ends with "]"
++        # Let's just skip the next 2 lines
++        # Wait, I need to be careful.
++        # The original code is:
++        # return [
++        #     _GroupTuple(key, list(values))
++        #     for key, values in groupby(sorted(value, key=expr), expr)
++        # ]
++        # So I need to skip the next 3 lines.
++        # Let's just set a flag to skip.
++        skip_lines = 3
++        in_sync_do_groupby = False
++    else:
++        if 'skip_lines' in locals() and skip_lines > 0:
++            skip_lines -= 1
++            continue
++        final_lines.append(line)
++
++# Modify do_groupby
++# Similar changes for do_groupby
++# ...
++
++with open("src/jinja2/filters.py", "w") as f:
++    f.writelines(final_lines)
+diff --git a/check_groupby_impl.py b/check_groupby_impl.py
+new file mode 100644
+index 0000000..220d2ef
+--- /dev/null
++++ b/check_groupby_impl.py
+@@ -0,0 +1,20 @@
++from jinja2.filters import sync_do_groupby
++from jinja2 import Environment
++
++env = Environment()
++
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": "y"},
++]
++
++# Let's see how it handles the sorting.
++# The current implementation:
++# expr = make_attrgetter(environment, attribute, default=default)
++# return [
++#     _GroupTuple(key, list(values))
++#     for key, values in groupby(sorted(value, key=expr), expr)
++# ]
++
++# Ah, the `make_attrgetter` might be doing something special.
++# Let's check `make_attrgetter` in `src/jinja2/filters.py`
+diff --git a/reproduce_groupby.py b/reproduce_groupby.py
+new file mode 100644
+index 0000000..7bbbd9f
+--- /dev/null
++++ b/reproduce_groupby.py
+@@ -0,0 +1,34 @@
++from jinja2 import Environment
++from jinja2.filters import do_groupby
++import asyncio
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": None},
++    {"name": "d", "val": None},
++    {"name": "e", "val": ""},
++]
++
++# Current behavior:
++# groupby("val")
++# The current implementation uses `groupby(sorted(value, key=expr), expr)`
++# Let's see what it does with the current implementation.
++
++def get_val(item):
++    return item["val"]
++
++# Simulate the current groupby behavior
++from itertools import groupby
++sorted_data = sorted(data, key=get_val)
++print("Sorted data:", sorted_data)
++# Wait, sorted() might fail if types are not comparable.
++# Let's see if it fails.
++try:
++    grouped = list(groupby(sorted_data, key=get_val))
++    print("Grouped:", [(k, [i['name'] for i in v]) for k, v in grouped])
++except Exception as e:
++    print("Error:", e)
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..c1f2809 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -17,7 +17,7 @@ from .async_utils import auto_aiter
+ from .async_utils import auto_await
+ from .async_utils import auto_to_list
+ from .exceptions import FilterArgumentError
+-from .runtime import Undefined
++from .runtime import Undefined, StrictUndefined
+ from .utils import htmlsafe_json_dumps
+ from .utils import pass_context
+ from .utils import pass_environment
+@@ -43,6 +43,32 @@ K = t.TypeVar("K")
+ V = t.TypeVar("V")
+ 
+ 
++class _Missing:
++    def __repr__(self):
++        return 'missing'
++    def __eq__(self, other):
++        return isinstance(other, _Missing)
++    def __hash__(self):
++        return hash(_Missing)
++
++_missing = _Missing()
++
++def _get_sort_key(key):
++    if isinstance(key, StrictUndefined):
++        return (3, 0)
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++def _get_group_key(key):
++    if isinstance(key, StrictUndefined):
++        return key
++    if isinstance(key, Undefined):
++        return _missing
++    return key
++
+ def ignore_case(value: V) -> V:
+     """For use as a postprocessor for :func:`make_attrgetter`. Converts strings
+     to lowercase and returns other types as-is."""
+@@ -1162,7 +1188,7 @@ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+-    default: t.Optional[t.Any] = None,
++    default: t.Optional[t.Any] = None, include_empty: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,9 +1236,11 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
++    if not include_empty:
++        value = [item for item in value if expr(item)]
+     return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
++        _GroupTuple(key if key is not _missing else _missing, list(values))
++        for key, values in groupby(sorted(value, key=lambda x: _get_sort_key(expr(x))), lambda x: _get_group_key(expr(x)))
+     ]
+ 
+ 
+@@ -1221,12 +1249,16 @@ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+-    default: t.Optional[t.Any] = None,
++    default: t.Optional[t.Any] = None, include_empty: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
++    if not include_empty:
++        value = [item for item in await auto_to_list(value) if expr(item)]
++    else:
++        value = await auto_to_list(value)
+     return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++        _GroupTuple(key if key is not _missing else _missing, await auto_to_list(values))
++        for key, values in groupby(sorted(value, key=lambda x: _get_sort_key(expr(x))), lambda x: _get_group_key(expr(x)))
+     ]
+ 
+ 
+diff --git a/test_async_fix.py b/test_async_fix.py
+new file mode 100644
+index 0000000..d9143fc
+--- /dev/null
++++ b/test_async_fix.py
+@@ -0,0 +1,21 @@
++import asyncio
++from jinja2 import Environment
++from jinja2.filters import do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++async def test():
++    data = [
++        {"name": "a", "val": Undefined()},
++        {"name": "b", "val": None},
++        {"name": "c", "val": ""},
++        {"name": "d", "val": "z"},
++        {"name": "e", "val": Undefined()},
++        {"name": "f", "val": None},
++    ]
++    
++    result = await do_groupby(env, data, "val", include_empty=True)
++    print("Result (include_empty=True):", [(k, [i['name'] for i in v]) for k, v in result])
++
++asyncio.run(test())
+diff --git a/test_async_fix_2.py b/test_async_fix_2.py
+new file mode 100644
+index 0000000..efb7456
+--- /dev/null
++++ b/test_async_fix_2.py
+@@ -0,0 +1,21 @@
++import asyncio
++from jinja2 import Environment
++from jinja2.filters import do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment(enable_async=True)
++
++async def test():
++    data = [
++        {"name": "a", "val": Undefined()},
++        {"name": "b", "val": None},
++        {"name": "c", "val": ""},
++        {"name": "d", "val": "z"},
++        {"name": "e", "val": Undefined()},
++        {"name": "f", "val": None},
++    ]
++    
++    result = await do_groupby(env, data, "val", include_empty=True)
++    print("Result (include_empty=True):", [(k, [i['name'] for i in v]) for k, v in result])
++
++asyncio.run(test())
+diff --git a/test_falsy.py b/test_falsy.py
+new file mode 100644
+index 0000000..f456036
+--- /dev/null
++++ b/test_falsy.py
+@@ -0,0 +1,5 @@
++from jinja2.runtime import Undefined
++print(bool(Undefined()))
++print(bool(None))
++print(bool(""))
++print(bool(0))
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000..2ca3982
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,21 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": None},
++    {"name": "d", "val": Undefined()},
++]
++
++# Test include_empty=False (default)
++result = sync_do_groupby(env, data, "val", include_empty=False)
++print("Result (include_empty=False):", [(k, [i['name'] for i in v]) for k, v in result])
++
++# Test include_empty=True
++result = sync_do_groupby(env, data, "val", include_empty=True)
++print("Result (include_empty=True):", [(k, [i['name'] for i in v]) for k, v in result])
+diff --git a/test_fix_2.py b/test_fix_2.py
+new file mode 100644
+index 0000000..f76f9fa
+--- /dev/null
++++ b/test_fix_2.py
+@@ -0,0 +1,46 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": None},
++    {"name": "d", "val": Undefined()},
++]
++
++# Test include_empty=True
++result = sync_do_groupby(env, data, "val", include_empty=True)
++# The requirement says:
++# "For example keys [missing, None, '', 'z', missing, None]
++# produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2]."
++
++# Let's check the output of my test.
++# Result (include_empty=True): [('', ['a']), ('z', ['b']), (None, ['c']), (None, ['d'])]
++# Wait, the last group is (None, ['d']). It should be (None, ['d'])?
++# The requirement says:
++# "Missing keys must not split into multiple groups when interleaved with None."
++# "For example keys [missing, None, '', 'z', missing, None]
++# produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2]."
++
++# My output:
++# [('', ['a']), ('z', ['b']), (None, ['c']), (None, ['d'])]
++# The last group is (None, ['d']). It should be (None, ['d'])?
++# Wait, the last group should be for "missing".
++# My output has (None, ['d']) for the last group.
++# Ah, I see. The `_GroupTuple` grouper is `key if key is not _missing else None`.
++# So `_missing` becomes `None`.
++# That's why it's `(None, ['d'])`.
++# But the requirement says:
++# "For example keys [missing, None, '', 'z', missing, None]
++# produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2]."
++# So the grouper for the missing group should be `missing` (or something that represents it), not `None`.
++
++# Let me check the `_GroupTuple` definition.
++# It's a `NamedTuple` with `grouper` and `list`.
++# If I want the grouper to be `missing`, I should not convert it to `None`.
++
++# Let's modify the `_GroupTuple` creation.
+diff --git a/test_fix_3.py b/test_fix_3.py
+new file mode 100644
+index 0000000..f88aedc
+--- /dev/null
++++ b/test_fix_3.py
+@@ -0,0 +1,17 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": None},
++    {"name": "d", "val": Undefined()},
++]
++
++# Test include_empty=True
++result = sync_do_groupby(env, data, "val", include_empty=True)
++print("Result (include_empty=True):", [(k, [i['name'] for i in v]) for k, v in result])
+diff --git a/test_fix_4.py b/test_fix_4.py
+new file mode 100644
+index 0000000..a2e71f0
+--- /dev/null
++++ b/test_fix_4.py
+@@ -0,0 +1,19 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": Undefined()},
++    {"name": "b", "val": None},
++    {"name": "c", "val": ""},
++    {"name": "d", "val": "z"},
++    {"name": "e", "val": Undefined()},
++    {"name": "f", "val": None},
++]
++
++# Test include_empty=True
++result = sync_do_groupby(env, data, "val", include_empty=True)
++print("Result (include_empty=True):", [(k, [i['name'] for i in v]) for k, v in result])
+diff --git a/test_groupby_behavior.py b/test_groupby_behavior.py
+new file mode 100644
+index 0000000..afe9afe
+--- /dev/null
++++ b/test_groupby_behavior.py
+@@ -0,0 +1,27 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": "y"},
++]
++
++# The current implementation of groupby in Jinja2
++# uses sorted(value, key=expr)
++# If expr returns None and str, it will fail.
++# Wait, does Jinja2's groupby filter actually work for mixed types?
++# Let's test it.
++
++data_mixed = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": None},
++]
++
++try:
++    result = sync_do_groupby(env, data_mixed, "val")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_10.py b/test_groupby_behavior_10.py
+new file mode 100644
+index 0000000..c2c24c0
+--- /dev/null
++++ b/test_groupby_behavior_10.py
+@@ -0,0 +1,35 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# Let's test the "falsy" behavior.
++# Falsy values: "", 0, False, None, [], {}, ()
++
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": 0},
++]
++
++# If I group by "val", it should fail because of sorting.
++# Wait, why did it work before?
++# Ah, because I had only one group.
++# If I have multiple groups, it sorts them.
++
++data_mixed = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": 0},
++]
++
++try:
++    result = sync_do_groupby(env, data_mixed, "val")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_11.py b/test_groupby_behavior_11.py
+new file mode 100644
+index 0000000..07ae0a9
+--- /dev/null
++++ b/test_groupby_behavior_11.py
+@@ -0,0 +1,43 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# Let's test the "falsy" behavior.
++# Falsy values: "", 0, False, None, [], {}, ()
++
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": 0},
++]
++
++# If I group by "val", it should fail because of sorting.
++# Wait, why did it work before?
++# Ah, because I had only one group.
++# If I have multiple groups, it sorts them.
++
++data_mixed = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": 0},
++]
++
++# Let's try to see if we can make it work by providing a default that makes them comparable.
++# But the default is applied to the *value* of the attribute, not the *key* itself.
++# Wait, the key is the value of the attribute.
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# This implies that we should filter out the items *before* sorting.
++# If include_empty=False, we filter out items where the key is falsy.
++# If include_empty=True, we keep them.
++
++# Let's see if we can implement this.
+diff --git a/test_groupby_behavior_2.py b/test_groupby_behavior_2.py
+new file mode 100644
+index 0000000..e7d91c2
+--- /dev/null
++++ b/test_groupby_behavior_2.py
+@@ -0,0 +1,22 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": "y"},
++]
++
++# Maybe it works if we provide a default?
++data_mixed = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": None},
++]
++
++try:
++    result = sync_do_groupby(env, data_mixed, "val", default="default")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_3.py b/test_groupby_behavior_3.py
+new file mode 100644
+index 0000000..feb7f39
+--- /dev/null
++++ b/test_groupby_behavior_3.py
+@@ -0,0 +1,22 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++
++env = Environment()
++
++# Test data
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": "y"},
++]
++
++# What if all values are the same type?
++data_same = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": "y"},
++]
++
++try:
++    result = sync_do_groupby(env, data_same, "val")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_4.py b/test_groupby_behavior_4.py
+new file mode 100644
+index 0000000..fa2cfa2
+--- /dev/null
++++ b/test_groupby_behavior_4.py
+@@ -0,0 +1,34 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++
++env = Environment()
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": None},
++]
++
++# Current behavior with include_empty=False (default)
++# If I try to group this, it will fail because of sorting.
++# Wait, if the current implementation fails, how does it work in Jinja2?
++# Maybe it only works if all keys are comparable.
++
++# Let's check the documentation again.
++# "The attribute can use dot notation for nested access"
++# "Unlike Python's groupby, the values are sorted first so only one group is returned for each unique value."
++
++# If I have a list of objects, and I group by an attribute,
++# if that attribute is None for some objects, it will fail.
++# Unless the user provides a default.
++
++# Let's try with default.
++try:
++    result = sync_do_groupby(env, data, "val", default="default")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_5.py b/test_groupby_behavior_5.py
+new file mode 100644
+index 0000000..71e0330
+--- /dev/null
++++ b/test_groupby_behavior_5.py
+@@ -0,0 +1,14 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++
++env = Environment()
++
++# Let's see what happens if we have a list of objects that all have the same type.
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": "y"},
++    {"name": "c", "val": "x"},
++]
++
++result = sync_do_groupby(env, data, "val")
++print("Result:", result)
+diff --git a/test_groupby_behavior_6.py b/test_groupby_behavior_6.py
+new file mode 100644
+index 0000000..a827094
+--- /dev/null
++++ b/test_groupby_behavior_6.py
+@@ -0,0 +1,17 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# Let's see what happens if we have Undefined
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": Undefined()},
++]
++
++try:
++    result = sync_do_groupby(env, data, "val")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_7.py b/test_groupby_behavior_7.py
+new file mode 100644
+index 0000000..81153ff
+--- /dev/null
++++ b/test_groupby_behavior_7.py
+@@ -0,0 +1,17 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# Let's see what happens if we have Undefined and a default
++data = [
++    {"name": "a", "val": "x"},
++    {"name": "b", "val": Undefined()},
++]
++
++try:
++    result = sync_do_groupby(env, data, "val", default="default")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_behavior_8.py b/test_groupby_behavior_8.py
+new file mode 100644
+index 0000000..af78fb4
+--- /dev/null
++++ b/test_groupby_behavior_8.py
+@@ -0,0 +1,28 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# Let's test the "falsy" behavior.
++# Falsy values: "", 0, False, None, [], {}, ()
++
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": 0},
++]
++
++# If I group by "val", it should fail because of sorting.
++# But if I have only falsy values?
++data_falsy = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": ""},
++]
++
++result = sync_do_groupby(env, data_falsy, "val")
++print("Result:", result)
+diff --git a/test_groupby_behavior_9.py b/test_groupby_behavior_9.py
+new file mode 100644
+index 0000000..9778780
+--- /dev/null
++++ b/test_groupby_behavior_9.py
+@@ -0,0 +1,33 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++
++env = Environment()
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# Let's test the "falsy" behavior.
++# Falsy values: "", 0, False, None, [], {}, ()
++
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++]
++
++# If I group by "val", it should fail because of sorting.
++# Wait, why did it work before?
++# Ah, because I had only one group.
++# If I have multiple groups, it sorts them.
++
++data_mixed = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++]
++
++try:
++    result = sync_do_groupby(env, data_mixed, "val")
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_groupby_implementation.py b/test_groupby_implementation.py
+new file mode 100644
+index 0000000..d49838e
+--- /dev/null
++++ b/test_groupby_implementation.py
+@@ -0,0 +1,51 @@
++from jinja2 import Environment
++from jinja2.filters import sync_do_groupby
++from jinja2.runtime import Undefined
++from itertools import groupby
++
++def new_sync_do_groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int],
++    default: t.Optional[t.Any] = None,
++    include_empty: bool = False,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    from jinja2.filters import make_attrgetter, _GroupTuple
++    
++    expr = make_attrgetter(environment, attribute, default=default)
++    
++    # Filter items
++    if not include_empty:
++        value = [item for item in value if expr(item)]
++    
++    # Sort items
++    # The requirement says:
++    # "Define the retained-key order as normal comparable keys first (including the empty string in string order), then None, then a separate missing/Undefined group."
++    
++    # This is tricky. We need a custom sort key.
++    
++    def sort_key(item):
++        key = expr(item)
++        # Define the order:
++        # 1. Normal comparable keys
++        # 2. None
++        # 3. Missing/Undefined
++        
++        # How to identify missing/Undefined?
++        # The `make_attrgetter` returns `default` if it's `Undefined`.
++        # Wait, `make_attrgetter` implementation:
++        # if default is not None and isinstance(item, Undefined):
++        #     item = default
++        
++        # So if it's Undefined, it becomes `default`.
++        # If `default` is None, it remains `Undefined`.
++        
++        # This is complex. Let's re-read the requirement.
++        # "Missing keys must not split into multiple groups when interleaved with None."
++        # "StrictUndefined retains its error behavior rather than silently becoming an ordinary missing key."
++        
++        return key
++    
++    # This is going to be hard to implement correctly.
++    return []
++
+diff --git a/test_sorting_logic.py b/test_sorting_logic.py
+new file mode 100644
+index 0000000..19d19dd
+--- /dev/null
++++ b/test_sorting_logic.py
+@@ -0,0 +1,21 @@
++from jinja2.runtime import Undefined, StrictUndefined
++
++def get_sort_key(key):
++    # Define the order:
++    # 1. Normal comparable keys
++    # 2. None
++    # 3. Missing/Undefined
++    
++    # We need to return a tuple that can be sorted.
++    # (type_priority, key_value)
++    
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++keys = ["z", "", None, Undefined(), "a", None, Undefined()]
++# Sort them
++sorted_keys = sorted(keys, key=get_sort_key)
++print(sorted_keys)
+diff --git a/test_sorting_logic_2.py b/test_sorting_logic_2.py
+new file mode 100644
+index 0000000..e2fae88
+--- /dev/null
++++ b/test_sorting_logic_2.py
+@@ -0,0 +1,46 @@
++from jinja2.runtime import Undefined, StrictUndefined
++
++def get_sort_key(key):
++    # Define the order:
++    # 1. Normal comparable keys
++    # 2. None
++    # 3. Missing/Undefined
++    
++    # We need to return a tuple that can be sorted.
++    # (type_priority, key_value)
++    
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++# The requirement says:
++# "For example keys [missing, None, '', 'z', missing, None]
++# produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2]."
++
++# Let's test this.
++keys = [Undefined(), None, '', 'z', Undefined(), None]
++# Sort them
++sorted_keys = sorted(keys, key=get_sort_key)
++print("Sorted keys:", sorted_keys)
++
++# Now group them
++from itertools import groupby
++grouped = groupby(sorted_keys, key=lambda x: (get_sort_key(x)[0], x if get_sort_key(x)[0] == 0 else None))
++# Wait, this grouping key is not quite right.
++# The requirement says:
++# "Missing keys must not split into multiple groups when interleaved with None."
++# "StrictUndefined retains its error behavior rather than silently becoming an ordinary missing key."
++
++# Let's refine the grouping key.
++def group_key(key):
++    if isinstance(key, Undefined):
++        return (2, None)
++    if key is None:
++        return (1, None)
++    return (0, key)
++
++grouped = groupby(sorted_keys, key=group_key)
++for k, v in grouped:
++    print(f"Group: {k}, Items: {list(v)}")
+diff --git a/test_sorting_logic_3.py b/test_sorting_logic_3.py
+new file mode 100644
+index 0000000..f4d44ca
+--- /dev/null
++++ b/test_sorting_logic_3.py
+@@ -0,0 +1,45 @@
++from jinja2.runtime import Undefined, StrictUndefined
++
++def get_sort_key(key):
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++def group_key(key):
++    if isinstance(key, Undefined):
++        return (2, None)
++    if key is None:
++        return (1, None)
++    return (0, key)
++
++# The requirement says:
++# "For example keys [missing, None, '', 'z', missing, None]
++# produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2]."
++
++# Let's test this.
++keys = [Undefined(), None, '', 'z', Undefined(), None]
++# Sort them
++sorted_keys = sorted(keys, key=get_sort_key)
++print("Sorted keys:", sorted_keys)
++
++# Now group them
++from itertools import groupby
++grouped = groupby(sorted_keys, key=group_key)
++for k, v in grouped:
++    # The grouper should be the key itself, but for Undefined it should be "missing"
++    # The requirement says:
++    # "For example keys [missing, None, '', 'z', missing, None]
++    # produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2]."
++    
++    # So the grouper for Undefined should be something that represents "missing".
++    # The requirement says:
++    # "Missing keys must not split into multiple groups when interleaved with None."
++    
++    # Let's see what the grouper should be.
++    # If I use the key itself, it will be Undefined.
++    
++    # Let's try to use a special object for missing.
++    pass
++
+diff --git a/test_sorting_logic_4.py b/test_sorting_logic_4.py
+new file mode 100644
+index 0000000..2e8829d
+--- /dev/null
++++ b/test_sorting_logic_4.py
+@@ -0,0 +1,45 @@
++from jinja2.runtime import Undefined
++
++class Missing:
++    def __repr__(self):
++        return "missing"
++    def __eq__(self, other):
++        return isinstance(other, Missing)
++    def __hash__(self):
++        return hash(Missing)
++
++missing = Missing()
++
++def get_sort_key(key):
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++def get_group_key(key):
++    if isinstance(key, Undefined):
++        return missing
++    return key
++
++keys = [Undefined(), None, '', 'z', Undefined(), None]
++# Sort them
++sorted_keys = sorted(keys, key=get_sort_key)
++print("Sorted keys:", sorted_keys)
++
++# Now group them
++from itertools import groupby
++# We need to group by the same key that we used for sorting, but with the special "missing" object.
++# Wait, if we group by `get_group_key`, will it work?
++# The `groupby` function groups consecutive elements that have the same key.
++# So we need to make sure that the `get_group_key` function returns the same value for all elements in the same group.
++
++# Let's try:
++def group_key_func(key):
++    if isinstance(key, Undefined):
++        return missing
++    return key
++
++grouped = groupby(sorted_keys, key=group_key_func)
++for k, v in grouped:
++    print(f"Group: {k}, Items: {list(v)}")
+diff --git a/test_sorting_logic_5.py b/test_sorting_logic_5.py
+new file mode 100644
+index 0000000..af5101b
+--- /dev/null
++++ b/test_sorting_logic_5.py
+@@ -0,0 +1,70 @@
++from jinja2.runtime import Undefined
++
++class Missing:
++    def __repr__(self):
++        return "missing"
++    def __eq__(self, other):
++        return isinstance(other, Missing)
++    def __hash__(self):
++        return hash(Missing)
++
++missing = Missing()
++
++def get_sort_key(key):
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++def get_group_key(key):
++    if isinstance(key, Undefined):
++        return missing
++    return key
++
++# The requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# Let's test this.
++# Falsy values: "", 0, False, None, [], {}, ()
++
++data = [
++    {"name": "a", "val": ""},
++    {"name": "b", "val": "z"},
++    {"name": "c", "val": 0},
++    {"name": "d", "val": None},
++    {"name": "e", "val": Undefined()},
++]
++
++# If include_empty=False, we should remove "", 0, False, None, [], {}, ()
++# Wait, the requirement says:
++# "False removes items whose resolved grouping key is falsy, after existing default substitution."
++# "True retains them."
++
++# So if I have a default, it's applied first.
++# If I have `default=None`, then `None` is still `None`.
++# If I have `default="default"`, then `None` becomes `"default"`.
++
++# Let's test this.
++def filter_items(item, expr, include_empty):
++    key = expr(item)
++    if include_empty:
++        return True
++    # Check if key is falsy
++    # But what about Undefined?
++    # The requirement says:
++    # "StrictUndefined retains its error behavior rather than silently becoming an ordinary missing key."
++    # So we should not check `bool(key)` if it's Undefined.
++    
++    if isinstance(key, Undefined):
++        return True # Should we keep Undefined if include_empty=False?
++        # The requirement says:
++        # "False removes items whose resolved grouping key is falsy"
++        # Is Undefined falsy?
++        # In Jinja2, Undefined is falsy.
++        # So it should be removed if include_empty=False.
++        
++    return bool(key)
++
++# Let's test this logic.
+diff --git a/test_sorting_logic_6.py b/test_sorting_logic_6.py
+new file mode 100644
+index 0000000..1821783
+--- /dev/null
++++ b/test_sorting_logic_6.py
+@@ -0,0 +1,46 @@
++from jinja2.runtime import Undefined
++
++class Missing:
++    def __repr__(self):
++        return "missing"
++    def __eq__(self, other):
++        return isinstance(other, Missing)
++    def __hash__(self):
++        return hash(Missing)
++
++missing = Missing()
++
++def get_sort_key(key):
++    if isinstance(key, Undefined):
++        return (2, 0)
++    if key is None:
++        return (1, 0)
++    return (0, key)
++
++def get_group_key(key):
++    if isinstance(key, Undefined):
++        return missing
++    return key
++
++# Let's test the sorting with mixed types that are not comparable.
++# The requirement says:
++# "Apart from the explicit None/Undefined rules, retained keys must be mutually orderable, even when falsy (for example mixing '' and 0 is outside scope)."
++# "No new cross-type ordering is required for other unrelated types."
++
++# So we don't need to worry about mixing '' and 0.
++# But we need to make sure that the sorting doesn't fail for the types we *do* support.
++
++# Let's test with a list of keys that are all strings.
++keys = ["", "z", "a"]
++sorted_keys = sorted(keys, key=get_sort_key)
++print("Sorted keys (strings):", sorted_keys)
++
++# Let's test with a list of keys that are all ints.
++keys = [0, 2, 1]
++sorted_keys = sorted(keys, key=get_sort_key)
++print("Sorted keys (ints):", sorted_keys)
++
++# Let's test with a list of keys that are mixed.
++# The requirement says:
++# "Apart from the explicit None/Undefined rules, retained keys must be mutually orderable"
++# So we don't need to support mixing strings and ints.
+diff --git a/test_strict_undefined_2.py b/test_strict_undefined_2.py
+new file mode 100644
+index 0000000..db5c99e
+--- /dev/null
++++ b/test_strict_undefined_2.py
+@@ -0,0 +1,7 @@
++from jinja2 import Environment, StrictUndefined
++env = Environment(undefined=StrictUndefined)
++u = env.undefined("missing")
++try:
++    print(bool(u))
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_strict_undefined_3.py b/test_strict_undefined_3.py
+new file mode 100644
+index 0000000..810b6fe
+--- /dev/null
++++ b/test_strict_undefined_3.py
+@@ -0,0 +1,26 @@
++from jinja2 import Environment, StrictUndefined
++from jinja2.filters import sync_do_groupby
++
++env = Environment(undefined=StrictUndefined)
++
++data = [
++    {"name": "a", "val": env.undefined("missing")},
++]
++
++# The `make_attrgetter` uses `environment.getitem`.
++# Let's see if `getitem` raises an error for `StrictUndefined`.
++# The `make_attrgetter` implementation:
++# def attrgetter(item: t.Any) -> t.Any:
++#     for part in parts:
++#         item = environment.getitem(item, part)
++#         if default is not None and isinstance(item, Undefined):
++#             item = default
++#     return item
++
++# If `item` is `StrictUndefined`, `environment.getitem` might raise an error.
++# Let's test `environment.getitem`.
++try:
++    val = env.getitem({"a": 1}, "b")
++    print("Val:", val)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_strict_undefined_4.py b/test_strict_undefined_4.py
+new file mode 100644
+index 0000000..98e1380
+--- /dev/null
++++ b/test_strict_undefined_4.py
+@@ -0,0 +1,16 @@
++from jinja2 import Environment, StrictUndefined
++from jinja2.filters import sync_do_groupby
++
++env = Environment(undefined=StrictUndefined)
++
++# If I try to access an attribute that doesn't exist, it should raise an error.
++data = [
++    {"name": "a"},
++]
++
++try:
++    # "val" doesn't exist in the dict.
++    result = sync_do_groupby(env, data, "val", include_empty=True)
++    print("Result:", result)
++except Exception as e:
++    print("Error:", e)
+diff --git a/test_strict_undefined_5.py b/test_strict_undefined_5.py
+new file mode 100644
+index 0000000..a4aaa6f
+--- /dev/null
++++ b/test_strict_undefined_5.py
+@@ -0,0 +1,18 @@
++from jinja2 import Environment, StrictUndefined
++from jinja2.filters import sync_do_groupby
++
++env = Environment(undefined=StrictUndefined)
++
++data = [
++    {"name": "a", "val": env.undefined("missing1")},
++    {"name": "b", "val": env.undefined("missing2")},
++]
++
++# If I treat them as normal keys, they will be grouped separately.
++# If I treat them as `_missing`, they will be grouped together.
++# The requirement says:
++# "StrictUndefined retains its error behavior rather than silently becoming an ordinary missing key."
++# If I group them together as `_missing`, I am "silently becoming an ordinary missing key".
++# So I should NOT group them together.
++
++# Let's modify `_get_group_key`.

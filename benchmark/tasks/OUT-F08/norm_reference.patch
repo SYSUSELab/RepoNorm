@@ -1,0 +1,424 @@
+diff --git a/docs/features/advanced/backends.md b/docs/features/advanced/backends.md
+index 84e222e1..2cbf7ea0 100644
+--- a/docs/features/advanced/backends.md
++++ b/docs/features/advanced/backends.md
+@@ -52,3 +52,12 @@ As mentioned previously, selecting the structured generation backend is only app
+ | JSON Schema | ✅ | ✅ | ✅ |
+ | Regex | ✅ | ✅ | ✅ |
+ | Grammar | ❌ | ✅ | ✅ |
++
++### Tracking XGrammar memory deltas
++
++The XGrammar processor factories can enable RSS-delta tracking with
++`track_memory_usage=True`. `get_memory_stats()` reports lifetime call, peak,
++and average statistics; `memory_history_limit` independently bounds the recent
++per-call history (`None` keeps all entries and zero keeps none). Sampling
++failures contribute a zero delta without interrupting generation. `reset()`
++clears the statistics and grammar state while preserving the tracking options.
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672d..4dcffee5 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,13 +1,16 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++import threading
++from typing import TYPE_CHECKING, Optional
++
++import psutil
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+ from outlines.models.transformers import Transformers
+ from outlines.processors.base_logits_processor import (
+     OutlinesLogitsProcessor,
+-    TensorType
++    TensorType,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -22,32 +25,116 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(
++        self,
++        compiled_grammar: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ):
+         """
+         Parameters
+         ----------
+         compiled_grammar: str
+             The compiled grammar to use to create the logits processor.
++        track_memory_usage: bool, optional
++            Whether to track memory usage during processing. Default is False.
++        memory_history_limit: int, optional
++            Maximum number of recent deltas to retain. ``None`` retains every
++            delta, and zero retains none. Lifetime aggregates are unaffected.
+ 
+         """
+         import xgrammar as xgr
+ 
++        if memory_history_limit is not None and (
++            type(memory_history_limit) is not int or memory_history_limit < 0
++        ):
++            raise ValueError(
++                "memory_history_limit must be a non-negative integer or None"
++            )
++
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+         self.xgrammar_logits_processor = None
++        self.track_memory_usage = track_memory_usage
++        self.memory_history_limit = memory_history_limit
++        self._memory_total = 0.0
++        self._memory_peak = 0.0
++        self._memory_calls = 0
++        self._memory_history: list[float] = []
++        self._memory_stats_lock = threading.Lock()
+         super().__init__("torch")
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+         self.xgrammar_logits_processor = None
++        with self._memory_stats_lock:
++            self._memory_total = 0.0
++            self._memory_peak = 0.0
++            self._memory_calls = 0
++            self._memory_history.clear()
++
++    def _get_memory_usage(self) -> Optional[float]:
++        """Get current memory usage in MB."""
++        try:
++            return psutil.Process().memory_info().rss / (1024**2)
++        except Exception:
++            return None
++
++    def _update_memory_stats(self, memory_mb: float) -> None:
++        """Update memory statistics."""
++        with self._memory_stats_lock:
++            self._memory_calls += 1
++            self._memory_total += memory_mb
++            self._memory_peak = max(self._memory_peak, memory_mb)
++            self._memory_history.append(memory_mb)
++            if self.memory_history_limit is not None:
++                excess = len(self._memory_history) - self.memory_history_limit
++                if excess > 0:
++                    del self._memory_history[:excess]
++
++    def get_memory_stats(self) -> dict[str, object]:
++        """Return a thread-safe copy of the memory statistics.
++
++        Returns
++        -------
++        dict
++            Lifetime call count, peak and average deltas, plus retained deltas
++            in call-completion order. Mutating the returned dictionary or list
++            does not affect the processor.
++        """
++        with self._memory_stats_lock:
++            average = (
++                self._memory_total / self._memory_calls if self._memory_calls else 0.0
++            )
++            return {
++                "peak_memory_mb": self._memory_peak,
++                "total_calls": self._memory_calls,
++                "avg_memory_per_call_mb": average,
++                "memory_history": self._memory_history.copy(),
++            }
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
++        if self.track_memory_usage:
++            memory_before = self._get_memory_usage()
++
+         if self.xgrammar_logits_processor is None:
+             self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+                 self.compiled_grammar
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++
++        result = self.xgrammar_logits_processor(input_ids, logits)  # type: ignore
++
++        if self.track_memory_usage:
++            memory_after = self._get_memory_usage()
++            delta = (
++                0.0
++                if memory_before is None or memory_after is None
++                else max(memory_after - memory_before, 0.0)
++            )
++            self._update_memory_stats(delta)
++
++        return result
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -65,21 +152,21 @@ class XGrammarBackend(BaseBackend):
+         from transformers import AutoConfig
+ 
+         if not isinstance(model, Transformers):
+-            raise ValueError(
+-                "The xgrammar backend only supports Transformers models"
+-            )
++            raise ValueError("The xgrammar backend only supports Transformers models")
+ 
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+-            model.hf_tokenizer,
+-            vocab_size=vocab_size
++            model.hf_tokenizer, vocab_size=vocab_size
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+-        self, json_schema: str
++        self,
++        json_schema: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
+     ) -> "LogitsProcessor":
+         """Create a logits processor from a JSON schema.
+ 
+@@ -87,6 +174,10 @@ class XGrammarBackend(BaseBackend):
+         ----------
+         json_schema: str
+             The JSON schema to create a logits processor from.
++        track_memory_usage: bool, optional
++            Whether to track memory usage during processing. Default is False.
++        memory_history_limit: int, optional
++            Number of recent per-call deltas to retain.
+ 
+         Returns
+         -------
+@@ -94,18 +185,27 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_json_schema(
+-            json_schema
++        compiled_grammar = self.grammar_compiler.compile_json_schema(json_schema)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, track_memory_usage, memory_history_limit
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self,
++        regex: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+         regex: str
+             The regex to create a logits processor from.
++        track_memory_usage: bool, optional
++            Whether to track memory usage during processing. Default is False.
++        memory_history_limit: int, optional
++            Number of recent per-call deltas to retain.
+ 
+         Returns
+         -------
+@@ -114,15 +214,26 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, track_memory_usage, memory_history_limit
++        )
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self,
++        grammar: str,
++        track_memory_usage: bool = False,
++        memory_history_limit: Optional[int] = None,
++    ) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+         grammar: str
+             The context-free grammar to create a logits processor from.
++        track_memory_usage: bool, optional
++            Whether to track memory usage during processing. Default is False.
++        memory_history_limit: int, optional
++            Number of recent per-call deltas to retain.
+ 
+         Returns
+         -------
+@@ -131,4 +242,6 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, track_memory_usage, memory_history_limit
++        )
+diff --git a/pyproject.toml b/pyproject.toml
+index af55d598..71d69fa4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -53,7 +53,7 @@ sglang = ["openai"]
+ tgi = ["huggingface_hub"]
+ transformers = ["accelerate", "datasets", "transformers"]
+ vllm = ["openai"]
+-xgrammar = ["xgrammar"]
++xgrammar = ["xgrammar", "psutil"]
+ llguidance = ["llguidance"]
+ test = [
+     "pre-commit",
+@@ -144,6 +144,8 @@ module = [
+     "diskcache.*",
+     "pydantic.*",
+     "pydantic_core.*",
++    "psutil",
++    "psutil.*",
+     "pytest",
+     "referencing.*",
+     "torch.*",
+diff --git a/tests/backends/test_xgrammar_contribution.py b/tests/backends/test_xgrammar_contribution.py
+new file mode 100644
+index 00000000..571b8868
+--- /dev/null
++++ b/tests/backends/test_xgrammar_contribution.py
+@@ -0,0 +1,129 @@
++from concurrent.futures import ThreadPoolExecutor
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from outlines.backends.xgrammar import XGrammarBackend, XGrammarLogitsProcessor
++
++
++def install_runtime(monkeypatch, readings):
++    primary = Mock(side_effect=lambda input_ids, logits: logits)
++    monkeypatch.setattr(
++        "xgrammar.contrib.hf.LogitsProcessor", Mock(return_value=primary)
++    )
++    memory_info = Mock(
++        side_effect=[SimpleNamespace(rss=value * 1024**2) for value in readings]
++    )
++    monkeypatch.setattr(
++        "outlines.backends.xgrammar.psutil.Process",
++        lambda: SimpleNamespace(memory_info=memory_info),
++    )
++    return primary, memory_info
++
++
++@pytest.mark.parametrize(
++    "limit,expected", [(None, [12.0, 3.0, 0.0, 5.0]), (0, []), (2, [0.0, 5.0])]
++)
++def test_history_window_keeps_lifetime_statistics(monkeypatch, limit, expected):
++    install_runtime(monkeypatch, [100, 112, 112, 115, 115, 114, 114, 119])
++    processor = XGrammarLogitsProcessor("grammar", True, limit)
++
++    for _ in range(4):
++        assert processor(torch.tensor([1]), torch.zeros(5)).shape == (5,)
++
++    stats = processor.get_memory_stats()
++    assert stats == {
++        "peak_memory_mb": 12.0,
++        "total_calls": 4,
++        "avg_memory_per_call_mb": 5.0,
++        "memory_history": expected,
++    }
++    stats["total_calls"] = 99
++    stats["memory_history"].append(99.0)
++    assert processor.get_memory_stats()["total_calls"] == 4
++    assert 99.0 not in processor.get_memory_stats()["memory_history"]
++
++    processor.reset()
++    assert processor.track_memory_usage is True
++    assert processor.memory_history_limit == limit
++    assert processor.get_memory_stats() == {
++        "peak_memory_mb": 0.0,
++        "total_calls": 0,
++        "avg_memory_per_call_mb": 0.0,
++        "memory_history": [],
++    }
++
++
++def test_sampling_and_processing_failures(monkeypatch):
++    primary, memory_info = install_runtime(monkeypatch, [0, 0, 0, 0])
++    memory_info.side_effect = [
++        OSError("before"),
++        SimpleNamespace(rss=10),
++        SimpleNamespace(rss=10),
++        OSError("after"),
++    ]
++    processor = XGrammarLogitsProcessor("grammar", True)
++    for _ in range(2):
++        processor(torch.tensor([[1]]), torch.zeros(1, 5))
++    assert processor.get_memory_stats()["memory_history"] == [0.0, 0.0]
++
++    error = ValueError("processing failed")
++    primary.side_effect = error
++    with pytest.raises(ValueError) as caught:
++        processor(torch.tensor([[1]]), torch.zeros(1, 5))
++    assert caught.value is error
++    assert processor.get_memory_stats()["total_calls"] == 2
++
++    disabled = XGrammarLogitsProcessor("grammar")
++    before = memory_info.call_count
++    primary.side_effect = lambda input_ids, logits: logits
++    disabled(torch.tensor([[1]]), torch.zeros(1, 5))
++    assert memory_info.call_count == before
++
++
++def test_public_statistics_updates_are_thread_safe(monkeypatch):
++    install_runtime(monkeypatch, [0] * 400)
++    processor = XGrammarLogitsProcessor("grammar", True, 3)
++
++    with ThreadPoolExecutor(max_workers=8) as executor:
++        list(
++            executor.map(
++                lambda _: processor(torch.tensor([[1]]), torch.zeros(1, 5)),
++                range(200),
++            )
++        )
++
++    assert processor.get_memory_stats() == {
++        "peak_memory_mb": 0.0,
++        "total_calls": 200,
++        "avg_memory_per_call_mb": 0.0,
++        "memory_history": [0.0, 0.0, 0.0],
++    }
++
++
++@pytest.mark.parametrize(
++    "factory,compile_method,source",
++    [
++        ("get_json_schema_logits_processor", "compile_json_schema", "{}"),
++        ("get_regex_logits_processor", "compile_regex", "a|b"),
++        ("get_cfg_logits_processor", "compile_grammar", 'root ::= "a"'),
++    ],
++)
++def test_factories_forward_memory_options(factory, compile_method, source):
++    backend = object.__new__(XGrammarBackend)
++    compiler = Mock()
++    setattr(compiler, compile_method, Mock(return_value="compiled"))
++    backend.grammar_compiler = compiler
++
++    processor = getattr(backend, factory)(source, True, 0)
++
++    assert processor.track_memory_usage is True
++    assert processor.memory_history_limit == 0
++
++
++@pytest.mark.parametrize("value", [-1, 1.5, True, "1"])
++def test_invalid_history_limits_are_rejected(value):
++    with pytest.raises(ValueError):
++        XGrammarLogitsProcessor("grammar", memory_history_limit=value)

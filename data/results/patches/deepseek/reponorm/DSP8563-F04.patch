@@ -1,0 +1,274 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..a975b2ba 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,12 @@
+ import asyncio
++import hashlib
+ import inspect
++import json
++import math
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, PrivateAttr, TypeAdapter, create_model
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -259,6 +262,22 @@ class ToolCalls(Type):
+         name: str
+         args: dict[str, Any]
+ 
++        _fingerprint: str = PrivateAttr()
++        _id: str = PrivateAttr()
++
++        def model_post_init(self, __context):
++            fp = _compute_tool_call_fingerprint(self.name, self.args)
++            object.__setattr__(self, '_fingerprint', fp)
++            object.__setattr__(self, '_id', fp[:8])
++
++        @property
++        def fingerprint(self) -> str:
++            return self._fingerprint
++
++        @property
++        def id(self) -> str:
++            return self._id
++
+     tool_calls: list[ToolCall]
+ 
+     @classmethod
+@@ -310,6 +329,47 @@ class ToolCalls(Type):
+         ]
+ 
+ 
++def _canonicalize_value(v: Any) -> Any:
++    """Recursively canonicalize a value for fingerprint computation.
++    
++    Sorts dictionary keys, converts tuples to lists, trims string whitespace,
++    rejects nonfinite numbers. Preserves numeric/boolean types and list order.
++    """
++    if isinstance(v, dict):
++        return {k: _canonicalize_value(v) for k, v in sorted(v.items())}
++    elif isinstance(v, tuple):
++        return [_canonicalize_value(item) for item in v]
++    elif isinstance(v, list):
++        return [_canonicalize_value(item) for item in v]
++    elif isinstance(v, str):
++        return v.strip()
++    elif isinstance(v, bool):
++        return v
++    elif isinstance(v, int):
++        return v
++    elif isinstance(v, float):
++        if not math.isfinite(v):
++            raise ValueError(f"Non-finite float value: {v}")
++        return v
++    elif v is None:
++        return None
++    else:
++        raise ValueError(f"Unsupported JSON value type for fingerprint: {type(v).__name__}")
++
++
++def _compute_tool_call_fingerprint(name: str, args: dict[str, Any]) -> str:
++    """Compute the SHA-256 fingerprint for a tool call.
++    
++    The fingerprint is the 64-character hexadecimal SHA-256 of the UTF-8
++    canonical JSON object {"name": name, "args": canonical_args}, using
++    sorted keys and compact comma/colon separators.
++    """
++    canonical_args = _canonicalize_value(args)
++    obj = {"name": name, "args": canonical_args}
++    json_str = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    return hashlib.sha256(json_str.encode("utf-8")).hexdigest()
++
++
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+ 
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..df390eb9 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,180 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# --- ToolCall fingerprint and id tests ---
++
++
++def test_tool_call_fingerprint_basic():
++    """Test that ToolCall has computed fingerprint and id attributes."""
++    tc = ToolCalls.ToolCall(name="search", args={"query": "hello"})
++    assert isinstance(tc.fingerprint, str)
++    assert len(tc.fingerprint) == 64
++    assert tc.fingerprint == "b54b691b00a1d207ee46f8c97b73513715eacb6105197ee731b59d51da7ccc39"
++    assert isinstance(tc.id, str)
++    assert len(tc.id) == 8
++    assert tc.id == "b54b691b"
++
++
++def test_tool_call_fingerprint_deterministic():
++    """Test that identical inputs produce identical fingerprints."""
++    tc1 = ToolCalls.ToolCall(name="search", args={"query": "hello"})
++    tc2 = ToolCalls.ToolCall(name="search", args={"query": "hello"})
++    assert tc1.fingerprint == tc2.fingerprint
++    assert tc1.id == tc2.id
++
++
++def test_tool_call_fingerprint_different_args():
++    """Test that different args produce different fingerprints."""
++    tc1 = ToolCalls.ToolCall(name="search", args={"query": "hello"})
++    tc2 = ToolCalls.ToolCall(name="search", args={"query": "world"})
++    assert tc1.fingerprint != tc2.fingerprint
++    assert tc1.id != tc2.id
++
++
++def test_tool_call_fingerprint_key_sorting():
++    """Test that args with different key order produce identical fingerprints."""
++    tc1 = ToolCalls.ToolCall(name="test", args={"z": 1, "a": 2, "m": 3})
++    tc2 = ToolCalls.ToolCall(name="test", args={"m": 3, "a": 2, "z": 1})
++    assert tc1.fingerprint == tc2.fingerprint
++
++
++def test_tool_call_fingerprint_string_trimming():
++    """Test that string values are trimmed before fingerprinting."""
++    tc1 = ToolCalls.ToolCall(name="test", args={"x": "  hello  "})
++    tc2 = ToolCalls.ToolCall(name="test", args={"x": "hello"})
++    assert tc1.fingerprint == tc2.fingerprint
++
++
++def test_tool_call_fingerprint_tuple_as_list():
++    """Test that tuples are treated as lists for fingerprinting."""
++    tc1 = ToolCalls.ToolCall(name="test", args={"items": (1, 2, 3)})
++    tc2 = ToolCalls.ToolCall(name="test", args={"items": [1, 2, 3]})
++    assert tc1.fingerprint == tc2.fingerprint
++
++
++def test_tool_call_fingerprint_list_order_preserved():
++    """Test that list order is preserved (different order = different fingerprint)."""
++    tc1 = ToolCalls.ToolCall(name="test", args={"items": [3, 1, 2]})
++    tc2 = ToolCalls.ToolCall(name="test", args={"items": [1, 2, 3]})
++    assert tc1.fingerprint != tc2.fingerprint
++
++
++def test_tool_call_fingerprint_bool_not_int():
++    """Test that bool True is distinct from int 1."""
++    tc1 = ToolCalls.ToolCall(name="test", args={"flag": True})
++    tc2 = ToolCalls.ToolCall(name="test", args={"flag": 1})
++    assert tc1.fingerprint != tc2.fingerprint
++
++
++def test_tool_call_fingerprint_from_dict_list():
++    """Test fingerprints are computed when created via from_dict_list."""
++    tcs = ToolCalls.from_dict_list([
++        {"name": "search", "args": {"query": "hello"}},
++        {"name": "translate", "args": {"text": "world"}},
++    ])
++    assert len(tcs.tool_calls) == 2
++    for tc in tcs.tool_calls:
++        assert isinstance(tc.fingerprint, str)
++        assert len(tc.fingerprint) == 64
++        assert isinstance(tc.id, str)
++        assert len(tc.id) == 8
++
++
++def test_tool_call_fingerprint_readonly():
++    """Test that fingerprint and id are read-only."""
++    tc = ToolCalls.ToolCall(name="test", args={"x": 1})
++    with pytest.raises(AttributeError):
++        tc.fingerprint = "xxx"
++    with pytest.raises(AttributeError):
++        tc.id = "xxx"
++
++
++def test_tool_call_fingerprint_excluded_from_dump():
++    """Test that fingerprint and id are excluded from model_dump."""
++    tc = ToolCalls.ToolCall(name="test", args={"x": 1})
++    dump = tc.model_dump()
++    assert "fingerprint" not in dump
++    assert "id" not in dump
++    assert "_fingerprint" not in dump
++    assert "_id" not in dump
++    assert list(dump.keys()) == ["name", "args"]
++
++
++def test_tool_call_fingerprint_excluded_from_format():
++    """Test that format does not include fingerprint or id."""
++    tcs = ToolCalls.from_dict_list([
++        {"name": "search", "args": {"query": "hello"}},
++    ])
++    fmt = tcs.format()
++    assert isinstance(fmt, list)
++    for entry in fmt:
++        assert "type" in entry
++        for tool_call in entry["tool_calls"]:
++            assert "type" in tool_call
++            assert "function" in tool_call
++            assert "fingerprint" not in tool_call
++            assert "id" not in tool_call
++
++
++def test_tool_call_fingerprint_no_mutation_recalc():
++    """Test that mutating name or args does not recalculate fingerprint."""
++    tc = ToolCalls.ToolCall(name="test", args={"x": 1})
++    original_fp = tc.fingerprint
++    original_id = tc.id
++    tc.name = "changed"
++    tc.args = {"y": 2}
++    assert tc.fingerprint == original_fp
++    assert tc.id == original_id
++
++
++def test_tool_call_fingerprint_nested_dicts():
++    """Test nested dictionary key sorting."""
++    tc1 = ToolCalls.ToolCall(name="test", args={"nested": {"b": 2, "a": 1}})
++    tc2 = ToolCalls.ToolCall(name="test", args={"nested": {"a": 1, "b": 2}})
++    assert tc1.fingerprint == tc2.fingerprint
++
++
++def test_tool_call_fingerprint_nested_mixed():
++    """Test nested structures: dicts inside lists, etc."""
++    tc = ToolCalls.ToolCall(name="test", args={
++        "items": [{"z": 3, "a": 1}, {"b": 2}],
++        "name": "  hello  ",
++    })
++    assert isinstance(tc.fingerprint, str)
++    assert len(tc.fingerprint) == 64
++    assert isinstance(tc.id, str)
++    assert len(tc.id) == 8
++
++
++def test_tool_call_fingerprint_rejects_nonfinite():
++    """Test that nonfinite float values raise ValueError."""
++    with pytest.raises(ValueError):
++        ToolCalls.ToolCall(name="test", args={"x": float("inf")})
++    with pytest.raises(ValueError):
++        ToolCalls.ToolCall(name="test", args={"x": float("nan")})
++    with pytest.raises(ValueError):
++        ToolCalls.ToolCall(name="test", args={"x": float("-inf")})
++
++
++def test_tool_call_fingerprint_rejects_nonjson():
++    """Test that non-JSON values in args raise ValueError."""
++    with pytest.raises(ValueError):
++        ToolCalls.ToolCall(name="test", args={"x": object()})
++
++
++def test_tool_call_fingerprint_empty_args():
++    """Test handling of empty args."""
++    tc = ToolCalls.ToolCall(name="get_time", args={})
++    assert isinstance(tc.fingerprint, str)
++    assert len(tc.fingerprint) == 64
++    assert isinstance(tc.id, str)
++    assert len(tc.id) == 8
++
++
++def test_tool_call_fingerprint_none_value():
++    """Test that None is a valid JSON value."""
++    tc = ToolCalls.ToolCall(name="test", args={"x": None})
++    assert isinstance(tc.fingerprint, str)
++    assert len(tc.fingerprint) == 64

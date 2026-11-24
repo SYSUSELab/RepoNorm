@@ -1,0 +1,326 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..c06d757 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -57,13 +57,14 @@ def make_attrgetter(
+     attribute: t.Optional[t.Union[str, int]],
+     postprocess: t.Optional[t.Callable[[t.Any], t.Any]] = None,
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> t.Callable[[t.Any], t.Any]:
+     """Returns a callable that looks up the given attribute from a
+     passed object with the rules of the environment.  Dots are allowed
+     to access attributes of attributes.  Integer parts in paths are
+     looked up as integers.
+     """
+-    parts = _prepare_attribute_parts(attribute)
++    parts = _prepare_attribute_parts(attribute, separator)
+ 
+     def attrgetter(item: t.Any) -> t.Any:
+         for part in parts:
+@@ -84,6 +85,7 @@ def make_multi_attrgetter(
+     environment: "Environment",
+     attribute: t.Optional[t.Union[str, int]],
+     postprocess: t.Optional[t.Callable[[t.Any], t.Any]] = None,
++    separator: str = ".",
+ ) -> t.Callable[[t.Any], t.List[t.Any]]:
+     """Returns a callable that looks up the given comma separated
+     attributes from a passed object with the rules of the environment.
+@@ -100,7 +102,7 @@ def make_multi_attrgetter(
+     else:
+         split = [attribute]
+ 
+-    parts = [_prepare_attribute_parts(item) for item in split]
++    parts = [_prepare_attribute_parts(item, separator) for item in split]
+ 
+     def attrgetter(item: t.Any) -> t.List[t.Any]:
+         items = [None] * len(parts)
+@@ -122,13 +124,16 @@ def make_multi_attrgetter(
+ 
+ 
+ def _prepare_attribute_parts(
+-    attr: t.Optional[t.Union[str, int]]
++    attr: t.Optional[t.Union[str, int]],
++    separator: str = ".",
+ ) -> t.List[t.Union[str, int]]:
+     if attr is None:
+         return []
+ 
+     if isinstance(attr, str):
+-        return [int(x) if x.isdigit() else x for x in attr.split(".")]
++        if not separator:
++            raise FilterArgumentError("separator must not be empty")
++        return [int(x) if x.isdigit() else x for x in attr.split(separator)]
+ 
+     return [attr]
+ 
+@@ -1163,6 +1168,7 @@ def sync_do_groupby(
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1208,8 +1214,11 @@ def sync_do_groupby(
+ 
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
++
++    .. versionchanged:: 2.12
++        Added the ``separator`` parameter.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
++    expr = make_attrgetter(environment, attribute, default=default, separator=separator)
+     return [
+         _GroupTuple(key, list(values))
+         for key, values in groupby(sorted(value, key=expr), expr)
+@@ -1222,8 +1231,9 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
++    expr = make_attrgetter(environment, attribute, default=default, separator=separator)
+     return [
+         _GroupTuple(key, await auto_to_list(values))
+         for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+@@ -1376,6 +1386,7 @@ def sync_do_map(
+     *,
+     attribute: str = ...,
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> t.Iterable:
+     ...
+ 
+@@ -1421,6 +1432,9 @@ def sync_do_map(
+     .. versionchanged:: 2.11.0
+         Added the ``default`` parameter.
+ 
++    .. versionchanged:: 2.12
++        Added the ``separator`` parameter.
++
+     .. versionadded:: 2.7
+     """
+     if value:
+@@ -1448,6 +1462,7 @@ def do_map(
+     *,
+     attribute: str = ...,
+     default: t.Optional[t.Any] = None,
++    separator: str = ".",
+ ) -> t.Iterable:
+     ...
+ 
+@@ -1656,13 +1671,16 @@ def prepare_map(
+     if not args and "attribute" in kwargs:
+         attribute = kwargs.pop("attribute")
+         default = kwargs.pop("default", None)
++        separator = kwargs.pop("separator", ".")
+ 
+         if kwargs:
+             raise FilterArgumentError(
+                 f"Unexpected keyword argument {next(iter(kwargs))!r}"
+             )
+ 
+-        func = make_attrgetter(context.environment, attribute, default=default)
++        func = make_attrgetter(
++            context.environment, attribute, default=default, separator=separator
++        )
+     else:
+         try:
+             name = args[0]
+diff --git a/tests/test_async_filters.py b/tests/test_async_filters.py
+index 5d4f332..fbadf2d 100644
+--- a/tests/test_async_filters.py
++++ b/tests/test_async_filters.py
+@@ -4,6 +4,7 @@ import pytest
+ from markupsafe import Markup
+ 
+ from jinja2 import Environment
++from jinja2.exceptions import FilterArgumentError
+ from jinja2.async_utils import auto_aiter
+ 
+ 
+@@ -251,3 +252,85 @@ def test_custom_async_iteratable_filter(env_async, items):
+     )
+     out = tmpl.render(items=items)
+     assert out == "0,1,2 .. 3,4,5"
++
++
++@mark_dualiter("items", lambda: [{"foo": "a", "bar": 1}, {"foo": "b", "bar": 2}, {"foo": "a", "bar": 3}])
++def test_groupby_separator_async(env_async, items):
++    # Default separator "." splits "foo" into ["foo"] -> works normally.
++    tmpl = env_async.from_string(
++        '{{ items()|groupby("foo")|list }}'
++    )
++    assert tmpl.render(items=items) == "[('a', [{'foo': 'a', 'bar': 1}, {'foo': 'a', 'bar': 3}]), ('b', [{'foo': 'b', 'bar': 2}])]"
++
++
++@mark_dualiter("items", lambda: [{"foo": {"bar": "a"}}, {"foo": {"bar": "b"}}])
++def test_groupby_literal_dot_with_separator_async(env_async, items):
++    # With separator="__", "foo__bar" splits into ["foo", "bar"]
++    # accessing item["foo"]["bar"]. A literal dot in the path is just a character.
++    tmpl = env_async.from_string(
++        '{{ items()|groupby("foo__bar", separator="__")|list }}'
++    )
++    assert tmpl.render(items=items) == "[('a', [{'foo': {'bar': 'a'}}]), ('b', [{'foo': {'bar': 'b'}}])]"
++
++
++@mark_dualiter("items", lambda: [{"foo": [{"name": "Alice"}]}, {"foo": [{"name": "Bob"}]}])
++def test_groupby_multi_char_separator_async(env_async, items):
++    # With separator="::", "foo::0::name" splits into ["foo", 0, "name"]
++    # accessing item["foo"][0]["name"].
++    tmpl = env_async.from_string(
++        '{{ items()|groupby("foo::0::name", separator="::")|list }}'
++    )
++    assert tmpl.render(items=items) == "[('Alice', [{'foo': [{'name': 'Alice'}]}]), ('Bob', [{'foo': [{'name': 'Bob'}]}])]"
++
++
++@mark_dualiter("items", lambda: [{"foo": "a"}, {"foo": "b"}])
++def test_groupby_empty_separator_async(env_async, items):
++    # Empty separator should raise FilterArgumentError on evaluation.
++    tmpl = env_async.from_string(
++        '{{ items()|groupby("foo", separator="")|list }}'
++    )
++    with pytest.raises(FilterArgumentError):
++        tmpl.render(items=items)
++
++
++@mark_dualiter("items", lambda: [{"foo": {"bar": "Alice"}}, {"foo": {"bar": "Bob"}}])
++def test_map_separator_async(env_async, items):
++    # Default separator="." works normally for nested attribute.
++    tmpl = env_async.from_string(
++        '{{ items()|map(attribute="foo.bar")|list }}'
++    )
++    assert tmpl.render(items=items) == "['Alice', 'Bob']"
++
++
++@mark_dualiter("items", lambda: [{"foo.bar": "val"}])
++def test_map_literal_dot_with_separator_async(env_async, items):
++    # With separator="__", ordinary dots are literal; "foo.bar" is not split.
++    tmpl = env_async.from_string(
++        "{{ items()|map(attribute=\"foo.bar\", separator=\"__\")|list }}"
++    )
++    assert tmpl.render(items=items) == "['val']"
++
++
++@mark_dualiter("items", lambda: [{"foo": [{"name": "Alice"}]}, {"foo": [{"name": "Bob"}]}])
++def test_map_multi_char_separator_async(env_async, items):
++    tmpl = env_async.from_string(
++        '{{ items()|map(attribute="foo::0::name", separator="::")|list }}'
++    )
++    assert tmpl.render(items=items) == "['Alice', 'Bob']"
++
++
++@mark_dualiter("items", lambda: [{"foo": "a"}, {"foo": "b"}])
++def test_map_empty_separator_async(env_async, items):
++    tmpl = env_async.from_string(
++        '{{ items()|map(attribute="foo", separator="")|list }}'
++    )
++    with pytest.raises(FilterArgumentError):
++        tmpl.render(items=items)
++
++
++@mark_dualiter("items", lambda: [1, 2, 3])
++def test_map_separator_pass_to_filter_async(env_async, items):
++    tmpl = env_async.from_string(
++        '{{ items()|map("format", separator="__")|list }}'
++    )
++    assert tmpl.render(items=items) == "['1', '2', '3']"
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+index 43ddf59..8ed10be 100644
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -714,6 +714,82 @@ class TestFilter:
+         assert test_list.render(users=users) == "lennon, edwards, None, ['smith', 'x']"
+         assert test_str.render(users=users) == "lennon, edwards, None, "
+ 
++    def test_groupby_separator(self, env):
++        # With separator='__', 'foo__bar' splits into ['foo', 'bar']
++        # accessing item['foo']['bar'].
++        tmpl = env.from_string(
++            "{{ items|groupby('foo__bar', separator='__')|list }}"
++        )
++        items = [{'foo': {'bar': 'a'}}, {'foo': {'bar': 'b'}}, {'foo': {'bar': 'a'}}]
++        assert tmpl.render(items=items) == "[('a', [{'foo': {'bar': 'a'}}, {'foo': {'bar': 'a'}}]), ('b', [{'foo': {'bar': 'b'}}])]"
++
++    def test_groupby_literal_dot_with_separator(self, env):
++        # With separator='__', a plain '.' is just a literal character.
++        # The path 'foo.bar' is not split and looks up item['foo.bar'].
++        tmpl = env.from_string(
++            "{{ items|groupby('foo.bar', separator='__')|list }}"
++        )
++        items = [{'foo.bar': 'x'}, {'foo.bar': 'y'}, {'foo.bar': 'x'}]
++        assert tmpl.render(items=items) == "[('x', [{'foo.bar': 'x'}, {'foo.bar': 'x'}]), ('y', [{'foo.bar': 'y'}])]"
++
++    def test_groupby_multi_char_separator(self, env):
++        # With separator='::', 'foo::0::name' splits into ['foo', 0, 'name']
++        # accessing item['foo'][0]['name'].
++        tmpl = env.from_string(
++            "{{ items|groupby('foo::0::name', separator='::')|list }}"
++        )
++        items = [{'foo': [{'name': 'Alice'}]}, {'foo': [{'name': 'Bob'}]}]
++        assert tmpl.render(items=items) == "[('Alice', [{'foo': [{'name': 'Alice'}]}]), ('Bob', [{'foo': [{'name': 'Bob'}]}])]"
++
++    def test_groupby_empty_separator(self, env):
++        with pytest.raises(TemplateRuntimeError):
++            env.from_string(
++                "{{ [1,2]|groupby('x', separator='')|list }}"
++            ).render()
++
++    def test_map_separator(self, env):
++        env = Environment()
++        # With separator='__', 'foo__bar' splits into ['foo', 'bar']
++        tmpl = env.from_string(
++            '{{ items|map(attribute="foo__bar", separator="__")|list }}'
++        )
++        items = [{'foo': {'bar': 'value'}}]
++        assert tmpl.render(items=items) == "['value']"
++
++    def test_map_literal_dot_with_separator(self, env):
++        env = Environment()
++        # With separator='__', a plain '.' is a literal.
++        # 'foo.bar' looks up item['foo.bar'].
++        tmpl = env.from_string(
++            '{{ items|map(attribute="foo.bar", separator="__")|list }}'
++        )
++        items = [{'foo.bar': 'val'}]
++        assert tmpl.render(items=items) == "['val']"
++
++    def test_map_multi_char_separator(self, env):
++        env = Environment()
++        tmpl = env.from_string(
++            '{{ items|map(attribute="foo::0::name", separator="::")|list }}'
++        )
++        items = [{'foo': [{'name': 'Alice'}]}, {'foo': [{'name': 'Bob'}]}]
++        assert tmpl.render(items=items) == "['Alice', 'Bob']"
++
++    def test_map_empty_separator(self, env):
++        env = Environment()
++        with pytest.raises(TemplateRuntimeError):
++            env.from_string(
++                "{{ [1]|map(attribute='x', separator='')|list }}"
++            ).render()
++
++    def test_map_separator_pass_to_filter(self, env):
++        # When map is used in filter-name mode, separator should be forwarded
++        # to the named filter as a keyword argument.
++        # Use format which accepts **kwargs so separator doesn't cause error.
++        tmpl = env.from_string(
++            '{{ [1, 2, 3]|map("format", separator="__")|list }}'
++        )
++        assert tmpl.render() == "['1', '2', '3']"
++
+     def test_simple_select(self, env):
+         env = Environment()
+         tmpl = env.from_string('{{ [1, 2, 3, 4, 5]|select("odd")|join("|") }}')
+@@ -734,6 +810,8 @@ class TestFilter:
+         tmpl = env.from_string('{{ [none, false, 0, 1, 2, 3, 4, 5]|reject|join("|") }}')
+         assert tmpl.render() == "None|False|0"
+ 
++
++
+     def test_simple_select_attr(self, env):
+         User = namedtuple("User", "name,is_active")
+         env = Environment()

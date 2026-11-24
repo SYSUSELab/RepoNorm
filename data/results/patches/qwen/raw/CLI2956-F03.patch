@@ -1,0 +1,508 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..988ab30 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -90,7 +90,20 @@ def _check_nested_chain(
+ 
+ 
+ def batch(iterable: cabc.Iterable[V], batch_size: int) -> list[tuple[V, ...]]:
+-    return list(zip(*repeat(iter(iterable), batch_size), strict=False))
++    """Group an iterable into batches of at most batch_size items."""
++    result: list[tuple[V, ...]] = []
++    iterator = iter(iterable)
++    while True:
++        batch_items: list[V] = []
++        for _ in range(batch_size):
++            try:
++                batch_items.append(next(iterator))
++            except StopIteration:
++                if batch_items:
++                    result.append(tuple(batch_items))
++                return result
++        result.append(tuple(batch_items))
++    return result  # type: ignore[return-value]
+ 
+ 
+ @contextmanager
+@@ -2027,6 +2040,12 @@ class Parameter:
+                         its deprecation in --help. The message can be customized
+                         by using a string as the value. A deprecated parameter
+                         cannot be required, a ValueError will be raised otherwise.
++    :param batch_size: If set, group multiple values into batches of at most
++                       this size. Only valid with ``multiple=True``. After
++                       normal type conversion and callback processing, the
++                       final ordered tuple is grouped into an outer tuple of
++                       non-empty tuple batches. Empty input produces ``()``.
++                       Must be a positive integer; booleans are rejected.
+ 
+     .. versionchanged:: 8.2.0
+         Introduction of ``deprecated``.
+@@ -2091,6 +2110,7 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        batch_size: int | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2139,7 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.batch_size = batch_size
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2354,6 +2375,10 @@ class Parameter:
+         if self.callback is not None:
+             value = self.callback(ctx, self, value)
+ 
++        # Apply batching if batch_size is set
++        if self.batch_size is not None and self.multiple:
++            value = tuple(batch(value, self.batch_size))
++
+         return value
+ 
+     def resolve_envvar_value(self, ctx: Context) -> str | None:
+@@ -2549,14 +2574,28 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        batch_size: int | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+             help = inspect.cleandoc(help)
+ 
+         default_is_missing = "default" not in attrs
++        
++        # Validate batch_size
++        if batch_size is not None:
++            if isinstance(batch_size, bool):
++                raise TypeError("batch_size must be an integer, not a boolean")
++            if not isinstance(batch_size, int):
++                raise TypeError("batch_size must be an integer")
++            if batch_size <= 0:
++                raise ValueError("batch_size must be a positive integer")
++            if not multiple:
++                raise TypeError("batch_size is only valid with multiple=True")
++        
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls, type=type, multiple=multiple, deprecated=deprecated, 
++            batch_size=batch_size, **attrs
+         )
+ 
+         if prompt is True:
+diff --git a/test_batch.py b/test_batch.py
+new file mode 100644
+index 0000000..93f8049
+--- /dev/null
++++ b/test_batch.py
+@@ -0,0 +1,108 @@
++import click
++from click.testing import CliRunner
++
++runner = CliRunner()
++
++# Test basic batching with multiple=True
++@click.command()
++@click.option("--item", multiple=True, batch_size=2)
++def cli(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli, ["--item", "a", "--item", "b", "--item", "c", "--item", "d", "--item", "e"])
++print("Test 1 - Basic batching:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with empty input
++@click.command()
++@click.option("--item", multiple=True, batch_size=2)
++def cli_empty(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_empty, [])
++print("Test 2 - Empty input:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with single value
++@click.command()
++@click.option("--item", multiple=True, batch_size=2)
++def cli_single(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_single, ["--item", "a"])
++print("Test 3 - Single value:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test preserving special values (0, False, "", None)
++@click.command()
++@click.option("--val", type=int, multiple=True, batch_size=2)
++def cli_special(val):
++    click.echo(f"val={val}")
++
++result = runner.invoke(cli_special, ["--val", "0", "--val", "-1", "--val", "5"])
++print("Test 4 - Special values (0, -1, 5):")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test batch_size without multiple=True should raise TypeError
++try:
++    @click.command()
++    @click.option("--item", batch_size=2)
++    def cli_no_multiple(item):
++        pass
++    print("Test 5 - Should have raised TypeError!")
++except TypeError as e:
++    print(f"Test 5 - Correctly raised TypeError: {e}")
++print()
++
++# Test non-positive batch_size should raise ValueError
++try:
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=0)
++    def cli_zero_batch(item):
++        pass
++    print("Test 6 - Should have raised ValueError!")
++except ValueError as e:
++    print(f"Test 6 - Correctly raised ValueError: {e}")
++print()
++
++# Test boolean batch_size should raise TypeError
++try:
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=True)
++    def cli_bool_batch(item):
++        pass
++    print("Test 7 - Should have raised TypeError!")
++except TypeError as e:
++    print(f"Test 7 - Correctly raised TypeError: {e}")
++print()
++
++# Test non-integer batch_size should raise TypeError
++try:
++    @click.command()
++    @click.option("--item", multiple=True, batch_size="2")
++    def cli_str_batch(item):
++        pass
++    print("Test 8 - Should have raised TypeError!")
++except TypeError as e:
++    print(f"Test 8 - Correctly raised TypeError: {e}")
++print()
++
++# Test batch_size=None preserves existing behavior
++@click.command()
++@click.option("--item", multiple=True, batch_size=None)
++def cli_none_batch(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_none_batch, ["--item", "a", "--item", "b", "--item", "c"])
++print("Test 9 - batch_size=None (no batching):")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
+diff --git a/test_batch2.py b/test_batch2.py
+new file mode 100644
+index 0000000..438c668
+--- /dev/null
++++ b/test_batch2.py
+@@ -0,0 +1,103 @@
++import click
++from click.testing import CliRunner
++
++runner = CliRunner()
++
++# Test with False values
++@click.command()
++@click.option("--val", type=bool, multiple=True, batch_size=2)
++def cli_false(val):
++    click.echo(f"val={val}")
++
++result = runner.invoke(cli_false, ["--val", "true", "--val", "false", "--val", "true"])
++print("Test - False values:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with empty string values
++@click.command()
++@click.option("--val", type=str, multiple=True, batch_size=2)
++def cli_empty_str(val):
++    click.echo(f"val={val}")
++
++result = runner.invoke(cli_empty_str, ["--val", "", "--val", "hello", "--val", ""])
++print("Test - Empty string values:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with None values (using nargs=1 and multiple)
++@click.command()
++@click.option("--val", type=str, multiple=True, nargs=1, batch_size=2)
++def cli_none(val):
++    click.echo(f"val={val}")
++
++result = runner.invoke(cli_none, ["--val", "a", "--val", "b"])
++print("Test - Normal values:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test batch_size=1
++@click.command()
++@click.option("--item", multiple=True, batch_size=1)
++def cli_batch1(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_batch1, ["--item", "a", "--item", "b", "--item", "c"])
++print("Test - batch_size=1:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test batch_size larger than input
++@click.command()
++@click.option("--item", multiple=True, batch_size=10)
++def cli_large_batch(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_large_batch, ["--item", "a", "--item", "b"])
++print("Test - batch_size larger than input:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with callback
++def my_callback(ctx, param, value):
++    return tuple(x.upper() for x in value)
++
++@click.command()
++@click.option("--item", multiple=True, batch_size=2, callback=my_callback)
++def cli_callback(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_callback, ["--item", "a", "--item", "b", "--item", "c"])
++print("Test - With callback:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with default values
++@click.command()
++@click.option("--item", multiple=True, batch_size=2, default=("x", "y"))
++def cli_default(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_default, [])
++print("Test - With default values:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
++
++# Test with nargs > 1 and multiple
++@click.command()
++@click.option("--item", type=(str, int), multiple=True, batch_size=2)
++def cli_nargs(item):
++    click.echo(f"item={item}")
++
++result = runner.invoke(cli_nargs, ["--item", "a", "1", "--item", "b", "2", "--item", "c", "3"])
++print("Test - With nargs > 1 and multiple:")
++print(result.output)
++print(f"Exit code: {result.exit_code}")
++print()
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..f413c35 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,184 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++# Tests for batch_size parameter
++def test_batch_size_basic(runner):
++    """Test basic batching functionality."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=2)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b", "--item", "c", "--item", "d", "--item", "e"])
++    assert not result.exception
++    assert result.output == "item=(('a', 'b'), ('c', 'd'), ('e',)))\n"
++
++
++def test_batch_size_empty_input(runner):
++    """Test empty input produces empty tuple."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=2)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert result.output == "item=()\n"
++
++
++def test_batch_size_single_value(runner):
++    """Test single value produces one batch."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=2)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a"])
++    assert not result.exception
++    assert result.output == "item=(('a',),))\n"
++
++
++def test_batch_size_one(runner):
++    """Test batch_size=1 produces individual batches."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=1)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b", "--item", "c"])
++    assert not result.exception
++    assert result.output == "item=(('a',), ('b',), ('c',)))\n"
++
++
++def test_batch_size_larger_than_input(runner):
++    """Test batch_size larger than input produces single batch."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=10)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b"])
++    assert not result.exception
++    assert result.output == "item=(('a', 'b'),))\n"
++
++
++def test_batch_size_with_callback(runner):
++    """Test batching works with callback."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=2, callback=lambda ctx, param, v: tuple(x.upper() for x in v))
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b", "--item", "c"])
++    assert not result.exception
++    assert result.output == "item=(('A', 'B'), ('C',)))\n"
++
++
++def test_batch_size_with_default(runner):
++    """Test batching works with default values."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=2, default=("x", "y"))
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert result.output == "item=(('x', 'y'),))\n"
++
++
++def test_batch_size_decorator(runner):
++    """Test batching with decorator syntax."""
++    @click.command()
++    @click.option("-i", "--item", multiple=True, batch_size=2)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["-i", "a", "-i", "b", "-i", "c"])
++    assert not result.exception
++    assert result.output == "item=(('a', 'b'), ('c',)))\n"
++
++
++def test_batch_size_special_values(runner):
++    """Test batching preserves special values like 0, False, empty string."""
++    @click.command()
++    @click.option("--val", multiple=True, type=int, batch_size=2)
++    def cli(val):
++        click.echo(f"val={val}")
++
++    result = runner.invoke(cli, ["--val", "0", "--val", "-1", "--val", "5"])
++    assert not result.exception
++    assert result.output == "val=((0, -1), (5,))\n"
++
++
++def test_batch_size_no_multiple_error(runner):
++    """Test that batch_size without multiple raises TypeError."""
++    with pytest.raises(TypeError, match="batch_size is only valid with multiple=True"):
++        click.Option(["--item"], batch_size=2)
++
++
++def test_batch_size_non_positive_error(runner):
++    """Test that non-positive batch_size raises ValueError."""
++    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
++        click.Option(["--item"], multiple=True, batch_size=0)
++
++
++def test_batch_size_boolean_error(runner):
++    """Test that boolean batch_size raises TypeError."""
++    with pytest.raises(TypeError, match="batch_size must be an integer, not a boolean"):
++        click.Option(["--item"], multiple=True, batch_size=True)
++
++
++def test_batch_size_non_int_error(runner):
++    """Test that non-integer batch_size raises TypeError."""
++    with pytest.raises(TypeError, match="batch_size must be an integer"):
++        click.Option(["--item"], multiple=True, batch_size="2")
++
++
++def test_batch_size_none_no_batching(runner):
++    """Test that batch_size=None preserves existing behavior."""
++    @click.command()
++    @click.option("--item", multiple=True, batch_size=None)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a", "--item", "b", "--item", "c"])
++    assert not result.exception
++    assert result.output == "item=('a', 'b', 'c')\n"
++
++
++def test_batch_size_false_values(runner):
++    """Test batching preserves False values."""
++    @click.command()
++    @click.option("--val", multiple=True, type=bool, batch_size=2)
++    def cli(val):
++        click.echo(f"val={val}")
++
++    result = runner.invoke(cli, ["--val", "True", "--val", "False", "--val", "True"])
++    assert not result.exception
++    assert result.output == "val=((True, False), (True,))\n"
++
++
++def test_batch_size_empty_string_values(runner):
++    """Test batching preserves empty string values."""
++    @click.command()
++    @click.option("--val", multiple=True, batch_size=2)
++    def cli(val):
++        click.echo(f"val={val}")
++
++    result = runner.invoke(cli, ["--val", "", "--val", "hello", "--val", ""])
++    assert not result.exception
++    assert result.output == "val=(('', 'hello'), ('',))\n"
++
++
++def test_batch_size_nargs(runner):
++    """Test batching with nargs > 1 and multiple."""
++    @click.command()
++    @click.option("--item", multiple=True, nargs=2, batch_size=2)
++    def cli(item):
++        click.echo(f"item={item}")
++
++    result = runner.invoke(cli, ["--item", "a", "1", "--item", "b", "2", "--item", "c", "3"])
++    assert not result.exception
++    assert result.output == "item=((('a', '1'), ('b', '2')), (('c', '3'),))\n"

@@ -1,0 +1,149 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..f49474fa 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -58,6 +58,13 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        
++        # Initialize cache statistics counters
++        self._hits = 0
++        self._mem_hits = 0
++        self._disk_hits = 0
++        self._misses = 0
++        self._stats_lock = threading.Lock()
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
+@@ -101,18 +108,28 @@ class Cache:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+             logger.debug(f"Failed to generate cache key for request: {request}")
++            with self._stats_lock:
++                self._misses += 1
+             return None
+ 
+         if self.enable_memory_cache and key in self.memory_cache:
+             with self._lock:
+                 response = self.memory_cache[key]
++            with self._stats_lock:
++                self._mem_hits += 1
++                self._hits += 1
+         elif self.enable_disk_cache and key in self.disk_cache:
+             # Found on disk but not in memory cache, add to memory cache
+             response = self.disk_cache[key]
+             if self.enable_memory_cache:
+                 with self._lock:
+                     self.memory_cache[key] = response
++            with self._stats_lock:
++                self._disk_hits += 1
++                self._hits += 1
+         else:
++            with self._stats_lock:
++                self._misses += 1
+             return None
+ 
+         response = copy.deepcopy(response)
+@@ -168,6 +185,29 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    def stats(self) -> Dict[str, int]:
++        """Return a fresh dictionary with cache statistics.
++        
++        Returns:
++            A dictionary with integer keys 'hits', 'mem_hits', 'disk_hits', 'misses'.
++            hits equals mem_hits plus disk_hits.
++        """
++        with self._stats_lock:
++            return {
++                "hits": self._hits,
++                "mem_hits": self._mem_hits,
++                "disk_hits": self._disk_hits,
++                "misses": self._misses,
++            }
++
++    def reset_stats(self) -> None:
++        """Reset all cache statistics counters without clearing cache entries."""
++        with self._stats_lock:
++            self._hits = 0
++            self._mem_hits = 0
++            self._disk_hits = 0
++            self._misses = 0
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+diff --git a/dspy/primitives/prediction.py b/dspy/primitives/prediction.py
+index 670b816b..ebd8faad 100644
+--- a/dspy/primitives/prediction.py
++++ b/dspy/primitives/prediction.py
+@@ -10,6 +10,7 @@ class Prediction(Example):
+ 
+         self._completions = None
+         self._lm_usage = None
++        self._cache_usage = None
+ 
+     def get_lm_usage(self):
+         return self._lm_usage
+@@ -17,6 +18,18 @@ class Prediction(Example):
+     def set_lm_usage(self, value):
+         self._lm_usage = value
+ 
++    def get_cache_usage(self):
++        """Return the cache usage snapshot attached to this prediction.
++        
++        Returns:
++            A dictionary with cache statistics or None if no cache usage was tracked.
++        """
++        return self._cache_usage
++
++    def set_cache_usage(self, value):
++        """Set the cache usage snapshot for this prediction."""
++        self._cache_usage = value
++
+     @classmethod
+     def from_completions(cls, list_or_dict, signature=None):
+         obj = cls()
+@@ -32,7 +45,7 @@ class Prediction(Example):
+             return f"Prediction(\n    {store_repr}\n)"
+ 
+         num_completions = len(self._completions)
+-        return f"Prediction(\n    {store_repr},\n    completions=Completions(...)\n) ({num_completions-1} completions omitted)"
++        return f"Prediction(\n    {store_repr},\n    completions=Completions(...)\\n) ({num_completions-1} completions omitted)"
+ 
+     def __str__(self):
+         return self.__repr__()
+diff --git a/dspy/primitives/program.py b/dspy/primitives/program.py
+index 39457c36..6517f043 100644
+--- a/dspy/primitives/program.py
++++ b/dspy/primitives/program.py
+@@ -59,6 +59,13 @@ class Module(BaseModule, metaclass=ProgramMeta):
+                 with track_usage() as usage_tracker:
+                     output = self.forward(*args, **kwargs)
+                 output.set_lm_usage(usage_tracker.get_total_tokens())
++                
++                # Attach cache usage snapshot if available
++                if hasattr(output, 'set_cache_usage'):
++                    import dspy
++                    cache_stats = dspy.cache.stats()
++                    output.set_cache_usage(cache_stats)
++                
+                 return output
+ 
+             return self.forward(*args, **kwargs)
+@@ -74,6 +81,13 @@ class Module(BaseModule, metaclass=ProgramMeta):
+                 with track_usage() as usage_tracker:
+                     output = await self.aforward(*args, **kwargs)
+                     output.set_lm_usage(usage_tracker.get_total_tokens())
++                    
++                    # Attach cache usage snapshot if available
++                    if hasattr(output, 'set_cache_usage'):
++                        import dspy
++                        cache_stats = dspy.cache.stats()
++                        output.set_cache_usage(cache_stats)
++                    
+                     return output
+ 
+             return await self.aforward(*args, **kwargs)

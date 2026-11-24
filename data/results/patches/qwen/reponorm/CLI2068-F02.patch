@@ -1,0 +1,221 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..474fa26 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -1,6 +1,7 @@
+ """
+ This module contains implementations for the termui module. To keep the
+ import time of Click down, some infrequently used functionality is
++import signal
+ placed in this module and only imported as needed.
+ """
+ 
+@@ -485,11 +486,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        timeout: int | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.timeout = timeout
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -516,8 +519,42 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            # Use process group for proper cleanup on timeout
++            kwargs: dict[str, t.Any] = {"env": environ, "shell": True}
++            if WIN:
++                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
++            else:
++                kwargs["preexec_fn"] = os.setsid
++
++            c = subprocess.Popen(f"{editor} \"{filename}\"", **kwargs)
++            try:
++                exit_code = c.wait(timeout=self.timeout)
++            except subprocess.TimeoutExpired:
++                # Request termination of the editor session
++                if WIN:
++                    c.send_signal(signal.CTRL_BREAK_EVENT)
++                else:
++                    try:
++                        os.killpg(os.getpgid(c.pid), signal.SIGTERM)
++                    except ProcessLookupError:
++                        pass
++                try:
++                    c.wait(timeout=1)
++                except subprocess.TimeoutExpired:
++                    # Forcefully stop the session
++                    if WIN:
++                        c.kill()
++                    else:
++                        try:
++                            os.killpg(os.getpgid(c.pid), signal.SIGKILL)
++                        except ProcessLookupError:
++                            pass
++                    c.wait()
++                raise ClickException(
++                    _("{editor}: Editing timed out after {timeout} seconds").format(
++                        editor=editor, timeout=self.timeout
++                    )
++                )
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..53bc634 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    timeout: int | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,22 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param timeout: if provided, the maximum number of seconds to wait for
++                    the editor to complete.  If the editor does not complete
++                    within this time, a :exc:`ClickException` is raised.
++                    Use ``None`` to wait indefinitely (the default).
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    if timeout is not None:
++        if isinstance(timeout, bool) or not isinstance(timeout, int):
++            raise ValueError("timeout must be an integer")
++        if timeout <= 0:
++            raise ValueError("timeout must be a positive integer")
++
++    ed = Editor(
++        editor=editor, env=env, require_save=require_save, extension=extension, timeout=timeout
++    )
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..bf319f8 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,109 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++
++class TestEditTimeout:
++    """Tests for the timeout parameter in click.edit."""
++
++    def test_timeout_none_allows_indefinite(self, monkeypatch):
++        """timeout=None should allow editor to run indefinitely (default behavior)."""
++        called = []
++
++        def mock_edit(text):
++            called.append(True)
++            return text
++
++        from click._termui_impl import Editor
++
++        ed = Editor(editor="cat", timeout=None)
++        ed.edit = mock_edit
++        result = ed.edit("test")
++        assert result == "test"
++        assert len(called) == 1
++
++    def test_timeout_zero_raises_valueerror(self):
++        """timeout=0 should raise ValueError before editor starts."""
++        with pytest.raises(ValueError, match="timeout must be a positive integer"):
++            click.edit("test", timeout=0)
++
++    def test_timeout_negative_raises_valueerror(self):
++        """timeout=-1 should raise ValueError before editor starts."""
++        with pytest.raises(ValueError, match="timeout must be a positive integer"):
++            click.edit("test", timeout=-1)
++
++    def test_timeout_float_raises_valueerror(self):
++        """timeout as float should raise ValueError before editor starts."""
++        with pytest.raises(ValueError, match="timeout must be an integer"):
++            click.edit("test", timeout=1.5)
++
++    def test_timeout_string_raises_valueerror(self):
++        """timeout as string should raise ValueError before editor starts."""
++        with pytest.raises(ValueError, match="timeout must be an integer"):
++            click.edit("test", timeout="1")
++
++    def test_timeout_boolean_raises_valueerror(self):
++        """timeout as boolean should raise ValueError before editor starts."""
++        with pytest.raises(ValueError, match="timeout must be an integer"):
++            click.edit("test", timeout=True)
++
++    def test_timeout_valid_integer_does_not_raise(self):
++        """Valid positive integer timeout should not raise."""
++        # This would actually try to launch an editor, so we just check it doesn't
++        # raise during validation by testing the internal logic
++        from click._termui_impl import Editor
++
++        ed = Editor(editor="cat", timeout=5)
++        assert ed.timeout == 5
++
++    @pytest.mark.parametrize(
++        ("timeout", "expected_msg"),
++        [
++            (1, "after 1 seconds"),
++            (2, "after 2 seconds"),
++            (999, "after 999 seconds"),
++        ],
++    )
++    def test_timeout_error_message_format(self, timeout, expected_msg, monkeypatch):
++        """Error message should use correct format without pluralization."""
++        from click._termui_impl import Editor
++
++        ed = Editor(editor="fake_editor", timeout=timeout)
++
++        # Mock subprocess.Popen to simulate timeout
++        import subprocess
++        import os
++
++        call_count = [0]
++
++        class MockProcess:
++            pid = 12345
++
++            def wait(self, timeout=None):
++                call_count[0] += 1
++                if call_count[0] == 1:
++                    # First call is with the actual timeout
++                    raise subprocess.TimeoutExpired(cmd="fake_editor", timeout=timeout)
++                else:
++                    # Second call is for graceful shutdown (timeout=1), succeed
++                    return 0
++
++            def terminate(self):
++                pass
++
++            def kill(self):
++                pass
++
++        def mock_killpg(pid, sig):
++            pass
++
++        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: MockProcess())
++        monkeypatch.setattr(os, "killpg", mock_killpg)
++
++        with pytest.raises(click.ClickException) as exc_info:
++            ed.edit_file("/tmp/test.txt")
++
++        assert expected_msg in str(exc_info.value)
++        assert f"fake_editor: Editing timed out after {timeout} seconds" == str(
++            exc_info.value
++        )

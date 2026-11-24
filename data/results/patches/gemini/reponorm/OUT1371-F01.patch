@@ -1,0 +1,364 @@
+diff --git a/outlines/prompts.py b/outlines/prompts.py
+index 86519ad..a84fb0c 100644
+--- a/outlines/prompts.py
++++ b/outlines/prompts.py
+@@ -4,7 +4,7 @@ import json
+ import os
+ import re
+ import textwrap
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Dict, Optional, Type, cast
+ 
+@@ -14,24 +14,16 @@ import pydantic
+ 
+ @dataclass
+ class Prompt:
+-    """Represents a prompt function.
+-
+-    We return a `Prompt` class instead of a simple function so the
+-    template defined in prompt functions can be accessed.
+-
+-    """
++    """Represents a prompt function."""
+ 
+     template: jinja2.Template
+     signature: Optional[inspect.Signature]
++    filters: Dict[str, Callable] = field(default_factory=dict)
++    source_type: str = "str"
++    source_content: str = ""
++    source_path: Optional[Path] = None
+ 
+     def __call__(self, *args, **kwargs) -> str:
+-        """Render and return the template.
+-
+-        Returns
+-        -------
+-        The rendered template as a Python ``str``.
+-
+-        """
+         if self.signature is not None:
+             bound_arguments = self.signature.bind(*args, **kwargs)
+             bound_arguments.apply_defaults()
+@@ -40,76 +32,71 @@ class Prompt:
+             return self.template.render(**kwargs)
+ 
+     @classmethod
+-    def from_str(cls, content: str):
+-        """
+-        Create an instance of the class from a string.
+-
+-        Parameters
+-        ----------
+-        content : str
+-            The string content to be converted into a template.
+-
+-        Returns
+-        -------
+-        An instance of the class with the provided content as a template.
+-        """
+-        return cls(cls._template_from_str(content), None)
+-
+-    @classmethod
+-    def from_file(cls, path: Path):
+-        """
+-        Create a Prompt instance from a file containing a Jinja template.
+-
+-        Note: This method does not allow to include and inheritance to reference files
+-        that are outside the folder or subfolders of the file given to `from_file`.
+-
+-        Parameters
+-        ----------
+-        path : Path
+-            The path to the file containing the Jinja template.
+-
+-        Returns
+-        -------
+-        Prompt
+-            An instance of the Prompt class with the template loaded from the file.
+-        """
+-        # We don't use a `Signature` here because it seems not feasible to infer one from a Jinja2 environment that is
+-        # split across multiple files (since e.g. we support features like Jinja2 includes and template inheritance)
+-        return cls(cls._template_from_file(path), None)
++    def from_str(cls, content: str, filters: Optional[Dict[str, Callable]] = None):
++        filters = filters or {}
++        return cls(
++            cls._template_from_str(content, filters),
++            None,
++            filters,
++            source_type="str",
++            source_content=content,
++        )
+ 
+     @classmethod
+-    def _template_from_str(_, content: str) -> jinja2.Template:
+-        # Dedent, and remove extra linebreak
+-        cleaned_template = inspect.cleandoc(content)
+-
+-        # Add linebreak if there were any extra linebreaks that
+-        # `cleandoc` would have removed
+-        ends_with_linebreak = content.replace(" ", "").endswith("\n\n")
+-        if ends_with_linebreak:
+-            cleaned_template += "\n"
++    def from_file(cls, path: Path, filters: Optional[Dict[str, Callable]] = None):
++        filters = filters or {}
++        return cls(
++            cls._template_from_file(path, filters),
++            None,
++            filters,
++            source_type="file",
++            source_path=path,
++        )
+ 
+-        # Remove extra whitespaces, except those that immediately follow a newline symbol.
+-        # This is necessary to avoid introducing whitespaces after backslash `\` characters
+-        # used to continue to the next line without linebreak.
+-        cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
++    def with_filters(self, filters: Optional[Dict[str, Callable]] = None):
++        new_filters = self.filters.copy()
++        if filters:
++            new_filters.update(filters)
++        
++        if self.source_type == "str":
++            return Prompt(self._template_from_str(self.source_content, new_filters), self.signature, new_filters, source_type="str", source_content=self.source_content)
++        else:
++            return Prompt(self._template_from_file(self.source_path, new_filters), self.signature, new_filters, source_type="file", source_path=self.source_path)
+ 
++    @classmethod
++    def _get_env(cls, filters: Dict[str, Callable]) -> jinja2.Environment:
+         env = jinja2.Environment(
+             trim_blocks=True,
+             lstrip_blocks=True,
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        
++        # Set default filters
+         env.filters["name"] = get_fn_name
+         env.filters["description"] = get_fn_description
+         env.filters["source"] = get_fn_source
+         env.filters["signature"] = get_fn_signature
+         env.filters["schema"] = get_schema
+         env.filters["args"] = get_fn_args
++        
++        # Apply custom filters
++        env.filters.update(filters)
++        return env
++
++    @classmethod
++    def _template_from_str(_, content: str, filters: Dict[str, Callable]) -> jinja2.Template:
++        cleaned_template = inspect.cleandoc(content)
++        ends_with_linebreak = content.replace(" ", "").endswith("\n\n")
++        if ends_with_linebreak:
++            cleaned_template += "\n"
++        cleaned_template = re.sub(r"(?![\r\n])(\b\s+)", " ", cleaned_template)
+ 
++        env = Prompt._get_env(filters)
+         return env.from_string(cleaned_template)
+ 
+     @classmethod
+-    def _template_from_file(_, path: Path) -> jinja2.Template:
++    def _template_from_file(_, path: Path, filters: Dict[str, Callable]) -> jinja2.Template:
+         file_directory = os.path.dirname(os.path.abspath(path))
+         env = jinja2.Environment(
+             loader=jinja2.FileSystemLoader(file_directory),
+@@ -118,58 +105,53 @@ class Prompt:
+             keep_trailing_newline=True,
+             undefined=jinja2.StrictUndefined,
+         )
++        
++        # Set default filters
++        env.filters["name"] = get_fn_name
++        env.filters["description"] = get_fn_description
++        env.filters["source"] = get_fn_source
++        env.filters["signature"] = get_fn_signature
++        env.filters["schema"] = get_schema
++        env.filters["args"] = get_fn_args
++        
++        # Apply custom filters
++        env.filters.update(filters)
++            
+         return env.get_template(os.path.basename(path))
+ 
+ 
+-def prompt(fn: Callable) -> Prompt:
+-    """Decorate a function that contains a prompt template.
+-
+-    This allows to define prompts in the docstring of a function and simplify their
+-    manipulation by providing some degree of encapsulation. It uses the `render`
+-    function internally to render templates.
+-
+-    >>> import outlines
+-    >>>
+-    >>> @outlines.prompt
+-    >>> def build_prompt(question):
+-    ...    "I have a ${question}"
+-    ...
+-    >>> prompt = build_prompt("How are you?")
+-
+-    This API can also be helpful in an "agent" context where parts of the prompt
+-    are set when the agent is initialized and never modified later. In this situation
+-    we can partially apply the prompt function at initialization.
+-
+-    >>> import outlines
+-    >>> import functools as ft
+-    ...
+-    >>> @outlines.prompt
+-    ... def solve_task(name: str, objective: str, task: str):
+-    ...     '''Your name is {{name}}.
+-    ..      Your overall objective is to {{objective}}.
+-    ...     Please solve the following task: {{task}}
+-    ...     '''
+-    ...
+-    >>> hal = ft.partial(solve_task, "HAL", "Travel to Jupiter")
+-
+-    Returns
+-    -------
+-    A `Prompt` callable class which will render the template when called.
+-
+-    """
+-
+-    signature = inspect.signature(fn)
+-
+-    # The docstring contains the template that will be rendered to be used
+-    # as a prompt to the language model.
+-    docstring = fn.__doc__
+-    if docstring is None:
+-        raise TypeError("Could not find a template in the function's docstring.")
+-
+-    template = Prompt._template_from_str(cast(str, docstring))
++def prompt(fn: Callable = None, *, filters: Optional[Dict[str, Callable]] = None) -> Prompt:
++    def decorator(fn: Callable) -> Prompt:
++        signature = inspect.signature(fn)
++        docstring = fn.__doc__
++        if docstring is None:
++            raise TypeError("Could not find a template in the function's docstring.")
++
++        # To support `with_filters` on a prompt that uses filters not yet defined,
++        # we need to allow the template to be created even if filters are missing.
++        # But Jinja2 doesn't support this easily.
++        # Wait, the only way to support `with_filters` is to re-compile the template.
++        # So the template *must* be valid with the *new* set of filters.
++        # If the user wants to use `with_filters`, they must provide all filters
++        # that are used in the template.
++        
++        # Let's just make sure the filters are passed correctly.
++        
++        template = Prompt._template_from_str(cast(str, docstring), filters or {})
++
++        return Prompt(
++            template, 
++            signature, 
++            filters or {},
++            source_type="str",
++            source_content=cast(str, docstring)
++        )
+ 
+-    return Prompt(template, signature)
++    if fn is None:
++        return decorator
++    return decorator(fn)
+ 
++# ... (rest of the functions remain the same)
+ 
+ def get_fn_name(fn: Callable):
+     """Returns the name of a callable."""
+diff --git a/tests/test_custom_filters.py b/tests/test_custom_filters.py
+new file mode 100644
+index 0000000..fd2c38f
+--- /dev/null
++++ b/tests/test_custom_filters.py
+@@ -0,0 +1,72 @@
++import pytest
++import outlines
++from outlines.prompts import Prompt
++
++def test_custom_filters_decorator():
++    def surround(value, left, right):
++        return f"{left}{value}{right}"
++
++    @outlines.prompt(filters={"surround": surround})
++    def tagged_prompt(text):
++        '''{{ text | surround("<", ">") }}'''
++
++    assert tagged_prompt("hello") == "<hello>"
++
++def test_custom_filters_from_str():
++    def upper(value):
++        return value.upper()
++
++    prompt = Prompt.from_str("{{ text | upper }}", filters={"upper": upper})
++    assert prompt(text="hello") == "HELLO"
++
++def test_custom_filters_precedence():
++    # Built-in filter 'name' should be overridden
++    def fake_name(fn):
++        return "fake"
++
++    @outlines.prompt(filters={"name": fake_name})
++    def name_prompt(fn):
++        '''{{ fn | name }}'''
++
++    def my_func():
++        pass
++
++    assert name_prompt(my_func) == "fake"
++
++def test_with_filters():
++    def add_exclamation(value):
++        return f"{value}!"
++
++    def dummy(value):
++        return value
++
++    # Define base_prompt with a dummy filter
++    @outlines.prompt(filters={"add_exclamation": dummy})
++    def base_prompt(text):
++        '''{{ text | add_exclamation }}'''
++
++    assert base_prompt("hello") == "hello"
++
++    # Add real filter
++    new_prompt = base_prompt.with_filters({"add_exclamation": add_exclamation})
++    assert new_prompt("hello") == "hello!"
++
++def test_with_filters_from_file(tmp_path):
++    d = tmp_path / "templates"
++    d.mkdir()
++    p = d / "hello.txt"
++    p.write_text("{{ text | add_exclamation }}")
++
++    def add_exclamation(value):
++        return f"{value}!"
++
++    def dummy(value):
++        return value
++
++    # Define prompt from file with dummy filter
++    prompt = Prompt.from_file(p, filters={"add_exclamation": dummy})
++    assert prompt(text="hello") == "hello"
++
++    # Add real filter
++    new_prompt = prompt.with_filters({"add_exclamation": add_exclamation})
++    assert new_prompt(text="hello") == "hello!"
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..59de50a 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -10,7 +10,7 @@ from outlines.prompts import Prompt
+ 
+ 
+ def render(content: str, **kwargs):
+-    template = Prompt._template_from_str(content)
++    template = Prompt._template_from_str(content, {})
+     return template.render(kwargs)
+ 
+ 
+@@ -401,5 +401,5 @@ def test_template_from_str_with_extra_linebreaks():
+ 
+ 
+     """
+-    template = Prompt._template_from_str(content)
++    template = Prompt._template_from_str(content, {})
+     assert template.render(name="World") == "Hello, World!\n"

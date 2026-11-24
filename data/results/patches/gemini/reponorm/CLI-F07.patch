@@ -1,0 +1,120 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..d1c1f24 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,9 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param validate_nesting: if enabled, the context will refuse to close
++                             if any children are still open.  This is
++                             inherited by descendants.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +283,7 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        validate_nesting: bool | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -431,6 +435,17 @@ class Context:
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._children: set[Context] = set()
++        if validate_nesting is None:
++            if parent is not None:
++                self.validate_nesting = parent.validate_nesting
++            else:
++                self.validate_nesting = False
++        else:
++            self.validate_nesting = validate_nesting
++        
++        if self.validate_nesting and parent is not None:
++            parent._children.add(self)
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -607,6 +622,11 @@ class Context:
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
++        if self.validate_nesting and self._children:
++            child_names = sorted([c.info_name or "unknown" for c in self._children])
++            raise RuntimeError(f"Cannot close context {self.info_name or 'unknown'!r} because children are still open: {child_names!r}")
++        if self.parent is not None:
++            self.parent._children.discard(self)
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+diff --git a/tests/test_context_nesting.py b/tests/test_context_nesting.py
+new file mode 100644
+index 0000000..8708ddb
+--- /dev/null
++++ b/tests/test_context_nesting.py
+@@ -0,0 +1,62 @@
++import pytest
++import click
++from click.core import Context
++
++def test_context_nesting_validation():
++    # Test that validation is disabled by default
++    ctx = Context(click.Command("test"))
++    assert ctx.validate_nesting is False
++
++    # Test that validation can be enabled
++    ctx = Context(click.Command("test"), validate_nesting=True)
++    assert ctx.validate_nesting is True
++
++    # Test that validation is inherited
++    parent = Context(click.Command("parent"), validate_nesting=True)
++    child = Context(click.Command("child"), parent=parent)
++    assert child.validate_nesting is True
++
++    # Test that validation can be disabled in child
++    child2 = Context(click.Command("child2"), parent=parent, validate_nesting=False)
++    assert child2.validate_nesting is False
++
++def test_context_nesting_enforcement():
++    parent = Context(click.Command("parent"), validate_nesting=True, info_name="parent")
++    child = Context(click.Command("child"), parent=parent, info_name="child")
++    
++    # Closing parent while child is open should raise RuntimeError
++    with pytest.raises(RuntimeError, match=r"Cannot close context 'parent' because children are still open: \['child'\]"):
++        parent.close()
++    
++    # Closing child should allow parent to close
++    child.close()
++    parent.close()
++
++def test_context_nesting_multiple_children():
++    parent = Context(click.Command("parent"), validate_nesting=True, info_name="parent")
++    child1 = Context(click.Command("child1"), parent=parent, info_name="child1")
++    child2 = Context(click.Command("child2"), parent=parent, info_name="child2")
++    
++    with pytest.raises(RuntimeError, match=r"Cannot close context 'parent' because children are still open: \['child1', 'child2'\]"):
++        parent.close()
++        
++    child1.close()
++    with pytest.raises(RuntimeError, match=r"Cannot close context 'parent' because children are still open: \['child2'\]"):
++        parent.close()
++        
++    child2.close()
++    parent.close()
++
++def test_context_nesting_reopen():
++    parent = Context(click.Command("parent"), validate_nesting=True, info_name="parent")
++    child = Context(click.Command("child"), parent=parent, info_name="child")
++    
++    child.close()
++    parent.close()
++    
++    # Re-opening child
++    child2 = Context(click.Command("child"), parent=parent, info_name="child")
++    with pytest.raises(RuntimeError, match=r"Cannot close context 'parent' because children are still open: \['child'\]"):
++        parent.close()
++    child2.close()
++    parent.close()

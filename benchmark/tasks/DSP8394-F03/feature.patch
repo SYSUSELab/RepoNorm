@@ -1,0 +1,207 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745..08dfa09 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -33,6 +33,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    ttl: Optional[float] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +44,7 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        ttl: Time-to-live for cache entries in seconds. If None, entries never expire.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,9 +74,18 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        ttl,
+     )
+ 
+ 
++def set_ttl(seconds: Optional[float]):
++    """Change the lifetime of future writes without renewing existing entries."""
++    import dspy
++
++    Cache._validate_ttl(seconds)
++    dspy.cache.ttl = seconds
++
++
+ litellm.telemetry = False
+ litellm.cache = None  # By default we disable litellm cache and use DSPy on-disk cache.
+ 
+@@ -84,6 +95,7 @@ DSPY_CACHE = Cache(
+     disk_cache_dir=DISK_CACHE_DIR,
+     disk_size_limit_bytes=DISK_CACHE_LIMIT,
+     memory_max_entries=1000000,
++    ttl=None,
+ )
+ 
+ # Turn off by default to avoid LiteLLM logging during every LM call.
+@@ -112,4 +124,5 @@ __all__ = [
+     "enable_litellm_logging",
+     "disable_litellm_logging",
+     "configure_cache",
++    "set_ttl",
+ ]
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbd..010e236 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,6 +1,8 @@
+ import copy
+ import inspect
+ import logging
++import math
++import time
+ import threading
+ from functools import wraps
+ from hashlib import sha256
+@@ -30,7 +32,7 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        ttl: Optional[float] = None,
+     ):
+         """
+         Args:
+@@ -39,14 +41,20 @@ class Cache:
+             disk_cache_dir: The directory where the disk cache is stored.
+             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+             memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            ttl: Time-to-live for cache entries in seconds. If None, entries never expire.
+         """
+ 
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
++        self._validate_ttl(ttl)
++        self.ttl = ttl
++        self._memory_expirations = {}
++ 
+         if self.enable_memory_cache:
+             self.memory_cache = LRUCache(maxsize=memory_max_entries)
+         else:
+             self.memory_cache = {}
++ 
+         if self.enable_disk_cache:
+             self.disk_cache = FanoutCache(
+                 shards=16,
+@@ -59,9 +67,27 @@ class Cache:
+ 
+         self._lock = threading.RLock()
+ 
++    @staticmethod
++    def _validate_ttl(seconds):
++        if seconds is not None and (
++            type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0
++        ):
++            raise ValueError("ttl must be a positive finite number or None")
++
+     def __contains__(self, key: str) -> bool:
+-        """Check if a key is in the cache."""
+-        return key in self.memory_cache or key in self.disk_cache
++        with self._lock:
++            deadline = self._memory_expirations.get(key)
++            if deadline is not None and time.time() >= deadline:
++                self.memory_cache.pop(key, None)
++                self._memory_expirations.pop(key, None)
++            return key in self.memory_cache or key in self.disk_cache
++
++    def _remember(self, key, value, deadline):
++        self.memory_cache[key] = value
++        self._memory_expirations[key] = deadline
++        for expired_key in list(self._memory_expirations):
++            if expired_key not in self.memory_cache:
++                self._memory_expirations.pop(expired_key)
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+@@ -103,16 +129,20 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return None
+ 
+-        if self.enable_memory_cache and key in self.memory_cache:
+-            with self._lock:
+-                response = self.memory_cache[key]
+-        elif self.enable_disk_cache and key in self.disk_cache:
+-            # Found on disk but not in memory cache, add to memory cache
+-            response = self.disk_cache[key]
++        missing = object()
++        response = missing
++        with self._lock:
++            deadline = self._memory_expirations.get(key)
++            if deadline is not None and time.time() >= deadline:
++                self.memory_cache.pop(key, None)
++                self._memory_expirations.pop(key, None)
+             if self.enable_memory_cache:
+-                with self._lock:
+-                    self.memory_cache[key] = response
+-        else:
++                response = self.memory_cache.get(key, missing)
++            if response is missing and self.enable_disk_cache:
++                response, deadline = self.disk_cache.get(key, default=missing, expire_time=True)
++                if response is not missing and self.enable_memory_cache:
++                    self._remember(key, response, deadline)
++        if response is missing:
+             return None
+ 
+         response = copy.deepcopy(response)
+@@ -134,13 +164,17 @@ class Cache:
+             logger.debug(f"Failed to generate cache key for request: {request}")
+             return
+ 
++        deadline = None if self.ttl is None else time.time() + self.ttl
+         if self.enable_memory_cache and enable_memory_cache:
+             with self._lock:
+-                self.memory_cache[key] = value
++                self._remember(key, value, deadline)
+ 
+         if self.enable_disk_cache:
+             try:
+-                self.disk_cache[key] = value
++                if self.ttl is not None:
++                    self.disk_cache.set(key, value, expire=max(0, deadline - time.time()))
++                else:
++                    self.disk_cache[key] = value
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+@@ -151,6 +185,7 @@ class Cache:
+ 
+         with self._lock:
+             self.memory_cache.clear()
++            self._memory_expirations.clear()
+ 
+     def save_memory_cache(self, filepath: str) -> None:
+         if not self.enable_memory_cache:
+@@ -158,7 +193,7 @@ class Cache:
+ 
+         with self._lock:
+             with open(filepath, "wb") as f:
+-                cloudpickle.dump(self.memory_cache, f)
++                cloudpickle.dump((self.memory_cache, self._memory_expirations), f)
+ 
+     def load_memory_cache(self, filepath: str) -> None:
+         if not self.enable_memory_cache:
+@@ -166,7 +201,12 @@ class Cache:
+ 
+         with self._lock:
+             with open(filepath, "rb") as f:
+-                self.memory_cache = cloudpickle.load(f)
++                stored = cloudpickle.load(f)
++                if isinstance(stored, tuple) and len(stored) == 2:
++                    self.memory_cache, self._memory_expirations = stored
++                else:
++                    self.memory_cache = stored
++                    self._memory_expirations = {}
+ 
+ 
+ def request_cache(

@@ -1,0 +1,119 @@
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..9ec85eb 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -470,3 +470,114 @@ def test_false_show_default_cause_no_default_display_in_prompt(runner):
+     # is False
+     result = runner.invoke(cmd, input="my-input", standalone_mode=False)
+     assert "my-default-value" not in result.output
++
++class _BackupProcess:
++    pid = 1001
++
++    def wait(self):
++        return 0
++
++
++def test_edit_auto_backup_is_opt_in(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("original")
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _BackupProcess())
++
++    click.edit(filename=str(path), editor="editor")
++
++    assert list(tmp_path.glob("note.txt.backup.*")) == []
++
++
++def test_edit_auto_backup_exists_before_editor_starts(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("original")
++
++    def popen(*args, **kwargs):
++        backups = list(tmp_path.glob("note.txt.backup.*"))
++        assert len(backups) == 1
++        assert backups[0].read_text() == "original"
++        return _BackupProcess()
++
++    monkeypatch.setattr("subprocess.Popen", popen)
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++
++
++def test_edit_auto_backup_preserves_mode(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("original")
++    path.chmod(0o640)
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _BackupProcess())
++
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++
++    backup, = tmp_path.glob("note.txt.backup.*")
++    assert backup.stat().st_mode & 0o777 == 0o640
++
++
++def test_edit_auto_backup_same_second_does_not_overwrite(tmp_path, monkeypatch):
++    path = tmp_path / "note.txt"
++    path.write_text("first")
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _BackupProcess())
++
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++    path.write_text("second")
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++
++    backups = sorted(tmp_path.glob("note.txt.backup.*"))
++    assert len(backups) == 2
++    assert {item.read_text() for item in backups} == {"first", "second"}
++
++
++def test_edit_auto_backup_skips_missing_direct_file(tmp_path, monkeypatch):
++    path = tmp_path / "new.txt"
++    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: _BackupProcess())
++
++    click.edit(filename=str(path), editor="editor", auto_backup=True)
++
++    assert list(tmp_path.glob("new.txt.backup.*")) == []
++
++
++def test_edit_auto_backup_failure_is_chained(tmp_path, monkeypatch):
++    import builtins
++    import io
++    import os
++
++    path = tmp_path / "note.txt"
++    path.write_text("original")
++    launched = False
++    backup_prefix = f"{path}.backup."
++    real_builtin_open = builtins.open
++    real_io_open = io.open
++    real_os_open = os.open
++
++    def checked_stream_open(opener):
++        def open_file(file, mode="r", *args, **kwargs):
++            if os.fspath(file).startswith(backup_prefix) and any(
++                flag in mode for flag in "wax+"
++            ):
++                raise OSError("disk full")
++            return opener(file, mode, *args, **kwargs)
++        return open_file
++
++    def checked_os_open(file, flags, *args, **kwargs):
++        writing = flags & (
++            os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
++        )
++        if os.fspath(file).startswith(backup_prefix) and writing:
++            raise OSError("disk full")
++        return real_os_open(file, flags, *args, **kwargs)
++
++    def popen(*args, **kwargs):
++        nonlocal launched
++        launched = True
++        return _BackupProcess()
++
++    monkeypatch.setattr(builtins, "open", checked_stream_open(real_builtin_open))
++    monkeypatch.setattr(io, "open", checked_stream_open(real_io_open))
++    monkeypatch.setattr(os, "open", checked_os_open)
++    monkeypatch.setattr("subprocess.Popen", popen)
++    with pytest.raises(click.ClickException, match="^Failed to create backup file") as exc_info:
++        click.edit(filename=str(path), editor="editor", auto_backup=True)
++
++    assert isinstance(exc_info.value.__cause__, OSError)
++    assert not launched

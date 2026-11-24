@@ -1,0 +1,108 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..e20290c8 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,11 @@
+ import asyncio
++import json
++import re
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, model_validator
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -254,6 +256,27 @@ class Tool(Type):
+         return f"{self.name}{desc} {arg_desc}"
+ 
+ 
++def _extract_fenced_json(text: str) -> str | None:
++    """Extract JSON body from the first triple-backtick code fence.
++
++    Only considers the first fence block. Opening fence may have any language
++    label (json, JSON, or no label) followed by a newline. The next
++    triple-backtick closes it. Returns the trimmed body or None if no valid
++    fence is found.
++    """
++    # The opening fence must be: optional whitespace, ```, optional label, newline
++    match = re.match(r'^[ \t]*```[ \t]*\w*[ \t]*\n', text)
++    if not match:
++        return None
++
++    start = match.end()
++    close_idx = text.find('```', start)
++    if close_idx == -1:
++        return None
++
++    return text[start:close_idx].strip()
++
++
+ class ToolCalls(Type):
+     class ToolCall(BaseModel):
+         name: str
+@@ -291,6 +314,62 @@ class ToolCalls(Type):
+             "Arguments must be provided in JSON format."
+         )
+ 
++    @classmethod
++    def validate_input(cls, data: Any) -> Any:
++        """Public extraction helper: returns parsed Python JSON structures on
++        success and the original input unchanged when extraction fails.
++        """
++        if not isinstance(data, str):
++            return data
++
++        # Try plain JSON first
++        try:
++            return json.loads(data)
++        except (json.JSONDecodeError, ValueError):
++            pass
++
++        # Try markdown fence extraction
++        body = _extract_fenced_json(data)
++        if body is not None:
++            try:
++                return json.loads(body)
++            except (json.JSONDecodeError, ValueError):
++                pass
++
++        return data
++
++    @model_validator(mode="before")
++    @classmethod
++    def _normalize_input(cls, data: Any) -> Any:
++        """Normalize input before validation: strip markdown fences, normalize lists/objects."""
++        if isinstance(data, str):
++            parsed = cls.validate_input(data)
++            if parsed is not data:
++                data = parsed
++            # If still a string, let pydantic raise its normal error
++            if isinstance(data, str):
++                return data
++
++        # Normalize: bare list -> {"tool_calls": [...]}
++        if isinstance(data, list):
++            return {"tool_calls": data}
++
++        # Normalize: single object with name/args -> {"tool_calls": [data]}
++        if isinstance(data, dict) and "name" in data and "args" in data:
++            return {"tool_calls": [data]}
++
++        return data
++
++    @classmethod
++    def model_validate_json(cls, obj, *, strict=None, context=None):
++        """Override to handle markdown-fenced JSON strings."""
++        if isinstance(obj, str):
++            parsed = cls.validate_input(obj)
++            if parsed is not obj:
++                # parsed is now a Python structure, validate using model_validate
++                return cls.model_validate(parsed, strict=strict, context=context)
++        return super().model_validate_json(obj, strict=strict, context=context)
++
+     def format(self) -> list[dict[str, Any]]:
+         # The tool_call field is compatible with OpenAI's tool calls schema.
+         return [

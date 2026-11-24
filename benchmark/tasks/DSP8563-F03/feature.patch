@@ -1,0 +1,68 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843ecee..ac2f1ad 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,8 @@
+ import asyncio
+ import inspect
++import re
++import math
++from decimal import Decimal, InvalidOperation, localcontext
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -16,6 +19,44 @@ if TYPE_CHECKING:
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
+ 
++def _coerce_args(kwargs: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
++    result = kwargs.copy()
++    for key, original in kwargs.items():
++        if key not in schema or not isinstance(original, str):
++            continue
++        field = schema[key]
++        kind = field.get("type")
++        value = original.strip()
++        if kind == "boolean":
++            if value.lower() in ("true", "false"):
++                result[key] = value.lower() == "true"
++            continue
++        if kind == "string" or not (kind in ("integer", "number") or field.get("format") in ("duration", "bytes")):
++            continue
++        match = re.fullmatch(r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?:\s*(ms|s|m|h|KB|MB|GB))?", value)
++        if not match:
++            continue
++        number, unit = match.groups()
++        if unit and (number.startswith('-') or 'e' in number.lower()):
++            continue
++        try:
++            with localcontext() as context:
++                context.prec = max(28, len(number) + 20)
++                parsed = Decimal(number)
++                factors = {None: '1', 'ms': '0.001', 's': '1', 'm': '60', 'h': '3600',
++                           'KB': '1000', 'MB': '1000000', 'GB': '1000000000'}
++                parsed *= Decimal(factors[unit])
++                if unit in ('KB', 'MB', 'GB') or parsed == parsed.to_integral_value():
++                    result[key] = int(parsed)
++                else:
++                    converted = float(parsed)
++                    if math.isfinite(converted):
++                        result[key] = converted
++        except (InvalidOperation, ValueError, OverflowError):
++            continue
++    return result
++
++
+ class Tool(Type):
+     """Tool class.
+ 
+@@ -116,6 +157,9 @@ class Tool(Type):
+         self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+ 
+     def _validate_and_parse_args(self, **kwargs):
++        # Coerce the arguments to the correct type.
++        kwargs = _coerce_args(kwargs, self.args)
++
+         # Validate the args value comply to the json schema.
+         for k, v in kwargs.items():
+             if k not in self.args:

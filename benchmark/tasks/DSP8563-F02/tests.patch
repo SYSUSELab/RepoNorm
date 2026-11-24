@@ -1,0 +1,181 @@
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 1857145..ff45282 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -5,7 +5,7 @@ import pytest
+ from pydantic import BaseModel
+ 
+ import dspy
+-from dspy.adapters.types.tool import Tool, ToolCalls
++from dspy.adapters.types.tool import Tool, ToolCalls, convert_input_schema_to_tool_args
+ 
+ 
+ # Test fixtures
+@@ -444,6 +444,83 @@ def test_tool_calls_format_basic(tool_calls_data, expected):
+     assert result == expected
+ 
+ 
++def test_toolcalls_validate_input_with_string():
++    """Test that ToolCalls.validate_input can handle string input."""
++    input_str = 'search(query="hello world")'
++ 
++    result = ToolCalls.model_validate(input_str)
++    assert isinstance(result, ToolCalls)
++    assert len(result.tool_calls) == 1
++    assert result.tool_calls[0].name == "search"
++    assert result.tool_calls[0].args == {"query": "hello world"}
++
++
++def test_toolcalls_validate_input_with_multiple_calls():
++    """Test that ToolCalls.validate_input can handle multiple calls in string."""
++    input_str = '''search(query="nlp")
++translate(text="world", lang="fr")'''
++ 
++    result = ToolCalls.model_validate(input_str)
++    assert isinstance(result, ToolCalls)
++    assert len(result.tool_calls) == 2
++    assert result.tool_calls[0].name == "search"
++    assert result.tool_calls[1].name == "translate"
++
++
++def test_parse_python_calls_basic():
++    """Test basic Python call parsing."""
++    from dspy.adapters.types.tool import parse_python_calls
++ 
++    input_str = 'search(query="hello")'
++    result = parse_python_calls(input_str)
++ 
++    expected = {
++        "tool_calls": [
++            {"name": "search", "args": {"query": "hello"}}
++        ]
++    }
++    assert result == expected
++
++
++def test_parse_python_calls_multiple():
++    """Test parsing multiple Python calls."""
++    from dspy.adapters.types.tool import parse_python_calls
++ 
++    input_str = 'search(query="nlp"); translate(text="world", lang="fr")'
++    result = parse_python_calls(input_str)
++ 
++    expected = {
++        "tool_calls": [
++            {"name": "search", "args": {"query": "nlp"}},
++            {"name": "translate", "args": {"text": "world", "lang": "fr"}}
++        ]
++    }
++    assert result == expected
++
++
++def test_parse_python_calls_positional_error():
++    """Test that positional arguments raise a clear error."""
++    from dspy.adapters.types.tool import parse_python_calls
++ 
++    input_str = 'search("hello world")'
++ 
++    with pytest.raises(ValueError) as error:
++        parse_python_calls(input_str)
++    assert str(error.value).strip()
++
++
++def test_parse_python_calls_variable_error():
++    """Test that variable names raise an error."""
++    from dspy.adapters.types.tool import parse_python_calls
++ 
++    input_str = 'search(query=query_var)'
++ 
++    with pytest.raises(ValueError) as error:
++        parse_python_calls(input_str)
++    assert str(error.value).strip()
++
++
++
+ def test_tool_calls_format_from_dict_list():
+     """Test format works with ToolCalls created from from_dict_list."""
+     tool_calls_dicts = [
+@@ -457,3 +534,83 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++@pytest.mark.parametrize("text", [
++    'f(x=side_effect())', 'factory().tool(x=1)', 'a[0].tool(x=1)',
++    'f(x=b"raw")', 'f(x=1j)', 'f(x=...)', 'f(x=+True)', 'f(x=1e309)',
++    'f(x={1: "not-json-key"})', 'f(x={"a": 1, "a": 2})', 'f(x=1, x=2)',
++    'f(**{"x": 1})', 'f(*[1])', 'f(x=[v for v in values])',
++    'f(x=f"{value}")', 'f(x=lambda: 1)', 'f(x=obj.value)',
++    'f(x=1) # comment', '# comment\nf(x=1)', 'f(x=1); x=2', '',
++])
++def test_python_call_parser_rejects_outside_grammar(text):
++    from dspy.adapters.types.tool import parse_python_calls
++    with pytest.raises(ValueError):
++        parse_python_calls(text)
++    with pytest.raises(ValueError):
++        ToolCalls.model_validate(text)
++
++
++def test_python_call_parser_nested_literals_and_dotted_names():
++    from dspy.adapters.types.tool import parse_python_calls
++    text = 'tools.search(data={"items": (1, -2.5, True, None, ["#雪", (+3,)])}); done()'
++    expected = {"tool_calls": [
++        {"name": "search", "args": {"data": {"items": [1, -2.5, True, None, ["#雪", [3]]]}}},
++        {"name": "done", "args": {}},
++    ]}
++    assert parse_python_calls(text) == expected
++    result = ToolCalls.model_validate(text)
++    assert [(call.name, call.args) for call in result.tool_calls] == [
++        (entry["name"], entry["args"]) for entry in expected["tool_calls"]
++    ]
++
++
++def test_python_call_parser_never_executes_values(tmp_path):
++    from dspy.adapters.types.tool import parse_python_calls
++    sentinel = tmp_path / "must-not-exist"
++    text = "f(x=__import__('pathlib').Path(" + repr(str(sentinel)) + ").touch())"
++    with pytest.raises(ValueError):
++        parse_python_calls(text)
++    assert not sentinel.exists()
++
++
++def test_python_call_parser_preserves_existing_model_input():
++    data = {"tool_calls": [{"name": "f", "args": {"x": "# literal"}}]}
++    result = ToolCalls.model_validate(data)
++    assert result.tool_calls[0].args == {"x": "# literal"}
++    assert data == {"tool_calls": [{"name": "f", "args": {"x": "# literal"}}]}
++
++
++@pytest.mark.parametrize("adapter_name", ["ChatAdapter", "JSONAdapter", "XMLAdapter"])
++def test_python_calls_in_nested_signature_models(adapter_name):
++    import json
++    import dspy
++    from pydantic import BaseModel
++    from dspy.utils.exceptions import AdapterParseError
++
++    class Batch(BaseModel):
++        calls: dspy.ToolCalls
++
++    class Result(dspy.Signature):
++        question: str = dspy.InputField()
++        batch: Batch = dspy.OutputField()
++
++    def completion(body):
++        payload = json.dumps({"calls": body})
++        if adapter_name == "JSONAdapter":
++            return '{"batch":' + payload + '}'
++        if adapter_name == "XMLAdapter":
++            return "<batch>" + payload + "</batch><completed/>"
++        return "[[ ## batch ## ]]\n" + payload + "\n[[ ## completed ## ]]"
++
++    adapter = getattr(dspy, adapter_name)()
++    parsed = adapter.parse(Result, completion("tools.search(query='snow', options=(1, None)); finish()"))["batch"]
++    assert isinstance(parsed, Batch)
++    assert isinstance(parsed.calls, dspy.ToolCalls)
++    assert [call.model_dump() for call in parsed.calls.tool_calls] == [
++        {"name": "search", "args": {"query": "snow", "options": [1, None]}},
++        {"name": "finish", "args": {}},
++    ]
++    with pytest.raises((ValueError, AdapterParseError)):
++        adapter.parse(Result, completion("tools.search(query=compute())"))

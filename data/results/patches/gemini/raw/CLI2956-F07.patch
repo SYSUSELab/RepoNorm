@@ -1,0 +1,274 @@
+diff --git a/fix_syntax.py b/fix_syntax.py
+new file mode 100644
+index 0000000..4ddd166
+--- /dev/null
++++ b/fix_syntax.py
+@@ -0,0 +1,13 @@
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++for i, line in enumerate(lines):
++    if 'raise UsageError(f"Option \'--{param.name.replace("_", "-")}\'' in line:
++        lines[i] = line.replace('replace("_", "-")', 'replace("_", "-")')
++        # Wait, this is not fixing it.
++        # The problem is the quotes inside the f-string.
++        # Let's just replace the whole line.
++        lines[i] = '                            raise UsageError(f"Option \'--{param.name.replace(\'_\', \'-\')}\' cannot be used together with \'--{conflict.replace(\'_\', \'-\')}\'.")\n'
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/invoke_patch.py b/invoke_patch.py
+new file mode 100644
+index 0000000..23aacf6
+--- /dev/null
++++ b/invoke_patch.py
+@@ -0,0 +1,40 @@
++import sys
++
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++new_lines = []
++in_invoke = False
++for line in lines:
++    if 'def invoke(self, ctx: Context) -> t.Any:' in line and 'class Command' in lines[lines.index(line)-5:lines.index(line)]:
++        in_invoke = True
++        new_lines.append(line)
++        new_lines.append('        for param in self.get_params(ctx):\n')
++        new_lines.append('            if isinstance(param, Option) and param.conflicts_with:\n')
++        new_lines.append('                for conflict in param.conflicts_with:\n')
++        new_lines.append('                    if not isinstance(conflict, str):\n')
++        new_lines.append('                        raise TypeError(f"Conflict name must be a string, got {type(conflict).__name__}")\n')
++        new_lines.append('                    if conflict.startswith("-"):\n')
++        new_lines.append('                        raise TypeError(f"Conflict name must not have option prefixes, got {conflict}")\n')
++        new_lines.append('                    if conflict == param.name:\n')
++        new_lines.append('                        raise UsageError(f"Option \'{param.name}\' cannot conflict with itself.")\n')
++        new_lines.append('                    found = False\n')
++        new_lines.append('                    for p in self.get_params(ctx):\n')
++        new_lines.append('                        if p.name == conflict:\n')
++        new_lines.append('                            found = True\n')
++        new_lines.append('                            break\n')
++        new_lines.append('                    if not found:\n')
++        new_lines.append('                        raise UsageError(f"Option \'{param.name}\' conflicts with unknown option \'{conflict}\'.")\n')
++        new_lines.append('                    source = ctx.get_parameter_source(param.name)\n')
++        new_lines.append('                    if source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):\n')
++        new_lines.append('                        conflict_source = ctx.get_parameter_source(conflict)\n')
++        new_lines.append('                        if conflict_source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):\n')
++        new_lines.append('                            raise UsageError(f"Option \'--{param.name.replace("_", "-")}\' cannot be used together with \'--{conflict.replace("_", "-")}\'.")\n')
++    elif in_invoke and 'return ctx.invoke(self.callback, **ctx.params)' in line:
++        new_lines.append(line)
++        in_invoke = False
++    else:
++        new_lines.append(line)
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/remove_validation.py b/remove_validation.py
+new file mode 100644
+index 0000000..754915c
+--- /dev/null
++++ b/remove_validation.py
+@@ -0,0 +1,16 @@
++with open('src/click/core.py', 'r') as f:
++    lines = f.readlines()
++
++new_lines = []
++skip = False
++for line in lines:
++    if 'for param in self.get_params(ctx):' in line and 'if isinstance(param, Option) and param.conflicts_with:' in lines[lines.index(line)+1]:
++        skip = True
++    if skip and 'if self.callback is not None:' in line:
++        skip = False
++        new_lines.append(line)
++    elif not skip:
++        new_lines.append(line)
++
++with open('src/click/core.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..3d63265 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1222,9 +1222,22 @@ class Command:
+             ).format(name=self.name, extra_message=extra_message)
+             echo(style(message, fg="red"), err=True)
+ 
++
+         if self.callback is not None:
++            params = self.get_params(ctx)
++            param_names = {p.name for p in params}
++            for param in params:
++                if isinstance(param, Option) and param.conflicts_with:
++                    for conflict in param.conflicts_with:
++                        if conflict not in param_names:
++                            raise UsageError(f"Option '{param.name}' conflicts with unknown parameter '{conflict}'.")
++                    source = ctx.get_parameter_source(param.name)
++                    if source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):
++                        for conflict in param.conflicts_with:
++                            conflict_source = ctx.get_parameter_source(conflict)
++                            if conflict_source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):
++                                raise UsageError(f"Option '--{param.name.replace('_', '-')}' cannot be used together with '--{conflict.replace('_', '-')}'.")
+             return ctx.invoke(self.callback, **ctx.params)
+-
+     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
+         """Return a list of completions for the incomplete value. Looks
+         at the names of options and chained multi-commands.
+@@ -2546,6 +2559,7 @@ class Option(Parameter):
+         type: types.ParamType | t.Any | None = None,
+         help: str | None = None,
+         hidden: bool = False,
++        conflicts_with: cabc.Sequence[str] | None = None,
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
+@@ -2644,6 +2658,17 @@ class Option(Parameter):
+             if self.nargs == -1:
+                 raise TypeError("nargs=-1 is not supported for options.")
+ 
++        self.conflicts_with = conflicts_with or []
++        if self.conflicts_with:
++            if isinstance(self.conflicts_with, str):
++                raise TypeError("conflicts_with must be a sequence of strings.")
++            for conflict in self.conflicts_with:
++                if not isinstance(conflict, str):
++                    raise TypeError("conflicts_with must be a sequence of strings.")
++                if conflict.startswith("-"):
++                    raise TypeError(f"conflicts_with must contain parameter names, not option strings: {conflict}")
++                if conflict == self.name:
++                    raise UsageError(f"Option '{self.name}' cannot conflict with itself.")
+             if self.prompt and self.is_flag and not self.is_bool_flag:
+                 raise TypeError("'prompt' is not valid for non-boolean flag.")
+ 
+@@ -2658,9 +2683,9 @@ class Option(Parameter):
+             if self.count:
+                 if self.multiple:
+                     raise TypeError("'count' is not valid with 'multiple'.")
+-
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
++            conflicts_with=self.conflicts_with,
+ 
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+@@ -2671,6 +2696,7 @@ class Option(Parameter):
+             flag_value=self.flag_value,
+             count=self.count,
+             hidden=self.hidden,
++            conflicts_with=self.conflicts_with,
+         )
+         return info_dict
+ 
+diff --git a/test_conflict_logic.py b/test_conflict_logic.py
+new file mode 100644
+index 0000000..e26317f
+--- /dev/null
++++ b/test_conflict_logic.py
+@@ -0,0 +1,17 @@
++import click
++from click.testing import CliRunner
++from click.core import ParameterSource
++
++def test_conflicts():
++    @click.command()
++    @click.option("--foo", conflicts_with=["bar"])
++    @click.option("--bar")
++    def cli(foo, bar):
++        click.echo(f"foo={foo}, bar={bar}")
++
++    # I need to implement the conflict check in handle_parse_result.
++    # Let's see if I can do it by modifying handle_parse_result.
++    pass
++
++if __name__ == "__main__":
++    print("Test")
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000..dd27580
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,85 @@
++import click
++from click.testing import CliRunner
++import pytest
++
++def test_defaults_no_conflict():
++    @click.command()
++    @click.option("--foo", conflicts_with=["bar"], default="1")
++    @click.option("--bar", default="2")
++    def cli(foo, bar):
++        click.echo(f"foo={foo}, bar={bar}")
++
++    runner = CliRunner()
++    result = runner.invoke(cli, [])
++    assert result.exit_code == 0
++    assert "foo=1, bar=2" in result.output
++
++def test_envvar_no_conflict():
++    import os
++    os.environ["FOO"] = "1"
++    os.environ["BAR"] = "2"
++    @click.command()
++    @click.option("--foo", conflicts_with=["bar"], envvar="FOO")
++    @click.option("--bar", envvar="BAR")
++    def cli(foo, bar):
++        click.echo(f"foo={foo}, bar={bar}")
++
++    runner = CliRunner()
++    result = runner.invoke(cli, [])
++    assert result.exit_code == 0
++    assert "foo=1, bar=2" in result.output
++    del os.environ["FOO"]
++    del os.environ["BAR"]
++
++def test_invalid_conflict_name_type():
++    try:
++        @click.command()
++        @click.option("--foo", conflicts_with=[123])
++        def cli(foo):
++            pass
++    except TypeError as e:
++        print(f"Caught expected TypeError: {e}")
++    else:
++        print("Failed to catch TypeError")
++
++def test_invalid_conflict_name_prefix():
++    try:
++        @click.command()
++        @click.option("--foo", conflicts_with=["--bar"])
++        def cli(foo):
++            pass
++    except TypeError as e:
++        print(f"Caught expected TypeError: {e}")
++    else:
++        print("Failed to catch TypeError")
++
++def test_unknown_conflict_name():
++    @click.command()
++    @click.option("--foo", conflicts_with=["baz"])
++    def cli(foo):
++        pass
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--foo", "1"])
++    assert result.exit_code != 0
++    assert "conflicts with unknown option 'baz'" in result.output
++
++def test_self_conflict():
++    @click.command()
++    @click.option("--foo", conflicts_with=["foo"])
++    def cli(foo):
++        pass
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--foo", "1"])
++    assert result.exit_code != 0
++    assert "cannot conflict with itself" in result.output
++
++if __name__ == "__main__":
++    test_defaults_no_conflict()
++    test_envvar_no_conflict()
++    test_invalid_conflict_name_type()
++    test_invalid_conflict_name_prefix()
++    test_unknown_conflict_name()
++    test_self_conflict()
++    print("All tests passed!")

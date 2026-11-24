@@ -1,0 +1,229 @@
+diff --git a/tests/test_encoding.py b/tests/test_encoding.py
+index f33cf85..cbf35b7 100644
+--- a/tests/test_encoding.py
++++ b/tests/test_encoding.py
+@@ -254,3 +254,147 @@ def test_hyp_batch_roundtrip(make_enc: Callable[[], tiktoken.Encoding], batch):
+     assert encoded == [enc.encode(t) for t in batch]
+     decoded = enc.decode_batch(encoded)
+     assert decoded == batch
++
++
++# ====================
++# Transformers
++# ====================
++
++
++def _lowercase(text: str) -> str:
++    return text.lower()
++
++
++def _strip_whitespace(text: str) -> str:
++    return text.strip()
++
++
++def _remove_punctuation(text: str) -> str:
++    import string
++    return text.translate(str.maketrans("", "", string.punctuation))
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_single(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++    text = "Hello World"
++    expected = enc.encode(text.lower())
++    assert enc.encode(text, transformers=_lowercase) == expected
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_chain(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++    text = "  Hello, World!  "
++    # strip -> lowercase -> remove punctuation
++    transformed = _remove_punctuation(_lowercase(_strip_whitespace(text)))
++    expected = enc.encode(transformed)
++    assert enc.encode(text, transformers=[_strip_whitespace, _lowercase, _remove_punctuation]) == expected
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_none_default(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++    text = "hello world"
++    # transformers=None should behave exactly as without the parameter
++    assert enc.encode(text, transformers=None) == enc.encode(text)
++    assert enc.encode_batch([text], transformers=None) == enc.encode_batch([text])
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_non_string_return(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++
++    def bad_transformer(text: str) -> int:
++        return 42
++
++    with pytest.raises(TypeError, match="Transformer returned non-string"):
++        enc.encode("hello", transformers=bad_transformer)
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_exception_propagation(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++
++    class CustomError(Exception):
++        pass
++
++    def failing_transformer(text: str) -> str:
++        raise CustomError("oops")
++
++    with pytest.raises(CustomError, match="oops"):
++        enc.encode("hello", transformers=failing_transformer)
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_chain_exception_stops(make_enc: Callable[[], tiktoken.Encoding]):
++    """Verify that if a transformer in a chain raises, later transformers are not called."""
++    enc = make_enc()
++    call_log = []
++
++    def first(text: str) -> str:
++        call_log.append("first")
++        return text
++
++    def second(text: str) -> str:
++        call_log.append("second")
++        raise ValueError("fail")
++
++    def third(text: str) -> str:
++        call_log.append("third")
++        return text
++
++    with pytest.raises(ValueError):
++        enc.encode("hello", transformers=[first, second, third])
++
++    assert call_log == ["first", "second"], f"Expected first and second to be called, got {call_log}"
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_batch(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++    texts = ["Hello World", "  Foo Bar  ", "Test!"]
++    expected = [enc.encode(t.lower()) for t in texts]
++    assert enc.encode_batch(texts, transformers=_lowercase) == expected
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_batch_empty(make_enc: Callable[[], tiktoken.Encoding]):
++    enc = make_enc()
++    assert enc.encode_batch([], transformers=_lowercase) == []
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_mutation_isolation(make_enc: Callable[[], tiktoken.Encoding]):
++    """Verify that transformers are not mutated and repeated documents invoke callbacks independently."""
++    enc = make_enc()
++    call_count = 0
++
++    def counting_transformer(text: str) -> str:
++        nonlocal call_count
++        call_count += 1
++        return text.lower()
++
++    pipeline = [counting_transformer]
++
++    # First call
++    result1 = enc.encode("Hello", transformers=pipeline)
++    assert call_count == 1
++
++    # Second call with same pipeline object
++    result2 = enc.encode("Hello", transformers=pipeline)
++    # Should be called again independently
++    assert call_count == 2, f"Expected 2 calls, got {call_count}"
++    assert result1 == result2
++
++    # Ensure pipeline list not mutated
++    assert pipeline == [counting_transformer]
++
++
++@pytest.mark.parametrize("make_enc", ENCODING_FACTORIES)
++def test_transformer_typed_empty_tuple(make_enc: Callable[[], tiktoken.Encoding]):
++    """Callables may be passed as a tuple (Sequence)."""
++    enc = make_enc()
++    text = "Hello World"
++    expected = enc.encode(text.lower())
++    assert enc.encode(text, transformers=(_lowercase,)) == expected
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..2fe0cd5 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+-from typing import TYPE_CHECKING, AbstractSet, Collection, Literal, NoReturn, Sequence
++from typing import TYPE_CHECKING, AbstractSet, Callable, Collection, Literal, NoReturn, Sequence
+ 
+ import regex
+ 
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Sequence[Callable[[str], str]] | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -109,7 +110,24 @@ class Encoding:
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
++
++        Args:
++            transformers: A callable or list/tuple of callables to apply to the text
++                before encoding. Each callable must accept a string and return a string.
++                When multiple transformers are provided, they are applied sequentially
++                in the order given.
+         """
++        if transformers is not None:
++            if callable(transformers):
++                transformers = [transformers]
++            for transformer in transformers:
++                result = transformer(text)
++                if not isinstance(result, str):
++                    raise TypeError(
++                        f"Transformer returned non-string of type {type(result).__name__}"
++                    )
++                text = result
++
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -179,6 +197,7 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        transformers: Callable[[str], str] | Sequence[Callable[[str], str]] | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -188,6 +207,12 @@ class Encoding:
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
+         ```
++
++        Args:
++            transformers: A callable or list/tuple of callables to apply to each text
++                before encoding. Each callable must accept a string and return a string.
++                When multiple transformers are provided, they are applied sequentially
++                in the order given.
+         """
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+@@ -197,7 +222,8 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special,
++            transformers=transformers,
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))

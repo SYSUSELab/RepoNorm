@@ -1,0 +1,209 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..9365137c 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,5 +1,7 @@
+ import asyncio
+ import inspect
++import json
++import re
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+@@ -111,95 +113,25 @@ class Tool(Type):
+ 
+         self.name = self.name or name
+         self.desc = self.desc or desc
+-        self.args = self.args or args
+-        self.arg_types = self.arg_types or arg_types
+-        self.has_kwargs = any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values())
+-
+-    def _validate_and_parse_args(self, **kwargs):
+-        # Validate the args value comply to the json schema.
+-        for k, v in kwargs.items():
+-            if k not in self.args:
+-                if self.has_kwargs:
+-                    continue
+-                else:
+-                    raise ValueError(f"Arg {k} is not in the tool's args.")
+-            try:
+-                instance = v.model_dump() if hasattr(v, "model_dump") else v
+-                type_str = self.args[k].get("type")
+-                if type_str is not None and type_str != "Any":
+-                    validate(instance=instance, schema=self.args[k])
+-            except ValidationError as e:
+-                raise ValueError(f"Arg {k} is invalid: {e.message}")
+-
+-        # Parse the args to the correct type.
+-        parsed_kwargs = {}
+-        for k, v in kwargs.items():
+-            if k in self.arg_types and self.arg_types[k] != Any:
+-                # Create a pydantic model wrapper with a dummy field `value` to parse the arg to the correct type.
+-                # This is specifically useful for handling nested Pydantic models like `list[list[MyPydanticModel]]`
+-                pydantic_wrapper = create_model("Wrapper", value=(self.arg_types[k], ...))
+-                parsed = pydantic_wrapper.model_validate({"value": v})
+-                parsed_kwargs[k] = parsed.value
+-            else:
+-                parsed_kwargs[k] = v
+-        return parsed_kwargs
+-
+-    def format(self):
+-        return str(self)
+-
+-    def format_as_litellm_function_call(self):
+-        return {
+-            "type": "function",
+-            "function": {
+-                "name": self.name,
+-                "description": self.desc,
+-                "parameters": {
+-                    "type": "object",
+-                    "properties": self.args,
+-                    "required": list(self.args.keys()),
+-                },
+-            },
+-        }
+-
+-    def _run_async_in_sync(self, coroutine):
+-        try:
+-            loop = asyncio.get_running_loop()
+-        except RuntimeError:
+-            return asyncio.run(coroutine)
+-
+-        return loop.run_until_complete(coroutine)
+-
+-    @with_callbacks
+-    def __call__(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            if settings.allow_tool_async_sync_conversion:
+-                return self._run_async_in_sync(result)
+-            else:
+-                raise ValueError(
+-                    "You are calling `__call__` on an async tool, please use `acall` instead or set "
+-                    "`allow_async=True` to run the async tool in sync mode."
+-                )
+-        return result
++        self.args = args
++        self.arg_types = arg_types
++        self.arg_desc = arg_desc
+ 
+-    @with_callbacks
+     async def acall(self, **kwargs):
+-        parsed_kwargs = self._validate_and_parse_args(**kwargs)
+-        result = self.func(**parsed_kwargs)
+-        if asyncio.iscoroutine(result):
+-            return await result
+-        else:
+-            # We should allow calling a sync tool in the async path.
+-            return result
++        """Asynchronous call to the tool."""
++        return await with_callbacks(self.func, **kwargs)
++
++    def __call__(self, **kwargs):
++        """Synchronous call to the tool."""
++        return self.func(**kwargs)
+ 
+     @classmethod
+-    def from_mcp_tool(cls, session: "mcp.client.session.ClientSession", tool: "mcp.types.Tool") -> "Tool":
++    def from_mcp(cls, session: "mcp.ClientSession", tool: "mcp.types.Tool") -> "Tool":
+         """
+-        Build a DSPy tool from an MCP tool and a ClientSession.
++        Build a DSPy tool from an MCP tool.
+ 
+         Args:
+-            session: The MCP session to use.
++            session: The MCP client session.
+             tool: The MCP tool to convert.
+ 
+         Returns:
+@@ -261,6 +193,47 @@ class ToolCalls(Type):
+ 
+     tool_calls: list[ToolCall]
+ 
++    @classmethod
++    def validate_input(cls, data: Any) -> Any:
++        """Validate and parse input data, supporting JSON and Markdown code fences."""
++        if isinstance(data, str):
++            # 1. Try parsing as plain JSON
++            try:
++                return json.loads(data)
++            except json.JSONDecodeError:
++                pass
++
++            # 2. Try parsing as Markdown code fence
++            # Regex to find the first triple-backtick block
++            # Opening fence: ```[optional_label]\n
++            # Closing fence: ```
++            match = re.search(r"```(?:[^\n]*)\n(.*?)\n```", data, re.DOTALL)
++            if match:
++                try:
++                    return json.loads(match.group(1))
++                except json.JSONDecodeError:
++                    pass
++        
++        return data
++
++    @classmethod
++    def model_validate(cls, data: Any, **kwargs) -> "ToolCalls":
++        parsed_data = cls.validate_input(data)
++        
++        # Handle bare list
++        if isinstance(parsed_data, list):
++            parsed_data = {"tool_calls": parsed_data}
++        
++        # Handle single name/args object
++        elif isinstance(parsed_data, dict) and "name" in parsed_data and "args" in parsed_data:
++            parsed_data = {"tool_calls": [parsed_data]}
++            
++        return super().model_validate(parsed_data, **kwargs)
++
++    @classmethod
++    def model_validate_json(cls, json_data: str, **kwargs) -> "ToolCalls":
++        return cls.model_validate(json_data, **kwargs)
++
+     @classmethod
+     def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+diff --git a/dspy/adapters/utils.py b/dspy/adapters/utils.py
+index 2ce6de20..edb9d0d1 100644
+--- a/dspy/adapters/utils.py
++++ b/dspy/adapters/utils.py
+@@ -11,6 +11,7 @@ from pydantic import TypeAdapter
+ from pydantic.fields import FieldInfo
+ 
+ from dspy.adapters.types.base_type import Type
++from dspy.adapters.types.tool import ToolCalls
+ from dspy.signatures.utils import get_dspy_field_type
+ 
+ 
+@@ -119,14 +120,12 @@ def find_enum_member(enum, identifier):
+     """
+     # Check if the identifier is a valid enum member value *before* checking if it's a valid enum
+     # member name, since the identifier will be a value for explicitly-valued enums. This handles
+-    # the (rare) case where an enum member value is the same as another enum member's name in
+-    # an explicitly-valued enum
++    # the (rare) case where an enum member's name is the same as another member's value.
+     for member in enum:
+         if member.value == identifier:
+             return member
+-
+-    # If the identifier is not a valid enum member value, check if it's a valid enum member name,
+-    # since the identifier will be a member name for auto-valued enums
++    
++    # If not found, check if the identifier is a valid enum member name
+     if identifier in enum.__members__:
+         return enum[identifier]
+ 
+@@ -162,6 +161,10 @@ def parse_value(value, annotation):
+     if not isinstance(value, str):
+         return TypeAdapter(annotation).validate_python(value)
+ 
++    # Special handling for ToolCalls
++    if annotation is ToolCalls:
++        return ToolCalls.model_validate(value)
++
+     candidate = json_repair.loads(value)  # json_repair.loads returns "" on failure.
+     if candidate == "" and value != "":
+         try:

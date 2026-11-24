@@ -1,0 +1,310 @@
+diff --git a/add_methods.py b/add_methods.py
+new file mode 100644
+index 0000000..d85025e
+--- /dev/null
++++ b/add_methods.py
+@@ -0,0 +1,39 @@
++import sys
++
++with open('src/jinja2/environment.py', 'r') as f:
++    lines = f.readlines()
++
++new_lines = []
++for line in lines:
++    new_lines.append(line)
++    if 'return iter(sorted(self.extensions.values(), key=lambda x: x.priority))' in line:
++        new_lines.append('\n')
++        new_lines.append('    def extract_marked_translations(self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None) -> t.Iterator[t.Dict[str, t.Any]]:\n')
++        new_lines.append('        from .ext import extract_from_ast\n')
++        new_lines.append('        if isinstance(source, str):\n')
++        new_lines.append('            source = self.parse(source, name=source_name)\n')
++        new_lines.append('\n')
++        new_lines.append('        for node in source.find_all(nodes.CallBlock):\n')
++        new_lines.append('            if not isinstance(node.call, nodes.Call) or not isinstance(node.call.func, nodes.ExtensionAttribute) or node.call.func.attr != "_render_extract":\n')
++        new_lines.append('                continue\n')
++        new_lines.append('\n')
++        new_lines.append('            metadata = node.call.args[0].value\n')
++        new_lines.append('            lineno = node.call.args[1].value\n')
++        new_lines.append('            messages = list(extract_from_ast(nodes.Template(node.body)))\n')
++        new_lines.append('            yield {\n')
++        new_lines.append('                "source": source_name,\n')
++        new_lines.append('                "lineno": lineno,\n')
++        new_lines.append('                "metadata": metadata,\n')
++        new_lines.append('                "messages": messages,\n')
++        new_lines.append('            }\n')
++        new_lines.append('\n')
++        new_lines.append('    def extract_marked_translations_from_templates(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[t.Dict[str, t.Any]]:\n')
++        new_lines.append('        if names is None:\n')
++        new_lines.append('            names = self.loader.list_templates()  # type: ignore\n')
++        new_lines.append('\n')
++        new_lines.append('        for name in names:\n')
++        new_lines.append('            source, _, _ = self.loader.get_source(self, name)  # type: ignore\n')
++        new_lines.append('            yield from self.extract_marked_translations(source, source_name=name)\n')
++
++with open('src/jinja2/environment.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/fix_ext.py b/fix_ext.py
+new file mode 100644
+index 0000000..5b56d37
+--- /dev/null
++++ b/fix_ext.py
+@@ -0,0 +1,36 @@
++with open('src/jinja2/ext.py', 'r') as f:
++    content = f.read()
++
++new_parse = """    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        lineno = next(parser.stream).lineno
++        metadata = {}
++        while parser.stream.current.type != "block_end":
++            key = parser.stream.expect("name").value
++            parser.stream.expect("assign")
++            value = parser.parse_expression()
++            if not isinstance(value, nodes.Const):
++                parser.fail(
++                    f"Metadata value for {key!r} must be a constant.", value.lineno
++                )
++            metadata[key] = value.value
++            if parser.stream.current.type == "comma":
++                next(parser.stream)
++
++        parser.stream.expect("block_end")
++        body = parser.parse_statements(["name:endextract"], drop_needle=True)
++        return nodes.CallBlock(
++            self.call_method("_render_extract", [nodes.Const(metadata), nodes.Const(lineno)]),
++            [],
++            [],
++            body,
++        ).set_lineno(lineno)
++"""
++# I will replace the old parse method with this one.
++# Wait, the old one was already like this.
++# Let me check the `TranslationExtractorExtension` again.
++# Maybe the issue is `parser.stream.expect("block_end")`?
++# What if there are spaces?
++# `{% extract key="value" %}`
++# The `block_end` is `%}`.
++# Maybe the `parser.stream` is not at `block_end`?
++# Let's try to print the tokens.
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..cc4d0e7 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -448,6 +448,128 @@ class Environment:
+         """Iterates over the extensions by priority."""
+         return iter(sorted(self.extensions.values(), key=lambda x: x.priority))
+ 
++    def extract_marked_translations(self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        from .ext import extract_from_ast, TranslationExtractorExtension
++        if isinstance(source, str):
++            source = self.parse(source, name=source_name)
++
++        for node in source.find_all(nodes.CallBlock):
++            if not isinstance(node.call, nodes.Call) or not isinstance(node.call.node, nodes.ExtensionAttribute) or node.call.node.name != "_render_extract":
++                continue
++
++            metadata = node.call.args[0].value
++            lineno = node.call.args[1].value
++            messages = list(extract_from_ast(nodes.Template(node.body)))
++            yield {
++                "source": source_name,
++                "lineno": lineno,
++                "metadata": metadata,
++                "messages": messages,
++            }
++
++    def extract_marked_translations_from_templates(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        if names is None:
++            if self.loader is None:
++                raise TypeError("No loader configured")
++            names = self.loader.list_templates()
++
++        for name in names:
++            source, _, _ = self.loader.get_source(self, name)
++            yield from self.extract_marked_translations(source, source_name=name)
++
++    def extract_marked_translations_from_templates(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        if names is None:
++            if self.loader is None:
++                raise TypeError("No loader configured")
++            names = self.loader.list_templates()
++
++        for name in names:
++            source, _, _ = self.loader.get_source(self, name)
++            yield from self.extract_marked_translations(source, source_name=name)
++        """Iterates over the extensions by priority."""
++    def extract_marked_translations(self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        from .ext import extract_from_ast, TranslationExtractorExtension
++        if isinstance(source, str):
++            source = self.parse(source, name=source_name)
++
++        for node in source.find_all(nodes.CallBlock):
++            if not isinstance(node.call, nodes.Call) or not isinstance(node.call.node, nodes.ExtensionAttribute) or node.call.node.name != "_render_extract":
++                continue
++
++            metadata = node.call.args[0].value
++            lineno = node.call.args[1].value
++            messages = list(extract_from_ast(nodes.Template(node.body)))
++            yield {
++                "source": source_name,
++                "lineno": lineno,
++                "metadata": metadata,
++                "messages": messages,
++            }
++
++    def extract_marked_translations_from_templates(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        if names is None:
++            if self.loader is None:
++                raise TypeError("No loader configured")
++            names = self.loader.list_templates()
++
++        for name in names:
++            source, _, _ = self.loader.get_source(self, name)
++            yield from self.extract_marked_translations(source, source_name=name)
++        return iter(sorted(self.extensions.values(), key=lambda x: x.priority))
++    def extract_marked_translations(self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        from .ext import extract_from_ast, TranslationExtractorExtension
++        if isinstance(source, str):
++            source = self.parse(source, name=source_name)
++
++        for node in source.find_all(nodes.CallBlock):
++            if not isinstance(node.call, nodes.Call) or not isinstance(node.call.node, nodes.ExtensionAttribute) or node.call.node.name != "_render_extract":
++                continue
++
++            metadata = node.call.args[0].value
++            lineno = node.call.args[1].value
++            messages = list(extract_from_ast(nodes.Template(node.body)))
++            yield {
++                "source": source_name,
++                "lineno": lineno,
++                "metadata": metadata,
++                "messages": messages,
++            }
++
++    def extract_marked_translations_from_templates(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        if names is None:
++            if self.loader is None:
++                raise TypeError("No loader configured")
++            names = self.loader.list_templates()
++
++        for name in names:
++            source, _, _ = self.loader.get_source(self, name)
++            yield from self.extract_marked_translations(source, source_name=name)
++    def extract_marked_translations(self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        from .ext import extract_from_ast, TranslationExtractorExtension
++        if isinstance(source, str):
++            source = self.parse(source, name=source_name)
++
++        for node in source.find_all(nodes.CallBlock):
++            if not isinstance(node.call, nodes.Call) or not isinstance(node.call.node, nodes.ExtensionAttribute) or node.call.node.name != "_render_extract":
++                continue
++
++            metadata = node.call.args[0].value
++            lineno = node.call.args[1].value
++            messages = list(extract_from_ast(nodes.Template(node.body)))
++            yield {
++                "source": source_name,
++                "lineno": lineno,
++                "metadata": metadata,
++                "messages": messages,
++            }
++    def extract_marked_translations_from_templates(self, names: t.Optional[t.Iterable[str]] = None) -> t.Iterator[t.Dict[str, t.Any]]:
++        if names is None:
++            names = self.loader.list_templates()  # type: ignore
++
++        for name in names:
++            source, _, _ = self.loader.get_source(self, name)  # type: ignore
++            yield from self.extract_marked_translations(source, source_name=name)
++
+     def getitem(
+         self, obj: t.Any, argument: t.Union[str, t.Any]
+     ) -> t.Union[t.Any, Undefined]:
+@@ -603,6 +725,7 @@ class Environment:
+     def _parse(
+         self, source: str, name: t.Optional[str], filename: t.Optional[str]
+     ) -> nodes.Template:
++        print(f"DEBUG: _parse called")
+         """Internal parsing function used by `parse` and `compile`."""
+         return Parser(self, source, name, filename).parse()
+ 
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..00e6c31 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -852,3 +852,38 @@ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+ loopcontrols = LoopControlExtension
+ debug = DebugExtension
++
++class TranslationExtractorExtension(Extension):
++    tags = {"extract"}
++    def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
++        print("DEBUG: TranslationExtractorExtension.parse called")
++        lineno = next(parser.stream).lineno
++        metadata = {}
++        while parser.stream.current.type != "block_end":
++            key = parser.stream.expect("name").value
++            parser.stream.expect("assign")
++            value = parser.parse_expression()
++            if not isinstance(value, nodes.Const):
++                parser.fail(f"Metadata value for {key!r} must be a constant.", value.lineno)
++            metadata[key] = value.value
++            if parser.stream.current.type == "comma":
++                next(parser.stream)
++        body = parser.parse_statements(("name:endextract",), drop_needle=True)
++        return nodes.CallBlock(
++            self.call_method("_render_extract", [nodes.Const(metadata), nodes.Const(lineno)]),
++            [], [], body,
++        ).set_lineno(lineno)
++    def _render_extract(self, metadata: t.Dict[str, t.Any], lineno: int, caller: t.Callable) -> str:
++        return caller()
++
++def extract_from_ast(ast: nodes.Template, gettext_functions: t.Sequence[str] = ("_", "gettext", "ngettext", "pgettext", "npgettext"), babel_style: bool = True) -> t.Iterator[t.Tuple[int, str, t.Union[t.Optional[str], t.Tuple[t.Optional[str], ...]]]]:
++    for node in ast.find_all(nodes.Call):
++        if not isinstance(node.node, nodes.Name) or node.node.name not in gettext_functions: continue
++        strings: t.List[t.Optional[str]] = []
++        for arg in node.args:
++            if isinstance(arg, nodes.Const) and isinstance(arg.value, str): strings.append(arg.value)
++            else: strings.append(None)
++        if not strings: out = None
++        elif len(strings) == 1: out = strings[0]
++        else: out = tuple(strings)
++        yield node.lineno, node.node.name, out
+diff --git a/src/jinja2/parser.py b/src/jinja2/parser.py
+index 4447396..8cc62f6 100644
+--- a/src/jinja2/parser.py
++++ b/src/jinja2/parser.py
+@@ -64,6 +64,7 @@ class Parser:
+         self.extensions: t.Dict[
+             str, t.Callable[["Parser"], t.Union[nodes.Node, t.List[nodes.Node]]]
+         ] = {}
++        print(f"DEBUG: extensions: {self.extensions}")
+         for extension in environment.iter_extensions():
+             for tag in extension.tags:
+                 self.extensions[tag] = extension.parse
+@@ -178,6 +179,7 @@ class Parser:
+             if token.value == "filter":
+                 return self.parse_filter_block()
+             ext = self.extensions.get(token.value)
++            print(f"DEBUG: token: {token.value}, ext: {ext}")
+             if ext is not None:
+                 return ext(self)
+ 
+diff --git a/tests/test_translation_extractor.py b/tests/test_translation_extractor.py
+new file mode 100644
+index 0000000..c523e77
+--- /dev/null
++++ b/tests/test_translation_extractor.py
+@@ -0,0 +1,13 @@
++from jinja2.exceptions import TemplateSyntaxError
++import pytest
++from jinja2 import Environment, DictLoader
++from jinja2.ext import TranslationExtractorExtension
++
++    print(f"DEBUG: Environment: {Environment}")
++def test_invalid_metadata():
++    env = Environment(extensions=[TranslationExtractorExtension])
++    template = '{% extract key=dynamic_var %}{% endextract %}'
++    # Print tokens
++    print(f"DEBUG: tokens: {list(env.lex(template))}")
++    with pytest.raises(TemplateSyntaxError):
++        env.extract_marked_translations(template)

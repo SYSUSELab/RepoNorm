@@ -1,0 +1,184 @@
+diff --git a/tests/clients/test_cache.py b/tests/clients/test_cache.py
+index edff148..0574f8e 100644
+--- a/tests/clients/test_cache.py
++++ b/tests/clients/test_cache.py
+@@ -280,3 +280,179 @@ async def test_request_cache_decorator_async(cache):
+         # Call with different arguments should compute again
+         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
+         assert result3 == "Response for Different with openai/gpt-4o-mini"
++
++def test_cache_bypass_context_manager(cache):
++    """Test the cache bypass context manager that skips reads but still writes."""
++    # Create a test request
++    request = {"prompt": "Test prompt", "model": "openai/gpt-4o-mini", "temperature": 0.7}
++ 
++    # First, put a value in cache
++    original_response = DummyResponse(message="Original cached response", usage={"prompt_tokens": 5, "completion_tokens": 10})
++    cache.put(request, original_response)
++ 
++    # Verify it's cached
++    cached_result = cache.get(request)
++    assert cached_result is not None
++    assert cached_result.message == "Original cached response"
++ 
++    # Now test bypass functionality
++    with cache.bypass():
++        # Inside bypass context, get() should return None even though value is cached
++        bypass_result = cache.get(request)
++        assert bypass_result is None
++ 
++        # put() should still work and store the new value
++        new_response = DummyResponse(message="New response during bypass", usage={"prompt_tokens": 8, "completion_tokens": 15})
++        cache.put(request, new_response)
++ 
++    # After exiting bypass context, should get the newly stored value
++    final_result = cache.get(request)
++    assert final_result is not None
++    assert final_result.message == "New response during bypass"
++
++
++def test_cache_bypass_nested_context_manager(cache):
++    """Test nested bypass context managers work correctly."""
++    request = {"prompt": "Nested test", "model": "openai/gpt-4o-mini"}
++ 
++    # Put initial value
++    cache.put(request, DummyResponse(message="Initial value", usage={}))
++ 
++    # Test normal access
++    assert cache.get(request).message == "Initial value"
++ 
++    # Test nested bypass
++    with cache.bypass():
++        assert cache.get(request) is None
++ 
++        # Nested bypass should still work
++        with cache.bypass():
++            assert cache.get(request) is None
++            cache.put(request, DummyResponse(message="Nested bypass value", usage={}))
++ 
++        # Still in outer bypass, should still return None
++        assert cache.get(request) is None
++ 
++    # Outside bypass, should get the value stored during nested bypass
++    assert cache.get(request).message == "Nested bypass value"
++
++
++def test_cache_bypass_with_request_cache_decorator(cache):
++    """Test that bypass works with the request_cache decorator."""
++    from dspy.clients.cache import request_cache
++ 
++    call_count = 0
++ 
++    @request_cache()
++    def test_function(prompt, model):
++        nonlocal call_count
++        call_count += 1
++        return f"Response {call_count} for {prompt}"
++ 
++    # Mock the dspy.cache attribute
++    with patch("dspy.cache", cache):
++        # First call should execute and cache
++        result1 = test_function(prompt="Hello", model="openai/gpt-4o-mini")
++        assert result1 == "Response 1 for Hello"
++        assert call_count == 1
++ 
++        # Second call should use cache
++        result2 = test_function(prompt="Hello", model="openai/gpt-4o-mini")
++        assert result2 == "Response 1 for Hello"  # Same cached result
++        assert call_count == 1  # Function not called again
++ 
++        # Third call with bypass should skip cache read and execute function
++        with cache.bypass():
++            result3 = test_function(prompt="Hello", model="openai/gpt-4o-mini")
++            assert result3 == "Response 2 for Hello"  # New result
++            assert call_count == 2  # Function called again
++ 
++        # Fourth call (outside bypass) should get the newly cached result
++        result4 = test_function(prompt="Hello", model="openai/gpt-4o-mini")
++        assert result4 == "Response 2 for Hello"  # Uses new cached result
++        assert call_count == 2  # Function not called again
++
++
++
++def test_bypass_exception_restores_nested_state(cache):
++    request = {"prompt": "restore"}
++    cache.put(request, "before")
++    with cache.bypass():
++        with pytest.raises(RuntimeError, match="sentinel"):
++            with cache.bypass():
++                cache.put(request, "written")
++                raise RuntimeError("sentinel")
++        assert cache.get(request) is None
++    assert cache.get(request) == "written"
++
++
++def test_bypass_thread_isolation_with_overlap(cache):
++    from concurrent.futures import ThreadPoolExecutor
++    from threading import Event
++    request = {"prompt": "overlap"}
++    cache.put(request, "available")
++    entered, inspected = Event(), Event()
++    def bypass_reader():
++        with cache.bypass():
++            entered.set()
++            assert inspected.wait(10)
++            return cache.get(request)
++    def normal_reader():
++        try:
++            assert entered.wait(10)
++            return cache.get(request)
++        finally:
++            inspected.set()
++    with ThreadPoolExecutor(max_workers=2) as executor:
++        bypassed = executor.submit(bypass_reader)
++        normal = executor.submit(normal_reader)
++        assert normal.result(timeout=15) == "available"
++        assert bypassed.result(timeout=15) is None
++    assert cache.get(request) == "available"
++
++
++@pytest.mark.asyncio
++async def test_bypass_async_decorator_and_task_isolation(cache):
++    import asyncio
++    from dspy.clients.cache import request_cache
++    calls = []
++    @request_cache()
++    async def compute(prompt):
++        calls.append(prompt)
++        return len(calls)
++    entered, observed = asyncio.Event(), asyncio.Event()
++    async def bypassed():
++        with cache.bypass():
++            entered.set()
++            await asyncio.wait_for(observed.wait(), 10)
++            assert await compute("async") == 2
++    async def normal():
++        try:
++            await asyncio.wait_for(entered.wait(), 10)
++            assert await compute("async") == 1
++        finally:
++            observed.set()
++    with patch("dspy.cache", cache):
++        assert await compute("async") == 1
++        await asyncio.gather(bypassed(), normal())
++        assert await compute("async") == 2
++        assert calls == ["async", "async"]
++
++
++def test_bypass_is_limited_to_its_cache_instance(tmp_path):
++    caches = [Cache(False, True, str(tmp_path / str(i))) for i in range(2)]
++    request = {"prompt": "independent"}
++    first, second = caches
++    first.put(request, "first")
++    second.put(request, "second")
++    with first.bypass():
++        assert first.get(request) is None
++        assert second.get(request) == "second"
++        with second.bypass():
++            assert first.get(request) is second.get(request) is None
++            first.put(request, "fresh first")
++            second.put(request, "fresh second")
++        assert first.get(request) is None
++        assert second.get(request) == "fresh second"
++    assert first.get(request) == "fresh first"
++    assert second.get(request) == "fresh second"

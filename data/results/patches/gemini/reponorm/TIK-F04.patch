@@ -1,0 +1,132 @@
+diff --git a/tests/test_chunking.py b/tests/test_chunking.py
+new file mode 100644
+index 0000000..63060fc
+--- /dev/null
++++ b/tests/test_chunking.py
+@@ -0,0 +1,53 @@
++import pytest
++import tiktoken
++
++def test_chunking_basic():
++    enc = tiktoken.get_encoding("gpt2")
++    text = "abcde"
++    expected = [enc.encode('abc'), enc.encode('cde')]
++    assert enc.encode(text, chunk_size=3, chunk_overlap=1) == expected
++
++def test_chunking_empty():
++    enc = tiktoken.get_encoding("gpt2")
++    assert enc.encode("", chunk_size=3, chunk_overlap=1) == [[]]
++
++def test_chunking_invalid_params():
++    enc = tiktoken.get_encoding("gpt2")
++    with pytest.raises(ValueError, match="chunk_size must be positive"):
++        enc.encode("abc", chunk_size=0)
++    with pytest.raises(ValueError, match="chunk_overlap must be 0 <= chunk_overlap < chunk_size"):
++        enc.encode("abc", chunk_size=3, chunk_overlap=3)
++    with pytest.raises(ValueError, match="chunk_overlap must be 0 <= chunk_overlap < chunk_size"):
++        enc.encode("abc", chunk_size=3, chunk_overlap=-1)
++    with pytest.raises(ValueError, match="chunk_overlap must be 0 if chunk_size is None"):
++        enc.encode("abc", chunk_size=None, chunk_overlap=1)
++
++def test_chunking_no_overlap():
++    enc = tiktoken.get_encoding("gpt2")
++    text = "abcdef"
++    expected = [enc.encode('abc'), enc.encode('def')]
++    assert enc.encode(text, chunk_size=3, chunk_overlap=0) == expected
++
++def test_chunking_exact_fit():
++    enc = tiktoken.get_encoding("gpt2")
++    text = "abcdef"
++    expected = [enc.encode('abc'), enc.encode('cde'), enc.encode('ef')]
++    assert enc.encode(text, chunk_size=3, chunk_overlap=1) == expected
++
++def test_chunking_special_tokens():
++    enc = tiktoken.get_encoding("gpt2")
++    text = "abc<|endoftext|>def"
++    
++    # Test ValueError
++    with pytest.raises(ValueError):
++        enc.encode(text, chunk_size=5, chunk_overlap=0)
++        
++    # Test disallowed_special=()
++    encoded = enc.encode(text, chunk_size=5, chunk_overlap=0, disallowed_special=())
++    assert len(encoded) == 4
++    
++    # Test with allowed_special
++    text = "abc <|endoftext|> def"
++    # size 22, overlap 0
++    encoded = enc.encode(text, chunk_size=22, chunk_overlap=0, allowed_special={"<|endoftext|>"})
++    assert encoded[0] == [39305, 220, 50256, 825]
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..04a2aae 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,9 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        chunk_size: int | None = None,
++        chunk_overlap: int = 0,
++    ) -> list[int] | list[list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -97,6 +99,11 @@ class Encoding:
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
+ 
++        If `chunk_size` is provided, the text is split into character windows of size `chunk_size`
++        with an overlap of `chunk_overlap`. The function returns a list of token lists.
++        `chunk_overlap` must be an integer satisfying 0 <= chunk_overlap < chunk_size.
++        Empty text yields [[]].
++
+         ```
+         >>> enc.encode("hello world")
+         [31373, 995]
+@@ -110,6 +117,19 @@ class Encoding:
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
+         """
++        if chunk_size is not None:
++            if not isinstance(chunk_size, int) or isinstance(chunk_size, bool):
++                raise ValueError("chunk_size must be an integer")
++            if chunk_size <= 0:
++                raise ValueError("chunk_size must be positive")
++            if not isinstance(chunk_overlap, int) or isinstance(chunk_overlap, bool):
++                raise ValueError("chunk_overlap must be an integer")
++            if chunk_overlap < 0 or chunk_overlap >= chunk_size:
++                raise ValueError("chunk_overlap must be 0 <= chunk_overlap < chunk_size")
++        else:
++            if chunk_overlap != 0:
++                raise ValueError("chunk_overlap must be 0 if chunk_size is None")
++
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -120,10 +140,24 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if chunk_size is not None:
++            if not text:
++                return [[]]
++            chunks = []
++            start = 0
++            while start < len(text):
++                end = start + chunk_size
++                chunks.append(text[start:end])
++                if end >= len(text):
++                    break
++                start += chunk_size - chunk_overlap
++            return [self._core_bpe.encode(chunk, allowed_special) for chunk in chunks]
++
+         try:
+             return self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            return self._core_bpe.encode(text, allowed_special)
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+             # fixup for any surrogate pairs that may have sneaked their way into the text.
+             # Technically, this introduces a place where encode + decode doesn't roundtrip a Python

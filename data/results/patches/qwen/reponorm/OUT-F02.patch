@@ -1,0 +1,236 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..e9602ed 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,6 +1,8 @@
+ """Backend class for XGrammar."""
+ 
+-from typing import TYPE_CHECKING
++import threading
++from collections import OrderedDict
++from typing import TYPE_CHECKING, Any
+ 
+ from outlines.backends.base import BaseBackend
+ from outlines.models import SteerableModel
+@@ -53,13 +55,27 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ class XGrammarBackend(BaseBackend):
+     """Backend for XGRammar."""
+ 
+-    def __init__(self, model: SteerableModel):
++    def __init__(
++        self,
++        model: SteerableModel,
++        cache_compiled_grammars: bool = False,
++        max_cached_grammars: int | None = None,
++    ):
+         """
+         Parameters
+         ----------
+         model
+             The Outlines model of the user.
++        cache_compiled_grammars
++            Whether to cache compiled grammars. Default is False.
++        max_cached_grammars
++            Maximum number of grammars to cache. If None, no limit.
++            Must be a positive integer when provided. Default is None.
+ 
++        Raises
++        ------
++        ValueError
++            If max_cached_grammars is not None and is not a positive integer.
+         """
+         import xgrammar as xgr
+         from transformers import AutoConfig
+@@ -69,6 +85,22 @@ class XGrammarBackend(BaseBackend):
+                 "The xgrammar backend only supports Transformers models"
+             )
+ 
++        # Validate max_cached_grammars
++        if max_cached_grammars is not None:
++            # Check it's an int, not a bool (bool is a subclass of int)
++            if isinstance(max_cached_grammars, bool):
++                raise ValueError(
++                    "max_cached_grammars must be an integer or None, not a boolean"
++                )
++            if not isinstance(max_cached_grammars, int):
++                raise ValueError(
++                    f"max_cached_grammars must be an integer or None, got {type(max_cached_grammars).__name__}"
++                )
++            if max_cached_grammars <= 0:
++                raise ValueError(
++                    f"max_cached_grammars must be a positive integer or None, got {max_cached_grammars}"
++                )
++
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+@@ -78,6 +110,119 @@ class XGrammarBackend(BaseBackend):
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
++        # Caching configuration
++        self.cache_compiled_grammars = cache_compiled_grammars
++        self.max_cached_grammars = max_cached_grammars
++
++        if cache_compiled_grammars:
++            # LRU cache: key -> compiled_grammar
++            self._compiled_cache: OrderedDict[str, Any] = OrderedDict()
++            # Lock for thread-safe cache access
++            self._cache_lock = threading.RLock()
++            # Track in-progress compilations: key -> Event
++            self._in_progress: dict[str, threading.Event] = {}
++            self._in_progress_lock = threading.Lock()
++        else:
++            self._compiled_cache = None
++            self._cache_lock = None
++            self._in_progress = None
++            self._in_progress_lock = None
++
++    def _get_cache_key(self, kind: str, source: str) -> str:
++        """Generate a cache key from grammar kind and source string."""
++        return f"{kind}:{source}"
++
++    def _compile_and_cache(
++        self,
++        kind: str,
++        source: str,
++        compile_func: callable,
++    ) -> Any:
++        """Compile a grammar and cache the result.
++
++        Handles concurrent cold requests by sharing in-progress compilation.
++        Failed compilations are not cached.
++
++        Parameters
++        ----------
++        kind
++            The grammar kind (e.g., "json_schema", "regex", "cfg").
++        source
++            The source string to compile.
++        compile_func
++            The compilation function to call.
++
++        Returns
++        -------
++        Any
++            The compiled grammar.
++
++        Raises
++        ------
++        Exception
++            If compilation fails.
++        """
++        cache_key = self._get_cache_key(kind, source)
++
++        while True:
++            event = None
++            with self._cache_lock:
++                # Check if already cached
++                if cache_key in self._compiled_cache:
++                    # Move to end (most recently used)
++                    self._compiled_cache.move_to_end(cache_key)
++                    return self._compiled_cache[cache_key]
++
++                # Check if compilation is in progress
++                if cache_key in self._in_progress:
++                    # Wait for the in-progress compilation to complete
++                    event = self._in_progress[cache_key]
++            
++            # Wait outside the lock to avoid blocking other operations
++            if event is not None:
++                event.wait()
++
++            # Re-check cache after wait (could have been populated by another thread)
++            with self._cache_lock:
++                if cache_key in self._compiled_cache:
++                    self._compiled_cache.move_to_end(cache_key)
++                    return self._compiled_cache[cache_key]
++
++            # Mark compilation as in progress
++            event = threading.Event()
++            with self._in_progress_lock:
++                self._in_progress[cache_key] = event
++
++            try:
++                # Perform compilation
++                compiled_grammar = compile_func(source)
++
++                # Signal completion before caching
++                event.set()
++
++                # Cache the successful result
++                with self._cache_lock:
++                    # Evict least recently used if at capacity
++                    if (
++                        self.max_cached_grammars is not None
++                        and len(self._compiled_cache) >= self.max_cached_grammars
++                    ):
++                        # Remove oldest entry
++                        self._compiled_cache.popitem(last=False)
++
++                    self._compiled_cache[cache_key] = compiled_grammar
++
++                return compiled_grammar
++
++            except Exception:
++                # Signal completion even on failure
++                event.set()
++                # Don't cache failed compilations
++                with self._in_progress_lock:
++                    if cache_key in self._in_progress:
++                        del self._in_progress[cache_key]
++                raise
++
+     def get_json_schema_logits_processor(
+         self, json_schema: str
+     ) -> "LogitsProcessor":
+@@ -94,9 +239,16 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_json_schema(
+-            json_schema
+-        )
++        if self.cache_compiled_grammars:
++            compiled_grammar = self._compile_and_cache(
++                "json_schema",
++                json_schema,
++                self.grammar_compiler.compile_json_schema,
++            )
++        else:
++            compiled_grammar = self.grammar_compiler.compile_json_schema(
++                json_schema
++            )
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+     def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
+@@ -113,7 +265,14 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_regex(regex)
++        if self.cache_compiled_grammars:
++            compiled_grammar = self._compile_and_cache(
++                "regex",
++                regex,
++                self.grammar_compiler.compile_regex,
++            )
++        else:
++            compiled_grammar = self.grammar_compiler.compile_regex(regex)
+         return XGrammarLogitsProcessor(compiled_grammar)
+ 
+     def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+@@ -130,5 +289,12 @@ class XGrammarBackend(BaseBackend):
+             The logits processor to use to constrain the generation.
+ 
+         """
+-        compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
++        if self.cache_compiled_grammars:
++            compiled_grammar = self._compile_and_cache(
++                "cfg",
++                grammar,
++                self.grammar_compiler.compile_grammar,
++            )
++        else:
++            compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+         return XGrammarLogitsProcessor(compiled_grammar)

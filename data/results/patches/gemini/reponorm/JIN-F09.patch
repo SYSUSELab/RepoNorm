@@ -1,0 +1,258 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..2d6193d 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1161,8 +1161,9 @@ class _GroupTuple(t.NamedTuple):
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.List[str]],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1209,25 +1210,96 @@ def sync_do_groupby(
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attrs = [a.strip() for a in attribute.split(",")]
++        elif isinstance(attribute, (list, tuple)):
++            attrs = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attrs) != levels:
++            raise FilterArgumentError(f"attribute count ({len(attrs)}) must match levels ({levels})")
++            
++        def group_recursive(items, attr_idx):
++            if attr_idx == levels:
++                return items
++            
++            attr = attrs[attr_idx]
++            expr = make_attrgetter(environment, attr, default=default)
++            
++            # Sort items by the current attribute
++            sorted_items = sorted(items, key=expr)
++            
++            result = []
++            for key, group in groupby(sorted_items, expr):
++                result.append(_GroupTuple(key, group_recursive(list(group), attr_idx + 1)))
++            return result
++            
++        return group_recursive(value, 0)
++    
++    else:
++        if isinstance(attribute, (list, tuple)):
++            raise FilterArgumentError("Multiple attributes require levels")
++            
++        expr = make_attrgetter(environment, attribute, default=default)
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(value, key=expr), expr)
++        ]
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.List[str]],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attrs = [a.strip() for a in attribute.split(",")]
++        elif isinstance(attribute, (list, tuple)):
++            attrs = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attrs) != levels:
++            raise FilterArgumentError(f"attribute count ({len(attrs)}) must match levels ({levels})")
++            
++        async def group_recursive(items, attr_idx):
++            if attr_idx == levels:
++                return items
++            
++            attr = attrs[attr_idx]
++            expr = make_attrgetter(environment, attr, default=default)
++            
++            # Sort items by the current attribute
++            sorted_items = sorted(items, key=expr)
++            
++            result = []
++            for key, group in groupby(sorted_items, expr):
++                result.append(_GroupTuple(key, await group_recursive(list(group), attr_idx + 1)))
++            return result
++            
++        return await group_recursive(await auto_to_list(value), 0)
++    
++    else:
++        if isinstance(attribute, (list, tuple)):
++            raise FilterArgumentError("Multiple attributes require levels")
++            
++        expr = make_attrgetter(environment, attribute, default=default)
++        return [
++            _GroupTuple(key, await auto_to_list(values))
++            for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++        ]
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_levels.py b/tests/test_groupby_levels.py
+new file mode 100644
+index 0000000..34390e6
+--- /dev/null
++++ b/tests/test_groupby_levels.py
+@@ -0,0 +1,129 @@
++import pytest
++from jinja2 import Environment
++from jinja2.exceptions import FilterArgumentError
++
++def test_groupby_levels_basic():
++    env = Environment(enable_async=True)
++    data = [
++        {'dept': 'A', 'role': 'dev', 'name': 'x'},
++        {'dept': 'A', 'role': 'dev', 'name': 'y'},
++        {'dept': 'A', 'role': 'qa', 'name': 'z'},
++        {'dept': 'B', 'role': 'dev', 'name': 'w'},
++    ]
++    
++    # Test hierarchical groupby
++    # groupby(['dept', 'role'], levels=2)
++    # Expected:
++    # [
++    #   ('A', [
++    #     ('dev', [{'dept': 'A', 'role': 'dev', 'name': 'x'}, {'dept': 'A', 'role': 'dev', 'name': 'y'}]),
++    #     ('qa', [{'dept': 'A', 'role': 'qa', 'name': 'z'}])
++    #   ]),
++    #   ('B', [
++    #     ('dev', [{'dept': 'B', 'role': 'dev', 'name': 'w'}])
++    #   ])
++    # ]
++    
++    # We need to check the structure.
++    # Since the result is a list of _GroupTuple, we can't easily compare it to a list of tuples.
++    # Let's convert it to a list of tuples for comparison.
++    
++    def to_tuple(item):
++        if isinstance(item, list):
++            return [to_tuple(i) for i in item]
++        if hasattr(item, 'grouper'):
++            return (item.grouper, to_tuple(item.list))
++        return item
++
++    result = env.from_string("{{ data|groupby(['dept', 'role'], levels=2) }}").render(data=data)
++    # The result is a string representation of the list of _GroupTuple.
++    # This is not what we want. We want to test the actual object structure.
++    # We can use a custom filter to return the object itself.
++    
++    env.filters['to_tuple'] = to_tuple
++    result = env.from_string("{{ data|groupby(['dept', 'role'], levels=2)|to_tuple }}").render(data=data)
++    
++    # The result is a string representation of the list of tuples.
++    # This is still not ideal. Let's use a test that runs in python.
++    
++    from jinja2.filters import sync_do_groupby
++    
++    # We need to pass the environment to sync_do_groupby
++    result = sync_do_groupby(env, data, ['dept', 'role'], levels=2)
++    
++    expected = [
++        ('A', [
++            ('dev', [{'dept': 'A', 'role': 'dev', 'name': 'x'}, {'dept': 'A', 'role': 'dev', 'name': 'y'}]),
++            ('qa', [{'dept': 'A', 'role': 'qa', 'name': 'z'}])
++        ]),
++        ('B', [
++            ('dev', [{'dept': 'B', 'role': 'dev', 'name': 'w'}])
++        ])
++    ]
++    
++    assert to_tuple(result) == expected
++
++def test_groupby_levels_validation():
++    env = Environment(enable_async=True)
++    
++    # Nonpositive levels
++    with pytest.raises(FilterArgumentError):
++        env.from_string("{{ data|groupby('a', levels=0) }}").render(data=[])
++        
++    # Mismatched attribute counts
++    with pytest.raises(FilterArgumentError):
++        env.from_string("{{ data|groupby(['a'], levels=2) }}").render(data=[])
++        
++    # Multiple attributes without levels
++    with pytest.raises(FilterArgumentError):
++        env.from_string("{{ data|groupby(['a', 'b']) }}").render(data=[])
++
++
++def test_groupby_levels_comma_separated():
++    from jinja2.filters import sync_do_groupby
++    from jinja2 import Environment
++    env = Environment(enable_async=True)
++    data = [
++        {'dept': 'A', 'role': 'dev', 'name': 'x'},
++    ]
++    
++    result = sync_do_groupby(env, data, "dept, role", levels=2)
++    
++    def to_tuple(item):
++        if isinstance(item, list):
++            return [to_tuple(i) for i in item]
++        if hasattr(item, 'grouper'):
++            return (item.grouper, to_tuple(item.list))
++        return item
++        
++    expected = [
++        ('A', [
++            ('dev', [{'dept': 'A', 'role': 'dev', 'name': 'x'}])
++        ])
++    ]
++    assert to_tuple(result) == expected
++
++def test_groupby_levels_async():
++    from jinja2.filters import do_groupby
++    from jinja2 import Environment
++    env = Environment(enable_async=True)
++    data = [
++        {'dept': 'A', 'role': 'dev', 'name': 'x'},
++    ]
++    
++    import asyncio
++    result = asyncio.run(do_groupby(env, data, "dept, role", levels=2))
++    
++    def to_tuple(item):
++        if isinstance(item, list):
++            return [to_tuple(i) for i in item]
++        if hasattr(item, 'grouper'):
++            return (item.grouper, to_tuple(item.list))
++        return item
++        
++    expected = [
++        ('A', [
++            ('dev', [{'dept': 'A', 'role': 'dev', 'name': 'x'}])
++        ])
++    ]
++    assert to_tuple(result) == expected

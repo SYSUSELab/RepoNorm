@@ -1,0 +1,318 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..794aba7 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -242,6 +242,137 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++
++def _make_priority_gettext(
++    gettext: t.Callable[[str], str],
++    priority_gettext: t.Optional[t.Callable[[str, int], t.Optional[str]]],
++    newstyle: bool = False,
++) -> t.Callable[..., str]:
++    """Wrap gettext with priority fallback support."""
++    @pass_context
++    def priority_aware_gettext(
++        __context: Context, __string: str, **variables: t.Any
++    ) -> str:
++        # Get priority from keyword argument or default to 0
++        priority = variables.pop("_priority", 0)
++        
++        # Filter out any extra kwargs that the underlying gettext might not accept
++        # by creating a clean dict for the underlying call
++        clean_variables = {k: v for k, v in variables.items() if k != "_priority"}
++        
++        # Convert priority to int; invalid/None/negative become 0
++        try:
++            priority = int(priority) if priority is not None else 0
++        except (TypeError, ValueError):
++            priority = 0
++        
++        # Ensure non-negative
++        if priority < 0:
++            priority = 0
++        
++        # Determine max level: min(converted_priority, 9)
++        max_level = min(priority, 9)
++        
++        # Try levels in increasing order
++        result = None
++        for level in range(max_level + 1):
++            if priority_gettext is not None:
++                candidate = priority_gettext(__string, level)
++            else:
++                # Fall back to regular gettext if no priority resolver installed
++                # For newstyle, use __context.call to handle context automatically
++                # For oldstyle, pass context directly since the function expects it
++                if newstyle:
++                    candidate = __context.call(gettext, __string, **variables)
++                else:
++                    candidate = gettext(__context, __string)
++            
++            # Check if result differs from source (miss detection)
++            if candidate is not None and candidate != __string:
++                result = candidate
++                break
++        
++        # If all levels returned miss (same as source), use last result
++        if result is None:
++            if newstyle:
++                result = __context.call(gettext, __string, **variables)
++            else:
++                result = gettext(__context, __string)
++        
++        rv = result
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++
++    return priority_aware_gettext
++
++
++def _make_priority_ngettext(
++    ngettext: t.Callable[[str, str, int], str],
++    priority_ngettext: t.Optional[t.Callable[[str, str, int, int], t.Optional[str]]],
++    newstyle: bool = False,
++) -> t.Callable[..., str]:
++    """Wrap ngettext with priority fallback support."""
++    @pass_context
++    def priority_aware_ngettext(
++        __context: Context,
++        __singular: str,
++        __plural: str,
++        __num: int,
++        **variables: t.Any,
++    ) -> str:
++        # Get priority from keyword argument or default to 0
++        priority = variables.pop("_priority", 0)
++        
++        # Convert priority to int; invalid/None/negative become 0
++        try:
++            priority = int(priority) if priority is not None else 0
++        except (TypeError, ValueError):
++            priority = 0
++        
++        # Ensure non-negative
++        if priority < 0:
++            priority = 0
++        
++        # Determine max level: min(converted_priority, 9)
++        max_level = min(priority, 9)
++        
++        # Try levels in increasing order
++        result = None
++        for level in range(max_level + 1):
++            if priority_ngettext is not None:
++                candidate = priority_ngettext(__singular, __plural, __num, level)
++            else:
++                # Fall back to regular ngettext if no priority resolver installed
++                # For newstyle, use __context.call to handle context automatically
++                # For oldstyle, pass context directly since the function expects it
++                if newstyle:
++                    candidate = __context.call(ngettext, __singular, __plural, __num, **variables)
++                else:
++                    candidate = ngettext(__context, __singular, __plural, __num)
++            
++            # Check if result differs from applicable source message
++            expected = __singular if __num == 1 else __plural
++            if candidate is not None and candidate != expected:
++                result = candidate
++                break
++        
++        # If all levels returned miss (same as source), use last result
++        if result is None:
++            if newstyle:
++                result = __context.call(ngettext, __singular, __plural, __num, **variables)
++            else:
++                result = ngettext(__context, __singular, __plural, __num)
++        
++        variables.setdefault("num", __num)
++        rv = result
++        if __context.eval_ctx.autoescape:
++            rv = Markup(rv)
++        return rv % variables  # type: ignore
++
++    return priority_aware_ngettext
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -257,6 +388,7 @@ class InternationalizationExtension(Extension):
+     def __init__(self, environment: Environment) -> None:
+         super().__init__(environment)
+         environment.globals["_"] = _gettext_alias
++        self._wrap_existing_gettext()
+         environment.extend(
+             install_gettext_translations=self._install,
+             install_null_translations=self._install_null,
+@@ -266,8 +398,28 @@ class InternationalizationExtension(Extension):
+             newstyle_gettext=False,
+         )
+ 
++    def _wrap_existing_gettext(self) -> None:
++        """Wrap any existing gettext functions with priority support."""
++        original_gettext = self.environment.globals.get("gettext")
++        original_ngettext = self.environment.globals.get("ngettext")
++        
++        if original_gettext is not None:
++            self.environment.globals["gettext"] = _make_priority_gettext(
++                original_gettext, None, self.environment.newstyle_gettext  # type: ignore
++            )
++        if original_ngettext is not None:
++            self.environment.globals["ngettext"] = _make_priority_ngettext(
++                original_ngettext, None, self.environment.newstyle_gettext  # type: ignore
++            )
++
+     def _install(
+-        self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
++        self,
++        translations: "_SupportedTranslations",
++        newstyle: t.Optional[bool] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], t.Optional[str]]] = None,
++        priority_ngettext: t.Optional[
++            t.Callable[[str, str, int, int], t.Optional[str]]
++        ] = None,
+     ) -> None:
+         # ugettext and ungettext are preferred in case the I18N library
+         # is providing compatibility with older Python versions.
+@@ -281,10 +433,23 @@ class InternationalizationExtension(Extension):
+         pgettext = getattr(translations, "pgettext", None)
+         npgettext = getattr(translations, "npgettext", None)
+         self._install_callables(
+-            gettext, ngettext, newstyle=newstyle, pgettext=pgettext, npgettext=npgettext
++            gettext,
++            ngettext,
++            newstyle=newstyle,
++            pgettext=pgettext,
++            npgettext=npgettext,
++            priority_gettext=priority_gettext,
++            priority_ngettext=priority_ngettext,
+         )
+ 
+-    def _install_null(self, newstyle: t.Optional[bool] = None) -> None:
++    def _install_null(
++        self,
++        newstyle: t.Optional[bool] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], t.Optional[str]]] = None,
++        priority_ngettext: t.Optional[
++            t.Callable[[str, str, int, int], t.Optional[str]]
++        ] = None,
++    ) -> None:
+         import gettext
+ 
+         translations = gettext.NullTranslations()
+@@ -310,8 +475,9 @@ class InternationalizationExtension(Extension):
+             newstyle=newstyle,
+             pgettext=pgettext,
+             npgettext=npgettext,
++            priority_gettext=priority_gettext,
++            priority_ngettext=priority_ngettext,
+         )
+-
+     def _install_callables(
+         self,
+         gettext: t.Callable[[str], str],
+@@ -319,6 +485,10 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        priority_gettext: t.Optional[t.Callable[[str, int], t.Optional[str]]] = None,
++        priority_ngettext: t.Optional[
++            t.Callable[[str, str, int, int], t.Optional[str]]
++        ] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
+@@ -332,6 +502,11 @@ class InternationalizationExtension(Extension):
+             if npgettext is not None:
+                 npgettext = _make_new_npgettext(npgettext)
+ 
++        # Always wrap with priority support so _priority kwarg can be safely consumed
++        # If no priority resolver is provided, the wrapper falls back to regular gettext
++        gettext = _make_priority_gettext(gettext, priority_gettext, self.environment.newstyle_gettext)  # type: ignore
++        ngettext = _make_priority_ngettext(ngettext, priority_ngettext, self.environment.newstyle_gettext)  # type: ignore
++
+         self.environment.globals.update(
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
+@@ -363,6 +538,7 @@ class InternationalizationExtension(Extension):
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
++        priority: t.Optional[nodes.Expr] = None
+         while parser.stream.current.type != "block_end":
+             if variables:
+                 parser.stream.expect("comma")
+@@ -379,6 +555,18 @@ class InternationalizationExtension(Extension):
+                     exc=TemplateAssertionError,
+                 )
+ 
++            # Check for duplicate priority
++            if token.value == "priority":
++                if priority is not None:
++                    parser.fail(
++                        "translatable priority defined twice.",
++                        token.lineno,
++                        exc=TemplateAssertionError,
++                    )
++                next(parser.stream)
++                priority = parser.parse_expression()
++                continue
++
+             # expressions
+             if parser.stream.current.type == "assign":
+                 next(parser.stream)
+@@ -459,6 +647,7 @@ class InternationalizationExtension(Extension):
+             plural_expr,
+             bool(referenced),
+             num_called_num and have_plural,
++            priority,
+         )
+         node.set_lineno(lineno)
+         if plural_expr_assignment is not None:
+@@ -514,6 +703,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr],
+         vars_referenced: bool,
+         num_called_num: bool,
++        priority: t.Optional[nodes.Expr] = None,
+     ) -> nodes.Output:
+         """Generates a useful node from the data provided."""
+         newstyle = self.environment.newstyle_gettext  # type: ignore
+@@ -552,22 +742,24 @@ class InternationalizationExtension(Extension):
+                 if num_called_num and key == "num":
+                     continue
+                 node.kwargs.append(nodes.Keyword(key, value))
++            # Add priority kwarg if present
++            if priority is not None:
++                node.kwargs.append(nodes.Keyword("_priority", priority))
+ 
+         # otherwise do that here
+         else:
++            # For old-style gettext, pass variables as kwargs so the
++            # priority wrapper can intercept them and format the result
++            for key, value in variables.items():
++                if num_called_num and key == "num":
++                    continue
++                node.kwargs.append(nodes.Keyword(key, value))
++            # Add priority kwarg if present
++            if priority is not None:
++                node.kwargs.append(nodes.Keyword("_priority", priority))
+             # mark the return value as safe if we are in an
+             # environment with autoescaping turned on
+             node = nodes.MarkSafeIfAutoescape(node)
+-            if variables:
+-                node = nodes.Mod(
+-                    node,
+-                    nodes.Dict(
+-                        [
+-                            nodes.Pair(nodes.Const(key), value)
+-                            for key, value in variables.items()
+-                        ]
+-                    ),
+-                )
+         return nodes.Output([node])
+ 
+ 

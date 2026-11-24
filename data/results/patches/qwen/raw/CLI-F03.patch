@@ -1,0 +1,257 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..a05f828 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,15 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param max_resources: An optional nonnegative integer that limits
++        the number of resources that can be registered through
++        :meth:`with_resource`. The default is unlimited. A child context
++        inherits the parent's limit when omitted; an explicit child limit
++        constrains that child's subtree without bypassing any ancestor's
++        limit.
++
++    .. versionadded:: 9.0
++       Added the ``max_resources`` parameter.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,9 +289,13 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
++        # Add this context to parent's children list
++        if parent is not None:
++            parent._children.append(self)
+         #: the :class:`Command` for this context.
+         self.command = command
+         #: the descriptive information name
+@@ -427,10 +440,27 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        # Track whether max_resources was explicitly set before inheritance
++        _max_resources_explicit = max_resources is not None
++        
++        if max_resources is None and parent is not None:
++            max_resources = parent.max_resources
++
++        #: The maximum number of resources that can be registered through
++        #: :meth:`with_resource`. The default is unlimited.
++        self.max_resources: int | None = max_resources
++        
++        # Track whether max_resources was explicitly set or inherited
++        self._explicit_max_resources: bool = _max_resources_explicit
++        
++        #: Child contexts for tracking resource limits in subtrees
++        self._children: list[Context] = []
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
++        self._resources_entered: int = 0
+ 
+     @property
+     def protected_args(self) -> list[str]:
+@@ -588,7 +618,36 @@ class Context:
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        # Check if we're at the limit before entering
++        if self.max_resources is not None:
++            if self._explicit_max_resources:
++                # Explicit limit: only check this context's own resources
++                if self._resources_entered >= self.max_resources:
++                    raise RuntimeError(
++                        f"Maximum number of resources ({self.max_resources}) exceeded."
++                    )
++            else:
++                # Inherited limit: find the nearest ancestor with explicit limit
++                # and check resources in that ancestor's subtree
++                ancestor = self._find_limit_ancestor()
++                if ancestor is not None:
++                    active_count = ancestor._count_in_subtree()
++                    if active_count >= self.max_resources:
++                        raise RuntimeError(
++                            f"Maximum number of resources ({self.max_resources}) exceeded."
++                        )
++        
++        # Reserve capacity for in-progress entry
++        if self.max_resources is not None:
++            self._resources_entered += 1
++        
++        try:
++            return self._exit_stack.enter_context(context_manager)
++        except Exception:
++            # Failed entry - return the reservation
++            if self.max_resources is not None:
++                self._resources_entered -= 1
++            raise
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+@@ -602,12 +661,47 @@ class Context:
+         """
+         return self._exit_stack.callback(f)
+ 
++    def _iter_ancestors(self):
++        """Iterate over all ancestor contexts."""
++        ctx = self.parent
++        while ctx is not None:
++            yield ctx
++            ctx = ctx.parent
++
++    def _count_in_subtree(self) -> int:
++        """Count active resources in this context's subtree (itself + all descendants)."""
++        count = self._resources_entered
++        # Recursively count from children
++        for child in self._children:
++            count += child._count_in_subtree()
++        return count
++    
++    def _find_limit_ancestor(self) -> "Context | None":
++        """Find the nearest ancestor with an explicit max_resources limit."""
++        ctx = self.parent
++        while ctx is not None:
++            if ctx._explicit_max_resources:
++                return ctx
++            ctx = ctx.parent
++        return None
++
++    def _get_active_resource_count(self) -> int:
++        """Get the total number of active resources in this context's
++        subtree (this context and all descendants)."""
++        count = self._resources_entered
++        # Recursively count from children
++        for child in self._children:
++            count += child._get_active_resource_count()
++        return count
++
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
+         """
+         self._exit_stack.close()
++        # Reset resource count for this context since all its resources are closed
++        self._resources_entered = 0
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 
+diff --git a/test_max_resources.py b/test_max_resources.py
+new file mode 100644
+index 0000000..3e54676
+--- /dev/null
++++ b/test_max_resources.py
+@@ -0,0 +1,103 @@
++import click
++from contextlib import contextmanager
++
++@contextmanager
++def resource(name):
++    print(f"Entering {name}")
++    yield name
++    print(f"Exiting {name}")
++
++# Test 1: Basic max_resources limit
++print("=== Test 1: Basic max_resources limit ===")
++ctx = click.Context(click.Command('test'), max_resources=2)
++r1 = ctx.with_resource(resource("r1"))
++print(f"Got resource: {r1}")
++r2 = ctx.with_resource(resource("r2"))
++print(f"Got resource: {r2}")
++try:
++    r3 = ctx.with_resource(resource("r3"))
++    print("ERROR: Should have raised RuntimeError")
++except RuntimeError as e:
++    print(f"Correctly raised RuntimeError: {e}")
++ctx.close()
++
++# Test 2: Zero max_resources
++print("\n=== Test 2: Zero max_resources ===")
++ctx = click.Context(click.Command('test'), max_resources=0)
++try:
++    r1 = ctx.with_resource(resource("r1"))
++    print("ERROR: Should have raised RuntimeError")
++except RuntimeError as e:
++    print(f"Correctly raised RuntimeError: {e}")
++
++# Test 3: Inheritance of max_resources
++print("\n=== Test 3: Inheritance of max_resources ===")
++parent = click.Context(click.Command('parent'), max_resources=2)
++p1 = parent.with_resource(resource("p1"))
++print(f"Parent got resource: {p1}")
++child = click.Context(click.Command('child'), parent=parent)
++c1 = child.with_resource(resource("c1"))
++print(f"Child got resource: c1")
++try:
++    c2 = child.with_resource(resource("c2"))
++    print(f"ERROR: Should have raised RuntimeError but got: {c2}")
++except RuntimeError as e:
++    print(f"Correctly raised RuntimeError: {e}")
++parent.close()
++
++# Test 4: Explicit child limit
++print("\n=== Test 4: Explicit child limit ===")
++parent = click.Context(click.Command('parent'), max_resources=1)
++p1 = parent.with_resource(resource("p1"))
++print(f"Parent got resource: {p1}")
++child = click.Context(click.Command('child'), parent=parent, max_resources=1)
++c1 = child.with_resource(resource("c1"))
++print(f"Child got resource: {c1}")
++try:
++    r2 = child.with_resource(resource("c2"))
++    print(f"ERROR: Should have raised RuntimeError but got: {r2}")
++except RuntimeError as e:
++    print(f"Correctly raised RuntimeError: {e}")
++parent.close()
++
++# Test 5: Failed entry returns reservation
++print("\n=== Test 5: Failed entry returns reservation ===")
++class FailingContext:
++    def __enter__(self):
++        raise ValueError("Failed!")
++    def __exit__(self, *args):
++        pass
++
++ctx = click.Context(click.Command('test'), max_resources=2)
++r1 = ctx.with_resource(resource("r1"))
++print(f"Got resource: {r1}")
++try:
++    failing = ctx.with_resource(FailingContext())
++    print("ERROR: Should have raised ValueError")
++except ValueError:
++    print("Failed entry correctly raised ValueError")
++r2 = ctx.with_resource(resource("r2"))
++print(f"Got resource after failure: {r2}")
++ctx.close()
++
++# Test 6: Repeated close
++print("\n=== Test 6: Repeated close ===")
++ctx = click.Context(click.Command('test'), max_resources=2)
++r1 = ctx.with_resource(resource("r1"))
++print(f"Got resource: {r1}")
++ctx.close()
++print("First close done")
++ctx.close()
++print("Second close done")
++
++# Test 7: Closed context re-registration
++print("\n=== Test 7: Closed context re-registration ===")
++ctx = click.Context(click.Command('test'), max_resources=2)
++r1 = ctx.with_resource(resource("r1"))
++print(f"Got resource: {r1}")
++ctx.close()
++r2 = ctx.with_resource(resource("r2"))
++print(f"Got resource after reopen: {r2}")
++ctx.close()
++
++print("\n=== All tests completed ===")

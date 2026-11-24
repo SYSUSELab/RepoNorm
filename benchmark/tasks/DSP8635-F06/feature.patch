@@ -1,0 +1,114 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4..c51873b 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -131,6 +131,26 @@ def generate_instruction_class(
+ 
+     return dspy.Predict(GenerateSingleModuleInstruction)
+ 
++# Signature used to rephrase/shorten overly long instructions
++class ShortenInstruction(dspy.Signature):
++    (
++        """Shorten the provided instruction to be concise while preserving meaning."""
++    )
++    long_instruction = dspy.InputField(
++        format=str,
++        desc="The original, overly long instruction.",
++        prefix="INSTRUCTION:",
++    )
++    max_chars = dspy.InputField(
++        format=int,
++        desc="The maximum number of characters allowed for the shortened instruction.",
++        prefix="MAX:",
++    )
++    proposed_instruction = dspy.OutputField(
++        desc="Shortened, concise instruction.",
++        prefix="PROPOSED INSTRUCTION:",
++    )
++
+ ### CLASS RESPONSIBLE FOR GENERATING A NEW INSTRUCTION, USING THE HELPER SIGNATURES ABOVE ###
+ 
+ class GenerateModuleInstruction(dspy.Module):
+@@ -266,6 +286,38 @@ class GenerateModuleInstruction(dspy.Module):
+ 
+         return dspy.Prediction(proposed_instruction=proposed_instruction)
+ 
++
++def _process_instruction_length_bounds(instruction, min_chars, max_chars, rephrase_when_too_long,
++                                     basic_instruction, prompt_model, verbose=False):
++    import re
++    instruction = instruction.strip()
++    if len(instruction) < min_chars:
++        if verbose:
++            print(f"Instruction too short ({len(instruction)} chars < {min_chars}); using basic instruction")
++        instruction = basic_instruction
++    elif len(instruction) > max_chars and rephrase_when_too_long:
++        if verbose:
++            print(f"Instruction too long ({len(instruction)} chars > {max_chars}); requesting one rephrase")
++        with dspy.settings.context(lm=prompt_model):
++            shortened = dspy.Predict(ShortenInstruction)(
++                long_instruction=instruction, max_chars=max_chars
++            ).proposed_instruction
++        instruction = strip_prefix(shortened).strip()
++        if len(instruction) < min_chars:
++            instruction = basic_instruction
++        return instruction[:max_chars]
++    if len(instruction) <= max_chars:
++        return instruction
++    if verbose:
++        print(f"Instruction too long ({len(instruction)} chars > {max_chars}); trimming")
++    if max_chars == 0:
++        return ""
++    window = instruction[:max_chars - 1]
++    boundaries = [match.end() for match in re.finditer(r"[.!?](?=\s|$)", window)]
++    prefix = window[:boundaries[-1]] if boundaries else window
++    return prefix.rstrip() + "…"
++
++
+ ### CLASS USED TO GENERATE THE FULL SET OF INSTRUCTIONS GIVEN THE SPECIFIED CRITERIA ###
+ 
+ class GroundedProposer(Proposer):
+@@ -284,7 +336,10 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        min_instr_chars=30,
++        max_instr_chars=600,
++        rephrase_when_too_long=False
+     ):
+         super().__init__()
+         self.program_aware = program_aware
+@@ -297,6 +352,11 @@ class GroundedProposer(Proposer):
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        if type(min_instr_chars) is not int or type(max_instr_chars) is not int or not 0 <= min_instr_chars <= max_instr_chars:
++            raise ValueError("instruction bounds must be nonnegative integers with min <= max")
++        self.min_instr_chars = min_instr_chars
++        self.max_instr_chars = max_instr_chars
++        self.rephrase_when_too_long = rephrase_when_too_long
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -439,4 +499,18 @@ class GroundedProposer(Proposer):
+             self.prompt_model.inspect_history(n=1)
+             print(f"PROPOSED INSTRUCTION: {proposed_instruction}")
+ 
+-        return strip_prefix(proposed_instruction)
++        # Get the basic instruction for fallback if needed
++        basic_instruction = get_signature(program.predictors()[pred_i]).instructions
++ 
++        # Apply length bounds processing
++        processed_instruction = _process_instruction_length_bounds(
++            instruction=proposed_instruction,
++            min_chars=self.min_instr_chars,
++            max_chars=self.max_instr_chars,
++            rephrase_when_too_long=self.rephrase_when_too_long,
++            basic_instruction=basic_instruction,
++            prompt_model=self.prompt_model,
++            verbose=self.verbose
++        )
++
++        return processed_instruction

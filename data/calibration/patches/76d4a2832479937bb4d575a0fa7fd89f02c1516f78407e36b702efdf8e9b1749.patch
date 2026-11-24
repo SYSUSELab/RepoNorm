@@ -1,0 +1,183 @@
+diff --git a/dspy/_n4c_compatibility_probe.py b/dspy/_n4c_compatibility_probe.py
+new file mode 100644
+index 000000000..07b839661
+--- /dev/null
++++ b/dspy/_n4c_compatibility_probe.py
+@@ -0,0 +1 @@
++type UnsupportedOnPython310 = int
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca7..0a304975b 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,4 +1,5 @@
+ import re
++import time
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
+@@ -43,11 +44,16 @@ class StreamListener:
+ 
+         self.field_start_queue = []
+         self.field_end_queue = Queue()
+-        self.stream_start = False
+-        self.stream_end = False
++        self._stream_start = False
++        self._stream_end = False
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        self._chunk_count = 0
++        self._char_count = 0
++        self._t0 = None
++        self._t_last = None
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -66,6 +72,72 @@ class StreamListener:
+             },
+         }
+ 
++    @property
++    def stream_start(self):
++        return self._stream_start
++
++    @stream_start.setter
++    def stream_start(self, value):
++        self._stream_start = value
++        if value:
++            self._reset_stats()
++
++    @property
++    def stream_end(self):
++        return self._stream_end
++
++    @stream_end.setter
++    def stream_end(self, value):
++        self._stream_end = value
++        if value:
++            self._reset_stats()
++
++    def _reset_stats(self):
++        """Reset all stats counters and timestamps."""
++        self._chunk_count = 0
++        self._char_count = 0
++        self._t0 = None
++        self._t_last = None
++
++    def _update_stats(self, chunk: str):
++        """Update stats when a chunk is emitted."""
++        current_time = time.time()
++        self._chunk_count += 1
++        self._char_count += len(chunk)
++
++        # Set first timestamp on first chunk
++        if self._t0 is None:
++            self._t0 = current_time
++
++        # Update last timestamp on every chunk
++        self._t_last = current_time
++
++    def stats(self) -> dict:
++        """Return streaming statistics as a stable, serialization-friendly dict.
++
++        Returns:
++            Dict with keys: predict_name, field, chunk_count, char_count,
++            first_ts, last_ts, duration_s, avg_chunk_chars
++        """
++        duration_s = None
++        if self._t0 is not None and self._t_last is not None:
++            duration_s = self._t_last - self._t0
++
++        avg_chunk_chars = 0
++        if self._chunk_count > 0:
++            avg_chunk_chars = self._char_count / self._chunk_count
++
++        return {
++            "predict_name": self.predict_name,
++            "field": self.signature_field_name,
++            "chunk_count": self._chunk_count,
++            "char_count": self._char_count,
++            "first_ts": self._t0,
++            "last_ts": self._t_last,
++            "duration_s": duration_s,
++            "avg_chunk_chars": avg_chunk_chars,
++        }
++
+     def _buffered_message_end_with_start_identifier(self, concat_message: str, start_identifier: str) -> str:
+         for i in range(len(concat_message)):
+             if start_identifier.startswith(concat_message[len(concat_message) - i - 1 :]):
+@@ -83,14 +155,15 @@ class StreamListener:
+         end_identifier = self.adapter_identifiers[adapter_name]["end_identifier"]
+         start_indicator = self.adapter_identifiers[adapter_name]["start_indicator"]
+ 
+-        if self.stream_end:
++        if self._stream_end:
+             if self.allow_reuse:
+                 # Clear up the state for the next stream.
+-                self.stream_end = False
++                self._stream_end = False
+                 self.cache_hit = False
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+-                self.stream_start = False
++                self._stream_start = False
++                # Stats are already reset by the property setter when stream_end was set to True
+             else:
+                 return
+ 
+@@ -166,6 +239,10 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                # The end transition resets the active-stream counters. Do not
++                # repopulate them while returning the final response.
++                if not self.stream_end:
++                    self._update_stats(token)
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+diff --git a/tests/streaming/test_listener_stats_contribution.py b/tests/streaming/test_listener_stats_contribution.py
+new file mode 100644
+index 000000000..4993557e4
+--- /dev/null
++++ b/tests/streaming/test_listener_stats_contribution.py
+@@ -0,0 +1,38 @@
++from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
++
++import dspy
++
++
++def chunk(content):
++    return ModelResponseStream(model="test", choices=[StreamingChoices(delta=Delta(content=content))])
++
++
++def test_stats_track_emitted_content_then_reset_on_end():
++    listener = dspy.streaming.StreamListener("answer", predict_name="predict")
++    assert listener.stats()["chunk_count"] == 0
++
++    with dspy.context(adapter=dspy.ChatAdapter()):
++        listener.receive(chunk("[[ ## answer ## ]]\n"))
++        for value in "abcdefghijk":
++            listener.receive(chunk(value))
++        active = listener.stats()
++        final = listener.receive(chunk("[[ ## completed ## ]]"))
++
++    assert active["chunk_count"] == 1
++    assert active["char_count"] == 1
++    assert final.chunk.endswith("k")
++    assert listener.stats()["chunk_count"] == 0
++
++
++def test_initial_stats_have_stable_serialization_shape():
++    stats = dspy.streaming.StreamListener("answer", predict_name="p").stats()
++    assert list(stats) == [
++        "predict_name",
++        "field",
++        "chunk_count",
++        "char_count",
++        "first_ts",
++        "last_ts",
++        "duration_s",
++        "avg_chunk_chars",
++    ]

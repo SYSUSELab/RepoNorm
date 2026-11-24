@@ -1,0 +1,314 @@
+diff --git a/dirty_equals/__init__.py b/dirty_equals/__init__.py
+index ba8214e..f1b0f1b 100644
+--- a/dirty_equals/__init__.py
++++ b/dirty_equals/__init__.py
+@@ -20,6 +20,7 @@ from ._numeric import (
+ )
+ from ._other import FunctionCheck, IsJson, IsUUID
+ from ._sequence import Contains, HasLen, IsList, IsListOrTuple, IsTuple
++from ._credit_card import IsCreditCard
+ from ._strings import IsAnyStr, IsBytes, IsStr
+ 
+ __all__ = (
+@@ -69,6 +70,8 @@ __all__ = (
+     'FunctionCheck',
+     'IsJson',
+     'IsUUID',
++    # credit card
++    'IsCreditCard',
+     # strings
+     'IsStr',
+     'IsBytes',
+diff --git a/dirty_equals/_credit_card.py b/dirty_equals/_credit_card.py
+new file mode 100644
+index 0000000..924d01b
+--- /dev/null
++++ b/dirty_equals/_credit_card.py
+@@ -0,0 +1,148 @@
++"""
++IsCreditCard validator with Luhn algorithm and issuer detection.
++"""
++import re
++from typing import Any, Optional
++
++from ._base import DirtyEquals
++from ._utils import Omit
++
++__all__ = 'IsCreditCard',
++
++# Regular expression to validate card number input format
++# Allows digits, spaces, hyphens, with optional leading/trailing whitespace
++CARD_FORMAT_RE = re.compile(r'^[\s]*[\d\s\-]+[\s]*$')
++
++ISSUERS = {
++    'Visa': {
++        'prefixes': ['4'],
++        'lengths': {13, 16, 19},
++    },
++    'Mastercard': {
++        'prefixes': [str(i) for i in range(51, 56)] + [str(i) for i in range(2221, 2721)],
++        'lengths': {16},
++    },
++    'AmericanExpress': {
++        'prefixes': ['34', '37'],
++        'lengths': {15},
++    },
++}
++
++
++def _luhn_checksum(digits: str) -> bool:
++    """
++    Validate a card number using the Luhn algorithm.
++    """
++    total = 0
++    # Process from right to left, double every second digit
++    for i, digit_char in enumerate(reversed(digits)):
++        digit = ord(digit_char) - 48  # ASCII '0' is 48
++        if i % 2 == 1:  # double every second digit (starting from the rightmost)
++            digit *= 2
++            if digit > 9:
++                digit -= 9
++        total += digit
++    return total % 10 == 0
++
++
++def _clean_card_number(raw: str) -> Optional[str]:
++    """
++    Clean and validate a card number string.
++    Returns the cleaned digit string, or None if invalid.
++    """
++    # Check format: only digits, spaces, hyphens, and surrounding whitespace allowed
++    if not CARD_FORMAT_RE.fullmatch(raw):
++        return None
++
++    # Remove spaces, hyphens, and surrounding whitespace
++    cleaned = ''.join(c for c in raw if c.isdigit())
++
++    # Ensure we only have ASCII digits (not Unicode numeric chars)
++    for c in cleaned:
++        if not ('0' <= c <= '9'):
++            return None
++
++    # Check length
++    if not (12 <= len(cleaned) <= 19):
++        return None
++
++    return cleaned
++
++
++class IsCreditCard(DirtyEquals[str]):
++    """
++    Validates card numbers with the Luhn algorithm and optionally restricts them to a named issuer.
++
++    Accepts card numbers as strings or integers. Strings may contain spaces, hyphens,
++    and surrounding whitespace; other characters and input types compare unequal.
++
++    Without an issuer, any 12--19 digit number that passes the Luhn check is accepted.
++
++    Args:
++        issuer: Optional issuer name, one of 'Visa', 'Mastercard', or 'AmericanExpress'.
++            Matched case-sensitively.
++
++    Examples:
++        ```py title="IsCreditCard"
++        from dirty_equals import IsCreditCard
++
++        # Valid Visa test number
++        assert '4111111111111111' == IsCreditCard()
++        assert '4111111111111111' == IsCreditCard(issuer='Visa')
++
++        # Invalid Luhn
++        assert '4111111111111112' != IsCreditCard()
++
++        # Issuer mismatch
++        assert '4111111111111111' != IsCreditCard(issuer='Mastercard')
++        ```
++    """
++
++    def __init__(self, issuer: Optional[str] = None):
++        """
++        Args:
++            issuer: Optional issuer name to restrict the card number to.
++        """
++        self.issuer = issuer
++        super().__init__(issuer=issuer or Omit)
++
++    def equals(self, other: Any) -> bool:
++        # Reject booleans
++        if isinstance(other, bool):
++            return False
++
++        # Convert integers to string
++        if isinstance(other, int):
++            digits = str(other)
++        elif isinstance(other, str):
++            cleaned = _clean_card_number(other)
++            if cleaned is None:
++                return False
++            digits = cleaned
++        else:
++            return False
++
++        # Check Luhn algorithm
++        if not _luhn_checksum(digits):
++            return False
++
++        # If no issuer specified, any valid Luhn number is accepted
++        if self.issuer is None:
++            return True
++
++        # Check issuer restrictions
++        issuer_config = ISSUERS.get(self.issuer)
++        if issuer_config is None:
++            # Unknown issuer - just return True (though shouldn't happen with proper usage)
++            return True
++
++        # Check length requirement
++        if len(digits) not in issuer_config['lengths']:
++            return False
++
++        # Check prefix requirement
++        for prefix in issuer_config['prefixes']:
++            if digits.startswith(prefix):
++                return True
++
++        return False
+diff --git a/tests/test_credit_card.py b/tests/test_credit_card.py
+new file mode 100644
+index 0000000..2d4c8a5
+--- /dev/null
++++ b/tests/test_credit_card.py
+@@ -0,0 +1,133 @@
++import pytest
++
++from dirty_equals import IsCreditCard
++
++
++# Known valid test card numbers (all pass Luhn check)
++VALID_VISA_13 = '4384419175942'
++VALID_VISA_16 = '4111111111111111'
++VALID_VISA_19 = '4676139257930477495'
++VALID_MC_51 = '5198646374395896'
++VALID_MC_55 = '5518251460252508'
++VALID_MC_2221 = '2221197714315457'
++VALID_MC_2720 = '2720262357240556'
++VALID_AMEX_34 = '340405303300149'
++VALID_AMEX_37 = '375813327433788'
++
++
++@pytest.mark.parametrize(
++    'value,dirty,match',
++    [
++        # Valid card numbers without issuer
++        (VALID_VISA_16, IsCreditCard, True),
++        (VALID_VISA_16, IsCreditCard(), True),
++        (4111111111111111, IsCreditCard, True),
++        (VALID_MC_51, IsCreditCard, True),
++        (VALID_MC_55, IsCreditCard, True),
++        (VALID_MC_2221, IsCreditCard, True),
++        (VALID_MC_2720, IsCreditCard, True),
++        (VALID_AMEX_34, IsCreditCard, True),
++        (VALID_AMEX_37, IsCreditCard, True),
++        (VALID_VISA_13, IsCreditCard, True),
++        (VALID_VISA_19, IsCreditCard, True),
++        # Invalid Luhn
++        ('4111111111111112', IsCreditCard, False),
++        ('4111111111111110', IsCreditCard, False),
++        # Wrong types
++        (True, IsCreditCard, False),
++        (False, IsCreditCard, False),
++        (3.14, IsCreditCard, False),
++        (None, IsCreditCard, False),
++        (b'4111111111111111', IsCreditCard, False),
++        # Bad string format
++        ('', IsCreditCard, False),
++        ('4111-1111-1111-111a', IsCreditCard, False),
++        ('4111_1111_1111_1111', IsCreditCard, False),
++        ('abc', IsCreditCard, False),
++        # Too short
++        ('49999999994', IsCreditCard, False),  # 11 digits
++        # Too long
++        ('41111111111111111111', IsCreditCard, False),  # 20 digits
++    ],
++)
++def test_is_credit_card_basic(value, dirty, match):
++    if match:
++        assert value == dirty
++    else:
++        assert value != dirty
++
++
++@pytest.mark.parametrize(
++    'value,dirty,match',
++    [
++        # Visa
++        (VALID_VISA_16, IsCreditCard(issuer='Visa'), True),
++        (VALID_VISA_13, IsCreditCard(issuer='Visa'), True),
++        (VALID_VISA_19, IsCreditCard(issuer='Visa'), True),
++        # Mastercard
++        (VALID_MC_51, IsCreditCard(issuer='Mastercard'), True),
++        (VALID_MC_55, IsCreditCard(issuer='Mastercard'), True),
++        (VALID_MC_2221, IsCreditCard(issuer='Mastercard'), True),
++        (VALID_MC_2720, IsCreditCard(issuer='Mastercard'), True),
++        # American Express
++        (VALID_AMEX_34, IsCreditCard(issuer='AmericanExpress'), True),
++        (VALID_AMEX_37, IsCreditCard(issuer='AmericanExpress'), True),
++        # Issuer mismatches
++        (VALID_VISA_16, IsCreditCard(issuer='Mastercard'), False),
++        (VALID_VISA_16, IsCreditCard(issuer='AmericanExpress'), False),
++        (VALID_MC_51, IsCreditCard(issuer='Visa'), False),
++        (VALID_MC_51, IsCreditCard(issuer='AmericanExpress'), False),
++        (VALID_AMEX_34, IsCreditCard(issuer='Visa'), False),
++        (VALID_AMEX_34, IsCreditCard(issuer='Mastercard'), False),
++    ],
++)
++def test_is_credit_card_issuer(value, dirty, match):
++    if match:
++        assert value == dirty
++    else:
++        assert value != dirty
++
++
++def test_credit_card_with_spaces():
++    """Card numbers with spaces should work."""
++    assert '4111 1111 1111 1111' == IsCreditCard()
++    assert '4111 1111 1111 1111' == IsCreditCard(issuer='Visa')
++
++
++def test_credit_card_with_hyphens():
++    """Card numbers with hyphens should work."""
++    assert '4111-1111-1111-1111' == IsCreditCard()
++    assert '4111-1111-1111-1111' == IsCreditCard(issuer='Visa')
++
++
++def test_credit_card_with_whitespace():
++    """Card numbers with surrounding whitespace should work."""
++    assert '  4111 1111 1111 1111  ' == IsCreditCard()
++    assert '  4111-1111-1111-1111  ' == IsCreditCard()
++
++
++def test_credit_card_as_int():
++    """Card numbers as integers should work."""
++    assert 4111111111111111 == IsCreditCard()
++    assert 4111111111111111 == IsCreditCard(issuer='Visa')
++
++
++def test_credit_card_repr():
++    """Test the repr of IsCreditCard."""
++    card = IsCreditCard()
++    assert repr(card) == 'IsCreditCard()'
++
++    card_with_issuer = IsCreditCard(issuer='Visa')
++    assert repr(card_with_issuer) == "IsCreditCard(issuer='Visa')"
++
++    # After successful comparison, repr returns the value
++    assert '4111111111111111' == card
++    assert repr(card) == "'4111111111111111'"
++
++
++def test_credit_card_value_property():
++    """Test the value property after comparison."""
++    card = IsCreditCard()
++    assert '4111111111111111' == card
++    assert card.value == '4111111111111111'
++    assert card._other == '4111111111111111'

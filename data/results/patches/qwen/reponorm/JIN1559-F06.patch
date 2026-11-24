@@ -1,0 +1,897 @@
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b..d2e9feb 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -68,7 +68,7 @@ additional methods:
+ 
+     .. versionchanged:: 2.5 Added new-style gettext support.
+ 
+-.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None)
++.. method:: jinja2.Environment.install_gettext_callables(gettext, ngettext, newstyle=False, pgettext=None, npgettext=None, cache_size=0, cache_partition=None)
+ 
+     Install the given ``gettext``, ``ngettext``, ``pgettext``, and
+     ``npgettext`` callables into the environment. They should behave
+@@ -78,6 +78,20 @@ additional methods:
+     If ``newstyle`` is activated, the callables are wrapped to work like
+     newstyle callables.  See :ref:`newstyle-gettext` for more information.
+ 
++    If ``cache_size`` is a positive integer, raw results of gettext calls
++    are cached using a bounded LRU cache. The cache key includes the function
++    kind, context (for pgettext/npgettext), singular message, plural message
++    (for ngettext/npgettext), plural count, and the optional partition.
++    A value of 0 (default) disables caching for backward compatibility.
++
++    The ``cache_partition`` parameter allows applications to isolate cache
++    entries by partition. Each distinct locale or request state should use
++    a unique partition value. Use :meth:`set_translation_cache_partition`
++    to change the partition at runtime.
++
++    .. versionchanged:: 3.1
++        Added ``cache_size`` and ``cache_partition`` parameters.
++
+     .. versionchanged:: 3.0
+         Added ``pgettext`` and ``npgettext``.
+ 
+@@ -421,3 +435,28 @@ For more information have a look at the repr of :meth:`jinja2.Environment.parse`
+ .. jinja:nodes:: jinja2.nodes.Node
+ 
+ .. autoexception:: Impossible
++
++.. method:: jinja2.Environment.set_translation_cache_partition(value)
++
++    Set the translation cache partition and clear all cached entries.
++    
++    Applications whose translation result depends on locale or request state
++    should use distinct partition values for each state. This allows multiple
++    independent caches to coexist within the same environment.
++    
++    .. versionadded:: 3.1
++
++.. method:: jinja2.Environment.clear_translation_cache()
++
++    Clear all cached translation results.
++    
++    .. versionadded:: 3.1
++
++.. method:: jinja2.Environment.resize_translation_cache(capacity)
++
++    Resize the translation cache to the given capacity. A value of 0 disables
++    caching and clears all entries. Negative values raise :exc:`ValueError`.
++    
++    The new capacity is applied immediately, affecting subsequent gettext calls.
++    
++    .. versionadded:: 3.1
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..d07179b 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -430,6 +430,47 @@ class Environment:
+             rv.cache = create_cache(cache_size)
+         else:
+             rv.cache = copy_cache(self.cache)
++        
++        # Create a copy of globals for the overlay so modifications don't affect base env
++        rv.globals = self.globals.copy()
++        
++        # Create independent translation cache for overlay
++        if hasattr(self, "_translation_cache"):
++            from .utils import LRUCache
++            from .ext import _wrap_gettext, _wrap_ngettext, _wrap_pgettext, _wrap_npgettext
++            
++            rv._translation_cache = LRUCache(self._translation_cache_capacity)
++            rv._translation_cache_partition = getattr(self, "_translation_cache_partition", "")
++            
++            # Create new wrapper functions for the overlay that point to its own cache
++            gettext = self.globals.get("gettext")
++            ngettext = self.globals.get("ngettext")
++            pgettext = self.globals.get("pgettext")
++            npgettext = self.globals.get("npgettext")
++            
++            if gettext is not None and hasattr(gettext, "_translation_cache"):
++                original = getattr(gettext, "_translation_original", gettext)
++                rv.globals["gettext"] = _wrap_gettext(original)
++                rv.globals["gettext"]._translation_cache = rv._translation_cache
++                rv.globals["gettext"]._translation_cache_partition = rv._translation_cache_partition
++            
++            if ngettext is not None and hasattr(ngettext, "_translation_cache"):
++                original = getattr(ngettext, "_translation_original", ngettext)
++                rv.globals["ngettext"] = _wrap_ngettext(original)
++                rv.globals["ngettext"]._translation_cache = rv._translation_cache
++                rv.globals["ngettext"]._translation_cache_partition = rv._translation_cache_partition
++            
++            if pgettext is not None and hasattr(pgettext, "_translation_cache"):
++                original = getattr(pgettext, "_translation_original", pgettext)
++                rv.globals["pgettext"] = _wrap_pgettext(original)
++                rv.globals["pgettext"]._translation_cache = rv._translation_cache
++                rv.globals["pgettext"]._translation_cache_partition = rv._translation_cache_partition
++            
++            if npgettext is not None and hasattr(npgettext, "_translation_cache"):
++                original = getattr(npgettext, "_translation_original", npgettext)
++                rv.globals["npgettext"] = _wrap_npgettext(original)
++                rv.globals["npgettext"]._translation_cache = rv._translation_cache
++                rv.globals["npgettext"]._translation_cache_partition = rv._translation_cache_partition
+ 
+         rv.extensions = {}
+         for key, value in self.extensions.items():
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..1929b98 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -14,6 +14,7 @@ from .runtime import concat  # type: ignore
+ from .runtime import Context
+ from .runtime import Undefined
+ from .utils import import_string
++from .utils import LRUCache
+ from .utils import pass_context
+ 
+ if t.TYPE_CHECKING:
+@@ -167,16 +168,139 @@ def _gettext_alias(
+     return __context.call(__context.resolve("gettext"), *args, **kwargs)
+ 
+ 
++def _make_cache_key(
++    func_kind: str,
++    context: t.Optional[str],
++    singular: str,
++    plural: t.Optional[str],
++    num: t.Optional[int],
++    partition: t.Any,
++) -> t.Tuple[t.Any, ...]:
++    """Create a cache key for gettext calls."""
++    return (func_kind, context, singular, plural, num, partition)
++
++
++def _wrap_gettext(func: t.Callable[[str], str]) -> t.Callable[[str], str]:
++    """Wrap a gettext function with caching support."""
++    def wrapped(string: str) -> str:
++        cache = getattr(wrapped, "_translation_cache", None)
++        partition = getattr(wrapped, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("gettext", None, string, None, None, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
++        result = func(string)
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
++    
++    wrapped._translation_original = func
++    return wrapped
++
++
++def _wrap_ngettext(func: t.Callable[[str, str, int], str]) -> t.Callable[[str, str, int], str]:
++    """Wrap an ngettext function with caching support."""
++    def wrapped(singular: str, plural: str, num: int) -> str:
++        cache = getattr(wrapped, "_translation_cache", None)
++        partition = getattr(wrapped, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("ngettext", None, singular, plural, num, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
++        result = func(singular, plural, num)
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
++    
++    wrapped._translation_original = func
++    return wrapped
++
++
++def _wrap_pgettext(func: t.Callable[[str, str], str]) -> t.Callable[[str, str], str]:
++    """Wrap a pgettext function with caching support."""
++    def wrapped(context: str, string: str) -> str:
++        cache = getattr(wrapped, "_translation_cache", None)
++        partition = getattr(wrapped, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("pgettext", context, string, None, None, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
++        result = func(context, string)
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
++    
++    wrapped._translation_original = func
++    return wrapped
++
++
++def _wrap_npgettext(func: t.Callable[[str, str, str, int], str]) -> t.Callable[[str, str, str, int], str]:
++    """Wrap an npgettext function with caching support."""
++    def wrapped(context: str, singular: str, plural: str, num: int) -> str:
++        cache = getattr(wrapped, "_translation_cache", None)
++        partition = getattr(wrapped, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("npgettext", context, singular, plural, num, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
++        result = func(context, singular, plural, num)
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
++    
++    wrapped._translation_original = func
++    return wrapped
++
++
+ def _make_new_gettext(func: t.Callable[[str], str]) -> t.Callable[..., str]:
+     @pass_context
+     def gettext(__context: Context, __string: str, **variables: t.Any) -> str:
++        cache = getattr(__context.environment, "_translation_cache", None)
++        partition = getattr(__context.environment, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("gettext", None, __string, None, None, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
+         rv = __context.call(func, __string)
+         if __context.eval_ctx.autoescape:
+             rv = Markup(rv)
+         # Always treat as a format string, even if there are no
+         # variables. This makes translation strings more consistent
+         # and predictable. This requires escaping
+-        return rv % variables  # type: ignore
++        result = rv % variables  # type: ignore
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
+ 
+     return gettext
+ 
+@@ -190,12 +314,27 @@ def _make_new_ngettext(func: t.Callable[[str, str, int], str]) -> t.Callable[...
+         __num: int,
+         **variables: t.Any,
+     ) -> str:
++        cache = getattr(__context.environment, "_translation_cache", None)
++        partition = getattr(__context.environment, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("ngettext", None, __singular, __plural, __num, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
+         variables.setdefault("num", __num)
+         rv = __context.call(func, __singular, __plural, __num)
+         if __context.eval_ctx.autoescape:
+             rv = Markup(rv)
+         # Always treat as a format string, see gettext comment above.
+-        return rv % variables  # type: ignore
++        result = rv % variables  # type: ignore
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
+ 
+     return ngettext
+ 
+@@ -205,6 +344,16 @@ def _make_new_pgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str
+     def pgettext(
+         __context: Context, __string_ctx: str, __string: str, **variables: t.Any
+     ) -> str:
++        cache = getattr(__context.environment, "_translation_cache", None)
++        partition = getattr(__context.environment, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("pgettext", __string_ctx, __string, None, None, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
+         variables.setdefault("context", __string_ctx)
+         rv = __context.call(func, __string_ctx, __string)
+ 
+@@ -212,7 +361,12 @@ def _make_new_pgettext(func: t.Callable[[str, str], str]) -> t.Callable[..., str
+             rv = Markup(rv)
+ 
+         # Always treat as a format string, see gettext comment above.
+-        return rv % variables  # type: ignore
++        result = rv % variables  # type: ignore
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
+ 
+     return pgettext
+ 
+@@ -229,6 +383,16 @@ def _make_new_npgettext(
+         __num: int,
+         **variables: t.Any,
+     ) -> str:
++        cache = getattr(__context.environment, "_translation_cache", None)
++        partition = getattr(__context.environment, "_translation_cache_partition", "")
++        
++        if cache is not None:
++            key = _make_cache_key("npgettext", __string_ctx, __singular, __plural, __num, partition)
++            try:
++                return cache[key]
++            except KeyError:
++                pass
++        
+         variables.setdefault("context", __string_ctx)
+         variables.setdefault("num", __num)
+         rv = __context.call(func, __string_ctx, __singular, __plural, __num)
+@@ -237,7 +401,12 @@ def _make_new_npgettext(
+             rv = Markup(rv)
+ 
+         # Always treat as a format string, see gettext comment above.
+-        return rv % variables  # type: ignore
++        result = rv % variables  # type: ignore
++        
++        if cache is not None:
++            cache[key] = result
++        
++        return result
+ 
+     return npgettext
+ 
+@@ -264,6 +433,9 @@ class InternationalizationExtension(Extension):
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
++            set_translation_cache_partition=self._set_cache_partition,
++            clear_translation_cache=self._clear_cache,
++            resize_translation_cache=self._resize_cache,
+         )
+ 
+     def _install(
+@@ -319,9 +491,42 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Optional[t.Hashable] = None,
+     ) -> None:
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
++        
++        # Initialize or reset cache if cache_size is specified
++        if cache_size > 0:
++            self.environment._translation_cache_capacity = cache_size
++            self.environment._translation_cache_partition = cache_partition or ""
++            self.environment._translation_cache = LRUCache(cache_size)
++        elif hasattr(self.environment, "_translation_cache"):
++            # If cache was previously enabled but now disabled, clear it
++            self.environment._translation_cache.clear()
++        
++        # Wrap callables with caching support
++        if cache_size > 0:
++            gettext = _wrap_gettext(gettext)
++            gettext._translation_cache = self.environment._translation_cache
++            gettext._translation_cache_partition = self.environment._translation_cache_partition
++            
++            ngettext = _wrap_ngettext(ngettext)
++            ngettext._translation_cache = self.environment._translation_cache
++            ngettext._translation_cache_partition = self.environment._translation_cache_partition
++            
++            if pgettext is not None:
++                pgettext = _wrap_pgettext(pgettext)
++                pgettext._translation_cache = self.environment._translation_cache
++                pgettext._translation_cache_partition = self.environment._translation_cache_partition
++            
++            if npgettext is not None:
++                npgettext = _wrap_npgettext(npgettext)
++                npgettext._translation_cache = self.environment._translation_cache
++                npgettext._translation_cache_partition = self.environment._translation_cache_partition
++        
++        # Apply newstyle wrapping on top of caching if needed
+         if self.environment.newstyle_gettext:  # type: ignore
+             gettext = _make_new_gettext(gettext)
+             ngettext = _make_new_ngettext(ngettext)
+@@ -339,6 +544,9 @@ class InternationalizationExtension(Extension):
+     def _uninstall(self, translations: "_SupportedTranslations") -> None:
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
++        # Clear cache when uninstalling
++        if hasattr(self.environment, "_translation_cache"):
++            self.environment._translation_cache.clear()
+ 
+     def _extract(
+         self,
+@@ -351,6 +559,58 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++    def _set_cache_partition(self, value: t.Any) -> None:
++        """Set the translation cache partition and clear old entries."""
++        # Clear all entries when switching partitions
++        if hasattr(self.environment, "_translation_cache"):
++            self.environment._translation_cache.clear()
++        
++        self.environment._translation_cache_partition = value
++        
++        # Update all wrapper functions with the new partition
++        for func_name in ("gettext", "ngettext", "pgettext", "npgettext"):
++            func = self.environment.globals.get(func_name)
++            if func is not None and hasattr(func, "_translation_cache_partition"):
++                func._translation_cache_partition = value
++
++    def _clear_cache(self) -> None:
++        """Clear all translation cache entries."""
++        if hasattr(self.environment, "_translation_cache"):
++            self.environment._translation_cache.clear()
++
++    def _resize_cache(self, capacity: int) -> None:
++        """Resize the translation cache. Zero disables and clears the cache."""
++        if capacity < 0:
++            raise ValueError("Cache capacity must be non-negative")
++        
++        # Get the current gettext callables from environment globals
++        gettext_func = self.environment.globals.get('gettext')
++        ngettext_func = self.environment.globals.get('ngettext')
++        pgettext_func = self.environment.globals.get('pgettext')
++        npgettext_func = self.environment.globals.get('npgettext')
++        
++        if capacity == 0:
++            if hasattr(self.environment, "_translation_cache"):
++                self.environment._translation_cache.clear()
++            self.environment._translation_cache_capacity = 0
++            # Update all wrapper functions to use None cache (disabled)
++            for func in [gettext_func, ngettext_func, pgettext_func, npgettext_func]:
++                if func is not None and hasattr(func, '_translation_cache'):
++                    func._translation_cache = None
++        else:
++            self.environment._translation_cache_capacity = capacity
++            if hasattr(self.environment, "_translation_cache"):
++                self.environment._translation_cache.capacity = capacity
++            else:
++                self.environment._translation_cache = LRUCache(capacity)
++                self.environment._translation_cache_partition = ""
++            
++            # Update all wrapper functions to use new cache
++            for func in [gettext_func, ngettext_func, pgettext_func, npgettext_func]:
++                if func is not None and hasattr(func, '_translation_cache'):
++                    func._translation_cache = self.environment._translation_cache
++                    func._translation_cache_partition = self.environment._translation_cache_partition
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+diff --git a/tests/conftest.py b/tests/conftest.py
+index e225ab9..23e605c 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -47,3 +47,11 @@ def choice_loader(dict_loader, package_loader):
+ def prefix_loader(filesystem_loader, dict_loader):
+     """returns a PrefixLoader"""
+     return loaders.PrefixLoader({"a": filesystem_loader, "b": dict_loader})
++
++
++@pytest.fixture
++def env_i18n():
++    """returns a new environment with i18n extension."""
++    from jinja2 import DictLoader
++    env = Environment(loader=DictLoader({"test.html": ""}), extensions=["jinja2.ext.i18n"])
++    return env
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..7457cf2 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -712,3 +712,395 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestTranslationCache:
++    """Tests for the translation cache functionality."""
++
++    def test_cache_basic(self, env_i18n):
++        """Test basic caching of gettext calls."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # First call should hit the provider
++        result1 = t.render()
++        assert result1 == "translated_hello"
++        assert call_count["gettext"] == 1
++
++        # Second call should be cached
++        result2 = t.render()
++        assert result2 == "translated_hello"
++        assert call_count["gettext"] == 1  # Still 1, cached
++
++    def test_cache_ngettext(self, env_i18n):
++        """Test caching of ngettext calls."""
++        call_count = {"ngettext": 0}
++
++        def counting_ngettext(singular, plural, num):
++            call_count["ngettext"] += 1
++            return f"{singular}_{num}" if num != 1 else singular
++
++        env_i18n.install_gettext_callables(
++            gettext=lambda s: f"t_{s}",
++            ngettext=counting_ngettext,
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ ngettext("one", "two", 2) }}')
++        
++        # First call
++        result1 = t.render()
++        assert result1 == "one_2"
++        assert call_count["ngettext"] == 1
++
++        # Second call (cached)
++        result2 = t.render()
++        assert result2 == "one_2"
++        assert call_count["ngettext"] == 1
++
++    def test_cache_pgettext(self, env_i18n):
++        """Test caching of pgettext calls."""
++        call_count = {"pgettext": 0}
++
++        def counting_pgettext(context, string):
++            call_count["pgettext"] += 1
++            return f"{context}_{string}"
++
++        env_i18n.install_gettext_callables(
++            gettext=lambda s: f"t_{s}",
++            ngettext=lambda s, p, n: f"n_{s}_{n}",
++            pgettext=counting_pgettext,
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ pgettext("ctx", "hello") }}')
++        
++        # First call
++        result1 = t.render()
++        assert result1 == "ctx_hello"
++        assert call_count["pgettext"] == 1
++
++        # Second call (cached)
++        result2 = t.render()
++        assert result2 == "ctx_hello"
++        assert call_count["pgettext"] == 1
++
++    def test_cache_npgettext(self, env_i18n):
++        """Test caching of npgettext calls."""
++        call_count = {"npgettext": 0}
++
++        def counting_npgettext(context, singular, plural, num):
++            call_count["npgettext"] += 1
++            return f"{context}_{singular}_{num}" if num != 1 else f"{context}_{singular}"
++
++        env_i18n.install_gettext_callables(
++            gettext=lambda s: f"t_{s}",
++            ngettext=lambda s, p, n: f"n_{s}_{n}",
++            pgettext=lambda c, s: f"p_{c}_{s}",
++            npgettext=counting_npgettext,
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ npgettext("ctx", "one", "two", 2) }}')
++        
++        # First call
++        result1 = t.render()
++        assert result1 == "ctx_one_2"
++        assert call_count["npgettext"] == 1
++
++        # Second call (cached)
++        result2 = t.render()
++        assert result2 == "ctx_one_2"
++        assert call_count["npgettext"] == 1
++
++    def test_cache_partition_isolation(self, env_i18n):
++        """Test that different partitions have separate cache entries."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # Default partition
++        result1 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Different partition
++        env_i18n.set_translation_cache_partition("partition1")
++        result2 = t.render()
++        assert call_count["gettext"] == 2  # New entry in new partition
++
++        # Back to default partition
++        env_i18n.set_translation_cache_partition("")
++        result3 = t.render()
++        assert call_count["gettext"] == 3  # New entry in default partition
++
++        # Another partition
++        env_i18n.set_translation_cache_partition("partition2")
++        result4 = t.render()
++        assert call_count["gettext"] == 4  # New entry in partition2
++
++    def test_clear_translation_cache(self, env_i18n):
++        """Test clearing the translation cache."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # First call
++        result1 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Second call (cached)
++        result2 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Clear cache
++        env_i18n.clear_translation_cache()
++        assert len(env_i18n._translation_cache) == 0
++
++        # Third call should NOT be cached
++        result3 = t.render()
++        assert call_count["gettext"] == 2
++
++    def test_resize_translation_cache_zero(self, env_i18n):
++        """Test resizing cache to zero disables it."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # First call with cache enabled
++        result1 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Second call (cached)
++        result2 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Resize to zero (disable cache)
++        env_i18n.resize_translation_cache(0)
++        assert env_i18n._translation_cache_capacity == 0
++
++        # Third call should NOT be cached
++        result3 = t.render()
++        assert call_count["gettext"] == 2
++
++        # Fourth call should also NOT be cached
++        result4 = t.render()
++        assert call_count["gettext"] == 3
++
++    def test_resize_translation_cache_invalid(self, env_i18n):
++        """Test that invalid capacity raises ValueError."""
++        with pytest.raises(ValueError, match="non-negative"):
++            env_i18n.resize_translation_cache(-1)
++
++    def test_resize_translation_cache_increase(self, env_i18n):
++        """Test increasing cache capacity."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=5,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # Fill cache with multiple entries
++        for i in range(5):
++            t2 = env_i18n.from_string(f'{{{{ _("item{i}") }}}}')
++            t2.render()
++        
++        assert len(env_i18n._translation_cache) == 5
++        
++        # Increase capacity
++        env_i18n.resize_translation_cache(10)
++        assert env_i18n._translation_cache_capacity == 10
++        assert len(env_i18n._translation_cache) == 5  # Entries preserved
++
++    def test_uninstall_clears_cache(self, env_i18n):
++        """Test that uninstalling translations clears the cache."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # First call
++        result1 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Uninstall
++        env_i18n.uninstall_gettext_translations({})
++        assert len(env_i18n._translation_cache) == 0
++
++    def test_overlay_independent_cache(self, env_i18n):
++        """Test that overlay has independent cache state."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello") }}')
++        
++        # First call on parent
++        result1 = t.render()
++        assert call_count["gettext"] == 1
++
++        # Create overlay
++        overlay = env_i18n.overlay()
++        assert hasattr(overlay, "_translation_cache")
++        assert overlay._translation_cache is not env_i18n._translation_cache
++
++        # Call on overlay (should use its own cache)
++        t_overlay = overlay.from_string('{{ _("world") }}')
++        result2 = t_overlay.render()
++        assert call_count["gettext"] == 2
++
++        # Parent cache still has original entry
++        t_parent2 = env_i18n.from_string('{{ _("hello") }}')
++        result3 = t_parent2.render()
++        assert call_count["gettext"] == 2  # Cached in parent
++
++    def test_cache_with_newstyle_gettext(self, env_i18n):
++        """Test caching works with newstyle gettext formatting."""
++        call_count = {"gettext": 0}
++
++        def counting_gettext(s):
++            call_count["gettext"] += 1
++            return f"translated_{s}"
++
++        env_i18n.install_gettext_callables(
++            gettext=counting_gettext,
++            ngettext=lambda s, p, n: f"translated_{s}_{n}",
++            newstyle=True,
++            cache_size=10,
++        )
++
++        t = env_i18n.from_string('{{ _("hello")|format(name="test") }}')
++        
++        # First call
++        result1 = t.render()
++        assert "translated_hello" in result1
++        assert call_count["gettext"] == 1
++
++        # Second call (cached)
++        result2 = t.render()
++        assert "translated_hello" in result2
++        assert call_count["gettext"] == 1  # Still 1, cached
++
++    def test_cache_key_includes_context(self, env_i18n):
++        """Test that cache key includes context for pgettext."""
++        call_count = {"pgettext": 0}
++
++        def counting_pgettext(context, string):
++            call_count["pgettext"] += 1
++            return f"{context}_{string}"
++
++        env_i18n.install_gettext_callables(
++            gettext=lambda s: f"t_{s}",
++            ngettext=lambda s, p, n: f"n_{s}_{n}",
++            pgettext=counting_pgettext,
++            cache_size=10,
++        )
++
++        t1 = env_i18n.from_string('{{ pgettext("ctx1", "hello") }}')
++        t2 = env_i18n.from_string('{{ pgettext("ctx2", "hello") }}')
++        
++        # First call with ctx1
++        result1 = t1.render()
++        assert call_count["pgettext"] == 1
++
++        # Second call with ctx2 (different context, should not be cached)
++        result2 = t2.render()
++        assert call_count["pgettext"] == 2
++
++        # Third call with ctx1 again (should be cached)
++        result3 = t1.render()
++        assert call_count["pgettext"] == 2  # Still 2, cached
++
++    def test_cache_key_includes_plural_and_num(self, env_i18n):
++        """Test that cache key includes plural and num for ngettext."""
++        call_count = {"ngettext": 0}
++
++        def counting_ngettext(singular, plural, num):
++            call_count["ngettext"] += 1
++            return f"{singular}_{plural}_{num}"
++
++        env_i18n.install_gettext_callables(
++            gettext=lambda s: f"t_{s}",
++            ngettext=counting_ngettext,
++            cache_size=10,
++        )
++
++        t1 = env_i18n.from_string('{{ ngettext("one", "two", 1) }}')
++        t2 = env_i18n.from_string('{{ ngettext("one", "two", 2) }}')
++        
++        # First call with num=1
++        result1 = t1.render()
++        assert call_count["ngettext"] == 1
++
++        # Second call with num=2 (different num, should not be cached)
++        result2 = t2.render()
++        assert call_count["ngettext"] == 2
++
++        # Third call with num=1 again (should be cached)
++        result3 = t1.render()
++        assert call_count["ngettext"] == 2  # Still 2, cached

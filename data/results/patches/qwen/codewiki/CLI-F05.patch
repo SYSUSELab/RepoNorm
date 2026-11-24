@@ -1,0 +1,127 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..c97cf7d 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -228,6 +228,13 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param retry_cleanup: Number of additional attempts after a cleanup callback's
++        first attempt. A root context defaults to zero. A child inherits an omitted
++        value; explicit zero disables retries for that child.
++    :param retry_cleanup_backoff: Initial delay in seconds before the first retry.
++        Defaults to 0.1 at the root and inherits from the parent when omitted or
++        ``None``. An explicit value overrides inheritance and must be a finite
++        positive integer or float (not a boolean).
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +287,8 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +436,33 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        # Handle retry_cleanup parameter
++        if retry_cleanup is None:
++            if parent is not None:
++                retry_cleanup = parent.retry_cleanup
++            else:
++                retry_cleanup = 0
++        self.retry_cleanup: int = retry_cleanup
++
++        # Handle retry_cleanup_backoff parameter
++        if retry_cleanup_backoff is None:
++            if parent is not None:
++                retry_cleanup_backoff = parent.retry_cleanup_backoff
++            else:
++                retry_cleanup_backoff = 0.1
++        else:
++            # Validate retry_cleanup_backoff
++            if isinstance(retry_cleanup_backoff, bool):
++                raise ValueError("retry_cleanup_backoff must not be a boolean")
++            if not isinstance(retry_cleanup_backoff, (int, float)):
++                raise ValueError("retry_cleanup_backoff must be a finite positive integer or float")
++            if retry_cleanup_backoff <= 0:
++                raise ValueError("retry_cleanup_backoff must be a positive value")
++            import math
++            if math.isinf(retry_cleanup_backoff):
++                raise ValueError("retry_cleanup_backoff must be a finite value")
++        self.retry_cleanup_backoff: float = float(retry_cleanup_backoff)
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -600,17 +636,64 @@ class Context:
+ 
+         :param f: The function to execute on teardown.
+         """
+-        return self._exit_stack.callback(f)
++        self._close_callbacks.append(f)
++        return f
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with
+         :meth:`call_on_close`, and exit all context managers entered
+         with :meth:`with_resource`.
++
++        Cleanup callbacks are retried on transient failures according to
++        the context's :attr:`retry_cleanup` setting. Each callback has its
++        own retry budget and backoff sequence.
+         """
++        import time
++        import math
++
++        # First, close all context managers registered via with_resource
+         self._exit_stack.close()
+         # In case the context is reused, create a new exit stack.
+         self._exit_stack = ExitStack()
+ 
++        # Now handle retry logic for call_on_close callbacks
++        # Callbacks are executed in reverse order (LIFO) to match nested context behavior
++        callbacks = list(reversed(self._close_callbacks))
++        self._close_callbacks.clear()
++
++        last_exception = None
++        for callback in callbacks:
++            # Try up to (retry_cleanup + 1) times
++            max_attempts = self.retry_cleanup + 1
++            current_backoff = self.retry_cleanup_backoff
++            attempt = 0
++            exception_to_propagate = None
++
++            while attempt < max_attempts:
++                try:
++                    callback()
++                    # Success - no need to retry
++                    exception_to_propagate = None
++                    break
++                except (KeyboardInterrupt, SystemExit):
++                    # Never retry these exceptions
++                    raise
++                except Exception as e:
++                    exception_to_propagate = e
++                    attempt += 1
++                    if attempt < max_attempts:
++                        # Wait before retrying with exponential backoff
++                        time.sleep(current_backoff)
++                        current_backoff *= 2
++
++            # If we exhausted all attempts, keep the last exception
++            if exception_to_propagate is not None:
++                last_exception = exception_to_propagate
++
++        # Propagate the last exception if any occurred
++        if last_exception is not None:
++            raise last_exception
++
+     @property
+     def command_path(self) -> str:
+         """The computed command path.  This is used for the ``usage``

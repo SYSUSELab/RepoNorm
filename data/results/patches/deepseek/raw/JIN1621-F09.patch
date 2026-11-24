@@ -1,0 +1,244 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..4b0f858 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -1,6 +1,7 @@
+ """API and implementations for loading templates from different data
+ sources.
+ """
++import threading
+ import importlib.util
+ import os
+ import sys
+@@ -170,9 +171,16 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param auto_reload: When ``True`` (the default), the loader tracks
++        environments and monitors the filesystem for changes. A background
++        thread polls for modifications every 0.5 seconds and invalidates
++        environment caches. When ``False``, no monitoring is performed.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionadded:: NEXT_VERSION
++        Added the ``auto_reload`` parameter, and ``start_monitoring``,
++        ``close``, ``scan_once``, and ``invalidate_changed`` methods.
+     """
+ 
+     def __init__(
+@@ -180,6 +188,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        auto_reload: bool = True,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,10 +196,198 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.auto_reload = auto_reload
++
++        self._environments: t.Optional["weakref.WeakSet"] = None
++        self._mtimes: t.Dict[str, float] = {}
++        self._lock = threading.Lock()
++        self._thread: t.Optional[threading.Thread] = None
++        self._closed = False
++        self._event = threading.Event()
++
++    def _init_environments(self) -> None:
++        if self._environments is None:
++            self._environments = weakref.WeakSet()
++
++    def _track_environment(self, environment: "Environment") -> None:
++        if not self.auto_reload:
++            return
++        self._init_environments()
++        self._environments.add(environment)
++        self._start_monitor_if_needed()
++
++    def _start_monitor_if_needed(self) -> None:
++        if self._thread is None or not self._thread.is_alive():
++            self._thread = threading.Thread(target=self._monitor, daemon=True)
++            self._thread.start()
++
++    def _monitor(self) -> None:
++        while not self._closed:
++            self._event.wait(0.5)
++            if self._closed:
++                break
++            try:
++                self.scan_once()
++            except Exception:
++                # Background filesystem errors do not terminate the monitor.
++                pass
++
++    def start_monitoring(self) -> None:
++        """Start the background filesystem monitor if ``auto_reload`` is
++        enabled. This is called automatically when an environment first
++        loads through the loader. It is idempotent.
++
++        If ``auto_reload`` is ``False``, this method does nothing even
++        when called explicitly.
++        """
++        if not self.auto_reload:
++            return
++        self._closed = False
++        self._init_environments()
++        self._start_monitor_if_needed()
++
++    def close(self) -> None:
++        """Stop the background filesystem monitor. A closed loader may be
++        explicitly restarted by calling :meth:`start_monitoring` again.
++        This method is idempotent.
++        """
++        self._closed = True
++        self._event.set()
++        if self._thread is not None:
++            self._thread.join(timeout=1)
++            self._thread = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        self.start_monitoring()
++        return self
++
++    def __exit__(
++        self,
++        exc_type: t.Optional[t.Type[BaseException]],
++        exc_value: t.Optional[BaseException],
++        traceback: t.Optional[t.Any],
++    ) -> None:
++        self.close()
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous scan of the filesystem, compare with
++        previously tracked state, and invalidate cache entries for any
++        modified, deleted, or added template files. Returns a list of
++        canonical ``/``-separated template names that were invalidated.
++        """
++        if not self.auto_reload:
++            return []
++
++        # Discover current state of the filesystem.
++        current: t.Dict[str, float] = {}
++        for searchpath in self.searchpath:
++            walk_dir = os.walk(searchpath, followlinks=self.followlinks)
++            for dirpath, _, filenames in walk_dir:
++                for filename in filenames:
++                    filepath = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(filepath)
++                    except OSError:
++                        continue
++                    current[filepath] = mtime
++
++        with self._lock:
++            old_mtimes = self._mtimes
++            self._mtimes = current
++
++        # Determine which paths have changed.
++        changed: t.List[str] = []
++        for path, old_mtime in old_mtimes.items():
++            if path not in current:
++                changed.append(path)
++            elif current[path] != old_mtime:
++                changed.append(path)
++        for path in current:
++            if path not in old_mtimes:
++                changed.append(path)
++
++        if not changed:
++            return []
++
++        return self._invalidate_internal(changed)
++
++    def invalidate_changed(self, paths: t.Iterable[str]) -> t.List[str]:
++        """Synchronously invalidate cache entries for the supplied
++        absolute paths. Paths that are not within any search root are
++        ignored. Returns a list of canonical ``/``-separated template
++        names that were invalidated.
++
++        :param paths: An iterable of absolute file paths to invalidate.
++        """
++        if not self.auto_reload:
++            return []
++
++        valid_paths: t.List[str] = []
++        for path in paths:
++            abs_path = os.path.normpath(os.path.abspath(path))
++            for searchpath in self.searchpath:
++                norm_search = os.path.normpath(searchpath)
++                if abs_path.startswith(norm_search + os.sep):
++                    valid_paths.append(abs_path)
++                    break
++
++        if not valid_paths:
++            return []
++
++        return self._invalidate_internal(valid_paths)
++
++    def _invalidate_internal(self, paths: t.List[str]) -> t.List[str]:
++        """Given a list of absolute file paths, compute canonical template
++        names and invalidate them in all tracked environments.
++        """
++        names: t.List[str] = []
++        for path in paths:
++            name = self._path_to_template_name(path)
++            if name is not None:
++                names.append(name)
++
++        if names:
++            self._remove_from_caches(names)
++
++        return names
++
++    def _path_to_template_name(self, path: str) -> t.Optional[str]:
++        """Convert an absolute path to a canonical ``/``-separated
++        template name relative to one of the search roots. Returns
++        ``None`` if the path is not within any search root.
++        """
++        norm_path = os.path.normpath(path)
++        for searchpath in self.searchpath:
++            norm_search = os.path.normpath(searchpath)
++            prefix = norm_search + os.sep
++            if norm_path.startswith(prefix):
++                rel = norm_path[len(prefix) :]
++                return rel.replace(os.sep, "/")
++        return None
++
++    def _remove_from_caches(self, names: t.List[str]) -> None:
++        """Remove the given template names from all tracked environment
++        caches.
++        """
++        if self._environments is None:
++            return
++
++        loader_ref = weakref.ref(self)
++
++        for env in list(self._environments):
++            if env.cache is None:
++                continue
++            for name in names:
++                key = (loader_ref, name)
++                try:
++                    del env.cache[key]
++                except KeyError:
++                    pass
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        self._track_environment(environment)
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+@@ -231,6 +428,7 @@ class FileSystemLoader(BaseLoader):
+         return sorted(found)
+ 
+ 
++
+ class PackageLoader(BaseLoader):
+     """Load templates from a directory in a Python package.
+ 

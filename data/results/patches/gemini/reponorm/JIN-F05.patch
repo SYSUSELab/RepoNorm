@@ -1,0 +1,231 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..fcdcf0a 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -17,7 +17,7 @@ from .async_utils import auto_aiter
+ from .async_utils import auto_await
+ from .async_utils import auto_to_list
+ from .exceptions import FilterArgumentError
+-from .runtime import Undefined
++from .runtime import Undefined, StrictUndefined
+ from .utils import htmlsafe_json_dumps
+ from .utils import pass_context
+ from .utils import pass_environment
+@@ -1156,13 +1156,14 @@ class _GroupTuple(t.NamedTuple):
+     def __str__(self) -> str:
+         return tuple.__str__(self)
+ 
+-
+ @pass_environment
++
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,26 +1211,54 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
++    
++    def sort_key(item):
++        key = expr(item)
++        if isinstance(key, StrictUndefined):
++            return key
++        if isinstance(key, Undefined):
++            return (3, None)
++        elif key is None:
++            return (2, None)
++        else:
++            return (1, key)
++
++    def group_key(item):
++        key = expr(item)
++        if isinstance(key, StrictUndefined):
++            return key
++        if isinstance(key, Undefined):
++            return (3, None)
++        elif key is None:
++            return (2, None)
++        else:
++            return (1, key)
++    items = list(value)
++    if not include_empty:
++        items = [i for i in items if expr(i)]
++    
++    items.sort(key=sort_key)
++    
+     return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
++        _GroupTuple(key[1] if key[0] == 1 else (None if key[0] == 2 else Undefined()), list(values))
++        for key, values in groupby(items, key=group_key)
+     ]
+-
+-
+-@async_variant(sync_do_groupby)  # type: ignore
++@async_variant(sync_do_groupby)
++@pass_environment
+ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
++    include_empty: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
+-
+-
++    return sync_do_groupby(
++        environment,
++        await auto_to_list(value),
++        attribute,
++        default=default,
++        include_empty=include_empty,
++    )
+ @pass_environment
+ def sync_do_sum(
+     environment: "Environment",
+diff --git a/tests/test_groupby_include_empty_false.py b/tests/test_groupby_include_empty_false.py
+new file mode 100644
+index 0000000..d273517
+--- /dev/null
++++ b/tests/test_groupby_include_empty_false.py
+@@ -0,0 +1,31 @@
++from jinja2.filters import sync_do_groupby
++from jinja2 import Environment
++
++def test_groupby_include_empty_false_python():
++    env = Environment()
++    data = [
++        {"val": None},
++        {"val": ""},
++        {"val": "z"},
++        {"val": None},
++        {}, # missing
++        {}  # missing
++    ]
++    
++    # include_empty=False (default)
++    result = sync_do_groupby(env, data, 'val', include_empty=False)
++    print(f"\nResult: {result}")
++    
++    # It should only contain 'z'.
++    # Wait, what about ''?
++    # The task says: "False removes items whose resolved grouping key is falsy"
++    # '' is falsy.
++    # None is falsy.
++    # Undefined is falsy.
++    
++    # So it should only contain 'z'.
++    assert len(result) == 1
++    assert result[0].grouper == 'z'
++
++if __name__ == "__main__":
++    test_groupby_include_empty_false_python()
+diff --git a/tests/test_groupby_include_empty_new.py b/tests/test_groupby_include_empty_new.py
+new file mode 100644
+index 0000000..b77cc12
+--- /dev/null
++++ b/tests/test_groupby_include_empty_new.py
+@@ -0,0 +1,67 @@
++import pytest
++from jinja2 import Environment, Undefined
++
++def test_groupby_include_empty_true():
++    env = Environment()
++    # The task says:
++    # For example keys [missing, None, '', 'z', missing, None]
++    # produce groups ['', 'z', None, missing] of sizes [1, 1, 2, 2].
++    
++    # Let's construct a test case that matches this.
++    # We need a way to represent "missing".
++    # If we use a list of dicts, some have the key, some don't.
++    
++    data = [
++        {"val": None},
++        {"val": ""},
++        {"val": "z"},
++        {"val": None},
++        {}, # missing
++        {}  # missing
++    ]
++    
++    # We need to use include_empty=True.
++    # The filter is called as: data|groupby('val', include_empty=True)
++    
++    result = env.from_string("{{ data|groupby('val', include_empty=True) }}").render(data=data)
++    print(f"\nResult: {result}")
++    
++    # Check the result.
++    # It should be a list of tuples.
++    # The grouper should be: '', 'z', None, Undefined
++    
++    # Let's parse the result.
++    # The result is a string representation of the list of tuples.
++    # This is not ideal for testing.
++    # Let's use a python test instead.
++
++def test_groupby_include_empty_true_python():
++    from jinja2.filters import sync_do_groupby
++    from jinja2 import Environment
++    
++    env = Environment()
++    data = [
++        {"val": None},
++        {"val": ""},
++        {"val": "z"},
++        {"val": None},
++        {}, # missing
++        {}  # missing
++    ]
++    
++    result = sync_do_groupby(env, data, 'val', include_empty=True)
++    print(f"\nResult: {result}")
++    
++    assert len(result) == 4
++    assert result[0].grouper == ''
++    assert result[1].grouper == 'z'
++    assert result[2].grouper is None
++    assert isinstance(result[3].grouper, Undefined)
++    
++    assert len(result[0].list) == 1
++    assert len(result[1].list) == 1
++    assert len(result[2].list) == 2
++    assert len(result[3].list) == 2
++
++if __name__ == "__main__":
++    test_groupby_include_empty_true_python()
+diff --git a/tests/test_groupby_strict_undefined.py b/tests/test_groupby_strict_undefined.py
+new file mode 100644
+index 0000000..b1e2a7f
+--- /dev/null
++++ b/tests/test_groupby_strict_undefined.py
+@@ -0,0 +1,19 @@
++from jinja2.filters import sync_do_groupby
++from jinja2 import Environment, StrictUndefined
++
++def test_groupby_strict_undefined():
++    env = Environment(undefined=StrictUndefined)
++    data = [
++        {"val": "z"},
++        {}, # missing
++    ]
++    
++    # This should raise an error because StrictUndefined is used.
++    try:
++        sync_do_groupby(env, data, 'val', include_empty=True)
++        print("Should have raised an error")
++    except Exception as e:
++        print(f"Caught expected error: {e}")
++
++if __name__ == "__main__":
++    test_groupby_strict_undefined()

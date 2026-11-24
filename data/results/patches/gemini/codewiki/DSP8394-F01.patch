@@ -1,0 +1,93 @@
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..d685f011 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -2,6 +2,8 @@ import copy
+ import inspect
+ import logging
+ import threading
++import contextvars
++from contextlib import contextmanager
+ from functools import wraps
+ from hashlib import sha256
+ from typing import Any, Dict, Optional
+@@ -58,9 +60,24 @@ class Cache:
+             self.disk_cache = {}
+ 
+         self._lock = threading.RLock()
++        self._bypass_var = contextvars.ContextVar(f"bypass_{id(self)}", default=False)
++
++    @contextmanager
++    def bypass(self):
++        """Bypass the cache for reads."""
++        token = self._bypass_var.set(True)
++        try:
++            yield
++        finally:
++            self._bypass_var.reset(token)
++
++    def _is_bypassed(self) -> bool:
++        return self._bypass_var.get()
+ 
+     def __contains__(self, key: str) -> bool:
+         """Check if a key is in the cache."""
++        if self._is_bypassed():
++            return False
+         return key in self.memory_cache or key in self.disk_cache
+ 
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+@@ -97,6 +114,9 @@ class Cache:
+         return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+ 
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
++        if self._is_bypassed():
++            return None
++
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+diff --git a/tests/caching/test_bypass.py b/tests/caching/test_bypass.py
+new file mode 100644
+index 00000000..73ac0bbe
+--- /dev/null
++++ b/tests/caching/test_bypass.py
+@@ -0,0 +1,39 @@
++import dspy
++from dspy.clients.cache import Cache
++from dspy.clients.cache import request_cache
++import pytest
++
++def test_cache_bypass():
++    # Setup a dummy cache
++    cache = Cache(enable_disk_cache=False, enable_memory_cache=True, disk_cache_dir="/tmp/dspy_cache")
++    dspy.cache = cache
++
++    @request_cache()
++    def my_function(x):
++        return x * 2
++
++    # 1. Normal caching
++    assert my_function(10) == 20
++    
++    # 2. Bypass
++    with dspy.cache.bypass():
++        # This should recompute
++        assert my_function(10) == 20
++        
++    # 3. Normal read
++    assert my_function(10) == 20
++
++def test_cache_bypass_nested():
++    cache = Cache(enable_disk_cache=False, enable_memory_cache=True, disk_cache_dir="/tmp/dspy_cache")
++    dspy.cache = cache
++
++    @request_cache()
++    def my_function(x):
++        return x * 2
++
++    with dspy.cache.bypass():
++        with dspy.cache.bypass():
++            assert my_function(10) == 20
++        assert my_function(10) == 20
++    assert my_function(10) == 20
++

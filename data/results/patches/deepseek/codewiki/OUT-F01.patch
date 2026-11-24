@@ -1,0 +1,235 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..b0d049c 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -1,5 +1,6 @@
+ """Backend class for XGrammar."""
+ 
++import warnings
+ from typing import TYPE_CHECKING
+ 
+ from outlines.backends.base import BaseBackend
+@@ -11,47 +12,111 @@ from outlines.processors.base_logits_processor import (
+ )
+ 
+ if TYPE_CHECKING:
+-    from xgrammar.contrib.hf import LogitsProcessor
++    from xgrammar import GrammarMatcher
+ 
+ 
+ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+     """Logits processor for XGrammar.
+ 
+-    This class wraps the `xgr.contrib.hf.LogitsProcessor` class and adds
+-    a `reset` method to reset the logits processor for a new generation.
++    This class builds on XGrammar's low-level ``GrammarMatcher`` and
++    token-bitmask APIs to bias logits per batch row.  A separate matcher
++    is created for each row in the batch.  On the first call the matchers
++    and a reusable bitmask are allocated; on subsequent calls each matcher
++    is advanced by consuming the last generated token before the bitmask
++    is filled and applied.
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: str, tensor_library_name: str):
+         """
+         Parameters
+         ----------
+-        compiled_grammar: str
+-            The compiled grammar to use to create the logits processor.
++        compiled_grammar
++            The compiled grammar to use for constraining generation.
++        tensor_library_name
++            The name of the tensor library used by the model (e.g. ``"torch"``).
+ 
+         """
+-        import xgrammar as xgr
+-
+-        self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+-        self.xgrammar_logits_processor = None
+-        super().__init__("torch")
++        self.tensor_library_name = tensor_library_name
++        self.is_first_token: bool = True
++        self._matchers: list["GrammarMatcher"] | None = None
++        self._bitmask = None
++        super().__init__(tensor_library_name)
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+-        self.xgrammar_logits_processor = None
++        self.is_first_token = True
++        self._matchers = None
++        self._bitmask = None
+ 
+-    def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+-        """Bias the logits."""
+-        if self.xgrammar_logits_processor is None:
+-            self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+-                self.compiled_grammar
+-            )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++    def _setup(self, batch_size: int, vocab_size: int) -> None:
++        """Create per-row matchers and a reusable bitmask.
++
++        Parameters
++        ----------
++        batch_size
++            Number of sequences in the batch.
++        vocab_size
++            Size of the model's vocabulary.
++        """
++        import xgrammar as xgr
++
++        self._matchers = [
++            xgr.GrammarMatcher(self.compiled_grammar)
++            for _ in range(batch_size)
++        ]
++        self._bitmask = xgr.allocate_token_bitmask(batch_size, vocab_size)
++
++    def process_logits(
++        self, input_ids: TensorType, logits: TensorType
++    ) -> TensorType:
++        """Bias the logits using XGrammar's grammar constraints.
++
++        Parameters
++        ----------
++        input_ids
++            The ids of the tokens of the existing sequences in a 2D tensor.
++        logits
++            The logits for the current generation step in a 2D tensor.
++
++        Returns
++        -------
++        TensorType
++            The biased logits.
++        """
++        import xgrammar as xgr
++
++        batch_size = self.tensor_adapter.shape(input_ids)[0]
++        vocab_size = self.tensor_adapter.shape(logits)[-1]
++
++        if self.is_first_token:
++            self._setup(batch_size, vocab_size)
++            self.is_first_token = False
++        else:
++            # Advance each matcher with the last generated token.
++            for i in range(batch_size):
++                last_token = int(input_ids[i, -1].item())
++                self._matchers[i].accept_token(last_token)
++
++        # Fill the bitmask for every row.
++        for i in range(batch_size):
++            self._matchers[i].fill_next_token_bitmask(self._bitmask, i)
++
++        # Move the bitmask to the logits device if needed.
++        if hasattr(logits, "device"):
++            bitmask = self._bitmask.to(logits.device)
++        else:
++            bitmask = self._bitmask
++
++        # Apply the bitmask in-place.
++        xgr.apply_token_bitmask_inplace(logits, bitmask)
++
++        return logits
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+-    """Backend for XGRammar."""
++    """Backend for XGrammar."""
+ 
+     def __init__(self, model: SteerableModel):
+         """
+@@ -69,66 +134,75 @@ class XGrammarBackend(BaseBackend):
+                 "The xgrammar backend only supports Transformers models"
+             )
+ 
++        self.tensor_library_name = model.tensor_library_name
++
+         vocab_size = AutoConfig.from_pretrained(
+             model.model.config._name_or_path
+         ).vocab_size
+         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+             model.hf_tokenizer,
+-            vocab_size=vocab_size
++            vocab_size=vocab_size,
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+ 
+     def get_json_schema_logits_processor(
+         self, json_schema: str
+-    ) -> "LogitsProcessor":
++    ) -> XGrammarLogitsProcessor:
+         """Create a logits processor from a JSON schema.
+ 
+         Parameters
+         ----------
+-        json_schema: str
++        json_schema
+             The JSON schema to create a logits processor from.
+ 
+         Returns
+         -------
+-        LogitsProcessor
++        XGrammarLogitsProcessor
+             The logits processor to use to constrain the generation.
+-
+         """
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, self.tensor_library_name
++        )
+ 
+-    def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
++    def get_regex_logits_processor(
++        self, regex: str
++    ) -> XGrammarLogitsProcessor:
+         """Create a logits processor from a regex.
+ 
+         Parameters
+         ----------
+-        regex: str
++        regex
+             The regex to create a logits processor from.
+ 
+         Returns
+         -------
+-        LogitsProcessor
++        XGrammarLogitsProcessor
+             The logits processor to use to constrain the generation.
+-
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, self.tensor_library_name
++        )
+ 
+-    def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
++    def get_cfg_logits_processor(
++        self, grammar: str
++    ) -> XGrammarLogitsProcessor:
+         """Create a logits processor from a context-free grammar.
+ 
+         Parameters
+         ----------
+-        grammar: str
++        grammar
+             The context-free grammar to create a logits processor from.
+ 
+         Returns
+         -------
+-        LogitsProcessor
++        XGrammarLogitsProcessor
+             The logits processor to use to constrain the generation.
+-
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(
++            compiled_grammar, self.tensor_library_name
++        )

@@ -1,0 +1,100 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..dfc4a18 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,15 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
++        if monitor_process is not None and not callable(monitor_process):
++            raise TypeError("monitor_process must be a callable")
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -505,6 +509,16 @@ class Editor:
+                 return editor
+         return "vi"
+ 
++
++    def _emit_event(self, event_type: str, pid: int, editor_command: str) -> None:
++        if self.monitor_process is None:
++            return
++        try:
++            self.monitor_process(event_type, pid, editor_command, time.time())
++        except Exception:
++            import warnings
++            warnings.warn(f"Exception in monitor_process callback: {event_type}", UserWarning)
++
+     def edit_file(self, filename: str) -> None:
+         import subprocess
+ 
+@@ -517,7 +531,9 @@ class Editor:
+ 
+         try:
+             c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            self._emit_event("start", c.pid, editor)
+             exit_code = c.wait()
++            self._emit_event("terminate", c.pid, editor)
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..2407837 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -680,7 +681,7 @@ def edit(
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, monitor_process=monitor_process)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_monitor_process.py b/tests/test_monitor_process.py
+new file mode 100644
+index 0000000..07ee4d7
+--- /dev/null
++++ b/tests/test_monitor_process.py
+@@ -0,0 +1,26 @@
++import click
++import pytest
++from unittest.mock import MagicMock
++
++def test_monitor_process_callback():
++    editor_cmd = "true"
++    mock_callback = MagicMock()
++    click.edit("hello", editor=editor_cmd, monitor_process=mock_callback)
++    assert mock_callback.call_count == 2
++    assert mock_callback.call_args_list[0][0][0] == 'start'
++    assert mock_callback.call_args_list[1][0][0] == 'terminate'
++
++def test_invalid_callback():
++    with pytest.raises(TypeError, match="monitor_process must be a callable"):
++        click.edit("hello", editor="true", monitor_process="not a callable")
++
++def test_callback_exception():
++    def bad_callback(event_type, process_id, editor_command, timestamp):
++        raise Exception("Boom!")
++    
++    import warnings
++    with warnings.catch_warnings(record=True) as w:
++        warnings.simplefilter("always")
++        click.edit("hello", editor="true", monitor_process=bad_callback)
++        assert len(w) == 2
++        assert "Exception in monitor_process callback" in str(w[0].message)

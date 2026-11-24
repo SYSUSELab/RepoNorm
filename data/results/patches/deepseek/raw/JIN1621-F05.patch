@@ -1,0 +1,213 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..9a40a0e 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -7,7 +7,7 @@ import sys
+ import typing as t
+ import weakref
+ import zipimport
+-from collections import abc
++from collections import OrderedDict, abc
+ from hashlib import sha1
+ from importlib import import_module
+ from types import ModuleType
+@@ -170,9 +170,15 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param path_cache_size: Size of an optional bounded resolved-path
++        cache. ``0`` (default) disables caching. A positive integer
++        enables least-recently-used eviction at that capacity.
++        Boolean and negative values are rejected.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionchanged:: 3.0
++        Added the ``path_cache_size`` parameter.
+     """
+ 
+     def __init__(
+@@ -180,6 +186,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_cache_size: int = 0,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -188,30 +195,125 @@ class FileSystemLoader(BaseLoader):
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+-    def get_source(
+-        self, environment: "Environment", template: str
+-    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        if isinstance(path_cache_size, bool) or path_cache_size < 0:
++            raise ValueError(
++                f"path_cache_size must be a non-negative integer, "
++                f"got {path_cache_size!r}"
++            )
++
++        self.path_cache_size = path_cache_size
++        self._path_cache: t.OrderedDict[str, str]
++        if path_cache_size > 0:
++            self._path_cache = OrderedDict()
++        else:
++            self._path_cache = OrderedDict()  # type: ignore[assignment]
++
++    def resolve_template_path(self, template: str) -> t.Optional[str]:
++        """Resolve a template name to the first matching filename by
++        searching through :attr:`searchpath` in priority order.
++
++        This is the public customization hook for uncached priority-order
++        lookup. Subclasses can override this method to customize or
++        observe resolution without depending on the cache's private
++        storage.
++
++        Returns the resolved filename or ``None`` if the template was
++        not found.
++        """
+         pieces = split_template_path(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+-            if f is None:
+-                continue
+-            try:
+-                contents = f.read().decode(self.encoding)
+-            finally:
++            if f is not None:
+                 f.close()
++                return filename
++        return None
+ 
+-            mtime = os.path.getmtime(filename)
++    def _get_cached_path(self, template: str) -> t.Optional[str]:
++        """Check the path cache for a template, verifying freshness.
+ 
+-            def uptodate() -> bool:
+-                try:
+-                    return os.path.getmtime(filename) == mtime
+-                except OSError:
+-                    return False
++        Returns the cached filename if it is still fresh, or ``None``
++        if there is no cache, no entry, or the cached file is stale.
++        """
++        if self.path_cache_size == 0:
++            return None
+ 
+-            return contents, filename, uptodate
+-        raise TemplateNotFound(template)
++        cached = self._path_cache.get(template)
++        if cached is None:
++            return None
++
++        # Check if the cached file still exists.
++        if not os.path.isfile(cached):
++            del self._path_cache[template]
++            return None
++
++        # Check if a higher-priority search path now has the template.
++        pieces = split_template_path(template)
++        for searchpath in self.searchpath:
++            candidate = os.path.join(searchpath, *pieces)
++            if candidate == cached:
++                # Found at same priority as cached — cache is fresh.
++                break
++            if open_if_exists(candidate) is not None:
++                # Found at a higher priority — update cache.
++                self._path_cache[template] = candidate
++                return candidate
++
++        self._path_cache.move_to_end(template)
++        return cached
++
++    def _put_cached_path(self, template: str, filename: str) -> None:
++        """Add a resolved path to the cache, evicting LRU entries if
++        the cache is full.
++        """
++        if self.path_cache_size == 0:
++            return
++
++        if template in self._path_cache:
++            # Update existing entry, mark as recently used.
++            del self._path_cache[template]
++        elif len(self._path_cache) >= self.path_cache_size:
++            # Evict the least-recently-used entry.
++            self._path_cache.popitem(last=False)
++
++        self._path_cache[template] = filename
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, str, t.Callable[[], bool]]:
++        filename = self._get_cached_path(template)
++
++        if filename is None:
++            # Cache miss or caching disabled. Use the public hook.
++            filename = self.resolve_template_path(template)
++
++            if filename is not None and self.path_cache_size > 0:
++                self._put_cached_path(template, filename)
++
++        if filename is None:
++            raise TemplateNotFound(template)
++
++        f = open_if_exists(filename)
++        if f is None:
++            # File was removed between cache check and open. Remove from
++            # cache and raise.
++            self._path_cache.pop(template, None)
++            raise TemplateNotFound(template)
++
++        try:
++            contents = f.read().decode(self.encoding)
++        finally:
++            f.close()
++
++        mtime = os.path.getmtime(filename)
++
++        def uptodate() -> bool:
++            try:
++                return os.path.getmtime(filename) == mtime
++            except OSError:
++                return False
++
++        return contents, filename, uptodate
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+@@ -230,6 +332,33 @@ class FileSystemLoader(BaseLoader):
+                         found.add(template)
+         return sorted(found)
+ 
++    def clear_path_cache(self) -> None:
++        """Remove all entries from the resolved-path cache."""
++        self._path_cache.clear()
++
++    def resize_path_cache(self, capacity: int) -> None:
++        """Change the maximum size of the resolved-path cache.
++
++        If *capacity* is ``0``, the cache is cleared and disabled.
++        If *capacity* is smaller than the current number of entries,
++        the least-recently-used entries are evicted. Booleans and
++        negative values are rejected.
++        """
++        if isinstance(capacity, bool) or capacity < 0:
++            raise ValueError(
++                f"path_cache_size must be a non-negative integer, "
++                f"got {capacity!r}"
++            )
++
++        self.path_cache_size = capacity
++
++        if capacity == 0:
++            self._path_cache.clear()
++            return
++
++        # Evict LRU entries if the cache is over capacity.
++        while len(self._path_cache) > capacity:
++            self._path_cache.popitem(last=False)
+ 
+ class PackageLoader(BaseLoader):
+     """Load templates from a directory in a Python package.

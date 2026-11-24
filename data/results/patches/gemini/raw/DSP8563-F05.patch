@@ -1,0 +1,465 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..c4c29c52 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,11 +1,11 @@
+ import asyncio
+ import inspect
+-from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
++from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints, Optional
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, Field, ConfigDict
+ 
+-from dspy.adapters.types.base_type import Type
++from dspy.adapters.types.base_type import Type as DSPyType
+ from dspy.dsp.utils.settings import settings
+ from dspy.utils.callback import with_callbacks
+ 
+@@ -16,7 +16,7 @@ if TYPE_CHECKING:
+ _TYPE_MAPPING = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
+ 
+ 
+-class Tool(Type):
++class Tool(DSPyType):
+     """Tool class.
+ 
+     This class is used to simplify the creation of tools for tool calling (function calling) in LLMs. Only supports
+@@ -254,36 +254,81 @@ class Tool(Type):
+         return f"{self.name}{desc} {arg_desc}"
+ 
+ 
+-class ToolCalls(Type):
++class ToolCalls(DSPyType):
+     class ToolCall(BaseModel):
+         name: str
+         args: dict[str, Any]
++        note: Optional[str] = None
++        comment: Optional[str] = None
++        annotation: Optional[str] = None
++        tags: Optional[list[str]] = None
++        priority: Optional[int | str] = None
++        meta: Optional[dict[str, Any]] = None
++
++        model_config = ConfigDict(extra="ignore")
+ 
+     tool_calls: list[ToolCall]
+ 
+     @classmethod
+-    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
++    def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]], comments: Optional[list[str]] = None) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+ 
+         Args:
+             dict_list: A list of dictionaries, where each dictionary should have 'name' and 'args' keys.
++            comments: Optional list of comment strings.
+ 
+         Returns:
+             A ToolCalls instance.
+-
+-        Example:
+-
+-            ```python
+-            tool_calls_dict = [
+-                {"name": "search", "args": {"query": "hello"}},
+-                {"name": "translate", "args": {"text": "world"}}
+-            ]
+-            tool_calls = ToolCalls.from_dict_list(tool_calls_dict)
+-            ```
+         """
++        if comments:
++            combined_comment = "\n".join(c.strip() for c in comments if c and c.strip())
++            if combined_comment:
++                for item in tool_calls_dicts:
++                    if "comment" not in item or not item["comment"]:
++                        item["comment"] = combined_comment
++        
+         tool_calls = [cls.ToolCall(**item) for item in tool_calls_dicts]
+         return cls(tool_calls=tool_calls)
+ 
++    @classmethod
++    def from_string(cls, text: str) -> "ToolCalls":
++        import json
++        lines = text.splitlines()
++        cleaned_lines = []
++        comments = []
++        
++        for line in lines:
++            in_string = False
++            escaped = False
++            comment_start = -1
++            
++            for i, char in enumerate(line):
++                if char == '"' and not escaped:
++                    in_string = not in_string
++                elif char == '\\' and not escaped:
++                    escaped = True
++                elif char == '#' and not in_string:
++                    comment_start = i
++                    break
++                else:
++                    escaped = False
++            
++            if comment_start != -1:
++                cleaned_lines.append(line[:comment_start])
++                comments.append(line[comment_start+1:].strip())
++            else:
++                cleaned_lines.append(line)
++                
++        cleaned_text = "\n".join(cleaned_lines)
++        data = json.loads(cleaned_text)
++        
++        if isinstance(data, dict) and "type" in data and data["type"] == "tool_calls":
++            data = data["tool_calls"]
++        elif isinstance(data, dict):
++            data = [data]
++        
++        return cls.from_dict_list(data, comments=comments)
++
+     @classmethod
+     def description(cls) -> str:
+         return (
+@@ -309,6 +354,38 @@ class ToolCalls(Type):
+             }
+         ]
+ 
++    def format_with_metadata(self) -> list[dict[str, Any]]:
++        result = []
++        for tool_call in self.tool_calls:
++            call_dict = {
++                "type": "function",
++                "function": {
++                    "name": tool_call.name,
++                    "arguments": tool_call.args,
++                },
++            }
++            
++            # Add metadata if present
++            metadata = {}
++            if tool_call.note is not None: metadata["note"] = tool_call.note
++            if tool_call.comment is not None: metadata["comment"] = tool_call.comment
++            if tool_call.annotation is not None: metadata["annotation"] = tool_call.annotation
++            if tool_call.tags is not None: metadata["tags"] = tool_call.tags
++            if tool_call.priority is not None: metadata["priority"] = tool_call.priority
++            if tool_call.meta is not None: metadata["meta"] = tool_call.meta
++            
++            if metadata:
++                call_dict["metadata"] = metadata
++            
++            result.append(call_dict)
++            
++        return [
++            {
++                "type": "tool_calls",
++                "tool_calls": result
++            }
++        ]
++
+ 
+ def _resolve_json_schema_reference(schema: dict) -> dict:
+     """Recursively resolve json model schema, expanding all references."""
+@@ -338,7 +415,7 @@ def _resolve_json_schema_reference(schema: dict) -> dict:
+ 
+ def convert_input_schema_to_tool_args(
+     schema: dict[str, Any],
+-) -> tuple[dict[str, Any], dict[str, Type], dict[str, str]]:
++) -> tuple[dict[str, Any], dict[str, DSPyType], dict[str, str]]:
+     """Convert an input json schema to tool arguments compatible with DSPy Tool.
+ 
+     Args:
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 00000000..55a8f45d
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,51 @@
++import json
++from dspy.adapters.types.tool import ToolCalls
++from pydantic import BaseModel
++from typing import Any
++
++# Test 1: Check if ToolCalls.ToolCall can accept new fields
++try:
++    tc = ToolCalls.ToolCall(
++        name="test",
++        args={"a": 1},
++        note="a note",
++        comment="a comment",
++        annotation="an annotation",
++        tags=["tag1", "tag2"],
++        priority=1,
++        meta={"key": "value"}
++    )
++    print("ToolCall construction successful")
++except Exception as e:
++    print(f"ToolCall construction failed: {e}")
++
++# Test 2: Check if ToolCalls.from_dict_list handles new fields
++try:
++    data = [
++        {
++            "name": "test",
++            "args": {"a": 1},
++            "note": "a note",
++            "comment": "a comment",
++            "annotation": "an annotation",
++            "tags": ["tag1", "tag2"],
++            "priority": 1,
++            "meta": {"key": "value"}
++        }
++    ]
++    tool_calls = ToolCalls.from_dict_list(data)
++    print("from_dict_list successful")
++    print(f"Tool call note: {tool_calls.tool_calls[0].note}")
++except Exception as e:
++    print(f"from_dict_list failed: {e}")
++
++# Test 3: Check format_with_metadata
++try:
++    # We need to define the method first, but let's see if it exists
++    if hasattr(ToolCalls, "format_with_metadata"):
++        print("format_with_metadata exists")
++    else:
++        print("format_with_metadata does not exist")
++except Exception as e:
++    print(f"Error checking format_with_metadata: {e}")
++
+diff --git a/test_json_comments.py b/test_json_comments.py
+new file mode 100644
+index 00000000..b67aa7a3
+--- /dev/null
++++ b/test_json_comments.py
+@@ -0,0 +1,40 @@
++import json
++import re
++
++def parse_json_with_comments(text):
++    # Remove Python-style # comments
++    # This regex handles # comments, but we need to be careful about # inside strings
++    # A better approach is to iterate through the string
++    
++    result = []
++    in_string = False
++    escaped = False
++    
++    cleaned_text = ""
++    comment_text = ""
++    
++    i = 0
++    while i < len(text):
++        char = text[i]
++        
++        if char == '"' and not escaped:
++            in_string = not in_string
++            cleaned_text += char
++        elif char == '\\' and not escaped:
++            escaped = True
++            cleaned_text += char
++        elif char == '#' and not in_string:
++            # Start of a comment
++            comment_text += text[i+1:]
++            break
++        else:
++            if escaped:
++                escaped = False
++            cleaned_text += char
++        i += 1
++        
++    return json.loads(cleaned_text), comment_text
++
++# Test
++text = '{"name": "test", "args": {"a": 1}} # This is a comment'
++print(parse_json_with_comments(text))
+diff --git a/test_json_comments_v2.py b/test_json_comments_v2.py
+new file mode 100644
+index 00000000..1f9a0c37
+--- /dev/null
++++ b/test_json_comments_v2.py
+@@ -0,0 +1,46 @@
++import json
++import re
++
++def parse_json_with_comments(text):
++    # Split by lines, remove comments, join back
++    lines = text.splitlines()
++    cleaned_lines = []
++    comments = []
++    
++    for line in lines:
++        # Find the first # that is not in a string
++        in_string = False
++        escaped = False
++        comment_start = -1
++        
++        for i, char in enumerate(line):
++            if char == '"' and not escaped:
++                in_string = not in_string
++            elif char == '\\' and not escaped:
++                escaped = True
++            elif char == '#' and not in_string:
++                comment_start = i
++                break
++            else:
++                escaped = False
++        
++        if comment_start != -1:
++            cleaned_lines.append(line[:comment_start])
++            comments.append(line[comment_start+1:].strip())
++        else:
++            cleaned_lines.append(line)
++            
++    cleaned_text = "\n".join(cleaned_lines)
++    return json.loads(cleaned_text), "\n".join(c for c in comments if c)
++
++# Test
++text = '''
++{
++    "name": "test", # comment 1
++    "args": {"a": 1} # comment 2
++}
++# comment 3
++'''
++data, comment = parse_json_with_comments(text)
++print(f"Data: {data}")
++print(f"Comment: {comment}")
+diff --git a/test_json_comments_v3.py b/test_json_comments_v3.py
+new file mode 100644
+index 00000000..2252fc56
+--- /dev/null
++++ b/test_json_comments_v3.py
+@@ -0,0 +1,48 @@
++import json
++import re
++
++def parse_json_with_comments(text):
++    # Split by lines, remove comments, join back
++    lines = text.splitlines()
++    cleaned_lines = []
++    comments = []
++    
++    for line in lines:
++        # Find the first # that is not in a string
++        in_string = False
++        escaped = False
++        comment_start = -1
++        
++        for i, char in enumerate(line):
++            if char == '"' and not escaped:
++                in_string = not in_string
++            elif char == '\\' and not escaped:
++                escaped = True
++            elif char == '#' and not in_string:
++                comment_start = i
++                break
++            else:
++                escaped = False
++        
++        if comment_start != -1:
++            cleaned_lines.append(line[:comment_start])
++            comments.append(line[comment_start+1:].strip())
++        else:
++            cleaned_lines.append(line)
++            
++    cleaned_text = "\n".join(cleaned_lines)
++    # Need to handle the case where the JSON might be a list or a dict
++    # The requirement says: "Accept a single call, a bare list or the canonical tool_calls container."
++    # The canonical container is {"type": "tool_calls", "tool_calls": [...]}
++    
++    data = json.loads(cleaned_text)
++    return data, "\n".join(c for c in comments if c)
++
++# Test
++text1 = '{"name": "test", "args": {"a": 1}} # comment 1'
++text2 = '[{"name": "test", "args": {"a": 1}}] # comment 2'
++text3 = '{"type": "tool_calls", "tool_calls": [{"name": "test", "args": {"a": 1}}]} # comment 3'
++
++for t in [text1, text2, text3]:
++    data, comment = parse_json_with_comments(t)
++    print(f"Data: {data}, Comment: {comment}")
+diff --git a/test_metadata_logic.py b/test_metadata_logic.py
+new file mode 100644
+index 00000000..85a54db5
+--- /dev/null
++++ b/test_metadata_logic.py
+@@ -0,0 +1,33 @@
++from dspy.adapters.types.tool import ToolCalls
++
++# Test 1: format_with_metadata
++data = [
++    {
++        "name": "test",
++        "args": {"a": 1},
++        "note": "a note",
++        "tags": ["tag1"],
++        "priority": 0,
++        "meta": {}
++    }
++]
++tool_calls = ToolCalls.from_dict_list(data)
++formatted = tool_calls.format_with_metadata()
++print(f"Formatted: {formatted}")
++
++# Test 2: from_string with comments
++text = '''
++[
++    {"name": "test", "args": {"a": 1}} # comment 1
++]
++# comment 2
++'''
++tool_calls = ToolCalls.from_string(text)
++print(f"Tool calls: {tool_calls.tool_calls}")
++print(f"Comment: {tool_calls.tool_calls[0].comment}")
++
++# Test 3: from_dict_list with comments
++data = [{"name": "test", "args": {"a": 1}}]
++comments = ["comment 1", "comment 2"]
++tool_calls = ToolCalls.from_dict_list(data, comments=comments)
++print(f"Comment: {tool_calls.tool_calls[0].comment}")
+diff --git a/test_metadata_logic_v2.py b/test_metadata_logic_v2.py
+new file mode 100644
+index 00000000..51212418
+--- /dev/null
++++ b/test_metadata_logic_v2.py
+@@ -0,0 +1,13 @@
++from dspy.adapters.types.tool import ToolCalls
++
++# Test 1: from_dict_list with explicit comment
++data = [{"name": "test", "args": {"a": 1}, "comment": "explicit"}]
++comments = ["comment 1", "comment 2"]
++tool_calls = ToolCalls.from_dict_list(data, comments=comments)
++print(f"Comment: {tool_calls.tool_calls[0].comment}")
++
++# Test 2: from_dict_list with empty explicit comment
++data = [{"name": "test", "args": {"a": 1}, "comment": ""}]
++comments = ["comment 1", "comment 2"]
++tool_calls = ToolCalls.from_dict_list(data, comments=comments)
++print(f"Comment: {tool_calls.tool_calls[0].comment}")
+diff --git a/test_pydantic_behavior.py b/test_pydantic_behavior.py
+new file mode 100644
+index 00000000..22686bde
+--- /dev/null
++++ b/test_pydantic_behavior.py
+@@ -0,0 +1,22 @@
++from pydantic import BaseModel, Field
++from typing import Optional, Any
++
++class ToolCall(BaseModel):
++    name: str
++    args: dict[str, Any]
++    note: Optional[str] = None
++    comment: Optional[str] = None
++    annotation: Optional[str] = None
++    tags: Optional[list[str]] = None
++    priority: Optional[int | str] = None
++    meta: Optional[dict[str, Any]] = None
++
++data = {
++    "name": "test",
++    "args": {"a": 1},
++    "unknown_field": "should_be_ignored"
++}
++
++tc = ToolCall(**data)
++print(f"ToolCall: {tc}")
++print(f"Unknown field ignored: {'unknown_field' not in tc.model_dump()}")

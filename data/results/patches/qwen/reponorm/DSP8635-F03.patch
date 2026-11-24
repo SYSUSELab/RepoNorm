@@ -1,0 +1,241 @@
+diff --git a/dspy/propose/grounded_proposer.py b/dspy/propose/grounded_proposer.py
+index 13722b4b..b5711860 100644
+--- a/dspy/propose/grounded_proposer.py
++++ b/dspy/propose/grounded_proposer.py
+@@ -1,3 +1,4 @@
++import math
+ import random
+ 
+ import dspy
+@@ -23,6 +24,88 @@ TIPS = {
+         "persona": 'Include a persona that is relevant to the task in the instruction (ie. "You are a ...")',
+     }
+ 
++def _get_effective_weights(tip_weights):
++    """
++    Compute effective weights for tip selection.
++    
++    - Missing keys have weight 1
++    - Unknown keys are ignored
++    - Positive finite integer/float weights are usable
++    - Non-numeric, boolean, nonfinite and nonpositive values have weight zero
++    
++    Returns a dict mapping tip keys to their effective weights.
++    """
++    if tip_weights is None:
++        return {key: 1.0 for key in TIPS}
++    
++    effective_weights = {}
++    for key, value in TIPS.items():
++        if key not in tip_weights:
++            # Missing keys have weight 1
++            effective_weights[key] = 1.0
++        else:
++            weight = tip_weights[key]
++            # Check if weight is valid (positive finite number, but not bool)
++            if isinstance(weight, bool):
++                # Booleans should be treated as invalid (weight 0)
++                effective_weights[key] = 0.0
++            elif isinstance(weight, (int, float)):
++                # Check for finite positive values
++                if math.isfinite(weight) and weight > 0:
++                    effective_weights[key] = float(weight)
++                else:
++                    # Non-positive or infinite values get weight 0
++                    effective_weights[key] = 0.0
++            else:
++                # Non-numeric values get weight 0
++                effective_weights[key] = 0.0
++    
++    return effective_weights
++
++
++def _weighted_choice(rng, items, weights):
++    """
++    Select an item from items using the given weights.
++    
++    - If all weights are zero or sum is zero, use uniform selection
++    - Avoid overflow by normalizing weights before computing cumulative sum
++    
++    Args:
++        rng: Random number generator (must have random() method)
++        items: List of items to choose from
++        weights: List of weights corresponding to items
++        
++    Returns:
++        Selected item
++    """
++    n = len(items)
++    if n == 0:
++        raise ValueError("Cannot select from empty list")
++    
++    # Normalize weights to avoid overflow
++    total_weight = sum(weights)
++    
++    if total_weight == 0:
++        # All weights are zero - use uniform selection
++        idx = int(rng.random() * n)
++        return items[idx]
++    
++    # Generate a random value in [0, total_weight)
++    r = rng.random() * total_weight
++    
++    # Find the selected index by accumulating weights
++    cumulative = 0.0
++    for i, w in enumerate(weights):
++        cumulative += w
++        if r < cumulative:
++            return items[i]
++    
++    # Fallback (should rarely happen due to floating point issues)
++    return items[-1]
++
++
++
++
+ ### SIGNATURES USED TO HELP WITH INSTRUCTION GENERATION ###
+ 
+ class DescribeProgram(dspy.Signature):
+@@ -284,7 +367,8 @@ class GroundedProposer(Proposer):
+         set_tip_randomly=True,
+         set_history_randomly=True,
+         verbose=False,
+-        rng=None
++        rng=None,
++        tip_weights=None,
+     ):
+         super().__init__()
+         self.program_aware = program_aware
+@@ -297,6 +381,7 @@ class GroundedProposer(Proposer):
+         self.set_history_randomly=set_history_randomly
+         self.verbose = verbose
+         self.rng = rng or random
++        self.tip_weights = tip_weights
+ 
+         self.prompt_model = get_prompt_model(prompt_model)
+ 
+@@ -361,12 +446,18 @@ class GroundedProposer(Proposer):
+                 if self.set_tip_randomly:
+                     if self.verbose:
+                         print("Using a randomly generated configuration for our grounded proposer.")
+-                    # Randomly select the tip
+-                    selected_tip_key = self.rng.choice(list(TIPS.keys()))
++                    # Get effective weights for tip selection
++                    effective_weights = _get_effective_weights(self.tip_weights)
++                    
++                    # Prepare items and weights for selection
++                    tip_keys = list(TIPS.keys())
++                    tip_values = [TIPS[k] for k in tip_keys]
++                    tip_weight_list = [effective_weights[k] for k in tip_keys]
++                    
++                    # Randomly select the tip using weighted choice
++                    selected_tip_key = _weighted_choice(self.rng, tip_keys, tip_weight_list)
+                     selected_tip = TIPS[selected_tip_key]
+-                    self.use_tip = bool(
+-                        selected_tip,
+-                    )
++                    self.use_tip = bool(selected_tip)
+                     if self.verbose:
+                         print(f"Selected tip: {selected_tip_key}")
+ 
+diff --git a/tests/propose/test_grounded_proposer.py b/tests/propose/test_grounded_proposer.py
+index 252afe8a..430ac99c 100644
+--- a/tests/propose/test_grounded_proposer.py
++++ b/tests/propose/test_grounded_proposer.py
+@@ -52,3 +52,96 @@ def test_propose_instruction_for_predictor(demo_candidates):
+         tip=None,
+     )
+     assert result == "instruction"
++
++
++def test_tip_weights_none():
++    """Test that tip_weights=None uses uniform selection."""
++    prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++    program = Predict("question -> answer")
++    trainset = []
++
++    proposer = GroundedProposer(
++        prompt_model=prompt_model, 
++        program=program, 
++        trainset=trainset, 
++        verbose=False,
++        set_tip_randomly=True,
++        tip_weights=None
++    )
++    
++    # Verify tip_weights is stored
++    assert proposer.tip_weights is None
++    
++    result = proposer.propose_instructions_for_program(
++        trainset=trainset, 
++        program=program, 
++        demo_candidates=None, 
++        trial_logs={}, 
++        N=1, 
++        T=0.5
++    )
++    
++    assert isinstance(result, dict)
++    assert len(result) == len(program.predictors())
++
++
++def test_tip_weights_custom():
++    """Test custom tip weights."""
++    prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++    program = Predict("question -> answer")
++    trainset = []
++
++    proposer = GroundedProposer(
++        prompt_model=prompt_model, 
++        program=program, 
++        trainset=trainset, 
++        verbose=False,
++        set_tip_randomly=True,
++        tip_weights={"creative": 10.0, "simple": 1.0}
++    )
++    
++    # Verify tip_weights is stored
++    assert proposer.tip_weights == {"creative": 10.0, "simple": 1.0}
++    
++    result = proposer.propose_instructions_for_program(
++        trainset=trainset, 
++        program=program, 
++        demo_candidates=None, 
++        trial_logs={}, 
++        N=1, 
++        T=0.5
++    )
++    
++    assert isinstance(result, dict)
++    assert len(result) == len(program.predictors())
++
++
++def test_set_tip_randomly_false_ignores_tip_weights():
++    """Test that set_tip_randomly=False ignores tip_weights."""
++    prompt_model = DummyLM([{"proposed_instruction": "instruction"}] * 10)
++    program = Predict("question -> answer")
++    trainset = []
++
++    proposer = GroundedProposer(
++        prompt_model=prompt_model, 
++        program=program, 
++        trainset=trainset, 
++        verbose=False,
++        set_tip_randomly=False,  # Random selection disabled
++        tip_weights={"creative": 100.0}  # Should be ignored
++    )
++    
++    assert proposer.set_tip_randomly is False
++    assert proposer.tip_weights == {"creative": 100.0}
++    
++    result = proposer.propose_instructions_for_program(
++        trainset=trainset, 
++        program=program, 
++        demo_candidates=None, 
++        trial_logs={}, 
++        N=1, 
++        T=0.5
++    )
++    
++    assert isinstance(result, dict)
++    assert len(result) == len(program.predictors())

@@ -1,0 +1,180 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..e14c13a 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -280,9 +280,12 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        max_resources: int | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
++        self.max_resources = max_resources if max_resources is not None else (parent.max_resources if parent is not None else None)
++        self._active_resources = 0
+         #: the :class:`Command` for this context.
+         self.command = command
+         #: the descriptive information name
+@@ -561,34 +564,35 @@ class Context:
+             width=self.terminal_width, max_width=self.max_content_width
+         )
+ 
+-    def with_resource(self, context_manager: AbstractContextManager[V]) -> V:
+-        """Register a resource as if it were used in a ``with``
+-        statement. The resource will be cleaned up when the context is
+-        popped.
+-
+-        Uses :meth:`contextlib.ExitStack.enter_context`. It calls the
+-        resource's ``__enter__()`` method and returns the result. When
+-        the context is popped, it closes the stack, which calls the
+-        resource's ``__exit__()`` method.
+-
+-        To register a cleanup function for something that isn't a
+-        context manager, use :meth:`call_on_close`. Or use something
+-        from :mod:`contextlib` to turn it into a context manager first.
+-
+-        .. code-block:: python
+-
+-            @click.group()
+-            @click.option("--name")
+-            @click.pass_context
+-            def cli(ctx):
+-                ctx.obj = ctx.with_resource(connect_db(name))
+-
+-        :param context_manager: The context manager to enter.
+-        :return: Whatever ``context_manager.__enter__()`` returns.
++    def with_resource(self, context_manager: t.ContextManager[t.Any]) -> t.Any:
++        """Registers a resource with the context.  The resource will be
++        automatically closed when the context is closed.
+ 
+         .. versionadded:: 8.0
+         """
+-        return self._exit_stack.enter_context(context_manager)
++        # Check limits
++        ctx = self
++        while ctx is not None:
++            if ctx.max_resources is not None and ctx._active_resources >= ctx.max_resources:
++                raise RuntimeError("Maximum number of resources ({}) reached for context {}".format(ctx.max_resources, ctx.info_name or "None"))
++            ctx = ctx.parent
++        
++        res = self._exit_stack.enter_context(context_manager)
++        
++        # Increment counts
++        ctx = self
++        while ctx is not None:
++            ctx._active_resources += 1
++            ctx = ctx.parent
++        
++        def _decrement():
++            ctx = self
++            while ctx is not None:
++                ctx._active_resources -= 1
++                ctx = ctx.parent
++        
++        self._exit_stack.callback(_decrement)
++        return res
+ 
+     def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+diff --git a/tests/test_resource_limits.py b/tests/test_resource_limits.py
+new file mode 100644
+index 0000000..cf026fc
+--- /dev/null
++++ b/tests/test_resource_limits.py
+@@ -0,0 +1,96 @@
++import pytest
++import click
++from contextlib import contextmanager
++
++@contextmanager
++def dummy_resource():
++    yield "resource"
++
++def test_resource_limits_enforced():
++    @click.group(context_settings={"max_resources": 1})
++    def cli():
++        pass
++
++    @cli.command()
++    @click.pass_context
++    def cmd(ctx):
++        ctx.with_resource(dummy_resource())
++        ctx.with_resource(dummy_resource())
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, ["cmd"])
++    assert result.exit_code != 0
++    assert isinstance(result.exception, RuntimeError)
++
++def test_resource_limits_inherited():
++    @click.group(context_settings={"max_resources": 1})
++    def cli():
++        pass
++
++    @cli.group()
++    @click.pass_context
++    def sub(ctx):
++        pass
++
++    @sub.command()
++    @click.pass_context
++    def cmd(ctx):
++        ctx.with_resource(dummy_resource())
++        ctx.with_resource(dummy_resource())
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, ["sub", "cmd"])
++    assert result.exit_code != 0
++    assert isinstance(result.exception, RuntimeError)
++
++def test_resource_limits_child_override_stricter():
++    @click.group(context_settings={"max_resources": 2})
++    def cli():
++        pass
++
++    @cli.group(context_settings={"max_resources": 1})
++    @click.pass_context
++    def sub(ctx):
++        pass
++
++    @sub.command()
++    @click.pass_context
++    def cmd(ctx):
++        ctx.with_resource(dummy_resource())
++        ctx.with_resource(dummy_resource())
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, ["sub", "cmd"])
++    assert result.exit_code != 0
++    assert isinstance(result.exception, RuntimeError)
++
++def test_resource_limits_zero():
++    @click.group(context_settings={"max_resources": 0})
++    def cli():
++        pass
++
++    @cli.command()
++    @click.pass_context
++    def cmd(ctx):
++        ctx.with_resource(dummy_resource())
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, ["cmd"])
++    assert result.exit_code != 0
++    assert isinstance(result.exception, RuntimeError)
++
++def test_resource_limits_release():
++    @click.group(context_settings={"max_resources": 1})
++    def cli():
++        pass
++
++    @cli.command()
++    @click.pass_context
++    def cmd(ctx):
++        ctx.with_resource(dummy_resource())
++        ctx.close()
++        ctx.with_resource(dummy_resource())
++
++    runner = click.testing.CliRunner()
++    result = runner.invoke(cli, ["cmd"])
++    assert result.exit_code == 0

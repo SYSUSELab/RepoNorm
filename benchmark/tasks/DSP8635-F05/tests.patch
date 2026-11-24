@@ -1,0 +1,100 @@
+diff --git a/tests/propose/test_grounded_proposer5.py b/tests/propose/test_grounded_proposer5.py
+new file mode 100644
+index 0000000..1d6d79e
+--- /dev/null
++++ b/tests/propose/test_grounded_proposer5.py
+@@ -0,0 +1,94 @@
++import copy
++import random
++from types import SimpleNamespace
++
++import pytest
++import dspy
++from dspy.predict.predict import Predict as RealPredict
++from dspy.propose import grounded_proposer as gp
++
++
++class ExampleProgram(dspy.Module):
++    def __init__(self, two=False):
++        super().__init__()
++        self.first = RealPredict('question -> answer')
++        if two:
++            self.second = RealPredict('question -> answer')
++
++
++def recording_proposer(monkeypatch, *, outputs=None, program=None, rng=None, **options):
++    program = program or ExampleProgram()
++    outputs = outputs or {}
++    events = []
++    model = SimpleNamespace(kwargs={'temperature': 0.7, 'max_tokens': 500}, inspect_history=lambda **kw: None)
++    class Recorder:
++        def __init__(self, signature):
++            self.signature = signature
++        def __call__(self, **kwargs):
++            events.append({'signature': self.signature, 'kwargs': copy.deepcopy(kwargs),
++                           'model_kwargs': dict(model.kwargs)})
++            if outputs.get('raise_on') == self.signature.__name__:
++                raise RuntimeError('recorded generation failure')
++            values = {}
++            for field in self.signature.output_fields:
++                if self.signature.__name__ == 'ShortenInstruction':
++                    values[field] = outputs.get('shortened', 'A shortened instruction.')
++                else:
++                    values[field] = outputs.get(field, {
++                        'program_description': 'Program description. More details.',
++                        'module_description': 'Module description. More details.',
++                        'proposed_instruction': 'PROPOSED INSTRUCTION: A useful generated instruction.',
++                    }.get(field, 'value'))
++            return dspy.Prediction(**values)
++    monkeypatch.setattr(gp.dspy, 'Predict', Recorder)
++    monkeypatch.setattr(gp, 'get_prompt_model', lambda supplied: supplied)
++    monkeypatch.setattr(gp, 'get_dspy_source_code', lambda program: 'recorded program code')
++    monkeypatch.setattr(gp, 'create_dataset_summary', lambda **kwargs: 'recorded summary')
++    settings = dict(use_dataset_summary=False, program_aware=True, use_task_demos=False,
++                    set_tip_randomly=False, set_history_randomly=False, rng=rng or random.Random(17))
++    settings.update(options)
++    proposer = gp.GroundedProposer(prompt_model=model, program=program, trainset=[], **settings)
++    return proposer, program, model, events
++
++
++def propose(proposer, program, *, count=1, logs=None):
++    return proposer.propose_instructions_for_program([], program, None, logs or {}, count, 0.5)
++
++
++def generation_events(events):
++    return [event for event in events if event['signature'].__name__ == 'GenerateSingleModuleInstruction']
++
++
++class TipRng:
++    def __init__(self, tip):
++        self.tip = tip
++    def choice(self, choices):
++        assert self.tip in choices
++        return self.tip
++    def uniform(self, low, high):
++        return .02
++
++
++@pytest.mark.parametrize('tip', ['creative', 'none'])
++def test_tip_logging_is_adjacent_and_once_per_proposal(monkeypatch, capsys, tip):
++    proposer, program, model, events = recording_proposer(monkeypatch, rng=TipRng(tip),
++        set_tip_randomly=True, verbose=True)
++    propose(proposer, program, count=2)
++    lines = capsys.readouterr().out.splitlines()
++    selected = [index for index, line in enumerate(lines) if line.startswith('Selected tip:')]
++    assert len(selected) == 2
++    for index in selected:
++        assert lines[index] == f'Selected tip: {tip}'
++        assert lines[index + 1] == f'Chosen tip: {gp.TIPS[tip]} (tip_key={tip})'
++    assert sum(line.startswith('Chosen tip:') for line in lines) == 2
++    assert [event['kwargs']['tip'] for event in generation_events(events)] == [gp.TIPS[tip]] * 2
++
++
++@pytest.mark.parametrize('verbose,random_tip', [(False, True), (True, False)])
++def test_tip_logs_are_absent_when_not_enabled(monkeypatch, capsys, verbose, random_tip):
++    proposer, program, model, events = recording_proposer(monkeypatch, rng=TipRng('creative'),
++        set_tip_randomly=random_tip, verbose=verbose)
++    propose(proposer, program)
++    output = capsys.readouterr().out
++    assert 'Selected tip:' not in output
++    assert 'Chosen tip:' not in output

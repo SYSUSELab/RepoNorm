@@ -1,0 +1,154 @@
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..f50586e 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -351,6 +351,94 @@ class InternationalizationExtension(Extension):
+             source = self.environment.parse(source)
+         return extract_from_ast(source, gettext_functions)
+ 
++    @staticmethod
++    def _validate_trans_expression(
++        parser: "Parser",
++        var_name: str,
++        expr: nodes.Expr,
++    ) -> None:
++        """Validate a trans variable expression tree.
++
++        Only constants, names, attribute access, filters, tests,
++        and calls whose callee is a simple name are allowed.
++        Dynamic *args and **kwargs are rejected.
++        """
++        from jinja2.nodes import (
++            Const, Name, Getattr, Filter, Test, Call,
++            Getitem, CondExpr,
++        )
++
++        def _check(node: nodes.Expr) -> None:
++            if isinstance(node, Const):
++                return
++            if isinstance(node, Name):
++                return
++            if isinstance(node, Getattr):
++                _check(node.node)
++                return
++            if isinstance(node, Filter):
++                if node.node is not None:
++                    _check(node.node)
++                for arg in node.args:
++                    _check(arg)
++                for kw in node.kwargs:
++                    _check(kw.value)
++                return
++            if isinstance(node, Test):
++                if node.node is not None:
++                    _check(node.node)
++                for arg in node.args:
++                    _check(arg)
++                for kw in node.kwargs:
++                    _check(kw.value)
++                return
++            if isinstance(node, Call):
++                if not isinstance(node.node, Name):
++                    parser.fail(
++                        f"Expression for {var_name!r} contains invalid call: "
++                        f"only simple name callees are allowed in trans block "
++                        f"template data and translation contexts",
++                        lineno=node.lineno,
++                    )
++                if node.dyn_args is not None or node.dyn_kwargs is not None:
++                    parser.fail(
++                        f"Expression for {var_name!r} contains dynamic *args or "
++                        f"**kwargs which are not allowed in trans block "
++                        f"template data and translation contexts",
++                        lineno=node.lineno,
++                    )
++                _check(node.node)
++                for arg in node.args:
++                    _check(arg)
++                for kw in node.kwargs:
++                    _check(kw.value)
++                return
++            if isinstance(node, Getitem):
++                parser.fail(
++                    f"Expression for {var_name!r} contains item access which "
++                    f"is not allowed in trans block "
++                    f"template data and translation contexts",
++                    lineno=node.lineno,
++                )
++            if isinstance(node, CondExpr):
++                parser.fail(
++                    f"Expression for {var_name!r} contains a conditional "
++                    f"expression which is not allowed in trans block "
++                    f"template data and translation contexts",
++                    lineno=node.lineno,
++                )
++            # Reject any other expression types (arithmetic, boolean,
++            # comparison, method calls, etc.)
++            parser.fail(
++                f"Expression for {var_name!r} contains constructs not "
++                f"allowed in trans block "
++                f"template data and translation contexts",
++                lineno=node.lineno,
++            )
++
++        _check(expr)
++
++
+     def parse(self, parser: "Parser") -> t.Union[nodes.Node, t.List[nodes.Node]]:
+         """Parse a translatable tag."""
+         lineno = next(parser.stream).lineno
+@@ -434,17 +522,53 @@ class InternationalizationExtension(Extension):
+             referenced.update(plural_names)
+         else:
+             next(parser.stream)
+-
+         # register free names as simple name expressions
+         for name in referenced:
+             if name not in variables:
+                 variables[name] = nodes.Name(name, "load")
+ 
++        # Validate all variable expressions and reserved names
++        reserved_names = {
++            "gettext", "ngettext", "pgettext", "npgettext", "_",
++        }
++        # Check that declared variable names are not reserved
++        for var_name in variables:
++            if var_name in reserved_names:
++                parser.fail(
++                    f"Variable name {var_name!r} in trans block conflicts "
++                    f"with translation function names",
++                    lineno=lineno,
++                )
++
++        for var_name, expr in variables.items():
++            self._validate_trans_expression(
++                parser, var_name, expr
++            )
++        # Validate the original call expression if it was moved to
++        # plural_expr_assignment (happens when a Call is assigned)
++        if plural_expr_assignment is not None:
++            # Find the variable name that was assigned to this call
++            for var_name, expr in variables.items():
++                if isinstance(expr, nodes.Name) and expr.name == "_trans":
++                    # Validate the original call in the assignment
++                    self._validate_trans_expression(
++                        parser, var_name, plural_expr_assignment.node
++                    )
++                    break
++        for name in referenced:
++            if name in reserved_names:
++                parser.fail(
++                    f"Variable name {name!r} in trans block conflicts "
++                    f"with translation function names",
++                    lineno=lineno,
++                )
++
+         if not have_plural:
+             plural_expr = None
+         elif plural_expr is None:
+             parser.fail("pluralize without variables", lineno)
+ 
++
+         if trimmed is None:
+             trimmed = self.environment.policies["ext.i18n.trimmed"]
+         if trimmed:

@@ -1,0 +1,184 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 666ad68..05f91a4 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -93,6 +93,42 @@ def batch(iterable: cabc.Iterable[V], batch_size: int) -> list[tuple[V, ...]]:
+     return list(zip(*repeat(iter(iterable), batch_size)))
+ 
+ 
++def _run_callback_with_retry(callback_info: dict) -> None:
++    """Run a callback with retry logic for transient failures.
++    
++    :param callback_info: Dict containing 'func', 'retry_cleanup', and 'backoff'.
++    """
++    import math
++    import time
++    
++    func = callback_info['func']
++    max_retries = callback_info['retry_cleanup']
++    backoff = callback_info['backoff']
++    
++    # First attempt (no delay)
++    last_exception = None
++    attempts = 1
++    
++    while True:
++        try:
++            func()
++            return  # Success, exit immediately
++        except (KeyboardInterrupt, SystemExit):
++            # Never retry these exceptions
++            raise
++        except Exception as e:
++            last_exception = e
++            attempts += 1
++            
++            if attempts > max_retries + 1:
++                # All retries exhausted, propagate the last exception
++                raise
++            else:
++                # Wait with exponential backoff before retry
++                time.sleep(backoff)
++                backoff *= 2  # Double for next retry
++
++
+ @contextmanager
+ def augment_usage_errors(
+     ctx: Context, param: Parameter | None = None
+@@ -228,6 +264,14 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param retry_cleanup: The number of additional attempts after a cleanup
++        callback's first attempt. A root Context defaults to zero. A child
++        inherits an omitted value; explicit zero disables retries for that
++        child.
++    :param retry_cleanup_backoff: The initial delay in seconds before the
++        first retry. Defaults to 0.1 at the root and inherits from the parent
++        when omitted or None. An explicit value overrides inheritance. Must be
++        a finite positive integer or float (not a boolean).
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -280,6 +324,8 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -427,6 +473,41 @@ class Context:
+         #: Show option default values when formatting help text.
+         self.show_default: bool | None = show_default
+ 
++        # Handle retry_cleanup parameter
++        if retry_cleanup is None:
++            if parent is not None:
++                retry_cleanup = parent.retry_cleanup
++            else:
++                retry_cleanup = 0
++        self.retry_cleanup: int = retry_cleanup
++
++        # Handle retry_cleanup_backoff parameter
++        if retry_cleanup_backoff is None:
++            if parent is not None:
++                retry_cleanup_backoff = parent.retry_cleanup_backoff
++            else:
++                retry_cleanup_backoff = 0.1
++        else:
++            # Validate explicit value
++            if isinstance(retry_cleanup_backoff, bool):
++                raise ValueError(
++                    "retry_cleanup_backoff must not be a boolean"
++                )
++            if not isinstance(retry_cleanup_backoff, (int, float)):
++                raise ValueError(
++                    "retry_cleanup_backoff must be a finite positive integer or float"
++                )
++            if retry_cleanup_backoff <= 0:
++                raise ValueError(
++                    "retry_cleanup_backoff must be a positive value"
++                )
++            import math
++            if math.isinf(retry_cleanup_backoff):
++                raise ValueError(
++                    "retry_cleanup_backoff must be a finite value"
++                )
++        self.retry_cleanup_backoff: float = retry_cleanup_backoff
++
+         self._close_callbacks: list[t.Callable[[], t.Any]] = []
+         self._depth = 0
+         self._parameter_source: dict[str, ParameterSource] = {}
+@@ -590,7 +671,13 @@ class Context:
+         """
+         return self._exit_stack.enter_context(context_manager)
+ 
+-    def call_on_close(self, f: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
++    def call_on_close(
++        self,
++        f: t.Callable[..., t.Any],
++        *,
++        retry_cleanup: int | None = None,
++        retry_cleanup_backoff: float | None = None,
++    ) -> t.Callable[..., t.Any]:
+         """Register a function to be called when the context tears down.
+ 
+         This can be used to close resources opened during the script
+@@ -599,8 +686,54 @@ class Context:
+         registered with :meth:`with_resource` instead.
+ 
+         :param f: The function to execute on teardown.
++        :param retry_cleanup: The number of additional attempts after a
++            cleanup callback's first attempt. If None, inherits from the
++            context's retry_cleanup. Explicit zero disables retries for this
++            callback.
++        :param retry_cleanup_backoff: The initial delay in seconds before the
++            first retry. If None, inherits from the context's
++            retry_cleanup_backoff. Must be a finite positive integer or float
++            (not a boolean).
++
++        .. versionchanged:: 8.2
++            Added the ``retry_cleanup`` and ``retry_cleanup_backoff`` parameters.
+         """
+-        return self._exit_stack.callback(f)
++        # Validate and resolve retry_cleanup_backoff
++        if retry_cleanup_backoff is not None:
++            # Booleans are a subclass of int in Python, so check first
++            if isinstance(retry_cleanup_backoff, bool):
++                raise ValueError(
++                    "retry_cleanup_backoff must not be a boolean"
++                )
++            if not isinstance(retry_cleanup_backoff, (int, float)):
++                raise ValueError(
++                    "retry_cleanup_backoff must be a finite positive integer or float"
++                )
++            if retry_cleanup_backoff <= 0:
++                raise ValueError(
++                    "retry_cleanup_backoff must be a positive value"
++                )
++            import math
++            if math.isinf(retry_cleanup_backoff):
++                raise ValueError(
++                    "retry_cleanup_backoff must be a finite value"
++                )
++            resolved_backoff = float(retry_cleanup_backoff)
++        else:
++            resolved_backoff = self.retry_cleanup_backoff
++
++        # Store callback info with retry settings
++        callback_info = {
++            'func': f,
++            'retry_cleanup': retry_cleanup if retry_cleanup is not None else self.retry_cleanup,
++            'backoff': resolved_backoff,
++        }
++        
++        # Register with exit stack using a wrapper that handles retries
++        def callback_wrapper():
++            _run_callback_with_retry(callback_info)
++        
++        return self._exit_stack.callback(callback_wrapper)
+ 
+     def close(self) -> None:
+         """Invoke all close callbacks registered with

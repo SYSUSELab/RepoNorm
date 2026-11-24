@@ -1,0 +1,1210 @@
+diff --git a/encode_method.py b/encode_method.py
+new file mode 100644
+index 0000000..5295cc0
+--- /dev/null
++++ b/encode_method.py
+@@ -0,0 +1,37 @@
++    def encode(
++        self,
++        text: str,
++        *,
++        use_cache: bool = False,
++        allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
++        disallowed_special: Literal["all"] | Collection[str] = "all",
++    ) -> list[int]:
++        if allowed_special == "all":
++            allowed_special = self.special_tokens_set
++        if disallowed_special == "all":
++            disallowed_special = self.special_tokens_set - allowed_special
++        if disallowed_special:
++            if not isinstance(disallowed_special, frozenset):
++                disallowed_special = frozenset(disallowed_special)
++            if match := _special_token_regex(disallowed_special).search(text):
++                raise_disallowed_special_token(match.group())
++
++        if use_cache:
++            key = (text, frozenset(allowed_special), frozenset(disallowed_special))
++            if (cached_result := self._cache.get(key)) is not None:
++                return list(cached_result)
++
++        try:
++            res = self._core_bpe.encode(text, allowed_special)
++        except UnicodeEncodeError:
++            # BPE operates on bytes, but the regex operates on strings.
++            # This can cause issues if the regex splits a UTF-8 character.
++            # We can fix this by encoding the text as UTF-8 and then decoding it
++            # with surrogatepass, which will allow us to encode the text as bytes.
++            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++            res = self._core_bpe.encode(text, allowed_special)
++        
++        if use_cache:
++            self._cache.put(key, res)
++        
++        return res
+diff --git a/fix_encode_method.py b/fix_encode_method.py
+new file mode 100644
+index 0000000..960c17f
+--- /dev/null
++++ b/fix_encode_method.py
+@@ -0,0 +1,30 @@
++with open("tiktoken/core.py", "r") as f:
++    lines = f.readlines()
++
++# Find the `encode` method and remove the extra lines
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.strip() == "def encode(" and lines[i-1].strip() == "":
++        start_line = i
++    if start_line != -1 and line.strip() == "def encode_to_numpy(":
++        # The `encode` method ends before `encode_to_numpy`
++        # Let's find the last line of `encode`
++        for j in range(i-1, start_line, -1):
++            if lines[j].strip() == "return res":
++                end_line = j
++                break
++        break
++
++# The lines after `return res` should be removed until `def encode_to_numpy(`
++# Let's find the line number of `def encode_to_numpy(`
++for i, line in enumerate(lines):
++    if line.strip() == "def encode_to_numpy(":
++        numpy_line = i
++        break
++
++# Remove the lines between `end_line` and `numpy_line`
++lines[end_line+1:numpy_line] = []
++
++with open("tiktoken/core.py", "w") as f:
++    f.writelines(lines)
+diff --git a/fix_indentation.py b/fix_indentation.py
+new file mode 100644
+index 0000000..c0f02b0
+--- /dev/null
++++ b/fix_indentation.py
+@@ -0,0 +1,15 @@
++with open("tiktoken/core.py", "r") as f:
++    lines = f.readlines()
++
++# Find the `except` block and fix the indentation
++for i, line in enumerate(lines):
++    if "except UnicodeEncodeError:" in line:
++        # The next lines should be indented by 12 spaces
++        lines[i+1] = "            text = text.encode(\"utf-16\", \"surrogatepass\").decode(\"utf-16\", \"replace\")\n"
++        lines[i+2] = "            res = self._core_bpe.encode(text, allowed_special)\n"
++        # Remove the extra lines that were there
++        lines[i+3:i+8] = []
++        break
++
++with open("tiktoken/core.py", "w") as f:
++    f.writelines(lines)
+diff --git a/replace_encode.py b/replace_encode.py
+new file mode 100644
+index 0000000..9a91e49
+--- /dev/null
++++ b/replace_encode.py
+@@ -0,0 +1,85 @@
++import sys
++
++with open("tiktoken/core.py", "r") as f:
++    lines = f.readlines()
++
++# Find the start and end of the `encode` method
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.strip() == "def encode(" and lines[i-1].strip() == "":
++        start_line = i
++    if start_line != -1 and line.strip() == "return self._core_bpe.encode(text, allowed_special)":
++        # This is the end of the `except` block
++        end_line = i + 1
++        break
++
++# Construct the new `encode` method
++new_encode = [
++    "    def encode(\n",
++    "        self,\n",
++    "        text: str,\n",
++    "        *,\n",
++    "        use_cache: bool = False,\n",
++    "        allowed_special: Literal[\"all\"] | AbstractSet[str] = set(),  # noqa: B006\n",
++    "        disallowed_special: Literal[\"all\"] | Collection[str] = \"all\",\n",
++    "    ) -> list[int]:\n",
++    "        \"\"\"Encodes a string into tokens.\n",
++    "\n",
++    "        Special tokens are artificial tokens used to unlock capabilities from a model,\n",
++    "        such as fill-in-the-middle. So we want to be careful about accidentally encoding special\n",
++    "        tokens, since they can be used to trick a model into doing something we don't want it to do.\n",
++    "\n",
++    "        Hence, by default, encode will raise an error if it encounters text that corresponds\n",
++    "        to a special token. This can be controlled on a per-token level using the `allowed_special`\n",
++    "        and `disallowed_special` parameters. In particular:\n",
++    "        - Setting `disallowed_special` to () will prevent this function from raising errors and\n",
++    "          cause all text corresponding to special tokens to be encoded as natural text.\n",
++    "        - Setting `allowed_special` to \"all\" will cause this function to treat all text\n",
++    "          corresponding to special tokens to be encoded as special tokens.\n",
++    "\n",
++    "        ```\n",
++    "        >>> enc.encode(\"hello world\")\n",
++    "        [31373, 995]\n",
++    "        >>> enc.encode(\"<|endoftext|>\", allowed_special={\"<|endoftext|>\"})\n",
++    "        [50256]\n",
++    "        >>> enc.encode(\"<|endoftext|>\", allowed_special=\"all\")\n",
++    "        [50256]\n",
++    "        >>> enc.encode(\"<|endoftext|>\")\n",
++    "        # Raises ValueError\n",
++    "        >>> enc.encode(\"<|endoftext|>\", disallowed_special=())\n",
++    "        [27, 91, 437, 1659, 5239, 91, 29]\n",
++    "        ```\n",
++    "        \"\"\"\n",
++    "        if allowed_special == \"all\":\n",
++    "            allowed_special = self.special_tokens_set\n",
++    "        if disallowed_special == \"all\":\n",
++    "            disallowed_special = self.special_tokens_set - allowed_special\n",
++    "        if disallowed_special:\n",
++    "            if not isinstance(disallowed_special, frozenset):\n",
++    "                disallowed_special = frozenset(disallowed_special)\n",
++    "            if match := _special_token_regex(disallowed_special).search(text):\n",
++    "                raise_disallowed_special_token(match.group())\n",
++    "\n",
++    "        if use_cache:\n",
++    "            key = (text, frozenset(allowed_special), frozenset(disallowed_special))\n",
++    "            if (cached_result := self._cache.get(key)) is not None:\n",
++    "                return list(cached_result)\n",
++    "\n",
++    "        try:\n",
++    "            res = self._core_bpe.encode(text, allowed_special)\n",
++    "        except UnicodeEncodeError:\n",
++    "            text = text.encode(\"utf-16\", \"surrogatepass\").decode(\"utf-16\", \"replace\")\n",
++    "            res = self._core_bpe.encode(text, allowed_special)\n",
++    "\n",
++    "        if use_cache:\n",
++    "            self._cache.put(key, res)\n",
++    "\n",
++    "        return res\n"
++]
++
++# Replace the old method
++lines[start_line:end_line+1] = new_encode
++
++with open("tiktoken/core.py", "w") as f:
++    f.writelines(lines)
+diff --git a/replace_encode_batch.py b/replace_encode_batch.py
+new file mode 100644
+index 0000000..efcbf02
+--- /dev/null
++++ b/replace_encode_batch.py
+@@ -0,0 +1,54 @@
++import sys
++
++with open("tiktoken/core.py", "r") as f:
++    lines = f.readlines()
++
++# Find the start and end of the `encode_batch` method
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.strip() == "def encode_batch(" and lines[i-1].strip() == "":
++        start_line = i
++    if start_line != -1 and line.strip() == "return list(e.map(encoder, text))":
++        end_line = i + 1
++        break
++
++# Construct the new `encode_batch` method
++new_encode_batch = [
++    "    def encode_batch(\n",
++    "        self,\n",
++    "        text: list[str],\n",
++    "        *,\n",
++    "        use_cache: bool = False,\n",
++    "        num_threads: int = 8,\n",
++    "        allowed_special: Literal[\"all\"] | AbstractSet[str] = set(),  # noqa: B006\n",
++    "        disallowed_special: Literal[\"all\"] | Collection[str] = \"all\",\n",
++    "    ) -> list[list[int]]:\n",
++    "        \"\"\"Encodes a list of strings into tokens, in parallel.\n",
++    "\n",
++    "        See `encode` for more details on `allowed_special` and `disallowed_special`.\n",
++    "\n",
++    "        ```\n",
++    "        >>> enc.encode_batch([\"hello world\", \"goodbye world\"])\n",
++    "        [[31373, 995], [11274, 16390, 995]]\n",
++    "        ```\n",
++    "        \"\"\"\n",
++    "        if allowed_special == \"all\":\n",
++    "            allowed_special = self.special_tokens_set\n",
++    "        if disallowed_special == \"all\":\n",
++    "            disallowed_special = self.special_tokens_set - allowed_special\n",
++    "        if not isinstance(disallowed_special, frozenset):\n",
++    "            disallowed_special = frozenset(disallowed_special)\n",
++    "\n",
++    "        encoder = functools.partial(\n",
++    "            self.encode, use_cache=use_cache, allowed_special=allowed_special, disallowed_special=disallowed_special\n",
++    "        )\n",
++    "        with ThreadPoolExecutor(num_threads) as e:\n",
++    "            return list(e.map(encoder, text))\n"
++]
++
++# Replace the old method
++lines[start_line:end_line] = new_encode_batch
++
++with open("tiktoken/core.py", "w") as f:
++    f.writelines(lines)
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000..a04da32
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,30 @@
++import tiktoken
++import time
++
++def test_caching():
++    encoding = tiktoken.get_encoding("cl100k_base")
++    text = "Hello world" * 100
++    
++    # Warm up
++    encoding.encode(text)
++    
++    # Measure without caching
++    start = time.perf_counter()
++    for _ in range(1000):
++        encoding.encode(text)
++    end = time.perf_counter()
++    print(f"Time without caching: {end - start:.4f}s")
++    
++    # Measure with caching (if it were implemented)
++    # This should fail or not work as expected currently
++    try:
++        start = time.perf_counter()
++        for _ in range(1000):
++            encoding.encode(text, use_cache=True)
++        end = time.perf_counter()
++        print(f"Time with caching: {end - start:.4f}s")
++    except TypeError as e:
++        print(f"Caught expected error: {e}")
++
++if __name__ == "__main__":
++    test_caching()
+diff --git a/reproduce_issue_v2.py b/reproduce_issue_v2.py
+new file mode 100644
+index 0000000..8a43d38
+--- /dev/null
++++ b/reproduce_issue_v2.py
+@@ -0,0 +1,32 @@
++import tiktoken
++import time
++
++def test_caching():
++    encoding = tiktoken.get_encoding("cl100k_base")
++    text = "Hello world" * 100
++    
++    # Warm up
++    encoding.encode(text)
++    
++    # Measure without caching
++    start = time.perf_counter()
++    for _ in range(1000):
++        encoding.encode(text)
++    end = time.perf_counter()
++    print(f"Time without caching: {end - start:.4f}s")
++    
++    # Measure with caching
++    start = time.perf_counter()
++    for _ in range(1000):
++        encoding.encode(text, use_cache=True)
++    end = time.perf_counter()
++    print(f"Time with caching: {end - start:.4f}s")
++    
++    # Verify caching works
++    tokens1 = encoding.encode(text, use_cache=True)
++    tokens2 = encoding.encode(text, use_cache=True)
++    assert tokens1 == tokens2
++    print("Caching works!")
++
++if __name__ == "__main__":
++    test_caching()
+diff --git a/rewrite_encode.py b/rewrite_encode.py
+new file mode 100644
+index 0000000..e11b376
+--- /dev/null
++++ b/rewrite_encode.py
+@@ -0,0 +1,90 @@
++import sys
++
++with open("tiktoken/core.py", "r") as f:
++    lines = f.readlines()
++
++# Find the start and end of the `encode` method
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.strip() == "def encode(" and lines[i-1].strip() == "":
++        start_line = i
++    if start_line != -1 and line.strip() == "def encode_to_numpy(":
++        # The `encode` method ends before `encode_to_numpy`
++        # Let's find the last line of `encode`
++        for j in range(i-1, start_line, -1):
++            if lines[j].strip() == "":
++                end_line = j
++                break
++        break
++
++# Construct the new `encode` method
++new_encode = [
++    "    def encode(\n",
++    "        self,\n",
++    "        text: str,\n",
++    "        *,\n",
++    "        use_cache: bool = False,\n",
++    "        allowed_special: Literal[\"all\"] | AbstractSet[str] = set(),  # noqa: B006\n",
++    "        disallowed_special: Literal[\"all\"] | Collection[str] = \"all\",\n",
++    "    ) -> list[int]:\n",
++    "        \"\"\"Encodes a string into tokens.\n",
++    "\n",
++    "        Special tokens are artificial tokens used to unlock capabilities from a model,\n",
++    "        such as fill-in-the-middle. So we want to be careful about accidentally encoding special\n",
++    "        tokens, since they can be used to trick a model into doing something we don't want it to do.\n",
++    "\n",
++    "        Hence, by default, encode will raise an error if it encounters text that corresponds\n",
++    "        to a special token. This can be controlled on a per-token level using the `allowed_special`\n",
++    "        and `disallowed_special` parameters. In particular:\n",
++    "        - Setting `disallowed_special` to () will prevent this function from raising errors and\n",
++    "          cause all text corresponding to special tokens to be encoded as natural text.\n",
++    "        - Setting `allowed_special` to \"all\" will cause this function to treat all text\n",
++    "          corresponding to special tokens to be encoded as special tokens.\n",
++    "\n",
++    "        ```\n",
++    "        >>> enc.encode(\"hello world\")\n",
++    "        [31373, 995]\n",
++    "        >>> enc.encode(\"<|endoftext|>\", allowed_special={\"<|endoftext|>\"})\n",
++    "        [50256]\n",
++    "        >>> enc.encode(\"<|endoftext|>\", allowed_special=\"all\")\n",
++    "        [50256]\n",
++    "        >>> enc.encode(\"<|endoftext|>\")\n",
++    "        # Raises ValueError\n",
++    "        >>> enc.encode(\"<|endoftext|>\", disallowed_special=())\n",
++    "        [27, 91, 437, 1659, 5239, 91, 29]\n",
++    "        ```\n",
++    "        \"\"\"\n",
++    "        if allowed_special == \"all\":\n",
++    "            allowed_special = self.special_tokens_set\n",
++    "        if disallowed_special == \"all\":\n",
++    "            disallowed_special = self.special_tokens_set - allowed_special\n",
++    "        if disallowed_special:\n",
++    "            if not isinstance(disallowed_special, frozenset):\n",
++    "                disallowed_special = frozenset(disallowed_special)\n",
++    "            if match := _special_token_regex(disallowed_special).search(text):\n",
++    "                raise_disallowed_special_token(match.group())\n",
++    "\n",
++    "        if use_cache:\n",
++    "            key = (text, frozenset(allowed_special), frozenset(disallowed_special))\n",
++    "            if (cached_result := self._cache.get(key)) is not None:\n",
++    "                return list(cached_result)\n",
++    "\n",
++    "        try:\n",
++    "            res = self._core_bpe.encode(text, allowed_special)\n",
++    "        except UnicodeEncodeError:\n",
++    "            text = text.encode(\"utf-16\", \"surrogatepass\").decode(\"utf-16\", \"replace\")\n",
++    "            res = self._core_bpe.encode(text, allowed_special)\n",
++    "\n",
++    "        if use_cache:\n",
++    "            self._cache.put(key, res)\n",
++    "\n",
++    "        return res\n",
++    "\n"
++]
++
++# Replace the old method
++lines[start_line:end_line+1] = new_encode
++
++with open("tiktoken/core.py", "w") as f:
++    f.writelines(lines)
+diff --git a/test_cache_key.py b/test_cache_key.py
+new file mode 100644
+index 0000000..a343575
+--- /dev/null
++++ b/test_cache_key.py
+@@ -0,0 +1,16 @@
++import tiktoken
++enc = tiktoken.get_encoding("cl100k_base")
++text = "hello"
++allowed_special = {"<|endoftext|>"}
++disallowed_special = {"<|startoftext|>"}
++
++# What should the cache key be?
++# The requirement says: "sharing the instance's capacity-128 cache with encode"
++# "Equivalent allowed/disallowed special-token policies must behave consistently"
++# "Returned results cannot mutate cached values"
++
++# If I use (text, frozenset(allowed_special), frozenset(disallowed_special)) as key,
++# that should be sufficient to uniquely identify the encoding result.
++
++key = (text, frozenset(allowed_special), frozenset(disallowed_special))
++print(key)
+diff --git a/test_cache_logic.py b/test_cache_logic.py
+new file mode 100644
+index 0000000..e92820a
+--- /dev/null
++++ b/test_cache_logic.py
+@@ -0,0 +1,29 @@
++import functools
++from collections import OrderedDict
++
++class LRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++
++    def get(self, key):
++        if key not in self.cache:
++            return None
++        self.cache.move_to_end(key)
++        return self.cache[key]
++
++    def put(self, key, value):
++        self.cache[key] = value
++        self.cache.move_to_end(key)
++        if len(self.cache) > self.capacity:
++            self.cache.popitem(last=False)
++
++# Test the logic
++cache = LRUCache(capacity=2)
++cache.put("a", 1)
++cache.put("b", 2)
++print(cache.get("a")) # Should be 1
++cache.put("c", 3) # Should evict "b"
++print(cache.get("b")) # Should be None
++print(cache.get("a")) # Should be 1
++print(cache.get("c")) # Should be 3
+diff --git a/test_copy.py b/test_copy.py
+new file mode 100644
+index 0000000..52cbe4f
+--- /dev/null
++++ b/test_copy.py
+@@ -0,0 +1,6 @@
++import copy
++l = [1, 2, 3]
++l2 = list(l)
++l2.append(4)
++print(l)
++print(l2)
+diff --git a/test_encode_batch.py b/test_encode_batch.py
+new file mode 100644
+index 0000000..28c5d79
+--- /dev/null
++++ b/test_encode_batch.py
+@@ -0,0 +1,13 @@
++import tiktoken
++enc = tiktoken.get_encoding("cl100k_base")
++texts = ["hello", "world"]
++# The requirement says: "Extend the same opt-in use_cache=False behavior to encode_batch"
++# "sharing the instance's capacity-128 cache with encode"
++
++# If I have a cache, how do I cache encode_batch?
++# Maybe I can cache each element of the batch individually?
++# "Concurrent cache hits, insertion and eviction must not corrupt results or raise cache-race errors."
++# "Batch order is preserved."
++
++# If I cache each element, I can just call encode(text, use_cache=True) for each element.
++# That seems to satisfy the requirement of sharing the cache.
+diff --git a/test_encoding_init.py b/test_encoding_init.py
+new file mode 100644
+index 0000000..e311376
+--- /dev/null
++++ b/test_encoding_init.py
+@@ -0,0 +1,14 @@
++import tiktoken
++from tiktoken.core import Encoding
++
++# Can I add a cache to the Encoding class?
++# The Encoding class is initialized with __init__.
++# I can add a cache attribute in __init__.
++
++class MyEncoding(Encoding):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._cache = {} # Need a thread-safe LRU cache
++
++enc = tiktoken.get_encoding("cl100k_base")
++print(dir(enc))
+diff --git a/test_lock_performance.py b/test_lock_performance.py
+new file mode 100644
+index 0000000..8a5bebd
+--- /dev/null
++++ b/test_lock_performance.py
+@@ -0,0 +1,35 @@
++import threading
++import time
++from collections import OrderedDict
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++cache = ThreadSafeLRUCache()
++def worker():
++    for i in range(10000):
++        cache.put(i % 128, i)
++        cache.get(i % 128)
++
++start = time.perf_counter()
++threads = [threading.Thread(target=worker) for _ in range(10)]
++for t in threads: t.start()
++for t in threads: t.join()
++print(f"Time: {time.perf_counter() - start:.4f}s")
+diff --git a/test_lock_performance_no_lock.py b/test_lock_performance_no_lock.py
+new file mode 100644
+index 0000000..e19820c
+--- /dev/null
++++ b/test_lock_performance_no_lock.py
+@@ -0,0 +1,6 @@
++import threading
++import time
++from collections import OrderedDict
++
++# This is just to see if we can do better, but the requirement says "Concurrent cache hits, insertion and eviction must not corrupt results or raise cache-race errors."
++# So we probably need a lock.
+diff --git a/test_lock_performance_v2.py b/test_lock_performance_v2.py
+new file mode 100644
+index 0000000..1d9d9af
+--- /dev/null
++++ b/test_lock_performance_v2.py
+@@ -0,0 +1,44 @@
++import threading
++import time
++from collections import OrderedDict
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++# Let's test with a more realistic scenario:
++# The cache is shared across threads.
++# The lock is held for the duration of the cache operation.
++# The encoding itself is NOT done under the lock.
++
++cache = ThreadSafeLRUCache()
++def worker():
++    for i in range(10000):
++        key = i % 128
++        val = cache.get(key)
++        if val is None:
++            # Simulate encoding
++            val = [1, 2, 3]
++            cache.put(key, val)
++
++start = time.perf_counter()
++threads = [threading.Thread(target=worker) for _ in range(10)]
++for t in threads: t.start()
++for t in threads: t.join()
++print(f"Time: {time.perf_counter() - start:.4f}s")
+diff --git a/test_pickle_cache.py b/test_pickle_cache.py
+new file mode 100644
+index 0000000..6c220c0
+--- /dev/null
++++ b/test_pickle_cache.py
+@@ -0,0 +1,44 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++    def __getstate__(self):
++        # We don't want to pickle the lock or the cache
++        return {}
++
++    def __setstate__(self, state):
++        self.cache = OrderedDict()
++        self.capacity = 128
++        self.lock = threading.Lock()
++
++enc = tiktoken.get_encoding("cl100k_base")
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++# Pickle the encoding
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++
++print(hasattr(unpickled, "_cache"))
++print(unpickled._cache.get("a"))
+diff --git a/test_pickle_cache_v2.py b/test_pickle_cache_v2.py
+new file mode 100644
+index 0000000..ab3fcee
+--- /dev/null
++++ b/test_pickle_cache_v2.py
+@@ -0,0 +1,47 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++    def __getstate__(self):
++        # Return state without the lock and cache
++        return {}
++
++    def __setstate__(self, state):
++        self.cache = OrderedDict()
++        self.capacity = 128
++        self.lock = threading.Lock()
++
++enc = tiktoken.get_encoding("cl100k_base")
++# The requirement says: "cache contents need not survive serialization."
++# So it's fine if the cache is empty after unpickling.
++# My current implementation of __setstate__ creates a new empty cache.
++# That seems correct.
++
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++
++print(unpickled._cache.get("a")) # Should be None
+diff --git a/test_pickle_cache_v3.py b/test_pickle_cache_v3.py
+new file mode 100644
+index 0000000..13e3562
+--- /dev/null
++++ b/test_pickle_cache_v3.py
+@@ -0,0 +1,43 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++    def __getstate__(self):
++        # Return state without the lock and cache
++        return {}
++
++    def __setstate__(self, state):
++        self.__dict__.update(state)
++        self.cache = OrderedDict()
++        self.capacity = 128
++        self.lock = threading.Lock()
++
++enc = tiktoken.get_encoding("cl100k_base")
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++
++print(unpickled._cache.get("a")) # Should be None
+diff --git a/test_pickle_cache_v4.py b/test_pickle_cache_v4.py
+new file mode 100644
+index 0000000..29b6175
+--- /dev/null
++++ b/test_pickle_cache_v4.py
+@@ -0,0 +1,72 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++    def __getstate__(self):
++        # Return state without the lock and cache
++        return {}
++
++    def __setstate__(self, state):
++        self.__dict__.update(state)
++        self.cache = OrderedDict()
++        self.capacity = 128
++        self.lock = threading.Lock()
++
++# Let's check how Encoding is pickled.
++# It has a __getstate__ method.
++enc = tiktoken.get_encoding("cl100k_base")
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++# The Encoding class's __getstate__ returns a dict or a string.
++# If it returns a dict, it's passed to __setstate__.
++# If it returns a string, it's passed to __setstate__.
++
++# My test_pickle_cache_v3.py failed because I was adding _cache to the instance,
++# but the Encoding class's __getstate__ doesn't know about _cache.
++# So when it's unpickled, the __setstate__ of Encoding is called, not my ThreadSafeLRUCache's __setstate__.
++
++# I need to make sure _cache is handled correctly.
++# Actually, if I add _cache to the Encoding instance, it will be part of __dict__.
++# But Encoding.__getstate__ explicitly returns a dict of specific fields.
++# So _cache will be lost during pickling, which is fine!
++# But I need to make sure it's re-initialized after unpickling.
++
++# If I add _cache to the Encoding instance, it will be lost.
++# So when I unpickle, I will have an Encoding instance without _cache.
++# I can add a property to access _cache, which initializes it if it's missing.
++
++class EncodingWithCache(tiktoken.core.Encoding):
++    @property
++    def cache(self):
++        if not hasattr(self, "_cache"):
++            self._cache = ThreadSafeLRUCache()
++        return self._cache
++
++enc = EncodingWithCache("cl100k_base", pat_str="", mergeable_ranks={}, special_tokens={})
++enc.cache.put("a", [1, 2, 3])
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++print(hasattr(unpickled, "_cache"))
++print(unpickled.cache.get("a"))
+diff --git a/test_pickle_cache_v5.py b/test_pickle_cache_v5.py
+new file mode 100644
+index 0000000..274d712
+--- /dev/null
++++ b/test_pickle_cache_v5.py
+@@ -0,0 +1,47 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++class EncodingWithCache(tiktoken.core.Encoding):
++    @property
++    def cache(self):
++        if not hasattr(self, "_cache"):
++            self._cache = ThreadSafeLRUCache()
++        return self._cache
++
++enc = tiktoken.get_encoding("cl100k_base")
++# Manually add the cache to the instance
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++# The Encoding class's __getstate__ will not include _cache.
++# So when we pickle it, _cache is lost.
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++
++# Now unpickled is a regular Encoding instance.
++# If I want to use the cache, I need to make sure it's initialized.
++# I can add a property to the Encoding class itself.
++
++print(hasattr(unpickled, "_cache"))
+diff --git a/test_pickle_cache_v6.py b/test_pickle_cache_v6.py
+new file mode 100644
+index 0000000..523344d
+--- /dev/null
++++ b/test_pickle_cache_v6.py
+@@ -0,0 +1,38 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++enc = tiktoken.get_encoding("cl100k_base")
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++# The Encoding class's __getstate__ does NOT include _cache.
++# Let's verify what __getstate__ returns.
++print(enc.__getstate__())
++
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++
++# If I unpickle it, _cache will be missing because it's not in __getstate__.
++print(hasattr(unpickled, "_cache"))
+diff --git a/test_pickle_cache_v7.py b/test_pickle_cache_v7.py
+new file mode 100644
+index 0000000..3a541b2
+--- /dev/null
++++ b/test_pickle_cache_v7.py
+@@ -0,0 +1,38 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++enc = tiktoken.get_encoding("cl100k_base")
++enc._cache = ThreadSafeLRUCache()
++enc._cache.put("a", [1, 2, 3])
++
++# The Encoding class's __getstate__ returns "cl100k_base" because it's a registered encoding.
++# So when we pickle it, it just pickles the string "cl100k_base".
++# When we unpickle it, it calls tiktoken.registry.get_encoding("cl100k_base").
++# This returns a NEW instance of Encoding.
++# So my _cache attribute on the original instance is lost.
++# This is actually GOOD! It means I don't need to worry about pickling the cache.
++# I just need to make sure that when I access the cache, it's initialized.
++
++# So I can just add a property to the Encoding class that initializes the cache if it's missing.
+diff --git a/test_pickle_cache_v8.py b/test_pickle_cache_v8.py
+new file mode 100644
+index 0000000..cfd3c00
+--- /dev/null
++++ b/test_pickle_cache_v8.py
+@@ -0,0 +1,48 @@
++import pickle
++import tiktoken
++from collections import OrderedDict
++import threading
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++# Let's simulate the Encoding class
++class Encoding:
++    def __init__(self, name):
++        self.name = name
++    
++    @property
++    def cache(self):
++        if not hasattr(self, "_cache"):
++            self._cache = ThreadSafeLRUCache()
++        return self._cache
++    
++    def __getstate__(self):
++        return self.name
++    
++    def __setstate__(self, name):
++        self.name = name
++
++enc = Encoding("cl100k_base")
++enc.cache.put("a", [1, 2, 3])
++pickled = pickle.dumps(enc)
++unpickled = pickle.loads(pickled)
++print(hasattr(unpickled, "_cache")) # Should be False
++print(unpickled.cache.get("a")) # Should be None
+diff --git a/test_threading.py b/test_threading.py
+new file mode 100644
+index 0000000..8382b0d
+--- /dev/null
++++ b/test_threading.py
+@@ -0,0 +1,38 @@
++import threading
++from collections import OrderedDict
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity=128):
++        self.cache = OrderedDict()
++        self.capacity = capacity
++        self.lock = threading.Lock()
++
++    def get(self, key):
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key, value):
++        with self.lock:
++            self.cache[key] = value
++            self.cache.move_to_end(key)
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
++
++def worker(cache, i):
++    cache.put(i, i)
++    cache.get(i)
++
++cache = ThreadSafeLRUCache(capacity=10)
++threads = []
++for i in range(100):
++    t = threading.Thread(target=worker, args=(cache, i))
++    threads.append(t)
++    t.start()
++
++for t in threads:
++    t.join()
++
++print("Finished without errors")
+diff --git a/tiktoken/cache.py b/tiktoken/cache.py
+new file mode 100644
+index 0000000..36a79a5
+--- /dev/null
++++ b/tiktoken/cache.py
+@@ -0,0 +1,24 @@
++import threading
++from collections import OrderedDict
++from typing import Any, Hashable
++
++class ThreadSafeLRUCache:
++    def __init__(self, capacity: int):
++        self.capacity = capacity
++        self.cache = OrderedDict()
++        self.lock = threading.Lock()
++
++    def get(self, key: Hashable) -> Any:
++        with self.lock:
++            if key not in self.cache:
++                return None
++            self.cache.move_to_end(key)
++            return self.cache[key]
++
++    def put(self, key: Hashable, value: Any) -> None:
++        with self.lock:
++            if key in self.cache:
++                self.cache.move_to_end(key)
++            self.cache[key] = value
++            if len(self.cache) > self.capacity:
++                self.cache.popitem(last=False)
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..da14921 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++from tiktoken.cache import ThreadSafeLRUCache
+ 
+ import functools
+ from concurrent.futures import ThreadPoolExecutor
+@@ -47,6 +48,7 @@ class Encoding:
+         self.max_token_value = max(
+             max(mergeable_ranks.values()), max(special_tokens.values(), default=0)
+         )
++        self._cache = ThreadSafeLRUCache(128)
+         if explicit_n_vocab:
+             assert len(mergeable_ranks) + len(special_tokens) == explicit_n_vocab
+             assert self.max_token_value == explicit_n_vocab - 1
+@@ -80,6 +82,7 @@ class Encoding:
+         self,
+         text: str,
+         *,
++        use_cache: bool = False,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+     ) -> list[int]:
+@@ -120,17 +123,22 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
++        if use_cache:
++            key = (text, frozenset(allowed_special), frozenset(disallowed_special))
++            if (cached_result := self._cache.get(key)) is not None:
++                return list(cached_result)
++
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            res = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            res = self._core_bpe.encode(text, allowed_special)
++
++        if use_cache:
++            self._cache.put(key, res)
++
++        return res
++
+ 
+     def encode_to_numpy(
+         self,
+@@ -176,6 +184,7 @@ class Encoding:
+         self,
+         text: list[str],
+         *,
++        use_cache: bool = False,
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+@@ -197,11 +206,12 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, use_cache=use_cache, allowed_special=allowed_special, disallowed_special=disallowed_special
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+             return list(e.map(encoder, text))
+ 
++
+     def encode_with_unstable(
+         self,
+         text: str,

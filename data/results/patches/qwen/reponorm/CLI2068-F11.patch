@@ -1,0 +1,151 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..5cadabc 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -478,6 +478,11 @@ def _nullpager(
+         stream.write(text)
+ 
+ 
++def _sigchld_handler(signum: int, frame) -> None:
++    """Signal handler for SIGCHLD to detect child process state changes."""
++    pass  # We use waitpid in the main loop instead
++
++
+ class Editor:
+     def __init__(
+         self,
+@@ -485,11 +490,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -506,6 +513,7 @@ class Editor:
+         return "vi"
+ 
+     def edit_file(self, filename: str) -> None:
++        import signal
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -515,10 +523,65 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        command = f'{editor} "{filename}"'
++
++        # Validate monitor_process callback
++        if self.monitor_process is not None and not callable(self.monitor_process):
++            raise TypeError("monitor_process must be callable or None")
++
++        def _emit_event(event_type: str) -> None:
++            """Emit an event to the monitor callback."""
++            if self.monitor_process is None:
++                return
++            try:
++                self.monitor_process(
++                    event_type,
++                    c.pid,
++                    command,
++                    time.time(),
++                )
++            except Exception:
++                import warnings
++                warnings.warn(
++                    "monitor_process callback raised an exception",
++                    UserWarning,
++                    stacklevel=2,
++                )
++
++        # Set up signal handler for SIGCHLD to detect state changes
++        old_sigchld = signal.signal(signal.SIGCHLD, _sigchld_handler)
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
+-            if exit_code != 0:
++            c = subprocess.Popen(command, env=environ, shell=True)
++            _emit_event("start")
++
++            while True:
++                try:
++                    pid, status = os.waitpid(c.pid, os.WNOHANG | os.WUNTRACED)
++                except ChildProcessError:
++                    break
++
++                if pid == 0:
++                    # No state change, wait a bit
++                    time.sleep(0.01)
++                    continue
++
++                if os.WIFSTOPPED(status):
++                    _emit_event("suspend")
++                elif os.WIFCONTINUED(status):
++                    _emit_event("resume")
++                elif os.WIFEXITED(status) or os.WIFSIGNALED(status):
++                    # Set returncode so subprocess knows the process is done
++                    if os.WIFEXITED(status):
++                        c.returncode = os.WEXITSTATUS(status)
++                    else:
++                        c.returncode = -os.WTERMSIG(status)
++                    _emit_event("terminate")
++                    break
++
++                time.sleep(0.01)
++
++            if c.returncode is not None and c.returncode != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+                 )
+@@ -526,6 +589,9 @@ class Editor:
+             raise ClickException(
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
++        finally:
++            # Restore old signal handler
++            signal.signal(signal.SIGCHLD, old_sigchld)
+ 
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..ec2398f 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,20 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param monitor_process: optionally a callback to monitor the editor process
++                            lifecycle. Receives (event_type, pid, command, timestamp)
++                            where event_type is one of "start", "suspend", "resume",
++                            or "terminate". If None, no monitoring is performed.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        monitor_process=monitor_process,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)

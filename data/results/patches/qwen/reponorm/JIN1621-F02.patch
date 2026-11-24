@@ -1,0 +1,275 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..6c17b10 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -21,23 +21,55 @@ if t.TYPE_CHECKING:
+     from .environment import Template
+ 
+ 
++
+ def split_template_path(template: str) -> t.List[str]:
+-    """Split a path into segments and perform a sanity check.  If it detects
+-    '..' in the path it will raise a `TemplateNotFound` error.
++    """Split a path into segments and perform normalization.
++    
++    Both ``/`` and ``\\`` are treated as logical separators. Empty segments
++    and ``.`` are removed. Internal ``..`` segments remove the preceding
++    ordinary segment.
++    
++    Raises :exc:`TemplateNotFound` if:
++    
++    - The path starts with ``/``, ``\\``, or ``\\\\`` (UNC form).
++    - The path starts with a drive prefix like ``C:``.
++    - An internal ``..`` would pop beyond the logical root.
+     """
++    # Check for absolute paths (starting with / or \)
++    if template.startswith("/") or template.startswith("\\"):
++        raise TemplateNotFound(template)
++    
++    # Check for UNC forms (\\server\share)
++    if template.startswith("\\\\"):
++        raise TemplateNotFound(template)
++    
++    # Check for drive prefix (e.g., C:, D:)
++    if len(template) >= 2 and template[1] == ":" and template[0].isalpha():
++        raise TemplateNotFound(template)
++    
++    # Replace all backslashes with forward slashes for uniform processing
++    normalized = template.replace("\\", "/")
++    
++    # Split by /
++    parts = normalized.split("/")
++    
++    # Process each part
+     pieces = []
+-    for piece in template.split("/"):
+-        if (
+-            os.path.sep in piece
+-            or (os.path.altsep and os.path.altsep in piece)
+-            or piece == os.path.pardir
+-        ):
+-            raise TemplateNotFound(template)
+-        elif piece and piece != ".":
++    for piece in parts:
++        if piece == "" or piece == ".":
++            continue
++        elif piece == "..":
++            if pieces:
++                pieces.pop()
++            else:
++                raise TemplateNotFound(template)
++        else:
+             pieces.append(piece)
++    
+     return pieces
+ 
+ 
++
+ class BaseLoader:
+     """Baseclass for all loaders.  Subclass this and override `get_source` to
+     implement a custom loading mechanism.  The environment provides a
+diff --git a/tests/test_loader.py b/tests/test_loader.py
+index b300c8f..7c56010 100644
+--- a/tests/test_loader.py
++++ b/tests/test_loader.py
+@@ -401,3 +401,200 @@ def test_pep_451_import_hook():
+         assert "test.html" in package_loader.list_templates()
+     finally:
+         sys.meta_path[:] = before
++
++
++class TestTemplatePathNormalization:
++    """Tests for normalized template path handling."""
++
++    def test_simple_path(self):
++        """Simple paths should work as before."""
++        assert split_template_path("foo.html") == ["foo.html"]
++        assert split_template_path("foo/bar.html") == ["foo", "bar.html"]
++        assert split_template_path("a/b/c/d.html") == ["a", "b", "c", "d.html"]
++
++    def test_dot_segments_removed(self):
++        """Dot segments should be removed during normalization."""
++        assert split_template_path("./foo.html") == ["foo.html"]
++        assert split_template_path("foo/./bar.html") == ["foo", "bar.html"]
++        assert split_template_path("./foo/./bar.html") == ["foo", "bar.html"]
++
++    def test_backslash_as_separator(self):
++        """Backslashes should be treated as separators."""
++        assert split_template_path("foo\\bar.html") == ["foo", "bar.html"]
++        assert split_template_path("foo\\bar\\baz.html") == ["foo", "bar", "baz.html"]
++
++    def test_mixed_separators(self):
++        """Mixed separators should be handled consistently."""
++        assert split_template_path("foo/\\bar.html") == ["foo", "bar.html"]
++        assert split_template_path("foo\\\\bar/baz.html") == ["foo", "bar", "baz.html"]
++
++    def test_double_dot_cancels_segment(self):
++        """Double dot should cancel preceding segment."""
++        assert split_template_path("foo/../bar.html") == ["bar.html"]
++        assert split_template_path("foo/bar/../baz.html") == ["foo", "baz.html"]
++        assert split_template_path("a/b/c/../d.html") == ["a", "b", "d.html"]
++
++    def test_backslash_double_dot(self):
++        """Backslash double dot should work the same."""
++        assert split_template_path("foo\\..\\bar.html") == ["bar.html"]
++        assert split_template_path("foo\\bar\\..\\baz.html") == ["foo", "baz.html"]
++
++    def test_mixed_double_dot(self):
++        """Mixed separators with double dots should work."""
++        assert split_template_path("foo/..\\bar.html") == ["bar.html"]
++        assert split_template_path("foo\\../bar.html") == ["bar.html"]
++
++    def test_empty_segments_removed(self):
++        """Empty segments from consecutive separators should be removed."""
++        assert split_template_path("foo//bar.html") == ["foo", "bar.html"]
++        assert split_template_path("foo///bar.html") == ["foo", "bar.html"]
++        assert split_template_path("foo\\/bar.html") == ["foo", "bar.html"]
++
++    def test_leading_slash_rejected(self):
++        """Leading slash should raise TemplateNotFound."""
++        with pytest.raises(TemplateNotFound, match="/"):
++            split_template_path("/foo.html")
++        with pytest.raises(TemplateNotFound, match="/foo/bar.html"):
++            split_template_path("/foo/bar.html")
++
++    def test_leading_backslash_rejected(self):
++        """Leading backslash should raise TemplateNotFound."""
++        with pytest.raises(TemplateNotFound, match="\\\\"):
++            split_template_path("\\foo.html")
++        with pytest.raises(TemplateNotFound, match="\\\\foo/bar.html"):
++            split_template_path("\\foo/bar.html")
++
++    def test_unc_form_rejected(self):
++        r"""UNC form (\\servershare) should raise TemplateNotFound."""
++        with pytest.raises(TemplateNotFound, match="\\\\\\\\"):
++            split_template_path("\\\\server\\share\\template.html")
++
++    def test_drive_prefix_rejected(self):
++        """Drive prefix like C: should raise TemplateNotFound."""
++        with pytest.raises(TemplateNotFound, match="C:"):
++            split_template_path("C:\\foo.html")
++        with pytest.raises(TemplateNotFound, match="D:"):
++            split_template_path("D:/foo/bar.html")
++
++    def test_leading_dotdot_rejected(self):
++        """Leading .. should raise TemplateNotFound."""
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("../foo.html")
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("..\\foo.html")
++
++    def test_internal_dotdot_beyond_root_rejected(self):
++        """Internal .. that would pop beyond root should raise."""
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("foo/bar/../../../baz.html")
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("a/b/c/../../../../../d.html")
++
++    def test_multiple_consecutive_dots(self):
++        """Multiple consecutive .. should be processed sequentially."""
++        # a/b/c/../../../d.html -> d.html (3 pops from 3 segments)
++        assert split_template_path("a/b/c/../../../d.html") == ["d.html"]
++        # a/b/../../c.html -> c.html (2 pops from 2 segments)
++        assert split_template_path("a/b/../../c.html") == ["c.html"]
++
++    def test_only_dotdot_rejected(self):
++        """Just .. should raise TemplateNotFound."""
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("..")
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("..\\")
++
++    def test_complex_normalization(self):
++        """Complex normalization scenarios."""
++        # foo/bar/../baz/qux/./test.html -> foo/baz/qux/test.html
++        assert split_template_path("foo/bar/../baz/qux/./test.html") == [
++            "foo", "baz", "qux", "test.html"
++        ]
++        # Multiple . and .. mixed
++        assert split_template_path("./foo/./bar/../baz/./test.html") == [
++            "foo", "baz", "test.html"
++        ]
++
++    def test_trailing_slash(self):
++        """Trailing slashes should not cause issues."""
++        assert split_template_path("foo/bar.html/") == ["foo", "bar.html"]
++        assert split_template_path("foo/bar.html//") == ["foo", "bar.html"]
++
++    def test_foo_dotdot_returns_empty(self):
++        """foo/.. normalizes to empty list (at root)."""
++        assert split_template_path("foo/..") == []
++        assert split_template_path("foo\\..") == []
++
++    def test_case_preserved(self):
++        """Case should be preserved in segment names."""
++        assert split_template_path("Foo/Bar.html") == ["Foo", "Bar.html"]
++        assert split_template_path("FOO/BAR.HTML") == ["FOO", "BAR.HTML"]
++
++    def test_unicode_segments(self):
++        """Unicode characters should be preserved."""
++        assert split_template_path("日本語/foo.html") == ["日本語", "foo.html"]
++        assert split_template_path("foo/日本語.html") == ["foo", "日本語.html"]
++
++    def test_special_characters_in_name(self):
++        """Special characters in filenames should be preserved."""
++        assert split_template_path("foo-bar.html") == ["foo-bar.html"]
++        assert split_template_path("foo_bar.html") == ["foo_bar.html"]
++        assert split_template_path("foo.bar.html") == ["foo.bar.html"]
++        assert split_template_path("foo+bar.html") == ["foo+bar.html"]
++        assert split_template_path("foo@bar.html") == ["foo@bar.html"]
++
++    def test_underscore_and_dash(self):
++        """Underscores and dashes should be preserved."""
++        assert split_template_path("_foo_.html") == ["_foo_.html"]
++        assert split_template_path("-foo-.html") == ["-foo-.html"]
++        assert split_template_path("foo_bar-baz.html") == ["foo_bar-baz.html"]
++
++    def test_numbered_segments(self):
++        """Numbered segments should work correctly."""
++        assert split_template_path("1.html") == ["1.html"]
++        assert split_template_path("1/2/3.html") == ["1", "2", "3.html"]
++        assert split_template_path("v1/foo.html") == ["v1", "foo.html"]
++
++    def test_empty_string(self):
++        """Empty string should return empty list (no segments)."""
++        assert split_template_path("") == []
++
++    def test_only_dot(self):
++        """Just . should return empty list."""
++        assert split_template_path(".") == []
++
++    def test_only_dots(self):
++        """Only dots should return empty list or raise."""
++        with pytest.raises(TemplateNotFound, match=".."):
++            split_template_path("..")
++        assert split_template_path("./") == []
++        assert split_template_path(".\\") == []
++
++    def test_normalized_vs_original_equivalence(self):
++        """Different spellings should resolve to same normalized form."""
++        # Group 1: Simple path with various separator styles
++        variants_group1 = [
++            "foo/bar.html",
++            "foo\\bar.html",
++            "foo/\\bar.html",
++            "foo\\.\\bar.html",
++            "./foo/bar.html",
++            "foo/./bar.html",
++        ]
++        results_group1 = [split_template_path(v) for v in variants_group1]
++        first = results_group1[0]
++        for i, r in enumerate(results_group1[1:], start=1):
++            assert r == first, f"group1 variant {i} {variants_group1[i]!r} != {first!r}"
++
++        # Group 2: Path with .. that cancels a segment
++        variants_group2 = [
++            "foo/bar/../test.html",
++            "foo\\bar\\..\\test.html",
++            "foo/\\bar\\/../test.html",
++            "./foo/bar/../test.html",
++            "foo/./bar/../test.html",
++        ]
++        results_group2 = [split_template_path(v) for v in variants_group2]
++        first = results_group2[0]
++        for i, r in enumerate(results_group2[1:], start=1):
++            assert r == first, f"group2 variant {i} {variants_group2[i]!r} != {first!r}"

@@ -1,0 +1,118 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..bf6130c 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1222,9 +1222,35 @@ class Command:
+             ).format(name=self.name, extra_message=extra_message)
+             echo(style(message, fg="red"), err=True)
+ 
++        # Validate required_if conditions for all parameters
++        self._validate_required_if(ctx)
++
+         if self.callback is not None:
+             return ctx.invoke(self.callback, **ctx.params)
+ 
++    def _validate_required_if(self, ctx: Context) -> None:
++        """Validate required_if conditions for all parameters after parsing."""
++        # First, collect all parameter names in this command
++        param_names = {p.name for p in self.get_params(ctx)}
++        
++        for param in self.get_params(ctx):
++            if param.required_if is not None and not callable(param.required_if):
++                # Validate that all keys in required_if map exist as parameters
++                for key in param.required_if.keys():
++                    if key not in param_names:
++                        from .exceptions import UsageError
++                        raise UsageError(
++                            f"required_if references unknown parameter '{key}'",
++                            ctx=ctx,
++                        )
++                
++                # Check if this parameter has a required_if condition
++                if param._check_required_if(ctx):
++                    # Check if the value is missing
++                    if param.value_is_missing(ctx.params.get(param.name)):
++                        from .exceptions import MissingParameter
++                        raise MissingParameter(ctx=ctx, param=param)
++
+     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
+         """Return a list of completions for the incomplete value. Looks
+         at the names of options and chained multi-commands.
+@@ -2091,6 +2117,7 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        required_if: dict[str, t.Any] | t.Callable[[Context, Parameter], bool] | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2146,7 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.required_if = required_if
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2168,6 +2196,23 @@ class Parameter:
+                     f"{self.param_type_name} cannot be required."
+                 )
+ 
++            # Validate required_if
++            if required_if is not None:
++                if isinstance(required_if, dict):
++                    for key in required_if:
++                        if not isinstance(key, str):
++                            raise TypeError(
++                                f"required_if keys must be strings, got {key!r}"
++                            )
++                        if key.startswith("-"):
++                            raise TypeError(
++                                f"required_if key {key!r} should not have option prefix"
++                            )
++                elif not callable(required_if):
++                    raise TypeError(
++                        f"required_if must be a dict, callable, or None, got {type(required_if).__name__}"
++                    )
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         """Gather information that could be useful for a tool generating
+         user-facing documentation.
+@@ -2345,6 +2390,28 @@ class Parameter:
+ 
+         return False
+ 
++    def _check_required_if(self, ctx: Context) -> bool:
++        """Check if this parameter is required based on required_if."""
++        if self.required_if is None:
++            return False
++
++        if callable(self.required_if):
++            # Call the predicate with context and this parameter
++            return self.required_if(ctx, self)
++
++        # It's a dict mapping parameter names to expected values
++        # Empty dict means never required
++        if not self.required_if:
++            return False
++
++        for param_name, expected_value in self.required_if.items():
++            # Get the actual value from context params
++            actual_value = ctx.params.get(param_name)
++            if actual_value != expected_value:
++                return False
++
++        return True
++
+     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
+         value = self.type_cast_value(ctx, value)
+ 
+@@ -3024,7 +3091,7 @@ class Option(Parameter):
+         elif (
+             source in {None, ParameterSource.DEFAULT}
+             and self.prompt is not None
+-            and (self.required or self.prompt_required)
++            and (self.required or self.prompt_required or self._check_required_if(ctx))
+             and not ctx.resilient_parsing
+         ):
+             value = self.prompt_for_value(ctx)

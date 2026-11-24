@@ -1,0 +1,329 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..6d7cb53 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,12 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add dependency-aware dynamic defaults to ``Option``.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..b4019e9 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -1196,6 +1196,65 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             value, args = param.handle_parse_result(ctx, opts, args)
+ 
++        params = self.get_params(ctx)
++        long_options = {
++            opt: param
++            for param in params
++            if isinstance(param, Option)
++            for opt in param.opts
++            if opt.startswith("--")
++        }
++        resolving: set[Option] = set()
++        resolved: set[Option] = set()
++
++        def resolve_dynamic(param: Option) -> None:
++            if param in resolved or not param._is_dynamic_default():
++                return
++            if (
++                param.name is None
++                or ctx.get_parameter_source(param.name) != ParameterSource.DEFAULT
++            ):
++                return
++            if param in resolving:
++                raise UsageError("Circular dynamic default dependency", ctx=ctx)
++            resolving.add(param)
++            selected = None
++            for option_name, value_mapping in t.cast(
++                dict[str, dict[str, t.Any]], param.default
++            ).items():
++                dependency = long_options.get(option_name)
++                if dependency is None:
++                    raise UsageError(
++                        f"Unknown option in dynamic default: {option_name}", ctx=ctx
++                    )
++                resolve_dynamic(dependency)
++                assert dependency.name is not None
++                current = ctx.params.get(dependency.name)
++                key = str(current)
++                if key in value_mapping:
++                    selected = value_mapping[key]
++            resolving.remove(param)
++            key = f"click.dynamic-default.{id(param)}"
++            ctx.meta[key] = True
++            try:
++                value = param.process_value(ctx, selected)
++            finally:
++                ctx.meta.pop(key, None)
++            if param.name is not None:
++                if param.expose_value:
++                    ctx.params[param.name] = value
++                ctx.set_parameter_source(param.name, ParameterSource.DEFAULT)
++            resolved.add(param)
++
++        for param in params:
++            if (
++                isinstance(param, Option)
++                and param._is_dynamic_default()
++                and param.name is not None
++                and ctx.get_parameter_source(param.name) == ParameterSource.DEFAULT
++            ):
++                resolve_dynamic(param)
++
+         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+             ctx.fail(
+                 ngettext(
+@@ -2463,70 +2522,6 @@ class Parameter:
+ 
+ 
+ class Option(Parameter):
+-    """Options are usually optional values on the command line and
+-    have some extra features that arguments don't have.
+-
+-    All other parameters are passed onwards to the parameter constructor.
+-
+-    :param show_default: Show the default value for this option in its
+-        help text. Values are not shown by default, unless
+-        :attr:`Context.show_default` is ``True``. If this value is a
+-        string, it shows that string in parentheses instead of the
+-        actual value. This is particularly useful for dynamic options.
+-        For single option boolean flags, the default remains hidden if
+-        its value is ``False``.
+-    :param show_envvar: Controls if an environment variable should be
+-        shown on the help page and error messages.
+-        Normally, environment variables are not shown.
+-    :param prompt: If set to ``True`` or a non empty string then the
+-        user will be prompted for input. If set to ``True`` the prompt
+-        will be the option name capitalized. A deprecated option cannot be
+-        prompted.
+-    :param confirmation_prompt: Prompt a second time to confirm the
+-        value if it was prompted for. Can be set to a string instead of
+-        ``True`` to customize the message.
+-    :param prompt_required: If set to ``False``, the user will be
+-        prompted for input only when the option was specified as a flag
+-        without a value.
+-    :param hide_input: If this is ``True`` then the input on the prompt
+-        will be hidden from the user. This is useful for password input.
+-    :param is_flag: forces this option to act as a flag.  The default is
+-                    auto detection.
+-    :param flag_value: which value should be used for this flag if it's
+-                       enabled.  This is set to a boolean automatically if
+-                       the option string contains a slash to mark two options.
+-    :param multiple: if this is set to `True` then the argument is accepted
+-                     multiple times and recorded.  This is similar to ``nargs``
+-                     in how it works but supports arbitrary number of
+-                     arguments.
+-    :param count: this flag makes an option increment an integer.
+-    :param allow_from_autoenv: if this is enabled then the value of this
+-                               parameter will be pulled from an environment
+-                               variable in case a prefix is defined on the
+-                               context.
+-    :param help: the help string.
+-    :param hidden: hide this option from help outputs.
+-    :param attrs: Other command arguments described in :class:`Parameter`.
+-
+-    .. versionchanged:: 8.2
+-        ``envvar`` used with ``flag_value`` will always use the ``flag_value``,
+-        previously it would use the value of the environment variable.
+-
+-    .. versionchanged:: 8.1
+-        Help text indentation is cleaned here instead of only in the
+-        ``@option`` decorator.
+-
+-    .. versionchanged:: 8.1
+-        The ``show_default`` parameter overrides
+-        ``Context.show_default``.
+-
+-    .. versionchanged:: 8.1
+-        The default of a single option boolean flag is not shown if the
+-        default value is ``False``.
+-
+-    .. versionchanged:: 8.0.1
+-        ``type`` is detected from ``flag_value`` if given.
+-    """
+ 
+     param_type_name = "option"
+ 
+@@ -2864,6 +2859,8 @@ class Option(Parameter):
+         if show_default_is_str or (show_default and (default_value is not None)):
+             if show_default_is_str:
+                 default_string = f"({self.show_default})"
++            elif self._is_dynamic_default():
++                default_string = _("(dynamic)")
+             elif isinstance(default_value, (list, tuple)):
+                 default_string = ", ".join(str(d) for d in default_value)
+             elif inspect.isfunction(default_value):
+@@ -2923,8 +2920,26 @@ class Option(Parameter):
+ 
+             return None
+ 
++        if self._is_dynamic_default():
++            return self.default if not call else None
+         return super().get_default(ctx, call=call)
+ 
++    def _is_dynamic_default(self) -> bool:
++        value = self.default
++        if not isinstance(value, dict) or not value:
++            return False
++        if not all(isinstance(key, str) and key.startswith("--") for key in value):
++            return False
++        if not all(isinstance(mapping, dict) for mapping in value.values()):
++            raise TypeError("Dynamic default values must be dictionaries")
++        return True
++
++    def process_value(self, ctx: Context, value: t.Any) -> t.Any:
++        key = f"click.dynamic-default.{id(self)}"
++        if self._is_dynamic_default() and value is None and key not in ctx.meta:
++            return None
++        return super().process_value(ctx, value)
++
+     def prompt_for_value(self, ctx: Context) -> t.Any:
+         """This is an alternative flow that can be activated in the full
+         value processing if a value does not exist.  It will prompt the
+diff --git a/tests/test_n4c_author_dynamic_defaults.py b/tests/test_n4c_author_dynamic_defaults.py
+new file mode 100644
+index 0000000..770beac
+--- /dev/null
++++ b/tests/test_n4c_author_dynamic_defaults.py
+@@ -0,0 +1,129 @@
++import pytest
++
++import click
++from click.core import ParameterSource
++
++
++@pytest.mark.parametrize(
++    ("source", "arguments", "environment", "default_map", "prompt", "input"),
++    [
++        (ParameterSource.COMMANDLINE, ["--dep", "explicit"], {}, None, False, None),
++        (
++            ParameterSource.ENVIRONMENT,
++            [],
++            {"DEPENDENCY": "explicit"},
++            None,
++            False,
++            None,
++        ),
++        (ParameterSource.DEFAULT_MAP, [], {}, {"dep": "explicit"}, False, None),
++        (ParameterSource.PROMPT, [], {}, None, True, "explicit\n"),
++    ],
++)
++def test_explicit_dynamic_dependency_is_not_resolved_again(
++    runner, source, arguments, environment, default_map, prompt, input
++):
++    observed = {}
++
++    @click.command()
++    @click.option(
++        "--target",
++        default={"--dep": {"explicit": "wanted", "derived": "wrong"}},
++    )
++    @click.option(
++        "--dep",
++        default={"--seed": {"base": "derived"}},
++        envvar="DEPENDENCY",
++        prompt=prompt,
++    )
++    @click.option("--seed", default="base")
++    @click.pass_context
++    def cli(ctx, target, dep, seed):
++        observed.update(
++            target=target,
++            dependency=dep,
++            source=ctx.get_parameter_source("dep"),
++        )
++
++    result = runner.invoke(
++        cli,
++        arguments,
++        env=environment,
++        default_map=default_map,
++        input=input,
++    )
++    assert result.exit_code == 0, result.output
++    assert observed == {"target": "wanted", "dependency": "explicit", "source": source}
++
++
++def test_dependency_resolves_then_target_pipeline_once(runner):
++    seen = []
++
++    @click.command()
++    @click.option(
++        "--port",
++        type=int,
++        callback=lambda c, p, v: seen.append(v) or v + 1,
++        default={"--protocol": {"https": "443"}},
++    )
++    @click.option("--protocol", default="https")
++    def cli(port, protocol):
++        click.echo(port)
++
++    assert runner.invoke(cli).output == "444\n"
++    assert seen == [443]
++
++
++def test_explicit_source_wins_and_later_match_wins(runner):
++    @click.command(context_settings={"default_map": {"level": "MAP"}})
++    @click.option(
++        "--level",
++        envvar="LEVEL",
++        default={"--env": {"dev": "INFO"}, "--debug": {"True": "DEBUG"}},
++    )
++    @click.option("--debug/--no-debug", default=True)
++    @click.option("--env", default="dev")
++    def cli(level, debug, env):
++        click.echo(level)
++
++    assert runner.invoke(cli).output == "MAP\n"
++    assert (
++        runner.invoke(cli, ["--level", "CLI"], env={"LEVEL": "ENV"}).output == "CLI\n"
++    )
++
++
++def test_unknown_cycle_and_invalid_shape_fail(runner):
++    @click.command()
++    @click.option("--target", default={"--missing": {"x": "y"}})
++    def unknown(target):
++        pass
++
++    assert isinstance(
++        runner.invoke(unknown, standalone_mode=False).exception, click.UsageError
++    )
++
++    @click.command()
++    @click.option("--left", default={"--right": {"None": "x"}})
++    @click.option("--right", default={"--left": {"None": "y"}})
++    def cycle(left, right):
++        pass
++
++    assert isinstance(
++        runner.invoke(cycle, standalone_mode=False).exception, click.UsageError
++    )
++    with pytest.raises(TypeError):
++        option = click.Option(["--target"], default={"--mode": "bad"})
++        runner.invoke(
++            click.Command("x", params=[click.Option(["--mode"]), option]),
++            catch_exceptions=False,
++        )
++
++
++def test_help_marks_dynamic_default(runner):
++    @click.command()
++    @click.option("--port", show_default=True, default={"--protocol": {"http": 80}})
++    @click.option("--protocol", default="http")
++    def cli(port, protocol):
++        pass
++
++    assert "[default: (dynamic)]" in runner.invoke(cli, ["--help"]).output

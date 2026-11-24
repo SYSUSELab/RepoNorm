@@ -1,0 +1,730 @@
+diff --git a/apply_fix.py b/apply_fix.py
+new file mode 100644
+index 0000000..da85127
+--- /dev/null
++++ b/apply_fix.py
+@@ -0,0 +1,67 @@
++import re
++
++with open('src/jinja2/filters.py', 'r') as f:
++    content = f.read()
++
++# 1. Add _stable_groupby helper
++helper = """
++def _stable_groupby(value, key_func):
++    groups = []
++    for item in value:
++        key = key_func(item)
++        found = False
++        for existing_key, group in groups:
++            if existing_key == key:
++                group.append(item)
++                found = True
++                break
++        if not found:
++            groups.append((key, [item]))
++    return [_GroupTuple(key, group) for key, group in groups]
++"""
++content = content.replace("def sync_do_groupby(", helper + "\n\ndef sync_do_groupby(")
++
++# 2. Add stable=False to sync_do_groupby
++content = content.replace(
++    "def sync_do_groupby(\n    environment: \"Environment\",\n    value: \"t.Iterable[V]\",\n    attribute: t.Union[str, int],\n    default: t.Optional[t.Any] = None,",
++    "def sync_do_groupby(\n    environment: \"Environment\",\n    value: \"t.Iterable[V]\",\n    attribute: t.Union[str, int],\n    default: t.Optional[t.Any] = None, stable: bool = False,"
++)
++
++# 3. Update sync_do_groupby body
++sync_body = """    expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(value, expr)
++    return [
++        _GroupTuple(key, list(values))
++        for key, values in groupby(sorted(value, key=expr), expr)
++    ]"""
++content = re.sub(
++    r'    expr = make_attrgetter\(environment, attribute, default=default\)\n    return \[\n        _GroupTuple\(key, list\(values\)\)\n        for key, values in groupby\(sorted\(value, key=expr\), expr\)\n    \]',
++    sync_body,
++    content,
++    count=1
++)
++
++# 4. Add stable=False to do_groupby
++content = content.replace(
++    "async def do_groupby(\n    environment: \"Environment\",\n    value: \"t.Union[t.AsyncIterable[V], t.Iterable[V]]\",\n    attribute: t.Union[str, int],\n    default: t.Optional[t.Any] = None,",
++    "async def do_groupby(\n    environment: \"Environment\",\n    value: \"t.Union[t.AsyncIterable[V], t.Iterable[V]]\",\n    attribute: t.Union[str, int],\n    default: t.Optional[t.Any] = None, stable: bool = False,"
++)
++
++# 5. Update do_groupby body
++do_body = """    expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(await auto_to_list(value), expr)
++    return [
++        _GroupTuple(key, await auto_to_list(values))
++        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++    ]"""
++content = re.sub(
++    r'    expr = make_attrgetter\(environment, attribute, default=default\)\n    return \[\n        _GroupTuple\(key, await auto_to_list\(values\)\)\n        for key, values in groupby\(sorted\(await auto_to_list\(value\), key=expr\), expr\)\n    \]',
++    do_body,
++    content,
++    count=1
++)
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.write(content)
+diff --git a/do_groupby_body.py b/do_groupby_body.py
+new file mode 100644
+index 0000000..4526e39
+--- /dev/null
++++ b/do_groupby_body.py
+@@ -0,0 +1,7 @@
++    expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(await auto_to_list(value), expr)
++    return [
++        _GroupTuple(key, await auto_to_list(values))
++        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++    ]
+diff --git a/edit_filters.py b/edit_filters.py
+new file mode 100644
+index 0000000..40dd4ab
+--- /dev/null
++++ b/edit_filters.py
+@@ -0,0 +1,124 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# 1. Add _stable_groupby helper
++# Find where to insert it. Let's insert it before sync_do_groupby.
++# sync_do_groupby is at line 1161.
++# Let's find the line number of "def sync_do_groupby"
++for i, line in enumerate(lines):
++    if 'def sync_do_groupby(' in line:
++        sync_do_groupby_idx = i
++        break
++
++helper = [
++    "\n",
++    "def _stable_groupby(value, key_func):\n",
++    "    groups = []\n",
++    "    for item in value:\n",
++    "        key = key_func(item)\n",
++    "        found = False\n",
++    "        for existing_key, group in groups:\n",
++    "            if existing_key == key:\n",
++    "                group.append(item)\n",
++    "                found = True\n",
++    "                break\n",
++    "        if not found:\n",
++    "            groups.append((key, [item]))\n",
++    "    return [_GroupTuple(key, group) for key, group in groups]\n",
++    "\n"
++]
++lines[sync_do_groupby_idx:sync_do_groupby_idx] = helper
++
++# 2. Add stable=False to sync_do_groupby
++# Find the line again
++for i, line in enumerate(lines):
++    if 'def sync_do_groupby(' in line:
++        # The signature spans multiple lines.
++        # Let's find the line with "default: t.Optional[t.Any] = None,"
++        for j in range(i, i + 10):
++            if 'default: t.Optional[t.Any] = None,' in lines[j]:
++                lines[j] = lines[j].replace('default: t.Optional[t.Any] = None,', 'default: t.Optional[t.Any] = None, stable: bool = False,')
++                break
++        break
++
++# 3. Update sync_do_groupby body
++# Find the body
++for i, line in enumerate(lines):
++    if 'def sync_do_groupby(' in line:
++        # Find the end of the docstring
++        for j in range(i, i + 50):
++            if '"""' in lines[j] and j > i + 5:
++                # The body starts after the docstring
++                # The body is:
++                #    expr = make_attrgetter(environment, attribute, default=default)
++                #    return [
++                #        _GroupTuple(key, list(values))
++                #        for key, values in groupby(sorted(value, key=expr), expr)
++                #    ]
++                # Let's replace it.
++                # Find the lines
++                start_body = j + 1
++                # Find the end of the body
++                for k in range(start_body, start_body + 10):
++                    if ']' in lines[k]:
++                        end_body = k
++                        break
++                
++                new_body = [
++                    "    expr = make_attrgetter(environment, attribute, default=default)\n",
++                    "    if stable:\n",
++                    "        return _stable_groupby(value, expr)\n",
++                    "    return [\n",
++                    "        _GroupTuple(key, list(values))\n",
++                    "        for key, values in groupby(sorted(value, key=expr), expr)\n",
++                    "    ]\n"
++                ]
++                lines[start_body:end_body+1] = new_body
++                break
++        break
++
++# 4. Add stable=False to do_groupby
++for i, line in enumerate(lines):
++    if 'async def do_groupby(' in line:
++        for j in range(i, i + 10):
++            if 'default: t.Optional[t.Any] = None,' in lines[j]:
++                lines[j] = lines[j].replace('default: t.Optional[t.Any] = None,', 'default: t.Optional[t.Any] = None, stable: bool = False,')
++                break
++        break
++
++# 5. Update do_groupby body
++for i, line in enumerate(lines):
++    if 'async def do_groupby(' in line:
++        # Find the body
++        # The body is:
++        #    expr = make_attrgetter(environment, attribute, default=default)
++        #    return [
++        #        _GroupTuple(key, await auto_to_list(values))
++        #        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++        #    ]
++        # Find the lines
++        for j in range(i, i + 10):
++            if 'expr = make_attrgetter' in lines[j]:
++                start_body = j
++                for k in range(start_body, start_body + 10):
++                    if ']' in lines[k]:
++                        end_body = k
++                        break
++                
++                new_body = [
++                    "    expr = make_attrgetter(environment, attribute, default=default)\n",
++                    "    if stable:\n",
++                    "        return _stable_groupby(await auto_to_list(value), expr)\n",
++                    "    return [\n",
++                    "        _GroupTuple(key, await auto_to_list(values))\n",
++                    "        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)\n",
++                    "    ]\n"
++                ]
++                lines[start_body:end_body+1] = new_body
++                break
++        break
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(lines)
+diff --git a/edit_filters_v2.py b/edit_filters_v2.py
+new file mode 100644
+index 0000000..11a8f7f
+--- /dev/null
++++ b/edit_filters_v2.py
+@@ -0,0 +1,79 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    content = f.read()
++
++# Helper function
++helper = """
++def _stable_groupby(value, key_func):
++    groups = []
++    for item in value:
++        key = key_func(item)
++        found = False
++        for existing_key, group in groups:
++            if existing_key == key:
++                group.append(item)
++                found = True
++                break
++        if not found:
++            groups.append((key, [item]))
++    return [_GroupTuple(key, group) for key, group in groups]
++"""
++
++# Insert helper before sync_do_groupby
++content = content.replace(
++    "def sync_do_groupby(",
++    helper + "\n\ndef sync_do_groupby("
++)
++
++# Add stable=False to sync_do_groupby
++content = content.replace(
++    "default: t.Optional[t.Any] = None,",
++    "default: t.Optional[t.Any] = None, stable: bool = False,"
++)
++
++# Update sync_do_groupby body
++# The body is:
++#    expr = make_attrgetter(environment, attribute, default=default)
++#    return [
++#        _GroupTuple(key, list(values))
++#        for key, values in groupby(sorted(value, key=expr), expr)
++#    ]
++# I need to be careful not to replace the body of do_groupby yet.
++# Let's use a more specific replacement.
++sync_body = """    expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(value, expr)
++    return [
++        _GroupTuple(key, list(values))
++        for key, values in groupby(sorted(value, key=expr), expr)
++    ]"""
++
++# This is tricky because the body is the same for both.
++# Let's use a regex to replace only the first occurrence.
++import re
++content = re.sub(
++    r'expr = make_attrgetter\(environment, attribute, default=default\)\n    return \[\n        _GroupTuple\(key, list\(values\)\)\n        for key, values in groupby\(sorted\(value, key=expr\), expr\)\n    \]',
++    sync_body,
++    content,
++    count=1
++)
++
++# Update do_groupby body
++do_body = """    expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(await auto_to_list(value), expr)
++    return [
++        _GroupTuple(key, await auto_to_list(values))
++        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
++    ]"""
++
++content = re.sub(
++    r'expr = make_attrgetter\(environment, attribute, default=default\)\n    return \[\n        _GroupTuple\(key, await auto_to_list\(values\)\)\n        for key, values in groupby\(sorted\(await auto_to_list\(value\), key=expr\), expr\)\n    \]',
++    do_body,
++    content,
++    count=1
++)
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.write(content)
+diff --git a/fix_filters.py b/fix_filters.py
+new file mode 100644
+index 0000000..ebaf9da
+--- /dev/null
++++ b/fix_filters.py
+@@ -0,0 +1,27 @@
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the first occurrence of "def sync_do_groupby("
++# and remove the one that is not the correct one.
++# Actually, I will just rewrite the file with the correct content.
++
++# Let's just read the file and fix it manually.
++# I will read the file, and then write it back with the correct content.
++# This is safer.
++
++with open('src/jinja2/filters.py', 'r') as f:
++    content = f.read()
++
++# Remove the duplicate sync_do_groupby
++# The file has:
++# def _stable_groupby(...)
++# ...
++# def sync_do_groupby(...)
++# ...
++# def sync_do_groupby(...)
++# ...
++
++# I will just use a regex to replace the whole block.
++import re
++# This is too complex. Let's just use a simpler approach.
++# I will read the file, and then use a list of lines to reconstruct it.
+diff --git a/reproduce_groupby.py b/reproduce_groupby.py
+new file mode 100644
+index 0000000..54ede75
+--- /dev/null
++++ b/reproduce_groupby.py
+@@ -0,0 +1,24 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++env = Environment()
++data = [
++    MockObject("a", [1, 2]),
++    MockObject("b", [3, 4]),
++    MockObject("c", [1, 2]),
++]
++
++# This should fail because [1, 2] is not sortable
++try:
++    result = sync_do_groupby(env, data, "attr")
++    print(result)
++except Exception as e:
++    print(f"Caught expected error: {e}")
++
+diff --git a/reproduce_groupby_2.py b/reproduce_groupby_2.py
+new file mode 100644
+index 0000000..26cfaa4
+--- /dev/null
++++ b/reproduce_groupby_2.py
+@@ -0,0 +1,26 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++env = Environment()
++# Let's try to make it fail by having unhashable keys that are not sortable
++# Actually, lists are not sortable in Python 3 if they contain uncomparable elements,
++# but [1, 2] and [3, 4] are comparable.
++# Let's try something that is not comparable.
++
++data = [
++    MockObject("a", [1]),
++    MockObject("b", "string"),
++]
++
++try:
++    result = sync_do_groupby(env, data, "attr")
++    print(result)
++except Exception as e:
++    print(f"Caught expected error: {e}")
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..37e9fc0 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1158,11 +1158,28 @@ class _GroupTuple(t.NamedTuple):
+ 
+ 
+ @pass_environment
++
++def _stable_groupby(value, key_func):
++    groups = []
++    for item in value:
++        key = key_func(item)
++        found = False
++        for existing_key, group in groups:
++            if existing_key == key:
++                group.append(item)
++                found = True
++                break
++        if not found:
++            groups.append((key, [item]))
++    return [_GroupTuple(key, group) for key, group in groups]
++
++@pass_environment
++
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+-    default: t.Optional[t.Any] = None,
++    default: t.Optional[t.Any] = None, stable: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1210,6 +1227,8 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(value, expr)
+     return [
+         _GroupTuple(key, list(values))
+         for key, values in groupby(sorted(value, key=expr), expr)
+@@ -1221,9 +1240,11 @@ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+-    default: t.Optional[t.Any] = None,
++    default: t.Optional[t.Any] = None, stable: bool = False,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(await auto_to_list(value), expr)
+     return [
+         _GroupTuple(key, await auto_to_list(values))
+         for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+diff --git a/stable_groupby_helper.py b/stable_groupby_helper.py
+new file mode 100644
+index 0000000..5dc421d
+--- /dev/null
++++ b/stable_groupby_helper.py
+@@ -0,0 +1,15 @@
++
++def _stable_groupby(value, key_func):
++    groups = []
++    for item in value:
++        key = key_func(item)
++        found = False
++        for existing_key, group in groups:
++            if existing_key == key:
++                group.append(item)
++                found = True
++                break
++        if not found:
++            groups.append((key, [item]))
++    return [_GroupTuple(key, group) for key, group in groups]
++
+diff --git a/sync_do_groupby_body.py b/sync_do_groupby_body.py
+new file mode 100644
+index 0000000..e530553
+--- /dev/null
++++ b/sync_do_groupby_body.py
+@@ -0,0 +1,7 @@
++    expr = make_attrgetter(environment, attribute, default=default)
++    if stable:
++        return _stable_groupby(value, expr)
++    return [
++        _GroupTuple(key, list(values))
++        for key, values in groupby(sorted(value, key=expr), expr)
++    ]
+diff --git a/test_key_retention.py b/test_key_retention.py
+new file mode 100644
+index 0000000..dd1af3f
+--- /dev/null
++++ b/test_key_retention.py
+@@ -0,0 +1,31 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++
++class Key:
++    def __init__(self, val):
++        self.val = val
++    def __eq__(self, other):
++        return self.val == other.val
++    def __repr__(self):
++        return f"Key({self.val})"
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++env = Environment()
++k1 = Key(1)
++k2 = Key(1)
++data = [
++    MockObject("a", k1),
++    MockObject("b", k2),
++]
++
++result = sync_do_groupby(env, data, "attr", stable=True)
++print(f"Result: {result}")
++print(f"Key in result: {result[0][0]}")
++print(f"Is it k1? {result[0][0] is k1}")
++assert result[0][0] is k1
+diff --git a/test_logic.py b/test_logic.py
+new file mode 100644
+index 0000000..9f8d458
+--- /dev/null
++++ b/test_logic.py
+@@ -0,0 +1,45 @@
++from collections import defaultdict
++
++def groupby_stable(data, key_func):
++    groups = []
++    seen = []
++    group_map = {}
++    
++    for item in data:
++        key = key_func(item)
++        
++        # We need to check if key is already in seen.
++        # But key might be unhashable (like a list).
++        # The requirement says: "Support equality-comparable keys including lists and dictionaries"
++        # "Equal keys merge even when not adjacent or not the same object; retain the first original key object as grouper."
++        
++        found = False
++        for existing_key, group in groups:
++            if existing_key == key:
++                group.append(item)
++                found = True
++                break
++        
++        if not found:
++            groups.append((key, [item]))
++            
++    return groups
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++data = [
++    MockObject("a", [1]),
++    MockObject("b", [2]),
++    MockObject("c", [1]),
++]
++
++def key_func(obj):
++    return obj.attr
++
++result = groupby_stable(data, key_func)
++print(result)
+diff --git a/test_logic_2.py b/test_logic_2.py
+new file mode 100644
+index 0000000..e7bca88
+--- /dev/null
++++ b/test_logic_2.py
+@@ -0,0 +1,54 @@
++class Key:
++    def __init__(self, val):
++        self.val = val
++    def __eq__(self, other):
++        return self.val == other.val
++    def __repr__(self):
++        return f"Key({self.val})"
++
++# The requirement says: "retain the first original key object as grouper."
++# My current logic:
++# groups.append((key, [item]))
++# If I have:
++# k1 = Key(1)
++# k2 = Key(1)
++# data = [obj1(k1), obj2(k2)]
++# My logic will use k1 as the key for the group.
++# Let's verify.
++
++def groupby_stable(data, key_func):
++    groups = []
++    
++    for item in data:
++        key = key_func(item)
++        
++        found = False
++        for existing_key, group in groups:
++            if existing_key == key:
++                group.append(item)
++                found = True
++                break
++        
++        if not found:
++            groups.append((key, [item]))
++            
++    return groups
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++k1 = Key(1)
++k2 = Key(1)
++data = [
++    MockObject("a", k1),
++    MockObject("b", k2),
++]
++
++result = groupby_stable(data, lambda x: x.attr)
++print(f"Result: {result}")
++print(f"Key in result: {result[0][0]}")
++print(f"Is it k1? {result[0][0] is k1}")
+diff --git a/test_stable_groupby.py b/test_stable_groupby.py
+new file mode 100644
+index 0000000..ca8e8a8
+--- /dev/null
++++ b/test_stable_groupby.py
+@@ -0,0 +1,32 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++env = Environment()
++data = [
++    MockObject("a", [1]),
++    MockObject("b", [2]),
++    MockObject("c", [1]),
++]
++
++# Current behavior: sorts by key, so [1] comes before [2]
++# Expected behavior with stable=False: [1], [2], [1] -> groups: [1], [2]
++# Wait, the requirement says:
++# "True orders groups by the first occurrence of each key instead of sorting keys."
++# "False retains existing sorted grouping."
++
++# So if I call it with stable=False (default), it should still sort.
++# If I call it with stable=True, it should preserve order.
++
++# Let's check if I can pass stable=True
++try:
++    result = sync_do_groupby(env, data, "attr", stable=True)
++    print(result)
++except Exception as e:
++    print(f"Caught error: {e}")
+diff --git a/test_stable_groupby_final.py b/test_stable_groupby_final.py
+new file mode 100644
+index 0000000..b5ca6db
+--- /dev/null
++++ b/test_stable_groupby_final.py
+@@ -0,0 +1,52 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++
++class MockObject:
++    def __init__(self, name, attr):
++        self.name = name
++        self.attr = attr
++    def __repr__(self):
++        return f"MockObject({self.name}, {self.attr})"
++
++env = Environment()
++data = [
++    MockObject("a", [1]),
++    MockObject("b", [2]),
++    MockObject("c", [1]),
++]
++
++# Test stable=True
++try:
++    result = sync_do_groupby(env, data, "attr", stable=True)
++    print(f"Stable=True result: {result}")
++    # Expected: [([1], [a, c]), ([2], [b])]
++    assert len(result) == 2
++    assert result[0][0] == [1]
++    assert result[1][0] == [2]
++except Exception as e:
++    print(f"Caught error: {e}")
++
++# Test stable=False (default)
++try:
++    result = sync_do_groupby(env, data, "attr", stable=False)
++    print(f"Stable=False result: {result}")
++    # Expected: [([1], [a, c]), ([2], [b])] (sorted by key)
++    assert len(result) == 2
++    assert result[0][0] == [1]
++    assert result[1][0] == [2]
++except Exception as e:
++    print(f"Caught error: {e}")
++
++# Test unhashable keys
++data2 = [
++    MockObject("a", [1]),
++    MockObject("b", [2]),
++    MockObject("c", [1]),
++]
++# This should work with stable=True
++try:
++    result = sync_do_groupby(env, data2, "attr", stable=True)
++    print(f"Unhashable keys result: {result}")
++except Exception as e:
++    print(f"Caught error: {e}")
++

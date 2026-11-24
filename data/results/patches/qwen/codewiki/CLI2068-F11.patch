@@ -1,0 +1,145 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..fa8460d 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -6,6 +6,7 @@ placed in this module and only imported as needed.
+ 
+ from __future__ import annotations
+ 
++import signal
+ import collections.abc as cabc
+ import contextlib
+ import math
+@@ -485,11 +486,13 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -507,6 +510,7 @@ class Editor:
+ 
+     def edit_file(self, filename: str) -> None:
+         import subprocess
++        import warnings
+ 
+         editor = self.get_editor()
+         environ: dict[str, str] | None = None
+@@ -515,8 +519,53 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        cmd = f'{editor} "{filename}"'
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            c = subprocess.Popen(cmd, env=environ, shell=True)
++            pid = c.pid
++
++            # Emit start event
++            if self.monitor_process is not None:
++                try:
++                    self.monitor_process("start", pid, cmd, time.time())
++                except Exception:
++                    warnings.warn(
++                        "monitor_process callback raised an exception",
++                        UserWarning,
++                        stacklevel=2,
++                    )
++
++            # Try to suspend/resume on POSIX platforms
++            if not WIN:
++                try:
++                    # Suspend the process
++                    os.kill(pid, signal.SIGSTOP)
++                    if self.monitor_process is not None:
++                        try:
++                            self.monitor_process("suspend", pid, cmd, time.time())
++                        except Exception:
++                            warnings.warn(
++                                "monitor_process callback raised an exception",
++                                UserWarning,
++                                stacklevel=2,
++                            )
++
++                    # Resume the process
++                    os.kill(pid, signal.SIGCONT)
++                    if self.monitor_process is not None:
++                        try:
++                            self.monitor_process("resume", pid, cmd, time.time())
++                        except Exception:
++                            warnings.warn(
++                                "monitor_process callback raised an exception",
++                                UserWarning,
++                                stacklevel=2,
++                            )
++                except (OSError, AttributeError):
++                    # Signal operations may fail or not be available
++                    pass
++
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+@@ -526,6 +575,17 @@ class Editor:
+             raise ClickException(
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
++        finally:
++            # Emit terminate event
++            if self.monitor_process is not None:
++                try:
++                    self.monitor_process("terminate", pid, cmd, time.time())
++                except Exception:
++                    warnings.warn(
++                        "monitor_process callback raised an exception",
++                        UserWarning,
++                        stacklevel=2,
++                    )
+ 
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..6354706 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,24 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param monitor_process: optional callback to monitor the editor process.
++                            Receives (event_type, pid, command, timestamp) where
++                            event_type is one of "start", "suspend", "resume", or
++                            "terminate". If a non-callable value other than None
++                            is provided, a TypeError is raised.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    if monitor_process is not None and not callable(monitor_process):
++        raise TypeError("monitor_process must be callable or None")
++
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        monitor_process=monitor_process,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)

@@ -1,0 +1,175 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..dc1d673 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,15 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        if monitor_process is not None and not callable(monitor_process):
++            raise TypeError("monitor_process must be callable or None")
++        self.monitor_process = monitor_process
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -506,6 +510,7 @@ class Editor:
+         return "vi"
+ 
+     def edit_file(self, filename: str) -> None:
++        import signal
+         import subprocess
+ 
+         editor = self.get_editor()
+@@ -515,9 +520,22 @@ class Editor:
+             environ = os.environ.copy()
+             environ.update(self.env)
+ 
++        command = f'{editor} "{filename}"'
++
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
+-            exit_code = c.wait()
++            c = subprocess.Popen(command, env=environ, shell=True)
++            
++            # Call start event
++            if self.monitor_process is not None:
++                try:
++                    self.monitor_process("start", c.pid, command, time.time())
++                except Exception as e:
++                    import warnings
++                    warnings.warn(f"Monitor process callback raised an exception: {e}", UserWarning)
++            
++            # Wait for process to complete, monitoring for suspend/resume
++            exit_code = self._wait_with_monitoring(c, command)
++            
+             if exit_code != 0:
+                 raise ClickException(
+                     _("{editor}: Editing failed").format(editor=editor)
+@@ -527,6 +545,87 @@ class Editor:
+                 _("{editor}: Editing failed: {e}").format(editor=editor, e=e)
+             ) from e
+ 
++    def _wait_with_monitoring(self, proc: subprocess.Popen, command: str) -> int:
++        """Wait for process to complete, emitting suspend/resume events on POSIX."""
++        import signal
++        
++        # On Windows, just wait normally
++        if WIN:
++            proc.wait()
++            # Emit terminate event on Windows
++            if self.monitor_process is not None:
++                try:
++                    self.monitor_process("terminate", proc.pid, command, time.time())
++                except Exception as e:
++                    import warnings
++                    warnings.warn(f"Monitor process callback raised an exception: {e}", UserWarning)
++            return 0
++        
++        # On POSIX, we can detect suspend/resume using waitpid with WNOHANG
++        # Use a thread to monitor the process state
++        import threading
++        
++        result = {"exit_code": None}
++        done = threading.Event()
++        
++        def wait_thread():
++            result["exit_code"] = proc.wait()
++            done.set()
++        
++        thread = threading.Thread(target=wait_thread, daemon=True)
++        thread.start()
++        
++        # Poll for state changes
++        last_state = "running"
++        while not done.is_set():
++            # Check if process has terminated
++            if proc.poll() is not None:
++                break
++            
++            # Try to get process status using waitpid with WNOHANG
++            try:
++                pid, status = os.waitpid(proc.pid, os.WNOHANG)
++                if pid == proc.pid:
++                    # Process changed state
++                    if os.WIFSTOPPED(status):
++                        # Process was stopped (suspended)
++                        if last_state != "stopped":
++                            last_state = "stopped"
++                            if self.monitor_process is not None:
++                                try:
++                                    self.monitor_process("suspend", proc.pid, command, time.time())
++                                except Exception as e:
++                                    import warnings
++                                    warnings.warn(f"Monitor process callback raised an exception: {e}", UserWarning)
++                    elif os.WIFCONTINUED(status):
++                        # Process was resumed
++                        if last_state != "running":
++                            last_state = "running"
++                            if self.monitor_process is not None:
++                                try:
++                                    self.monitor_process("resume", proc.pid, command, time.time())
++                                except Exception as e:
++                                    import warnings
++                                    warnings.warn(f"Monitor process callback raised an exception: {e}", UserWarning)
++            except (OSError, ValueError):
++                pass
++            
++            # Small sleep to avoid busy waiting
++            time.sleep(0.01)
++        
++        # Wait for the thread to finish
++        thread.join()
++        
++        # Emit terminate event
++        if self.monitor_process is not None:
++            try:
++                self.monitor_process("terminate", proc.pid, command, time.time())
++            except Exception as e:
++                import warnings
++                warnings.warn(f"Monitor process callback raised an exception: {e}", UserWarning)
++        
++        return result["exit_code"]
++
+     def edit(self, text: t.AnyStr | None) -> t.AnyStr | None:
+         import tempfile
+ 
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..3f2df58 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    monitor_process: t.Callable[[str, int, str, float], None] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,20 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param monitor_process: optional callback to monitor the editor process.
++                            Receives ``(event_type, pid, command, timestamp)`` where
++                            event_type is one of ``start``, ``suspend``, ``resume``, or
++                            ``terminate``.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(
++        editor=editor,
++        env=env,
++        require_save=require_save,
++        extension=extension,
++        monitor_process=monitor_process,
++    )
+ 
+     if filename is None:
+         return ed.edit(text)

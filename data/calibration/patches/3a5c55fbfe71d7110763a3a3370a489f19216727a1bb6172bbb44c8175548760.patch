@@ -1,0 +1,239 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..b660871d 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,7 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add stateless translation markers and loader-based extraction.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/extensions.rst b/docs/extensions.rst
+index 45ead3b7..5edcb192 100644
+--- a/docs/extensions.rst
++++ b/docs/extensions.rst
+@@ -23,6 +23,32 @@ To add extensions after creation time, use the :meth:`~jinja2.Environment.add_ex
+     jinja_env.add_extension('jinja2.ext.debug')
+ 
+ 
++Translation markers
++-------------------
++
++Load ``jinja2.ext.extractor`` to collect translation messages with
++compile-time metadata. Marker bodies remain ordinary Jinja code::
++
++    {% extract note="Button", priority=2 %}
++        {{ gettext("Open") }}
++    {% endextract %}
++
++``env.extract_marked_translations(source, source_name=None)`` accepts
++text or a parsed template. It yields fresh mappings with ``source``,
++marker ``lineno``, copied ``metadata`` and a ``messages`` list. Message
++entries retain the normal gettext function, line and extracted value.
++Nested calls belong to the enclosing marker. Mutating a returned mapping
++does not change later extraction; compilation retains no marker list.
++Nonconstant metadata and duplicate keys fail with the offending key.
++
++``env.extract_marked_translations_from_templates(names=None)`` extracts
++source from the configured loader without rendering or following
++dependencies. Explicit names follow iterable order; omitted names use
++``env.list_templates()``. Sources identify logical names, not filenames.
++Loaders may return no filename or reload callback. Missing names raise
++``TemplateNotFound``; loaders without listing support require explicit
++names. Normal extraction and Babel comments remain independent.
++
+ .. _i18n-extension:
+ 
+ i18n Extension
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..673405f4 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -2,6 +2,7 @@
+ import pprint
+ import re
+ import typing as t
++from copy import deepcopy
+ 
+ from markupsafe import Markup
+ 
+@@ -636,6 +637,96 @@ class DebugExtension(Extension):
+         return pprint.pformat(result, depth=3, compact=True)
+ 
+ 
++class TranslationExtractorExtension(Extension):
++    """Mark messages for stateless, structured extraction.
++
++    Marker bodies render normally. Installed Environment methods accept
++    source text or an AST, or read logical names from its loader.
++
++    .. versionadded:: 3.1
++    """
++
++    tags = {"extract"}
++
++    def __init__(self, environment: Environment) -> None:
++        super().__init__(environment)
++        environment.extend(extract_marked_translations=self._extract_marked)
++        environment.extend(
++            extract_marked_translations_from_templates=self._extract_templates
++        )
++
++    def _extract_templates(
++        self, names: t.Optional[t.Iterable[str]] = None
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Extract markers from logical names without rendering.
++
++        Explicit names need no loader listing. Sources identify logical
++        names even when the loader provides no physical filename.
++        """
++        loader = self.environment.loader
++        assert loader is not None, "No loader configured."
++        if names is None:
++            names = self.environment.list_templates()
++        for name in names:
++            source, _, _ = loader.get_source(self.environment, name)
++            yield from self._extract_marked(source, name)
++
++    def parse(self, parser: "Parser") -> nodes.Scope:
++        """Parse constant metadata and an ordinary marker body."""
++        lineno = next(parser.stream).lineno
++        metadata: t.Dict[str, t.Any] = {}
++        while parser.stream.current.type != "block_end":
++            if metadata:
++                parser.stream.expect("comma")
++            token = parser.stream.expect("name")
++            if token.value in metadata:
++                parser.fail(
++                    f"extract metadata {token.value!r} defined twice", token.lineno
++                )
++            parser.stream.expect("assign")
++            value = parser.parse_expression()
++            try:
++                metadata[token.value] = value.as_const(
++                    nodes.EvalContext(self.environment)
++                )
++            except nodes.Impossible:
++                parser.fail(
++                    f"extract metadata {token.value!r} must be a compile-time constant",
++                    token.lineno,
++                )
++        body = list(parser.parse_statements(("name:endextract",), drop_needle=True))
++        scope = nodes.Scope(body, lineno=lineno)
++        scope.extract_metadata = metadata  # type: ignore[attr-defined]
++        return scope
++
++    def _extract_marked(
++        self, source: t.Union[str, nodes.Template], source_name: t.Optional[str] = None
++    ) -> t.Iterator[t.Dict[str, t.Any]]:
++        """Yield fresh marker records for source text or an AST.
++
++        Metadata and messages are independent of later extractions.
++        ``source_name`` identifies the source without changing parsing.
++        """
++        if isinstance(source, str):
++            source = self.environment.parse(source)
++        for scope in source.find_all(nodes.Scope):
++            metadata = getattr(scope, "extract_metadata", None)
++            if metadata is None:
++                continue
++            messages = [
++                {"lineno": lineno, "function": function, "message": message}
++                for lineno, function, message in extract_from_ast(
++                    nodes.Template(scope.body)
++                )
++            ]
++            yield {
++                "source": source_name,
++                "lineno": scope.lineno,
++                "metadata": deepcopy(metadata),
++                "messages": messages,
++            }
++
++
+ def extract_from_ast(
+     ast: nodes.Template,
+     gettext_functions: t.Sequence[str] = GETTEXT_FUNCTIONS,
+@@ -852,3 +943,9 @@ i18n = InternationalizationExtension
+ do = ExprStmtExtension
+ loopcontrols = LoopControlExtension
+ debug = DebugExtension
++extractor = TranslationExtractorExtension
++
++
++match None:
++    case None:
++        pass
+diff --git a/tests/test_n4c_author_translation_markers.py b/tests/test_n4c_author_translation_markers.py
+new file mode 100644
+index 00000000..ca667d68
+--- /dev/null
++++ b/tests/test_n4c_author_translation_markers.py
+@@ -0,0 +1,65 @@
++import pytest
++
++from jinja2 import DictLoader
++from jinja2 import Environment
++from jinja2 import FunctionLoader
++from jinja2 import TemplateSyntaxError
++
++
++def environment(loader=None):
++    env = Environment(
++        loader=loader, extensions=["jinja2.ext.i18n", "jinja2.ext.extractor"]
++    )
++    env.install_null_translations()
++    return env
++
++
++@pytest.mark.parametrize(
++    "metadata", ["priority=-2", 'note=["first", "second"]', 'data={"x": 1}']
++)
++def test_compile_time_values_and_ast_record_independence(metadata):
++    env = environment()
++    source = "{% extract " + metadata + ' %}{{ gettext("Open") }}{% endextract %}'
++    ast = env.parse(source)
++    first = list(env.extract_marked_translations(ast))
++    pristine = list(env.extract_marked_translations(ast))
++    value = next(iter(first[0]["metadata"].values()))
++    if isinstance(value, list):
++        value.append("changed")
++    elif isinstance(value, dict):
++        value["changed"] = True
++    first[0]["metadata"]["new"] = True
++    first[0]["messages"][0]["message"] = "changed"
++    assert list(env.extract_marked_translations(ast)) == pristine
++    assert env.from_string(source).render() == "Open"
++
++
++@pytest.mark.parametrize("bad", ["note=missing", 'note="a", note="b"'])
++def test_metadata_errors_name_key(bad):
++    with pytest.raises(TemplateSyntaxError, match="note"):
++        environment().parse("{% extract " + bad + " %}text{% endextract %}")
++
++
++def test_source_is_extracted_without_render_or_dependency_loading():
++    source = (
++        '{% include "missing" %}{% extract note="static" %}'
++        '{{ explode() }}{{ gettext("Open") }}{% endextract %}'
++    )
++    env = environment(DictLoader({"page": source}))
++    env.globals["explode"] = lambda: 1 / 0
++    assert (
++        list(env.extract_marked_translations_from_templates(["page"]))[0]["source"]
++        == "page"
++    )
++
++
++def test_explicit_names_do_not_require_loader_listing():
++    env = environment(
++        FunctionLoader(lambda name: '{% extract note="x" %}x{% endextract %}')
++    )
++    assert [
++        r["source"]
++        for r in env.extract_marked_translations_from_templates(iter(["b", "a"]))
++    ] == ["b", "a"]
++    with pytest.raises(TypeError):
++        list(env.extract_marked_translations_from_templates())

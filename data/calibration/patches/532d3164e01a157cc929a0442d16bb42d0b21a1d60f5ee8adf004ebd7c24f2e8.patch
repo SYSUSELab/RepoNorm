@@ -1,0 +1,239 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d641712d..33f7cf21 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Validate translation placeholder names and restrict assigned expressions
++    to data-safe forms when compiling ``trans`` blocks.
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/templates.rst b/docs/templates.rst
+index 89958b86..13368f86 100644
+--- a/docs/templates.rst
++++ b/docs/templates.rst
+@@ -1732,6 +1732,19 @@ to disable it for a block.
+ .. versionadded:: 2.10
+    The ``trimmed`` and ``notrimmed`` modifiers have been added.
+ 
++Translation variable safety
++~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Names declared in a ``trans`` header or referenced by its body must be
++Python identifiers and must not shadow ``gettext``, ``ngettext``,
++``pgettext``, ``npgettext``, or ``_``. Assigned values may use
++constants, names, attributes, filters, tests, and calls to simple
++function names.
++Item access, arithmetic, conditional expressions, method calls, and
++dynamic ``*args`` or ``**kwargs`` are rejected when the template is
++compiled. This keeps translation placeholders independent from arbitrary
++template data operations.
++
+ It's possible to translate strings in expressions with these functions:
+ 
+ -   ``gettext``: translate a single string
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83aa..5f093572 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -266,6 +266,57 @@ class InternationalizationExtension(Extension):
+             newstyle_gettext=False,
+         )
+ 
++    def _validate_trans_variables(
++        self, variables: t.Dict[str, nodes.Expr], parser: "Parser", lineno: int
++    ) -> None:
++        """Validate names and expressions declared by a translation block."""
++        reserved = {"gettext", "ngettext", "pgettext", "npgettext", "_"}
++        for name, expression in variables.items():
++            if not name.isidentifier():
++                parser.fail(
++                    f"Invalid variable name {name!r}; translation variables must "
++                    "be Python identifiers.",
++                    lineno,
++                    exc=TemplateSyntaxError,
++                )
++            if reserved.__contains__(name):
++                parser.fail(
++                    f"Variable name {name!r} conflicts with translation function "
++                    "names.",
++                    lineno,
++                    exc=TemplateSyntaxError,
++                )
++            if not self._is_valid_trans_expression(expression):
++                parser.fail(
++                    f"Variable {name!r} uses template data that is not allowed in "
++                    "translation contexts.",
++                    lineno,
++                    exc=TemplateSyntaxError,
++                )
++
++    def _is_valid_trans_expression(self, expression: nodes.Expr) -> bool:
++        if isinstance(expression, (nodes.Const, nodes.Name)):
++            return True
++        if isinstance(expression, nodes.Getattr):
++            return self._is_valid_trans_expression(expression.node)
++        if isinstance(expression, nodes.Call):
++            if not isinstance(expression.node, nodes.Name):
++                return False
++        elif not isinstance(expression, (nodes.Filter, nodes.Test)):
++            return False
++        if expression.node is None or not self._is_valid_trans_expression(
++            expression.node
++        ):
++            return False
++        if any(not self._is_valid_trans_expression(arg) for arg in expression.args):
++            return False
++        if any(
++            not self._is_valid_trans_expression(item.value)
++            for item in expression.kwargs
++        ):
++            return False
++        return expression.dyn_args is None and expression.dyn_kwargs is None
++
+     def _install(
+         self, translations: "_SupportedTranslations", newstyle: t.Optional[bool] = None
+     ) -> None:
+@@ -362,6 +413,7 @@ class InternationalizationExtension(Extension):
+         plural_expr: t.Optional[nodes.Expr] = None
+         plural_expr_assignment: t.Optional[nodes.Assign] = None
+         variables: t.Dict[str, nodes.Expr] = {}
++        validation_variables: t.Dict[str, nodes.Expr] = {}
+         trimmed = None
+         while parser.stream.current.type != "block_end":
+             if variables:
+@@ -389,6 +441,8 @@ class InternationalizationExtension(Extension):
+             else:
+                 variables[token.value] = var = nodes.Name(token.value, "load")
+ 
++            validation_variables[token.value] = var
++
+             if plural_expr is None:
+                 if isinstance(var, nodes.Call):
+                     plural_expr = nodes.Name("_trans", "load")
+@@ -439,6 +493,9 @@ class InternationalizationExtension(Extension):
+         for name in referenced:
+             if name not in variables:
+                 variables[name] = nodes.Name(name, "load")
++                validation_variables[name] = variables[name]
++
++        self._validate_trans_variables(validation_variables, parser, lineno)
+ 
+         if not have_plural:
+             plural_expr = None
+diff --git a/tests/test_n4c_author_translation_validation.py b/tests/test_n4c_author_translation_validation.py
+new file mode 100644
+index 00000000..4576b4c8
+--- /dev/null
++++ b/tests/test_n4c_author_translation_validation.py
+@@ -0,0 +1,107 @@
++import pytest
++
++from jinja2 import Environment
++from jinja2 import pass_context
++from jinja2 import TemplateAssertionError
++from jinja2 import TemplateSyntaxError
++
++
++@pytest.fixture
++def env():
++    value = Environment(extensions=["jinja2.ext.i18n"])
++    value.install_null_translations()
++    return value
++
++
++@pytest.mark.parametrize("name", ["gettext", "ngettext", "pgettext", "npgettext", "_"])
++@pytest.mark.parametrize("location", ["header", "body"])
++def test_reserved_translation_names(env, name, location):
++    if location == "header":
++        source = f"{{% trans {name}=1 %}}{{{{ {name} }}}}{{% endtrans %}}"
++    else:
++        source = f"{{% trans %}}{{{{ {name} }}}}{{% endtrans %}}"
++    with pytest.raises(
++        TemplateSyntaxError, match="conflicts with translation function names"
++    ) as error:
++        env.from_string(source)
++    assert name in str(error.value)
++
++
++@pytest.mark.parametrize(
++    "expression",
++    [
++        "42",
++        "value",
++        "user.name",
++        "make(value, default='x')",
++        "value|default('x')",
++        "value is defined",
++        "user.name|upper",
++    ],
++)
++def test_safe_translation_expressions(env, expression):
++    env.from_string(f"{{% trans item={expression} %}}{{{{ item }}}}{{% endtrans %}}")
++
++
++@pytest.mark.parametrize(
++    "expression",
++    [
++        "items[0]",
++        "left + right",
++        "value if enabled else other",
++        "user.make()",
++        "make(items[0])",
++        "value|default(*args)",
++        "make(**kwargs)",
++    ],
++)
++def test_unsafe_translation_expressions(env, expression):
++    with pytest.raises(
++        TemplateSyntaxError, match="template data.*translation contexts"
++    ) as error:
++        env.from_string(
++            f"{{% trans item={expression} %}}{{{{ item }}}}{{% endtrans %}}"
++        )
++    assert "item" in str(error.value)
++
++
++def test_plural_unicode_trim_and_existing_duplicate_error(env):
++    template = env.from_string(
++        "{% trans количество=2, trimmed %} {{ количество }} item "
++        "{% pluralize %} {{ количество }} items {% endtrans %}"
++    )
++    assert template.render() == "2 items"
++    with pytest.raises(TemplateAssertionError, match="defined twice"):
++        env.from_string("{% trans value=1, value=2 %}{{ value }}{% endtrans %}")
++
++
++@pytest.mark.parametrize("newstyle", [False, True])
++@pytest.mark.parametrize("escape", [False, True])
++@pytest.mark.parametrize("count", [1, 2])
++def test_validation_preserves_provider_and_count_evaluation(newstyle, escape, count):
++    environment = Environment(extensions=["jinja2.ext.i18n"])
++    seen = []
++    counts = []
++
++    @pass_context
++    def translate(context, singular, plural, n):
++        seen.append((context.environment, n))
++        return "<b>%(name)s</b>"
++
++    def make():
++        counts.append(count)
++        return count
++
++    environment.install_gettext_callables(
++        lambda message: message, translate, newstyle=newstyle
++    )
++    source = (
++        "{% autoescape escape %}{% trans n=make(), name=name, trimmed %}\n"
++        "one{% pluralize %}\nmany{% endtrans %}{% endautoescape %}"
++    )
++    result = environment.from_string(source).render(
++        make=make, name="<x>", escape=escape
++    )
++    assert result == ("<b>&lt;x&gt;</b>" if escape else "<b><x></b>")
++    assert seen == [(environment, count)]
++    assert counts == [count]

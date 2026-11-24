@@ -1,0 +1,202 @@
+diff --git a/dspy/streaming/streamify.py b/dspy/streaming/streamify.py
+index 5376d28..af28cf3 100644
+--- a/dspy/streaming/streamify.py
++++ b/dspy/streaming/streamify.py
+@@ -14,7 +14,7 @@ from litellm import ModelResponseStream
+ 
+ from dspy.dsp.utils.settings import settings
+ from dspy.primitives.prediction import Prediction
+-from dspy.streaming.messages import StatusMessage, StatusMessageProvider, StatusStreamingCallback
++from dspy.streaming.messages import StreamResponse, StatusMessage, StatusMessageProvider, StatusStreamingCallback
+ from dspy.streaming.streaming_listener import StreamListener, find_predictor_for_stream_listeners
+ from dspy.utils.asyncify import asyncify
+ 
+@@ -172,10 +172,25 @@ def streamify(
+ 
+         await stream.send(prediction)
+ 
++    async def pump_idle_timeouts(stream: MemoryObjectSendStream):
++        timed_listeners = [listener for listener in stream_listeners if listener.idle_timeout_s is not None]
++        if not timed_listeners:
++            return
++        interval = max(min(listener.idle_timeout_s for listener in timed_listeners) / 2, 0.001)
++        while True:
++            await asyncio.sleep(interval)
++            for listener in timed_listeners:
++                response = listener.tick()
++                if response is not None:
++                    await stream.send(response)
++                    return
++
+     async def async_streamer(*args, **kwargs):
+         send_stream, receive_stream = create_memory_object_stream(16)
+         async with create_task_group() as tg, send_stream, receive_stream:
+             tg.start_soon(generator, args, kwargs, send_stream)
++            if any(listener.idle_timeout_s is not None for listener in stream_listeners):
++                tg.start_soon(pump_idle_timeouts, send_stream)
+ 
+             async for value in receive_stream:
+                 if isinstance(value, ModelResponseStream):
+@@ -193,6 +208,15 @@ def streamify(
+                             yield output
+                 elif isinstance(value, StatusMessage):
+                     yield value
++                elif isinstance(value, StreamResponse):
++                    # Timeout responses are sent by the periodic pump rather
++                    # than produced by a model chunk.
++                    yield value
++                    # A listener timeout terminates this stream invocation.
++                    # Cancel the stalled upstream program after the timeout
++                    # response has become visible to the consumer.
++                    tg.cancel_scope.cancel()
++                    return
+                 elif isinstance(value, Prediction):
+                     if include_final_prediction_in_output_stream:
+                         yield value
+@@ -202,6 +226,7 @@ def streamify(
+                         or not any(listener.stream_start for listener in stream_listeners)
+                     ):
+                         yield value
++                    tg.cancel_scope.cancel()
+                     return
+ 
+     if async_streaming:
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4ac..3c62deb 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,9 @@
++import math
+ import re
++import time
+ from collections import defaultdict
+ from queue import Queue
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, Callable
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -26,6 +28,8 @@ class StreamListener:
+         predict: Any = None,
+         predict_name: str | None = None,
+         allow_reuse: bool = False,
++        idle_timeout_s: float | None = None,
++        clock: Callable[[], float] | None = None,
+     ):
+         """
+         Args:
+@@ -36,17 +40,33 @@ class StreamListener:
+                 automatically look for the predictor that has the `signature_field_name` in its signature.
+             allow_reuse: If True, the stream listener can be reused for multiple streams. Please note that this could
+                 hurt the performance because the same stream chunk is sent to multiple listeners.
++            idle_timeout_s: If not None, the stream will be terminated if no chunks arrive within this many seconds.
++                Prevents indefinitely stuck UIs on backend stalls. If None, no timeout is applied.
++            clock: Zero-argument callable returning monotonic seconds. Defaults
++                to time.monotonic.
+         """
+         self.signature_field_name = signature_field_name
+         self.predict = predict
+         self.predict_name = predict_name
++        if idle_timeout_s is not None:
++            if (
++                isinstance(idle_timeout_s, bool)
++                or not isinstance(idle_timeout_s, (int, float))
++                or not math.isfinite(idle_timeout_s)
++                or idle_timeout_s <= 0
++            ):
++                raise ValueError("idle_timeout_s must be a positive finite number or None")
++
++        self.allow_reuse = allow_reuse
++        self.idle_timeout_s = idle_timeout_s
++        self._clock = clock or time.monotonic
+ 
+         self.field_start_queue = []
+         self.field_end_queue = Queue()
+         self.stream_start = False
+         self.stream_end = False
+         self.cache_hit = False
+-        self.allow_reuse = allow_reuse
++        self._last_chunk_ts = None
+ 
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+@@ -91,6 +111,7 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                self._last_chunk_ts = None
+             else:
+                 return
+ 
+@@ -101,6 +122,10 @@ class StreamListener:
+         except Exception:
+             return
+ 
++        # Update timestamp for idle timeout tracking when we receive non-empty chunks
++        if chunk_message and self.idle_timeout_s is not None:
++            self._last_chunk_ts = self._clock()
++
+         if chunk_message and start_identifier in chunk_message:
+             # If the cache is hit, the chunk_message could be the full response. When it happens we can
+             # directly end the stream listening. In some models like gemini, each stream chunk can be multiple
+@@ -131,6 +156,9 @@ class StreamListener:
+                 # We have a full identifier, we can start the stream.
+                 self.stream_start = True
+                 self.field_start_queue = []
++                # Initialize timestamp for idle timeout tracking
++                if self.idle_timeout_s is not None:
++                    self._last_chunk_ts = self._clock()
+                 # Keep the part after the start_identifier from the concat_message, we need to write it to the buffer.
+                 value_start_index = concat_message.find(start_identifier) + len(start_identifier)
+                 chunk_message = concat_message[value_start_index:].lstrip()
+@@ -168,6 +196,50 @@ class StreamListener:
+             if token:
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
++    def tick(self, now_ts: float | None = None) -> "StreamResponse | None":
++        """Return one empty timeout response when the active stream is idle.
++
++        ``now_ts`` uses the same monotonic time domain as the configured clock.
++        When omitted, the listener calls its clock. A timeout clears all
++        per-stream state before the response is returned.
++        """
++        # If no timeout is configured, nothing to do
++        if self.idle_timeout_s is None:
++            return None
++ 
++        # If stream hasn't started or has already ended, nothing to do
++        if not self.stream_start or self.stream_end:
++            return None
++ 
++        # If no timestamp has been set, nothing to do
++        if self._last_chunk_ts is None:
++            return None
++ 
++        current_time = now_ts if now_ts is not None else self._clock()
++ 
++        # Check if timeout has occurred
++        if current_time - self._last_chunk_ts >= self.idle_timeout_s:
++            # Timeout occurred - emit final chunk and reset state
++            timeout_response = StreamResponse(
++                self.predict_name,
++                self.signature_field_name,
++                ""  # Empty chunk
++                # Note: is_last_chunk field will be added in feature1
++            )
++ 
++            # Clear the whole per-stream state so only one timeout response can
++            # be emitted and a reusable listener starts cleanly.
++            self.stream_start = False
++            self.stream_end = False
++            self.cache_hit = False
++            self.field_start_queue = []
++            self.field_end_queue = Queue()
++            self._last_chunk_ts = None
++ 
++            return timeout_response
++ 
++        return None
++
+     def flush(self) -> str:
+         """Flush all tokens in the field end queue.
+ 

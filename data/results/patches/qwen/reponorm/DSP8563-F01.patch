@@ -1,0 +1,170 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..9199572f 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,3 +1,5 @@
++import json
++import pydantic
+ import asyncio
+ import inspect
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+@@ -261,6 +263,47 @@ class ToolCalls(Type):
+ 
+     tool_calls: list[ToolCall]
+ 
++    @pydantic.model_validator(mode="before")
++    @classmethod
++    def validate_input(cls, values: Any) -> Any:
++        """Normalize various input formats into the standard tool_calls container.
++
++        Accepts:
++            - Existing {"tool_calls": [...]} container (passes through)
++            - Single {"name": "...", "args": {...}} object (wraps in list)
++            - Bare list of objects (including empty list)
++            - Plain JSON strings representing any of the above
++            - Existing ToolCalls instance (passes through)
++
++        Returns normalized structures for model validation. Raises on malformed input.
++        """
++        # Pass through existing ToolCalls instances unchanged
++        if isinstance(values, cls):
++            return values
++
++        # Handle JSON strings by parsing them first
++        if isinstance(values, str):
++            try:
++                values = json.loads(values)
++            except (json.JSONDecodeError, ValueError):
++                # Non-JSON strings are returned unchanged and will be rejected by model validation
++                return values
++
++        # Handle single tool call object: {"name": "...", "args": {...}}
++        if isinstance(values, dict):
++            # Check if it's a single tool call (has name and args at top level)
++            if "name" in values and "args" in values:
++                return {"tool_calls": [values]}
++            # Otherwise assume it's already a {"tool_calls": [...]} container
++            return values
++
++        # Handle bare list of tool calls
++        if isinstance(values, list):
++            return {"tool_calls": values}
++
++        # For any other type, pass through and let model validation handle errors
++        return values
++
+     @classmethod
+     def from_dict_list(cls, tool_calls_dicts: list[dict[str, Any]]) -> "ToolCalls":
+         """Convert a list of dictionaries to a ToolCalls instance.
+diff --git a/tests/adapters/test_tool.py b/tests/adapters/test_tool.py
+index 18571453..b7d05e13 100644
+--- a/tests/adapters/test_tool.py
++++ b/tests/adapters/test_tool.py
+@@ -457,3 +457,107 @@ def test_tool_calls_format_from_dict_list():
+     assert len(result[0]["tool_calls"]) == 2
+     assert result[0]["tool_calls"][0]["function"]["name"] == "search"
+     assert result[0]["tool_calls"][1]["function"]["name"] == "translate"
++
++
++# Tests for ToolCalls.validate_input normalization
++@pytest.mark.parametrize(
++    "input_data,expected_names",
++    [
++        # Existing container format
++        ({"tool_calls": [{"name": "foo", "args": {"x": 1}}]}, ["foo"]),
++        # Single object
++        ({"name": "bar", "args": {"y": 2}}, ["bar"]),
++        # Bare list with one item
++        ([{"name": "baz", "args": {"z": 3}}], ["baz"]),
++        # Empty list
++        ([], []),
++        # Multiple items in bare list
++        (
++            [{"name": "first", "args": {}}, {"name": "second", "args": {}}],
++            ["first", "second"],
++        ),
++        # JSON string with single object
++        ('[{"name": "json_single", "args": {}}]', ["json_single"]),
++        # JSON string with container
++        ('{"tool_calls": [{"name": "json_container", "args": {}}]}', ["json_container"]),
++        # JSON string with bare list
++        ('[{"name": "json_list", "args": {}}]', ["json_list"]),
++        # Nested structures preserved
++        (
++            {"tool_calls": [{"name": "nested", "args": {"a": {"b": {"c": [1, 2, 3]}}}}]},
++            ["nested"],
++        ),
++        # Order preserved
++        (
++            [
++                {"name": "first", "args": {"order": 1}},
++                {"name": "second", "args": {"order": 2}},
++                {"name": "third", "args": {"order": 3}},
++            ],
++            ["first", "second", "third"],
++        ),
++    ],
++)
++def test_tool_calls_validate_input_normalization(input_data, expected_names):
++    """Test that validate_input normalizes various input formats correctly."""
++    tool_calls = ToolCalls.model_validate(input_data)
++    names = [tc.name for tc in tool_calls.tool_calls]
++    assert names == expected_names
++
++
++def test_tool_calls_validate_input_from_dict_list():
++    """Test that from_dict_list still works as before."""
++    tool_calls = ToolCalls.from_dict_list(
++        [{"name": "search", "args": {"query": "hello"}}]
++    )
++    assert len(tool_calls.tool_calls) == 1
++    assert tool_calls.tool_calls[0].name == "search"
++
++
++def test_tool_calls_validate_input_existing_instance():
++    """Test that existing ToolCalls instances are passed through unchanged."""
++    original = ToolCalls.from_dict_list([{"name": "test", "args": {}}])
++    result = ToolCalls.model_validate(original)
++    assert result is original
++
++
++def test_tool_calls_validate_input_non_json_string_rejected():
++    """Test that non-JSON strings are rejected by model validation."""
++    with pytest.raises(Exception):
++        ToolCalls.model_validate("not a json string")
++
++
++def test_tool_calls_validate_input_malformed_container():
++    """Test that malformed containers raise validation errors."""
++    # Missing 'name' field
++    with pytest.raises(Exception):
++        ToolCalls.model_validate({"tool_calls": [{"args": {"x": 1}}]})
++
++    # Missing 'args' field
++    with pytest.raises(Exception):
++        ToolCalls.model_validate({"tool_calls": [{"name": "test"}]})
++
++
++def test_tool_calls_validate_input_model_validate_json():
++    """Test that model_validate_json works with normalized inputs."""
++    json_str = '[{"name": "api_test", "args": {"key": "value"}}]'
++    tool_calls = ToolCalls.model_validate_json(json_str)
++    assert len(tool_calls.tool_calls) == 1
++    assert tool_calls.tool_calls[0].name == "api_test"
++
++
++def test_tool_calls_validate_input_format_preserved():
++    """Test that format() output schema is unchanged."""
++    data = {"tool_calls": [{"name": "test", "args": {"x": 1}}]}
++    tool_calls = ToolCalls.model_validate(data)
++    result = tool_calls.format()
++
++    # Verify the format output structure
++    assert isinstance(result, list)
++    assert len(result) == 1
++    assert result[0]["type"] == "tool_calls"
++    assert "tool_calls" in result[0]
++    assert len(result[0]["tool_calls"]) == 1
++    assert result[0]["tool_calls"][0]["type"] == "function"
++    assert result[0]["tool_calls"][0]["function"]["name"] == "test"
++    assert result[0]["tool_calls"][0]["function"]["arguments"] == {"x": 1}

@@ -1,0 +1,5 @@
+**Title:** Add translation metadata with a public extraction API
+
+A `trans` header accepts the compile-time string-literal keys `note`, `created`, and `modified` in any order with ordinary variables and whitespace modifiers. Empty and Unicode values are valid. A missing assignment, non-string value, or duplicate key raises `TemplateAssertionError` mentioning the key and reason. Metadata does not change rendering or ordinary `extract_translations` results.
+
+`Environment.extract_translations_with_metadata(source, source_name=None)` returns an iterator of independent record mappings for metadata-bearing translation blocks. Each record contains `source`, the block `lineno`, a copied `metadata` mapping, and `messages`. Each message contains the ordinary extraction `lineno`, gettext `function`, and extracted `message` value, including plural and contextual forms where applicable. Repeated extraction is stable and has no retained Environment state; callers may modify returned records without affecting later results.

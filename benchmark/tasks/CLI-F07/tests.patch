@@ -1,0 +1,223 @@
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 5bd618b..9f2cbc5 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -543,3 +543,79 @@ def test_propagate_opt_prefixes():
+     ctx = click.Context(click.Command("test2"), parent=parent)
+ 
+     assert ctx._opt_prefixes == {"-", "--", "!"}
++@pytest.mark.parametrize("factory", ["constructor", "make_context"])
++def test_nesting_public_paths_and_reuse(factory):
++    root = click.Context(click.Command("root"), validate_nesting=True)
++    released = []
++    root.call_on_close(lambda: released.append(True))
++
++    def child(name):
++        command = click.Command(name)
++        if factory == "constructor":
++            return click.Context(command, parent=root)
++        return command.make_context(name, [], parent=root)
++
++    first, second = child("first"), child("second")
++    assert first.validate_nesting and second.validate_nesting
++    with pytest.raises(RuntimeError) as caught:
++        root.close()
++    assert "first" in str(caught.value) and "second" in str(caught.value)
++    assert released == []
++    first.close()
++    with pytest.raises(RuntimeError, match="second"):
++        root.close()
++    second.close()
++    root.close()
++    assert released == [True]
++    with root:
++        with first:
++            with pytest.raises(RuntimeError, match="first"):
++                root.close()
++    assert click.get_current_context(silent=True) is None
++
++
++def test_nesting_failed_exit_restores_current_context_stack():
++    root = click.Context(click.Command("root"), validate_nesting=True)
++    child = click.Context(click.Command("child"), parent=root)
++    grandchild = click.Context(click.Command("grandchild"), parent=child)
++    with pytest.raises(RuntimeError, match="child"):
++        with root:
++            pass
++    assert click.get_current_context(silent=True) is None
++    with pytest.raises(RuntimeError, match="grandchild"):
++        child.close()
++    grandchild.close()
++    child.close()
++    root.close()
++
++
++@pytest.mark.parametrize("chain", [False, True])
++def test_nesting_actual_cli_and_completion(runner, chain):
++    from click.shell_completion import ShellComplete
++
++    @click.group(chain=chain, context_settings={"validate_nesting": True})
++    def cli():
++        pass
++
++    @cli.command()
++    @click.option("--value", default="x")
++    @click.pass_context
++    def child(ctx, value):
++        assert ctx.validate_nesting
++        click.echo(value)
++
++    assert runner.invoke(cli, ["child", "--value", "y"]).output == "y\n"
++    result = runner.invoke(cli, ["child", "--value", "y"])
++    assert result.exit_code == 0
++    complete = ShellComplete(cli, {}, "cli", "_CLI_COMPLETE")
++    assert "--value" in [
++        item.value for item in complete.get_completions(["child"], "--v")
++    ]
++
++
++def test_nesting_failed_child_parse_not_left_open():
++    root = click.Context(click.Command("root"), validate_nesting=True)
++    child = click.Command("child", params=[click.Option(["--number"], type=int)])
++    with pytest.raises(click.BadParameter):
++        child.make_context("child", ["--number", "bad"], parent=root)
++    root.close()
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index 3e7a2bd..5ea7986 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -414,3 +414,134 @@ def test_add_completion_class_decorator():
+     # Using `add_completion_class` as a decorator adds the new shell immediately
+     assert "mysh" in click.shell_completion._available_shells
+     assert click.shell_completion._available_shells["mysh"] is MyshComplete
++
++
++def test_validate_nesting_disabled():
++    """Test that validate_nesting=False allows normal context usage."""
++
++    @click.group(invoke_without_command=True)
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        pass
++
++    # Should work normally without validation
++    ctx = cli.make_context("cli", [], validate_nesting=False)
++    sub_ctx = ctx._make_sub_context(sub)
++
++    # Close parent before child - should work fine
++    ctx.close()
++    sub_ctx.close()
++
++
++def test_validate_nesting_enabled_proper_cleanup():
++    """Test that validate_nesting=True allows proper context cleanup."""
++
++    @click.group(invoke_without_command=True)
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        pass
++
++    ctx = cli.make_context("cli", [], validate_nesting=True)
++    sub_ctx = ctx._make_sub_context(sub)
++
++    # Proper cleanup order - child first, then parent
++    sub_ctx.close()
++    ctx.close()
++
++
++def test_validate_nesting_multiple_children():
++    """Test validation with multiple child contexts."""
++
++    @click.group(invoke_without_command=True)
++    def cli():
++        pass
++
++    @cli.command()
++    def sub1():
++        pass
++
++    @cli.command()
++    def sub2():
++        pass
++
++    ctx = cli.make_context("cli", [], validate_nesting=True)
++    sub_ctx1 = ctx._make_sub_context(sub1)
++    sub_ctx2 = ctx._make_sub_context(sub2)
++
++    # Try to close parent while children are open
++    with pytest.raises(RuntimeError):
++        ctx.close()
++
++    # Close one child
++    sub_ctx1.close()
++
++    # Still should fail with one child open
++    with pytest.raises(RuntimeError):
++        ctx.close()
++
++    # Close second child
++    sub_ctx2.close()
++
++    # Now parent should close successfully
++    ctx.close()
++
++
++def test_validate_nesting_inheritance():
++    """Test that validate_nesting is inherited by child contexts."""
++
++    @click.group(invoke_without_command=True)
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        pass
++
++    @cli.command()
++    def subsub():
++        pass
++
++    # Parent with validation enabled
++    ctx = cli.make_context("cli", [], validate_nesting=True)
++    sub_ctx = ctx._make_sub_context(sub)
++
++    # Grandchild should inherit validation
++    assert sub_ctx.validate_nesting is True
++
++    subsub_ctx = sub_ctx._make_sub_context(subsub)
++    assert subsub_ctx.validate_nesting is True
++
++    # Try to close middle context while grandchild is open
++    with pytest.raises(RuntimeError):
++        sub_ctx.close()
++
++    # Clean up properly
++    subsub_ctx.close()
++    sub_ctx.close()
++    ctx.close()
++
++
++def test_validate_nesting_context_manager():
++    """Test validation with context managers."""
++
++    @click.group(invoke_without_command=True)
++    def cli():
++        pass
++
++    @cli.command()
++    def sub():
++        pass
++
++    ctx = cli.make_context("cli", [], validate_nesting=True)
++
++    # Using context manager should work properly
++    with ctx:
++        sub_ctx = ctx._make_sub_context(sub)
++        with sub_ctx:
++            pass  # Both contexts will be cleaned up properly

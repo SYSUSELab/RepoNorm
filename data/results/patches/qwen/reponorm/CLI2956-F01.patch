@@ -1,0 +1,589 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..a619297 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2027,6 +2027,13 @@ class Parameter:
+                         its deprecation in --help. The message can be customized
+                         by using a string as the value. A deprecated parameter
+                         cannot be required, a ValueError will be raised otherwise.
++    :param auto_complete: Enable automatic shell completion. If ``True``,
++        automatically determine the completion strategy based on the option
++        name. If a string, use the specified strategy (e.g., "user", "branch",
++        "environment", "file", "directory"). See :meth:`shell_complete` for
++        details on available strategies.
++
++    .. versionadded:: 8.3
+ 
+     .. versionchanged:: 8.2.0
+         Introduction of ``deprecated``.
+@@ -2091,6 +2098,7 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        auto_complete: bool | str = False,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2118,6 +2126,22 @@ class Parameter:
+         self.metavar = metavar
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
++        
++        # Validate and store auto_complete strategy
++        if isinstance(auto_complete, bool):
++            self._auto_complete_strategy = auto_complete
++        elif isinstance(auto_complete, str):
++            valid_strategies = {"user", "branch", "environment", "file", "directory"}
++            if auto_complete not in valid_strategies:
++                raise ValueError(
++                    f"Invalid auto_complete strategy {auto_complete!r}. "
++                    f"Valid strategies are: {', '.join(sorted(valid_strategies))}"
++                )
++            self._auto_complete_strategy = auto_complete
++        else:
++            raise TypeError(
++                f"auto_complete must be a boolean or string, not {auto_complete.__class__.__name__}"
++            )
+         self.deprecated = deprecated
+ 
+         if __debug__:
+@@ -2205,6 +2229,14 @@ class Parameter:
+         """
+         return self.name  # type: ignore
+ 
++    @property
++    def auto_complete(self) -> bool | str:
++        """The auto_complete setting for this parameter.
++        
++        .. versionadded:: 8.3
++        """
++        return self._auto_complete_strategy
++
+     def make_metavar(self, ctx: Context) -> str:
+         if self.metavar is not None:
+             return self.metavar
+@@ -2441,14 +2473,18 @@ class Parameter:
+     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
+         """Return a list of completions for the incomplete value. If a
+         ``shell_complete`` function was given during init, it is used.
+-        Otherwise, the :attr:`type`
++        Otherwise, if :attr:`auto_complete` is enabled, use automatic
++        completion based on the option name. Otherwise, the :attr:`type`
+         :meth:`~click.types.ParamType.shell_complete` function is used.
+ 
+         :param ctx: Invocation context for this command.
+         :param incomplete: Value being completed. May be empty.
+ 
+         .. versionadded:: 8.0
++        .. versionchanged:: 8.3
++            Added support for :attr:`auto_complete`.
+         """
++        # Explicit shell_complete callback always takes precedence
+         if self._custom_shell_complete is not None:
+             results = self._custom_shell_complete(ctx, self, incomplete)
+ 
+@@ -2459,6 +2495,13 @@ class Parameter:
+ 
+             return t.cast("list[CompletionItem]", results)
+ 
++        # Check for auto_complete strategy
++        from .shell_completion import _get_auto_complete_strategy
++        
++        auto_results = _get_auto_complete_strategy(self, incomplete)
++        if auto_results is not None:
++            return auto_results
++
+         return self.type.shell_complete(ctx, self, incomplete)
+ 
+ 
+@@ -2549,6 +2592,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        auto_complete: bool | str = False,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2556,7 +2600,8 @@ class Option(Parameter):
+ 
+         default_is_missing = "default" not in attrs
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls, type=type, multiple=multiple, deprecated=deprecated, 
++            auto_complete=auto_complete, **attrs
+         )
+ 
+         if prompt is True:
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 6c39d5e..b5ac12e 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -91,6 +91,228 @@ class CompletionItem:
+         return self._info.get(name)
+ 
+ 
++def _get_auto_complete_strategy(
++    param: Parameter, incomplete: str
++) -> list[CompletionItem] | None:
++    """Determine if auto-completion should be used based on the parameter name.
++    
++    Returns a list of CompletionItems if auto-completion is applicable,
++    or None if it should fall back to normal completion.
++    """
++    strategy = param.auto_complete
++    
++    # If False, no auto-completion
++    if strategy is False:
++        return None
++    
++    # If True, determine strategy from option name
++    if strategy is True:
++        name = param.name
++        if name is None:
++            return None
++        
++        tokens = name.split("_")
++        
++        # Check for username-related tokens
++        username_tokens = {"user", "username", "owner", "author"}
++        if any(token in username_tokens for token in tokens):
++            return _complete_username(incomplete)
++        
++        # Check for branch/ref/revision tokens
++        branch_tokens = {"branch", "ref", "revision", "rev"}
++        if any(token in branch_tokens for token in tokens):
++            return _complete_branch(incomplete)
++        
++        # Check for environment tokens
++        env_tokens = {"env", "environment"}
++        if any(token in env_tokens for token in tokens):
++            return _complete_environment(incomplete)
++        
++        # Check for directory tokens first (more specific than path)
++        dir_tokens = {"dir", "directory"}
++        if any(token in dir_tokens for token in tokens):
++            return _complete_directory(incomplete)
++        
++        # Check for path-related tokens
++        path_tokens = {"path", "input", "output", "file"}
++        if any(token in path_tokens for token in tokens):
++            return _complete_path(incomplete)
++        
++        # No matching strategy found
++        return None
++    
++    # If string, use explicit strategy
++    if isinstance(strategy, str):
++        if strategy == "user":
++            return _complete_username(incomplete)
++        elif strategy == "branch":
++            return _complete_branch(incomplete)
++        elif strategy == "environment":
++            return _complete_environment(incomplete)
++        elif strategy == "file":
++            return _complete_path(incomplete)
++        elif strategy == "directory":
++            return _complete_directory(incomplete)
++    
++    return None
++
++
++def _complete_username(incomplete: str) -> list[CompletionItem]:
++    """Complete usernames from the system password database."""
++    try:
++        import pwd
++        
++        results = []
++        for entry in pwd.getpwall():
++            username = entry.pw_name
++            # Exclude usernames starting with underscore
++            if username.startswith("_"):
++                continue
++            
++            if username.startswith(incomplete):
++                results.append(CompletionItem(username))
++        
++        # Sort and limit to 20 results
++        results.sort(key=lambda x: x.value)
++        return results[:20]
++    except (ImportError, OSError, KeyError):
++        # Fallback to empty list if pwd module unavailable
++        return []
++
++
++def _complete_branch(incomplete: str) -> list[CompletionItem]:
++    """Complete Git branch names."""
++    import subprocess
++    
++    try:
++        result = subprocess.run(
++            ["git", "branch", "-a"],
++            capture_output=True,
++            text=True,
++            timeout=5,
++        )
++        
++        if result.returncode != 0:
++            return []
++        
++        branches = set()
++        for line in result.stdout.splitlines():
++            # Remove leading asterisk for current branch indicator
++            branch = line.lstrip("* ").lstrip()
++            # Remove remote tracking suffixes
++            if "/" in branch:
++                branch = branch.split("/")[-1]
++            # Skip empty lines and comments
++            if branch and not branch.startswith("#"):
++                branches.add(branch)
++        
++        # Filter by incomplete prefix
++        results = [
++            CompletionItem(branch)
++            for branch in sorted(branches)
++            if branch.startswith(incomplete)
++        ]
++        
++        return results[:20]
++    except (subprocess.SubprocessError, OSError, ValueError):
++        # Fallback to empty list if git command fails
++        return []
++
++
++def _complete_environment(incomplete: str) -> list[CompletionItem]:
++    """Complete environment variable names."""
++    import os
++    
++    env_vars = os.environ.keys()
++    results = [
++        CompletionItem(var)
++        for var in sorted(env_vars)
++        if var.startswith(incomplete)
++    ]
++    
++    return results[:20]
++
++
++def _complete_path(incomplete: str) -> list[CompletionItem]:
++    """Complete file paths using Path completion."""
++    from pathlib import Path
++    
++    # Handle tilde expansion
++    if incomplete.startswith("~"):
++        home = str(Path.home())
++        incomplete = incomplete.replace("~", home, 1)
++    
++    # Use Path's glob-like completion
++    path = Path(incomplete)
++    
++    # If incomplete ends with separator, complete directories/files at that level
++    if incomplete.endswith(os.sep) or incomplete.endswith("/"):
++        try:
++            matches = list(path.glob("*"))
++        except (OSError, ValueError):
++            return []
++    else:
++        # Try to match partial paths
++        try:
++            parent = path.parent
++            stem = path.name
++            if parent.exists():
++                matches = [p for p in parent.iterdir() if p.name.startswith(stem)]
++            else:
++                return []
++        except (OSError, ValueError):
++            return []
++    
++    results = []
++    for match in matches:
++        # Add trailing slash for directories
++        suffix = os.sep if match.is_dir() else ""
++        value = str(match.relative_to(Path.cwd())) if match.is_absolute() else str(match)
++        results.append(CompletionItem(value + suffix))
++    
++    # Sort and limit results
++    results.sort(key=lambda x: x.value)
++    return results[:20]
++
++
++def _complete_directory(incomplete: str) -> list[CompletionItem]:
++    """Complete directory paths only."""
++    from pathlib import Path
++    
++    # Handle tilde expansion
++    if incomplete.startswith("~"):
++        home = str(Path.home())
++        incomplete = incomplete.replace("~", home, 1)
++    
++    path = Path(incomplete)
++    
++    # Only complete directories
++    try:
++        if incomplete.endswith(os.sep) or incomplete.endswith("/"):
++            matches = list(path.glob("*"))
++        else:
++            parent = path.parent
++            stem = path.name
++            if parent.exists():
++                matches = [p for p in parent.iterdir() if p.name.startswith(stem)]
++            else:
++                return []
++    except (OSError, ValueError):
++        return []
++    
++    results = []
++    for match in matches:
++        if match.is_dir():
++            # Add trailing slash for directories
++            suffix = os.sep
++            value = str(match.relative_to(Path.cwd())) if match.is_absolute() else str(match)
++            results.append(CompletionItem(value + suffix))
++    
++    # Sort and limit results
++    results.sort(key=lambda x: x.value)
++    return results[:20]
++
++
+ # Only Bash >= 4.4 has the nosort option.
+ _SOURCE_BASH = """\
+ %(complete_func)s() {
+diff --git a/tests/test_shell_completion.py b/tests/test_shell_completion.py
+index fb39486..fc7bdbc 100644
+--- a/tests/test_shell_completion.py
++++ b/tests/test_shell_completion.py
+@@ -470,3 +470,235 @@ def test_files_closed(runner) -> None:
+             assert not current_warnings, "There should be no warnings to start"
+             _get_completions(cli, args=[], incomplete="")
+             assert not current_warnings, "There should be no warnings after either"
++
++
++# Tests for auto_complete feature
++def test_auto_complete_invalid_type(runner) -> None:
++    """Test that non-boolean/non-string auto_complete raises TypeError."""
++    with pytest.raises(TypeError, match="auto_complete must be a boolean or string"):
++        @click.command()
++        @click.option("--test", type=str, auto_complete=123)  # type: ignore
++        def cli(test):
++            pass
++
++
++def test_auto_complete_invalid_string(runner) -> None:
++    """Test that invalid auto_complete string raises ValueError."""
++    with pytest.raises(ValueError, match="Invalid auto_complete strategy"):
++        @click.command()
++        @click.option("--test", type=str, auto_complete="invalid")
++        def cli(test):
++            pass
++
++
++def test_auto_complete_true_name_based_user(runner) -> None:
++    """Test auto_complete=True with username-related option name."""
++    @click.command()
++    @click.option("--username", type=str, auto_complete=True)
++    def cli(username):
++        pass
++
++    completions = _get_completions(cli, args=["--username"], incomplete="")
++    # Should return usernames (may be empty if pwd not available)
++    assert len(completions) >= 0  # May be empty on some systems
++
++
++def test_auto_complete_true_name_based_branch(runner) -> None:
++    """Test auto_complete=True with branch-related option name."""
++    @click.command()
++    @click.option("--branch", type=str, auto_complete=True)
++    def cli(branch):
++        pass
++
++    completions = _get_completions(cli, args=["--branch"], incomplete="")
++    # Should return git branches (may be empty outside git repo)
++    assert len(completions) >= 0
++
++
++def test_auto_complete_true_name_based_environment(runner) -> None:
++    """Test auto_complete=True with environment-related option name."""
++    @click.command()
++    @click.option("--environment", type=str, auto_complete=True)
++    def cli(environment):
++        pass
++
++    completions = _get_completions(cli, args=["--environment"], incomplete="H")
++    # Should return environment variables starting with H
++    assert len(completions) > 0
++    for c in completions:
++        assert c.value.startswith("H")
++
++
++def test_auto_complete_true_name_based_file(runner) -> None:
++    """Test auto_complete=True with file-related option name."""
++    @click.command()
++    @click.option("--input-file", type=str, auto_complete=True)
++    def cli(input_file):
++        pass
++
++    completions = _get_completions(cli, args=["--input-file"], incomplete=".")
++    # Should return files/directories starting with .
++    assert len(completions) > 0
++
++
++def test_auto_complete_true_name_based_directory(runner) -> None:
++    """Test auto_complete=True with directory-related option name."""
++    @click.command()
++    @click.option("--output-dir", type=str, auto_complete=True)
++    def cli(output_dir):
++        pass
++
++    completions = _get_completions(cli, args=["--output-dir"], incomplete=".")
++    # Should return directories only
++    assert len(completions) > 0
++    for c in completions:
++        assert c.value.endswith("/")
++
++
++def test_auto_complete_explicit_user(runner) -> None:
++    """Test explicit auto_complete='user' strategy."""
++    @click.command()
++    @click.option("--myuser", type=str, auto_complete="user")
++    def cli(myuser):
++        pass
++
++    completions = _get_completions(cli, args=["--myuser"], incomplete="")
++    # Should return usernames
++    assert len(completions) >= 0
++
++
++def test_auto_complete_explicit_branch(runner) -> None:
++    """Test explicit auto_complete='branch' strategy."""
++    @click.command()
++    @click.option("--myref", type=str, auto_complete="branch")
++    def cli(myref):
++        pass
++
++    completions = _get_completions(cli, args=["--myref"], incomplete="")
++    # Should return git branches
++    assert len(completions) >= 0
++
++
++def test_auto_complete_explicit_environment(runner) -> None:
++    """Test explicit auto_complete='environment' strategy."""
++    @click.command()
++    @click.option("--myenv", type=str, auto_complete="environment")
++    def cli(myenv):
++        pass
++
++    completions = _get_completions(cli, args=["--myenv"], incomplete="P")
++    # Should return environment variables starting with P
++    assert len(completions) > 0
++    for c in completions:
++        assert c.value.startswith("P")
++
++
++def test_auto_complete_explicit_file(runner) -> None:
++    """Test explicit auto_complete='file' strategy."""
++    @click.command()
++    @click.option("--myfile", type=str, auto_complete="file")
++    def cli(myfile):
++        pass
++
++    completions = _get_completions(cli, args=["--myfile"], incomplete=".")
++    # Should return files and directories
++    assert len(completions) > 0
++
++
++def test_auto_complete_explicit_directory(runner) -> None:
++    """Test explicit auto_complete='directory' strategy."""
++    @click.command()
++    @click.option("--mydir", type=str, auto_complete="directory")
++    def cli(mydir):
++        pass
++
++    completions = _get_completions(cli, args=["--mydir"], incomplete=".")
++    # Should return directories only
++    assert len(completions) > 0
++    for c in completions:
++        assert c.value.endswith("/")
++
++
++def test_auto_complete_false_no_completion(runner) -> None:
++    """Test auto_complete=False uses normal completion."""
++    @click.command()
++    @click.option("--test", type=click.Choice(["a", "b", "c"]), auto_complete=False)
++    def cli(test):
++        pass
++
++    completions = _get_completions(cli, args=["--test"], incomplete="")
++    # Should use Choice completion
++    assert len(completions) == 3
++    values = [c.value for c in completions]
++    assert set(values) == {"a", "b", "c"}
++
++
++def test_auto_complete_custom_callback_takes_precedence(runner) -> None:
++    """Test that custom shell_complete callback takes precedence over auto_complete."""
++    def custom_complete(ctx, param, incomplete):
++        return ["custom1", "custom2"]
++
++    @click.command()
++    @click.option("--test", type=str, auto_complete="user", shell_complete=custom_complete)
++    def cli(test):
++        pass
++
++    completions = _get_completions(cli, args=["--test"], incomplete="")
++    # Should use custom completion, not username completion
++    assert len(completions) == 2
++    values = [c.value for c in completions]
++    assert values == ["custom1", "custom2"]
++
++
++def test_auto_complete_username_excludes_underscore_prefix(runner) -> None:
++    """Test that username completion excludes names starting with underscore."""
++    @click.command()
++    @click.option("--user", type=str, auto_complete="user")
++    def cli(user):
++        pass
++
++    completions = _get_completions(cli, args=["--user"], incomplete="_")
++    # Should not return any usernames starting with _
++    for c in completions:
++        assert not c.value.startswith("_")
++
++
++def test_auto_complete_limit_20_results(runner) -> None:
++    """Test that completion results are limited to 20 items."""
++    @click.command()
++    @click.option("--env", type=str, auto_complete="environment")
++    def cli(env):
++        pass
++
++    completions = _get_completions(cli, args=["--env"], incomplete="")
++    # Should be limited to 20 results
++    assert len(completions) <= 20
++
++
++def test_auto_complete_sorted_unique(runner) -> None:
++    """Test that completion results are sorted and unique."""
++    @click.command()
++    @click.option("--env", type=str, auto_complete="environment")
++    def cli(env):
++        pass
++
++    completions = _get_completions(cli, args=["--env"], incomplete="")
++    values = [c.value for c in completions]
++    # Should be sorted
++    assert values == sorted(values)
++    # Should be unique
++    assert len(values) == len(set(values))
++
++
++def test_auto_complete_unknown_name_fallback(runner) -> None:
++    """Test that unknown option names fall back to normal completion."""
++    @click.command()
++    @click.option("--randomname", type=click.Choice(["x", "y", "z"]), auto_complete=True)
++    def cli(randomname):
++        pass
++
++    completions = _get_completions(cli, args=["--randomname"], incomplete="")
++    # Should use Choice completion since no matching tokens
++    assert len(completions) == 3
++    values = [c.value for c in completions]
++    assert set(values) == {"x", "y", "z"}

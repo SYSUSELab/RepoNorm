@@ -1,0 +1,103 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..9e7e022 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2091,6 +2091,8 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        validators: cabc.Sequence[t.Callable[[Context, Parameter, t.Any], t.Any]]
++        | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2121,7 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.validators = validators
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2126,6 +2129,15 @@ class Parameter:
+                     f"'nargs' must be {self.type.arity} (or None) for"
+                     f" type {self.type!r}, but it was {nargs}."
+                 )
++            # Validate validators
++            if validators is not None:
++                if isinstance(validators, str):
++                    raise TypeError("'validators' must be a sequence, not a string.")
++                for i, v in enumerate(validators):
++                    if not callable(v):
++                        raise TypeError(
++                            f"'validators[{i}]' must be callable, got {v!r}."
++                        )
+ 
+             # Skip no default or callable default.
+             check_default = default if not callable(default) else None
+@@ -2345,8 +2357,43 @@ class Parameter:
+ 
+         return False
+ 
++    def _type_cast_value_only(self, ctx: Context, value: t.Any) -> t.Any:
++        """Type cast value without running callback or validators.
++        
++        Used by prompt_for_value to avoid double-processing when
++        handle_parse_result also calls process_value.
++        """
++        return self.type_cast_value(ctx, value)
++
++    def _process_value_for_prompt(self, ctx: Context, value: t.Any) -> t.Any:
++        """Process value for prompt, catching BadParameter to enable retry.
++        
++        This runs type casting, callback, and validators, catching BadParameter
++        exceptions so the prompt retry mechanism can handle them properly.
++        """
++        try:
++            # Type cast the value
++            value = self._type_cast_value_only(ctx, value)
++            
++            # Run callback if present
++            if self.callback is not None:
++                value = self.callback(ctx, self, value)
++            
++            # Run validators if present
++            if self.validators is not None:
++                for validator in self.validators:
++                    value = validator(ctx, self, value)
++            
++            return value
++        except BadParameter as e:
++            if e.ctx is None:
++                e.ctx = ctx
++            if e.param is None:
++                e.param = self
++            raise
++
+     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
+-        value = self.type_cast_value(ctx, value)
++        value = self._type_cast_value_only(ctx, value)
+ 
+         if self.required and self.value_is_missing(value):
+             raise MissingParameter(ctx=ctx, param=self)
+@@ -2354,6 +2401,11 @@ class Parameter:
+         if self.callback is not None:
+             value = self.callback(ctx, self, value)
+ 
++        # Skip validators if value came from prompt (already validated)
++        source = ctx.get_parameter_source(self.name)
++        if self.validators is not None and source != ParameterSource.PROMPT:
++            for validator in self.validators:
++                value = validator(ctx, self, value)
+         return value
+ 
+     def resolve_envvar_value(self, ctx: Context) -> str | None:
+@@ -2954,7 +3006,7 @@ class Option(Parameter):
+             hide_input=self.hide_input,
+             show_choices=self.show_choices,
+             confirmation_prompt=self.confirmation_prompt,
+-            value_proc=lambda x: self.process_value(ctx, x),
++            value_proc=lambda x: self._process_value_for_prompt(ctx, x),
+             **prompt_kwargs,
+         )
+ 

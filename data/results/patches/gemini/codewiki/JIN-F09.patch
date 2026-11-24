@@ -1,0 +1,1672 @@
+diff --git a/apply_fix_v2.py b/apply_fix_v2.py
+new file mode 100644
+index 0000000..2e07597
+--- /dev/null
++++ b/apply_fix_v2.py
+@@ -0,0 +1,160 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start and end of sync_do_groupby and do_groupby
++start_idx = -1
++end_idx = -1
++for i, line in enumerate(lines):
++    if '@pass_environment' in line and 'def sync_do_groupby' in lines[i+1]:
++        start_idx = i
++    if 'def sync_do_sum(' in line:
++        end_idx = i
++        break
++
++print(f"Replacing from {start_idx} to {end_idx}")
++
++new_code = """@pass_environment
++def sync_do_groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    \"\"\"Group a sequence of objects by an attribute using Python's
++    :func:`itertools.groupby`. The attribute can use dot notation for
++    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
++    the values are sorted first so only one group is returned for each
++    unique value.
++
++    For example, a list of ``User`` objects with a ``city`` attribute
++    can be rendered in groups. In this example, ``grouper`` refers to
++    the ``city`` value of the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items in users|groupby("city") %}
++          <li>{{ city }}
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    ``groupby`` yields namedtuples of ``(grouper, list)``, which
++    can be used instead of the tuple unpacking above. ``grouper`` is the
++    value of the attribute, and ``list`` is the items with that value.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for group in users|groupby("city") %}
++          <li>{{ group.grouper }}: {{ group.list|join(", ") }}
++        {% endfor %}</ul>
++
++    You can specify a ``default`` value to use if an object in the list
++    does not have the given attribute.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", default="NY") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
++    .. versionchanged:: 2.6
++        The attribute supports dot notation for nested access.
++    \"\"\"
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(value, attributes)
++
++
++@async_variant(sync_do_groupby)  # type: ignore
++async def do_groupby(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return await auto_to_list(items)
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = await auto_to_list(items)
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
++
++
++"""
++
++new_lines = lines[:start_idx] + [new_code] + lines[end_idx:]
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/edit_filters.py b/edit_filters.py
+new file mode 100644
+index 0000000..c75c892
+--- /dev/null
++++ b/edit_filters.py
+@@ -0,0 +1,178 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start and end of sync_do_groupby
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.startswith('def sync_do_groupby('):
++        start_line = i
++    if line.startswith('@async_variant(sync_do_groupby)'):
++        end_line = i
++        break
++
++# Replace the function
++new_function = """def sync_do_groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    \"\"\"Group a sequence of objects by an attribute using Python's
++    :func:`itertools.groupby`. The attribute can use dot notation for
++    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
++    the values are sorted first so only one group is returned for each
++    unique value.
++
++    For example, a list of ``User`` objects with a ``city`` attribute
++    can be rendered in groups. In this example, ``grouper`` refers to
++    the ``city`` value of the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items in users|groupby("city") %}
++          <li>{{ city }}
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    ``groupby`` yields namedtuples of ``(grouper, list)``, which
++    can be used instead of the tuple unpacking above. ``grouper`` is the
++    value of the attribute, and ``list`` is the items with that value.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for group in users|groupby("city") %}
++          <li>{{ group.grouper }}: {{ group.list|join(", ") }}
++        {% endfor %}</ul>
++
++    You can specify a ``default`` value to use if an object in the list
++    does not have the given attribute.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", default="NY") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
++    .. versionchanged:: 2.6
++        The attribute supports dot notation for nested access.
++    \"\"\"
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(value, attributes)
++"""
++
++# Find the start and end of do_groupby
++do_start_line = -1
++do_end_line = -1
++for i, line in enumerate(lines):
++    if line.startswith('async def do_groupby('):
++        do_start_line = i
++    if line.startswith('    "groupby": do_groupby,'):
++        do_end_line = i
++        break
++
++# Replace the async function
++new_async_function = """async def do_groupby(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(await auto_to_list(items), key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
++"""
++
++# Apply changes
++new_lines = lines[:start_line] + [new_function + "\n"] + lines[end_line:]
++# Now find the new do_groupby start and end
++for i, line in enumerate(new_lines):
++    if line.startswith('async def do_groupby('):
++        do_start_line = i
++    if line.startswith('    "groupby": do_groupby,'):
++        do_end_line = i
++        break
++# This is tricky because the line numbers changed.
++# Let's just replace the whole block from @async_variant(sync_do_groupby) to the end of do_groupby
++# Actually, I can just replace the whole file content.
++
++# Let's just do it in two steps.
++# First, replace sync_do_groupby.
++# Then, replace do_groupby.
+diff --git a/edit_filters_v2.py b/edit_filters_v2.py
+new file mode 100644
+index 0000000..119526c
+--- /dev/null
++++ b/edit_filters_v2.py
+@@ -0,0 +1,178 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start and end of sync_do_groupby
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.startswith('def sync_do_groupby('):
++        start_line = i
++    if line.startswith('@async_variant(sync_do_groupby)'):
++        end_line = i
++        break
++
++# Replace the function
++new_function = """def sync_do_groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    \"\"\"Group a sequence of objects by an attribute using Python's
++    :func:`itertools.groupby`. The attribute can use dot notation for
++    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
++    the values are sorted first so only one group is returned for each
++    unique value.
++
++    For example, a list of ``User`` objects with a ``city`` attribute
++    can be rendered in groups. In this example, ``grouper`` refers to
++    the ``city`` value of the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items in users|groupby("city") %}
++          <li>{{ city }}
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    ``groupby`` yields namedtuples of ``(grouper, list)``, which
++    can be used instead of the tuple unpacking above. ``grouper`` is the
++    value of the attribute, and ``list`` is the items with that value.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for group in users|groupby("city") %}
++          <li>{{ group.grouper }}: {{ group.list|join(", ") }}
++        {% endfor %}</ul>
++
++    You can specify a ``default`` value to use if an object in the list
++    does not have the given attribute.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", default="NY") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
++    .. versionchanged:: 2.6
++        The attribute supports dot notation for nested access.
++    \"\"\"
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(value, attributes)
++"""
++
++# Find the start and end of do_groupby
++do_start_line = -1
++do_end_line = -1
++for i, line in enumerate(lines):
++    if line.startswith('@async_variant(sync_do_groupby)'):
++        do_start_line = i
++    if line.startswith('    "groupby": do_groupby,'):
++        # This is not the end of the function, but the end of the block I want to replace
++        # Actually, I need to find the end of do_groupby.
++        # Let's look for the next function definition.
++        pass
++
++# Let's just find the end of do_groupby by looking for the next function definition
++for i in range(do_start_line + 1, len(lines)):
++    if lines[i].startswith('def '):
++        do_end_line = i
++        break
++
++# Replace the async function
++new_async_function = """@async_variant(sync_do_groupby)  # type: ignore
++async def do_groupby(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(await auto_to_list(items), key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
++"""
++
++# Apply changes
++# We need to be careful with the order of replacement.
++# Let's replace from start_line to do_end_line.
++new_lines = lines[:start_line] + [new_function + "\n"] + [new_async_function + "\n"] + lines[do_end_line:]
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/edit_filters_v3.py b/edit_filters_v3.py
+new file mode 100644
+index 0000000..0f9756a
+--- /dev/null
++++ b/edit_filters_v3.py
+@@ -0,0 +1,165 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start and end of sync_do_groupby
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.startswith('@pass_environment'):
++        # Check if the next line is sync_do_groupby
++        if i + 1 < len(lines) and lines[i+1].startswith('def sync_do_groupby('):
++            start_line = i
++    if line.startswith('@async_variant(sync_do_groupby)'):
++        # Find the end of do_groupby
++        # It ends before the next function definition
++        for j in range(i + 1, len(lines)):
++            if lines[j].startswith('def '):
++                end_line = j
++                break
++        break
++
++# Replace the functions
++new_functions = """@pass_environment
++def sync_do_groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    \"\"\"Group a sequence of objects by an attribute using Python's
++    :func:`itertools.groupby`. The attribute can use dot notation for
++    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
++    the values are sorted first so only one group is returned for each
++    unique value.
++
++    For example, a list of ``User`` objects with a ``city`` attribute
++    can be rendered in groups. In this example, ``grouper`` refers to
++    the ``city`` value of the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items in users|groupby("city") %}
++          <li>{{ city }}
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    ``groupby`` yields namedtuples of ``(grouper, list)``, which
++    can be used instead of the tuple unpacking above. ``grouper`` is the
++    value of the attribute, and ``list`` is the items with that value.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for group in users|groupby("city") %}
++          <li>{{ group.grouper }}: {{ group.list|join(", ") }}
++        {% endfor %}</ul>
++
++    You can specify a ``default`` value to use if an object in the list
++    does not have the given attribute.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", default="NY") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
++    .. versionchanged:: 2.6
++        The attribute supports dot notation for nested access.
++    \"\"\"
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(value, attributes)
++
++
++@async_variant(sync_do_groupby)  # type: ignore
++async def do_groupby(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(await auto_to_list(items), key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
++"""
++
++# Apply changes
++new_lines = lines[:start_line] + [new_functions + "\n"] + lines[end_line:]
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/edit_filters_v4.py b/edit_filters_v4.py
+new file mode 100644
+index 0000000..0f9756a
+--- /dev/null
++++ b/edit_filters_v4.py
+@@ -0,0 +1,165 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++# Find the start and end of sync_do_groupby
++start_line = -1
++end_line = -1
++for i, line in enumerate(lines):
++    if line.startswith('@pass_environment'):
++        # Check if the next line is sync_do_groupby
++        if i + 1 < len(lines) and lines[i+1].startswith('def sync_do_groupby('):
++            start_line = i
++    if line.startswith('@async_variant(sync_do_groupby)'):
++        # Find the end of do_groupby
++        # It ends before the next function definition
++        for j in range(i + 1, len(lines)):
++            if lines[j].startswith('def '):
++                end_line = j
++                break
++        break
++
++# Replace the functions
++new_functions = """@pass_environment
++def sync_do_groupby(
++    environment: "Environment",
++    value: "t.Iterable[V]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    \"\"\"Group a sequence of objects by an attribute using Python's
++    :func:`itertools.groupby`. The attribute can use dot notation for
++    nested access, like ``"address.city"``. Unlike Python's ``groupby``,
++    the values are sorted first so only one group is returned for each
++    unique value.
++
++    For example, a list of ``User`` objects with a ``city`` attribute
++    can be rendered in groups. In this example, ``grouper`` refers to
++    the ``city`` value of the group.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items in users|groupby("city") %}
++          <li>{{ city }}
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    ``groupby`` yields namedtuples of ``(grouper, list)``, which
++    can be used instead of the tuple unpacking above. ``grouper`` is the
++    value of the attribute, and ``list`` is the items with that value.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for group in users|groupby("city") %}
++          <li>{{ group.grouper }}: {{ group.list|join(", ") }}
++        {% endfor %}</ul>
++
++    You can specify a ``default`` value to use if an object in the list
++    does not have the given attribute.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for city, items in users|groupby("city", default="NY") %}
++          <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
++    .. versionchanged:: 2.6
++        The attribute supports dot notation for nested access.
++    \"\"\"
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(value, attributes)
++
++
++@async_variant(sync_do_groupby)  # type: ignore
++async def do_groupby(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(await auto_to_list(items), key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
++"""
++
++# Apply changes
++new_lines = lines[:start_line] + [new_functions + "\n"] + lines[end_line:]
++
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/fix_do_groupby.py b/fix_do_groupby.py
+new file mode 100644
+index 0000000..b0a6fc2
+--- /dev/null
++++ b/fix_do_groupby.py
+@@ -0,0 +1,57 @@
++import sys
++
++with open('src/jinja2/filters.py', 'r') as f:
++    lines = f.readlines()
++
++start_idx = 1252 - 1 # 0-indexed
++end_idx = 1298 - 1 # 0-indexed
++
++new_do_groupby = """async def do_groupby(
++    environment: "Environment",
++    value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
++    attribute: t.Union[str, int, t.List[str]],
++    default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
++) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return await auto_to_list(items)
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = await auto_to_list(items)
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
++"""
++
++new_lines = lines[:start_idx] + [new_do_groupby + "\n"] + lines[end_idx:]
++with open('src/jinja2/filters.py', 'w') as f:
++    f.writelines(new_lines)
+diff --git a/reproduce_groupby.py b/reproduce_groupby.py
+new file mode 100644
+index 0000000..0314ccb
+--- /dev/null
++++ b/reproduce_groupby.py
+@@ -0,0 +1,30 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++# Current behavior
++result = sync_do_groupby(env, items, 'department')
++print("Group by department:")
++for grouper, group in result:
++    print(f"  {grouper}: {group}")
++
++# Expected behavior (hypothetical)
++# result = sync_do_groupby(env, items, ['department', 'role'], levels=2)
++# print("\nGroup by department, role:")
++# ...
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..23f2c76 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1157,12 +1157,14 @@ class _GroupTuple(t.NamedTuple):
+         return tuple.__str__(self)
+ 
+ 
++@pass_environment
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.List[str]],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1209,25 +1211,88 @@ def sync_do_groupby(
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
+-
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(value, attributes)
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.List[str]],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    async def _recursive_groupby(items, attrs):
++        if not attrs:
++            return await auto_to_list(items)
++        
++        attr = attrs[0]
++        expr = make_attrgetter(environment, attr, default=default)
++        
++        # Sort by the current attribute
++        items = await auto_to_list(items)
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, await _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return await _recursive_groupby(value, attributes)
+ 
+ 
+ @pass_environment
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 0000000..e104064
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,52 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++from jinja2.exceptions import FilterArgumentError
++import pytest
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++# Test invalid levels
++try:
++    sync_do_groupby(env, items, 'department, role', levels=0)
++except FilterArgumentError as e:
++    print("Caught expected error (levels=0):", e)
++
++try:
++    sync_do_groupby(env, items, 'department, role', levels=-1)
++except FilterArgumentError as e:
++    print("Caught expected error (levels=-1):", e)
++
++# Test mismatched attribute counts
++try:
++    sync_do_groupby(env, items, 'department', levels=2)
++except FilterArgumentError as e:
++    print("Caught expected error (mismatched counts):", e)
++
++# Test multiple attributes without levels
++try:
++    sync_do_groupby(env, items, ['department', 'role'])
++except FilterArgumentError as e:
++    print("Caught expected error (multiple attributes without levels):", e)
++
++# Test non-integer levels
++try:
++    sync_do_groupby(env, items, 'department, role', levels=1.5)
++except FilterArgumentError as e:
++    print("Caught expected error (non-integer levels):", e)
++
++print("All edge cases passed!")
+diff --git a/test_fix.py b/test_fix.py
+new file mode 100644
+index 0000000..e0a4fdb
+--- /dev/null
++++ b/test_fix.py
+@@ -0,0 +1,35 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++import pytest
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++# Test hierarchical groupby
++result = sync_do_groupby(env, items, ['department', 'role'], levels=2)
++print("Result:", result)
++
++# Verify structure
++assert len(result) == 2
++assert result[0].grouper == 'HR'
++assert result[1].grouper == 'IT'
++assert len(result[1].list) == 2
++assert result[1].list[0].grouper == 'Dev'
++assert len(result[1].list[0].list) == 2
++assert result[1].list[0].list[0].name == 'Alice'
++
++print("Test passed!")
+diff --git a/test_groupby_levels.py b/test_groupby_levels.py
+new file mode 100644
+index 0000000..94a6945
+--- /dev/null
++++ b/test_groupby_levels.py
+@@ -0,0 +1,27 @@
++from jinja2.filters import sync_do_groupby
++from jinja2.environment import Environment
++import pytest
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++# This should fail currently as levels is not supported
++try:
++    result = sync_do_groupby(env, items, ['department', 'role'], levels=2)
++    print("Result:", result)
++except Exception as e:
++    print("Caught expected error:", e)
+diff --git a/test_logic.py b/test_logic.py
+new file mode 100644
+index 0000000..f17e326
+--- /dev/null
++++ b/test_logic.py
+@@ -0,0 +1,34 @@
++from itertools import groupby
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++def get_attr(item, attr):
++    return getattr(item, attr)
++
++def hierarchical_groupby(items, attributes):
++    if not attributes:
++        return items
++    
++    attr = attributes[0]
++    # Sort by the current attribute
++    items = sorted(items, key=lambda x: get_attr(x, attr))
++    
++    result = []
++    for key, group in groupby(items, key=lambda x: get_attr(x, attr)):
++        result.append((key, hierarchical_groupby(list(group), attributes[1:])))
++    return result
++
++print(hierarchical_groupby(items, ['department', 'role']))
+diff --git a/test_logic_v2.py b/test_logic_v2.py
+new file mode 100644
+index 0000000..aa44a60
+--- /dev/null
++++ b/test_logic_v2.py
+@@ -0,0 +1,37 @@
++from itertools import groupby
++from jinja2.filters import make_attrgetter
++from jinja2.environment import Environment
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++def hierarchical_groupby(env, items, attributes, default=None):
++    if not attributes:
++        return items
++    
++    attr = attributes[0]
++    expr = make_attrgetter(env, attr, default=default)
++    
++    # Sort by the current attribute
++    items = sorted(items, key=expr)
++    
++    result = []
++    for key, group in groupby(items, key=expr):
++        result.append((key, hierarchical_groupby(env, list(group), attributes[1:], default)))
++    return result
++
++print(hierarchical_groupby(env, items, ['department', 'role']))
+diff --git a/test_logic_v3.py b/test_logic_v3.py
+new file mode 100644
+index 0000000..7790e63
+--- /dev/null
++++ b/test_logic_v3.py
+@@ -0,0 +1,65 @@
++from itertools import groupby
++from jinja2.filters import make_attrgetter
++from jinja2.environment import Environment
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++def hierarchical_groupby(env, items, attributes, default=None):
++    if not attributes:
++        return items
++    
++    attr = attributes[0]
++    expr = make_attrgetter(env, attr, default=default)
++    
++    # Sort by the current attribute
++    items = sorted(items, key=expr)
++    
++    result = []
++    for key, group in groupby(items, key=expr):
++        # The requirement says: "Each result group retains the grouper/list interface"
++        # So we should probably use _GroupTuple or similar.
++        # Let's see what _GroupTuple is.
++        # It's a NamedTuple with grouper and list.
++        # Wait, the current implementation uses _GroupTuple(key, list(values))
++        # If we want to support the same interface, we should probably use that.
++        
++        # Let's try to use a simple tuple for now and see if it works.
++        # The requirement says: "Each result group retains the grouper/list interface"
++        # "intermediate lists contain child groups and the final lists contain the original items."
++        
++        # If I use a class that has .grouper and .list, it might work.
++        
++        # Let's try to implement a simple class for this.
++        class Group:
++            def __init__(self, grouper, items):
++                self.grouper = grouper
++                self.list = items
++            def __repr__(self):
++                return f"Group(grouper={self.grouper}, list={self.list})"
++            def __getitem__(self, index):
++                if index == 0: return self.grouper
++                if index == 1: return self.list
++                raise IndexError
++            def __iter__(self):
++                yield self.grouper
++                yield self.list
++        
++        result.append(Group(key, hierarchical_groupby(env, list(group), attributes[1:], default)))
++    return result
++
++print(hierarchical_groupby(env, items, ['department', 'role']))
+diff --git a/test_logic_v4.py b/test_logic_v4.py
+new file mode 100644
+index 0000000..ac5e576
+--- /dev/null
++++ b/test_logic_v4.py
+@@ -0,0 +1,45 @@
++from itertools import groupby
++from jinja2.filters import make_attrgetter
++from jinja2.environment import Environment
++import typing as t
++
++class _GroupTuple(t.NamedTuple):
++    grouper: t.Any
++    list: t.List
++
++    def __repr__(self) -> str:
++        return tuple.__repr__(self)
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++def hierarchical_groupby(env, items, attributes, default=None):
++    if not attributes:
++        return items
++    
++    attr = attributes[0]
++    expr = make_attrgetter(env, attr, default=default)
++    
++    # Sort by the current attribute
++    items = sorted(items, key=expr)
++    
++    result = []
++    for key, group in groupby(items, key=expr):
++        result.append(_GroupTuple(key, hierarchical_groupby(env, list(group), attributes[1:], default)))
++    return result
++
++print(hierarchical_groupby(env, items, ['department', 'role']))
+diff --git a/test_logic_v5.py b/test_logic_v5.py
+new file mode 100644
+index 0000000..401a241
+--- /dev/null
++++ b/test_logic_v5.py
+@@ -0,0 +1,59 @@
++from itertools import groupby
++from jinja2.filters import make_attrgetter
++from jinja2.environment import Environment
++import typing as t
++
++class _GroupTuple(t.NamedTuple):
++    grouper: t.Any
++    list: t.List
++
++    def __repr__(self) -> str:
++        return tuple.__repr__(self)
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++def hierarchical_groupby(env, items, attributes, default=None):
++    if not attributes:
++        return items
++    
++    attr = attributes[0]
++    expr = make_attrgetter(env, attr, default=default)
++    
++    # Sort by the current attribute
++    items = sorted(items, key=expr)
++    
++    result = []
++    for key, group in groupby(items, key=expr):
++        # The requirement says: "Each result group retains the grouper/list interface"
++        # "intermediate lists contain child groups and the final lists contain the original items."
++        
++        # If I use _GroupTuple, it has .grouper and .list.
++        # Let's check if it works as expected.
++        
++        child_groups = hierarchical_groupby(env, list(group), attributes[1:], default)
++        result.append(_GroupTuple(key, child_groups))
++    return result
++
++# Let's test the access
++result = hierarchical_groupby(env, items, ['department', 'role'])
++for dept in result:
++    print(f"Dept: {dept.grouper}")
++    for role in dept.list:
++        print(f"  Role: {role.grouper}")
++        for item in role.list:
++            print(f"    Item: {item.name}")
+diff --git a/test_logic_v6.py b/test_logic_v6.py
+new file mode 100644
+index 0000000..d733268
+--- /dev/null
++++ b/test_logic_v6.py
+@@ -0,0 +1,80 @@
++from itertools import groupby
++from jinja2.filters import make_attrgetter
++from jinja2.environment import Environment
++import typing as t
++from jinja2.exceptions import FilterArgumentError
++
++class _GroupTuple(t.NamedTuple):
++    grouper: t.Any
++    list: t.List
++
++    def __repr__(self) -> str:
++        return tuple.__repr__(self)
++
++    def __str__(self) -> str:
++        return tuple.__str__(self)
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++def hierarchical_groupby(env, items, attribute, levels=None, default=None):
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        # Default behavior
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(env, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(items, attributes)
++
++# Test cases
++print(hierarchical_groupby(env, items, ['department', 'role'], levels=2))
++print(hierarchical_groupby(env, items, 'department, role', levels=2))
++print(hierarchical_groupby(env, items, 'department'))
++try:
++    hierarchical_groupby(env, items, ['department', 'role'])
++except FilterArgumentError as e:
++    print("Caught expected error:", e)
+diff --git a/test_logic_v7.py b/test_logic_v7.py
+new file mode 100644
+index 0000000..8c65fa4
+--- /dev/null
++++ b/test_logic_v7.py
+@@ -0,0 +1,82 @@
++from itertools import groupby
++from jinja2.filters import make_attrgetter
++from jinja2.environment import Environment
++import typing as t
++from jinja2.exceptions import FilterArgumentError
++
++class _GroupTuple(t.NamedTuple):
++    grouper: t.Any
++    list: t.List
++
++    def __repr__(self) -> str:
++        return tuple.__repr__(self)
++
++    def __str__(self) -> str:
++        return tuple.__str__(self)
++
++class Item:
++    def __init__(self, department, role, name):
++        self.department = department
++        self.role = role
++        self.name = name
++    def __repr__(self):
++        return f"Item({self.department}, {self.role}, {self.name})"
++
++items = [
++    Item('IT', 'Dev', 'Alice'),
++    Item('IT', 'Dev', 'Bob'),
++    Item('IT', 'QA', 'Charlie'),
++    Item('HR', 'Recruiter', 'Dave'),
++]
++
++env = Environment()
++
++def hierarchical_groupby(env, items, attribute, levels=None, default=None):
++    if levels is not None:
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        if isinstance(attribute, str):
++            attributes = [x.strip() for x in attribute.split(',')]
++        elif isinstance(attribute, (list, tuple)):
++            attributes = list(attribute)
++        else:
++            raise FilterArgumentError("attribute must be a string or list")
++            
++        if len(attributes) != levels:
++            raise FilterArgumentError("attribute count must equal levels")
++    else:
++        # Default behavior
++        if isinstance(attribute, (list, tuple)):
++            if len(attribute) > 1:
++                raise FilterArgumentError("Multiple attributes without levels")
++            attribute = attribute[0]
++        attributes = [attribute]
++
++    def _recursive_groupby(items, attrs):
++        if not attrs:
++            return items
++        
++        attr = attrs[0]
++        expr = make_attrgetter(env, attr, default=default)
++        
++        # Sort by the current attribute
++        items = sorted(items, key=expr)
++        
++        result = []
++        for key, group in groupby(items, key=expr):
++            result.append(_GroupTuple(key, _recursive_groupby(list(group), attrs[1:])))
++        return result
++
++    return _recursive_groupby(items, attributes)
++
++# Test cases
++print(hierarchical_groupby(env, items, ['department', 'role'], levels=2))
++print(hierarchical_groupby(env, items, 'department, role', levels=2))
++print(hierarchical_groupby(env, items, 'department'))
++# Test one-element list
++print(hierarchical_groupby(env, items, ['department']))
++try:
++    hierarchical_groupby(env, items, ['department', 'role'])
++except FilterArgumentError as e:
++    print("Caught expected error:", e)

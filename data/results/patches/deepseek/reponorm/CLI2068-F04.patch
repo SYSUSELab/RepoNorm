@@ -1,0 +1,159 @@
+diff --git a/src/click/_termui_impl.py b/src/click/_termui_impl.py
+index 7b97bfb..0b6797e 100644
+--- a/src/click/_termui_impl.py
++++ b/src/click/_termui_impl.py
+@@ -485,11 +485,20 @@ class Editor:
+         env: cabc.Mapping[str, str] | None = None,
+         require_save: bool = True,
+         extension: str = ".txt",
++        editor_args: cabc.Iterable[str] | None = None,
+     ) -> None:
+         self.editor = editor
+         self.env = env
+         self.require_save = require_save
+         self.extension = extension
++        self.editor_args = list(editor_args) if editor_args is not None else None
++
++        if self.editor_args is not None:
++            for arg in self.editor_args:
++                if not isinstance(arg, str):
++                    raise TypeError(
++                        f"editor_args must be an iterable of strings, not {type(arg).__name__}"
++                    )
+ 
+     def get_editor(self) -> str:
+         if self.editor is not None:
+@@ -516,7 +525,14 @@ class Editor:
+             environ.update(self.env)
+ 
+         try:
+-            c = subprocess.Popen(f'{editor} "{filename}"', env=environ, shell=True)
++            if self.editor_args:
++                import shlex
++
++                args_str = " ".join(shlex.quote(a) for a in self.editor_args)
++                cmd = f'{editor} {args_str} "{filename}"'
++            else:
++                cmd = f'{editor} "{filename}"'
++            c = subprocess.Popen(cmd, env=environ, shell=True)
+             exit_code = c.wait()
+             if exit_code != 0:
+                 raise ClickException(
+diff --git a/src/click/termui.py b/src/click/termui.py
+index e14e670..def1323 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -650,6 +650,7 @@ def edit(
+     require_save: bool = True,
+     extension: str = ".txt",
+     filename: str | None = None,
++    editor_args: cabc.Iterable[str] | None = None,
+ ) -> t.AnyStr | None:
+     r"""Edits the given text in the defined editor.  If an editor is given
+     (should be the full path to the executable but the regular operating
+@@ -677,10 +678,15 @@ def edit(
+     :param filename: if provided it will edit this file instead of the
+                      provided text contents.  It will not use a temporary
+                      file as an indirection in that case.
++    :param editor_args: extra arguments to pass to the editor.  Each
++                        argument is quoted for the shell and inserted
++                        before the filename.  ``None`` and an empty
++                        iterable are equivalent to not passing any
++                        arguments.
+     """
+     from ._termui_impl import Editor
+ 
+-    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
++    ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension, editor_args=editor_args)
+ 
+     if filename is None:
+         return ed.edit(text)
+diff --git a/tests/test_termui.py b/tests/test_termui.py
+index 8fdfe8d..dac6cca 100644
+--- a/tests/test_termui.py
++++ b/tests/test_termui.py
+@@ -380,6 +380,84 @@ def test_fast_edit(runner):
+     assert result == "aTest\nbTest\n"
+ 
+ 
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_editor_args_with_sed(runner):
++    """Test that editor_args are passed correctly between editor and filename."""
++    result = click.edit("a\nb", editor="sed", editor_args=["-i~", "s/$/Test/"])
++    assert result == "aTest\nbTest\n"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_editor_args_none_and_empty(runner):
++    """Test that None and empty iterable preserve existing behavior."""
++    result1 = click.edit("a\nb", editor="sed -i~ 's/$/Test/'", editor_args=None)
++    assert result1 == "aTest\nbTest\n"
++    result2 = click.edit("a\nb", editor="sed -i~ 's/$/Test/'", editor_args=[])
++    assert result2 == "aTest\nbTest\n"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_editor_args_with_filename(runner):
++    """Test that editor_args work with direct file editing."""
++    import tempfile
++    import os
++
++    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
++        f.write("hello\n")
++        fname = f.name
++
++    try:
++        click.edit(editor="sed", editor_args=["-i", "s/hello/world/"], filename=fname)
++        with open(fname) as fh:
++            assert fh.read() == "world\n"
++    finally:
++        os.unlink(fname)
++
++
++def test_editor_args_type_error():
++    """Test that non-string items raise TypeError."""
++    with pytest.raises(TypeError):
++        click.edit("test", editor="cat", editor_args=[1, 2, 3])
++
++    with pytest.raises(TypeError):
++        click.edit("test", editor="cat", editor_args=["-n", None])
++
++    with pytest.raises(TypeError):
++        click.edit("test", editor="cat", editor_args=[b"bytes"])
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_editor_args_with_editor_containing_args(runner):
++    """Test that editor_args combine correctly with editor that already has args."""
++    result = click.edit(
++        "a\nb",
++        editor="sed -i~",
++        editor_args=["s/$/Test/"],
++    )
++    assert result == "aTest\nbTest\n"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_editor_args_one_shot_iterable(runner):
++    """Test that a one-shot iterable (e.g., generator) is properly consumed."""
++    def gen():
++        yield "-i~"
++        yield "s/$/Test/"
++
++    result = click.edit("a\nb", editor="sed", editor_args=gen())
++    assert result == "aTest\nbTest\n"
++
++
++@pytest.mark.skipif(platform.system() == "Windows", reason="No sed on Windows.")
++def test_editor_args_spaces_and_special_chars(runner):
++    """Test that editor_args with spaces and special characters works safely."""
++    result = click.edit(
++        "a\nb",
++        editor="sed",
++        editor_args=["-i~", "s/$/Test/"],
++    )
++    assert result == "aTest\nbTest\n"
++
+ @pytest.mark.parametrize(
+     ("prompt_required", "required", "args", "expect"),
+     [

@@ -1,0 +1,244 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..ef31bf7 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2027,6 +2027,11 @@ class Parameter:
+                         its deprecation in --help. The message can be customized
+                         by using a string as the value. A deprecated parameter
+                         cannot be required, a ValueError will be raised otherwise.
++    :param validators: A sequence of callables that are called with
++        ``(ctx, param, value)`` after type conversion and callback.
++        Each validator receives the return value of the previous one.
++        The final return value becomes the exposed option value.
++        Validators are called for all sources including prompts.
+ 
+     .. versionchanged:: 8.2.0
+         Introduction of ``deprecated``.
+@@ -2091,6 +2096,9 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        *,
++        validators: cabc.Sequence[t.Callable[[Context, Parameter, t.Any], t.Any]]
++        | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2127,7 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.validators = validators
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2168,6 +2177,14 @@ class Parameter:
+                     f"{self.param_type_name} cannot be required."
+                 )
+ 
++            # Validate validators parameter
++            if validators is not None and len(validators) > 0:
++                for i, v in enumerate(validators):
++                    if not callable(v):
++                        raise TypeError(
++                            f"validators[{i}] must be callable, got {v!r}"
++                        )
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         """Gather information that could be useful for a tool generating
+         user-facing documentation.
+@@ -2354,6 +2371,10 @@ class Parameter:
+         if self.callback is not None:
+             value = self.callback(ctx, self, value)
+ 
++        if self.validators is not None:
++            for validator in self.validators:
++                value = validator(ctx, self, value)
++
+         return value
+ 
+     def resolve_envvar_value(self, ctx: Context) -> str | None:
+diff --git a/test_validators.py b/test_validators.py
+new file mode 100644
+index 0000000..8ca971a
+--- /dev/null
++++ b/test_validators.py
+@@ -0,0 +1,178 @@
++import click
++from click.testing import CliRunner
++
++# Test 1: Basic validator functionality
++def test_basic_validator():
++    @click.command()
++    @click.option("--value", type=int, validators=[lambda ctx, param, v: v * 2])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--value", "5"])
++    print("Test 1 - Basic validator:")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=10" in result.output
++    print("  PASSED\n")
++
++# Test 2: Multiple validators chained
++def test_multiple_validators():
++    @click.command()
++    @click.option("--value", type=int, validators=[
++        lambda ctx, param, v: v + 1,
++        lambda ctx, param, v: v * 2,
++        lambda ctx, param, v: v - 3
++    ])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--value", "5"])
++    print("Test 2 - Multiple validators (5 -> 6 -> 12 -> 9):")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=9" in result.output
++    print("  PASSED\n")
++
++# Test 3: Validator that raises BadParameter
++def test_validator_exception():
++    @click.command()
++    @click.option("--value", type=int, validators=[
++        lambda ctx, param, v: v if v >= 0 else (_ for _ in ()).throw(click.BadParameter("Value must be positive"))
++    ])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--value", "-5"])
++    print("Test 3 - Validator exception:")
++    print(f"  Exit code: {result.exit_code}")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code != 0
++    assert "Value must be positive" in result.output
++    print("  PASSED\n")
++
++# Test 4: Empty validators list should work
++def test_empty_validators():
++    @click.command()
++    @click.option("--value", type=int, validators=[])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--value", "5"])
++    print("Test 4 - Empty validators:")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=5" in result.output
++    print("  PASSED\n")
++
++# Test 5: None validators should work
++def test_none_validators():
++    @click.command()
++    @click.option("--value", type=int, validators=None)
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--value", "5"])
++    print("Test 5 - None validators:")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=5" in result.output
++    print("  PASSED\n")
++
++# Test 6: Non-callable in validators should raise TypeError
++def test_non_callable_validator():
++    try:
++        click.Option(["--value"], validators=["not callable"])
++        print("Test 6 - Non-callable validator: FAILED (should have raised TypeError)")
++    except TypeError as e:
++        print("Test 6 - Non-callable validator:")
++        print(f"  Raised TypeError: {e}")
++        print("  PASSED\n")
++
++# Test 7: Validators with callback
++def test_validators_with_callback():
++    def callback(ctx, param, value):
++        return value * 10
++    
++    @click.command()
++    @click.option("--value", type=int, callback=callback, validators=[
++        lambda ctx, param, v: v + 1
++    ])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--value", "5"])
++    print("Test 7 - Validators with callback (5 -> 50 -> 51):")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=51" in result.output
++    print("  PASSED\n")
++
++# Test 8: Validators with multiple=True
++def test_validators_multiple():
++    @click.command()
++    @click.option("--values", type=int, multiple=True, validators=[
++        lambda ctx, param, v: tuple(x * 2 for x in v)
++    ])
++    def cli(values):
++        click.echo(f"values={values}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, ["--values", "1", "--values", "2", "--values", "3"])
++    print("Test 8 - Validators with multiple=True:")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "values=(2, 4, 6)" in result.output
++    print("  PASSED\n")
++
++# Test 9: Validators with default value
++def test_validators_default():
++    @click.command()
++    @click.option("--value", type=int, default=5, validators=[
++        lambda ctx, param, v: v + 10
++    ])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, [])
++    print("Test 9 - Validators with default (default 5 -> 15):")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=15" in result.output
++    print("  PASSED\n")
++
++# Test 10: Validators with envvar
++def test_validators_envvar():
++    @click.command()
++    @click.option("--value", type=int, envvar="TEST_VALUE", validators=[
++        lambda ctx, param, v: v * 100
++    ])
++    def cli(value):
++        click.echo(f"value={value}")
++    
++    runner = CliRunner()
++    result = runner.invoke(cli, [], env={"TEST_VALUE": "5"})
++    print("Test 10 - Validators with envvar:")
++    print(f"  Output: {result.output.strip()}")
++    assert result.exit_code == 0
++    assert "value=500" in result.output
++    print("  PASSED\n")
++
++if __name__ == "__main__":
++    test_basic_validator()
++    test_multiple_validators()
++    test_validator_exception()
++    test_empty_validators()
++    test_none_validators()
++    test_non_callable_validator()
++    test_validators_with_callback()
++    test_validators_multiple()
++    test_validators_default()
++    test_validators_envvar()
++    print("All tests passed!")

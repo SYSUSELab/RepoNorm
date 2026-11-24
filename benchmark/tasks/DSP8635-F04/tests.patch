@@ -1,0 +1,99 @@
+diff --git a/tests/propose/test_grounded_proposer4.py b/tests/propose/test_grounded_proposer4.py
+new file mode 100644
+index 0000000..c983061
+--- /dev/null
++++ b/tests/propose/test_grounded_proposer4.py
+@@ -0,0 +1,93 @@
++import copy
++import random
++from types import SimpleNamespace
++
++import pytest
++import dspy
++from dspy.predict.predict import Predict as RealPredict
++from dspy.propose import grounded_proposer as gp
++
++
++class ExampleProgram(dspy.Module):
++    def __init__(self, two=False):
++        super().__init__()
++        self.first = RealPredict('question -> answer')
++        if two:
++            self.second = RealPredict('question -> answer')
++
++
++def recording_proposer(monkeypatch, *, outputs=None, program=None, rng=None, **options):
++    program = program or ExampleProgram()
++    outputs = outputs or {}
++    events = []
++    model = SimpleNamespace(kwargs={'temperature': 0.7, 'max_tokens': 500}, inspect_history=lambda **kw: None)
++    class Recorder:
++        def __init__(self, signature):
++            self.signature = signature
++        def __call__(self, **kwargs):
++            events.append({'signature': self.signature, 'kwargs': copy.deepcopy(kwargs),
++                           'model_kwargs': dict(model.kwargs)})
++            if outputs.get('raise_on') == self.signature.__name__:
++                raise RuntimeError('recorded generation failure')
++            values = {}
++            for field in self.signature.output_fields:
++                if self.signature.__name__ == 'ShortenInstruction':
++                    values[field] = outputs.get('shortened', 'A shortened instruction.')
++                else:
++                    values[field] = outputs.get(field, {
++                        'program_description': 'Program description. More details.',
++                        'module_description': 'Module description. More details.',
++                        'proposed_instruction': 'PROPOSED INSTRUCTION: A useful generated instruction.',
++                    }.get(field, 'value'))
++            return dspy.Prediction(**values)
++    monkeypatch.setattr(gp.dspy, 'Predict', Recorder)
++    monkeypatch.setattr(gp, 'get_prompt_model', lambda supplied: supplied)
++    monkeypatch.setattr(gp, 'get_dspy_source_code', lambda program: 'recorded program code')
++    monkeypatch.setattr(gp, 'create_dataset_summary', lambda **kwargs: 'recorded summary')
++    settings = dict(use_dataset_summary=False, program_aware=True, use_task_demos=False,
++                    set_tip_randomly=False, set_history_randomly=False, rng=rng or random.Random(17))
++    settings.update(options)
++    proposer = gp.GroundedProposer(prompt_model=model, program=program, trainset=[], **settings)
++    return proposer, program, model, events
++
++
++def propose(proposer, program, *, count=1, logs=None):
++    return proposer.propose_instructions_for_program([], program, None, logs or {}, count, 0.5)
++
++
++def generation_events(events):
++    return [event for event in events if event['signature'].__name__ == 'GenerateSingleModuleInstruction']
++
++
++@pytest.mark.parametrize('text,cap,expected', [
++    ('Tiny', 4, 'Tiny'), ('First. Second sentence is long.', 12, 'First.…'),
++    ('无空格的一段长描述', 5, '无空格的…'), ('abcdef', 1, '…'),
++    ('unchanged description', None, 'unchanged description'),
++])
++def test_description_caps_apply_at_real_prompt_boundaries(monkeypatch, text, cap, expected):
++    proposer, program, model, events = recording_proposer(monkeypatch,
++        outputs={'program_description': text, 'module_description': text}, max_description_chars=cap)
++    propose(proposer, program)
++    assert len(events) == 3
++    describe_module = events[1]['kwargs']
++    instruction = generation_events(events)[0]['kwargs']
++    assert describe_module['program_description'] == expected
++    assert instruction['program_description'] == expected
++    assert instruction['module_description'] == expected
++    if cap is not None:
++        assert len(expected) <= cap
++
++
++def test_default_description_cap_is_applied_to_both_descriptions(monkeypatch):
++    proposer, program, model, events = recording_proposer(monkeypatch,
++        outputs={'program_description': 'x' * 3000, 'module_description': 'y' * 3000})
++    propose(proposer, program)
++    arguments = generation_events(events)[0]['kwargs']
++    assert len(arguments['program_description']) == 2000
++    assert len(arguments['module_description']) == 2000
++
++
++@pytest.mark.parametrize('invalid', [0, -1, 2.5, True, '3'])
++def test_invalid_description_cap_rejected(monkeypatch, invalid):
++    with pytest.raises(ValueError):
++        recording_proposer(monkeypatch, max_description_chars=invalid)

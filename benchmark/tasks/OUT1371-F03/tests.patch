@@ -1,0 +1,144 @@
+diff --git a/tests/test_prompts.py b/tests/test_prompts.py
+index 4cc4d8f..c69691a 100644
+--- a/tests/test_prompts.py
++++ b/tests/test_prompts.py
+@@ -2,6 +2,7 @@ import os
+ import tempfile
+ from typing import Dict, List
+ 
++import jinja2
+ import pytest
+ from pydantic import BaseModel, Field
+ 
+@@ -403,3 +404,131 @@ def test_template_from_str_with_extra_linebreaks():
+     """
+     template = Prompt._template_from_str(content)
+     assert template.render(name="World") == "Hello, World!\n"
++
++
++@pytest.fixture(autouse=True)
++def isolate_conditional_filter_environment(monkeypatch):
++    for name in (
++        "OUTLINES_DEBUG",
++        "ENVIRONMENT",
++        "ENV",
++        "OUTLINES_TESTING",
++        "TESTING_MODE",
++    ):
++        monkeypatch.delenv(name, raising=False)
++
++
++def test_conditional_filters_across_public_entry_points(monkeypatch, tmp_path):
++    filters = {
++        "debug": {"active": lambda value: f"debug:{value}"},
++        "production": {"active": lambda value: f"production:{value}"},
++        "testing": {"active": lambda value: f"testing:{value}"},
++    }
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "TRUE")
++
++    @outlines.prompt(conditional_filters=filters)
++    def decorated(value):
++        """{{ value | active }}"""
++
++    assert decorated("decorator") == "debug:decorator"
++
++    monkeypatch.delenv("OUTLINES_DEBUG")
++    monkeypatch.setenv("ENVIRONMENT", "Production")
++    assert (
++        Prompt.from_str("{{ value | active }}", conditional_filters=filters)(
++            value="string"
++        )
++        == "production:string"
++    )
++
++    monkeypatch.delenv("ENVIRONMENT")
++    monkeypatch.setenv("TESTING_MODE", "ON")
++    (tmp_path / "included.txt").write_text(
++        "{{ value | active }}", encoding="utf-8"
++    )
++    template_path = tmp_path / "prompt.txt"
++    template_path.write_text('{% include "included.txt" %}', encoding="utf-8")
++    assert (
++        Prompt.from_file(template_path, conditional_filters=filters)(value="file")
++        == "testing:file"
++    )
++
++
++def test_conditional_filter_priority(monkeypatch):
++    filters = {
++        "debug": {"active": lambda value: "debug"},
++        "production": {"active": lambda value: "production"},
++        "testing": {"active": lambda value: "testing"},
++    }
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    monkeypatch.setenv("ENV", "testing")
++
++    prompt = Prompt.from_str("{{ value | active }}", conditional_filters=filters)
++    assert prompt(value="ignored") == "debug"
++
++
++def test_conditional_filter_fallback_is_alphabetical():
++    filters = {
++        "zebra": {"active": lambda value: "zebra"},
++        "alpha": {"active": lambda value: "alpha"},
++    }
++
++    prompt = Prompt.from_str("{{ value | active }}", conditional_filters=filters)
++    assert prompt(value="ignored") == "alpha"
++
++
++def test_conditional_filter_values_are_exact(monkeypatch):
++    filters = {
++        "debug": {"active": lambda value: "debug"},
++        "alpha": {"active": lambda value: "alpha"},
++    }
++    monkeypatch.setenv("OUTLINES_DEBUG", "true-ish")
++
++    prompt = Prompt.from_str("{{ value | active }}", conditional_filters=filters)
++    assert prompt(value="ignored") == "alpha"
++
++
++def test_conditions_are_selected_when_prompt_is_created(monkeypatch):
++    filters = {
++        "debug": {"active": lambda value: "debug"},
++        "production": {"active": lambda value: "production"},
++    }
++    monkeypatch.setenv("ENVIRONMENT", "production")
++    prompt = Prompt.from_str("{{ value | active }}", conditional_filters=filters)
++
++    monkeypatch.setenv("OUTLINES_DEBUG", "true")
++    monkeypatch.delenv("ENVIRONMENT")
++
++    assert prompt(value="ignored") == "production"
++
++
++def test_unselected_filter_is_not_installed():
++    filters = {
++        "alpha": {"selected": lambda value: value},
++        "debug": {"debug_only": lambda value: value},
++    }
++
++    with pytest.raises(jinja2.TemplateAssertionError, match="No filter named"):
++        Prompt.from_str(
++            "{{ value | debug_only }}",
++            conditional_filters=filters,
++        )
++
++
++def test_conditional_filters_none_and_empty_keep_default_behavior():
++    assert Prompt.from_str("{{ value }}", conditional_filters=None)(value="x") == "x"
++    assert Prompt.from_str("{{ value }}", conditional_filters={})(value="x") == "x"
++
++    @outlines.prompt
++    def decorated(value):
++        """{{ value }}"""
++
++    assert decorated("x") == "x"
++
++
++def test_selected_conditional_filter_overrides_existing_filter():
++    filters = {"alpha": {"upper": lambda value: f"local:{value}"}}
++    prompt = Prompt.from_str("{{ value | upper }}", conditional_filters=filters)
++    assert prompt(value="x") == "local:x"

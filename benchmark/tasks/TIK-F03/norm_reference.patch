@@ -1,0 +1,161 @@
+diff --git a/tests/test_frequency_contribution.py b/tests/test_frequency_contribution.py
+new file mode 100644
+index 0000000..67cd08d
+--- /dev/null
++++ b/tests/test_frequency_contribution.py
+@@ -0,0 +1,51 @@
++from collections import Counter
++
++import pytest
++
++import tiktoken
++
++
++@pytest.fixture(scope="module")
++def encoding():
++    return tiktoken.get_encoding("cl100k_base")
++
++
++@pytest.mark.parametrize("text", ["", "hello hello", "🙂 café", "你好吗"])
++def test_frequency_matches_returned_tokens(encoding, text) -> None:
++    tokens, frequency = encoding.encode(text, analyze_frequency=True)
++    assert tokens == encoding.encode(text)
++    assert frequency == dict(Counter(tokens))
++
++
++def test_frequency_keeps_special_token_policy(encoding) -> None:
++    special = "<|endoftext|>"
++    with pytest.raises(ValueError, match="disallowed special token"):
++        encoding.encode(special, analyze_frequency=True)
++    tokens, frequency = encoding.encode(
++        special, allowed_special="all", analyze_frequency=True
++    )
++    assert frequency == {tokens[0]: 1}
++
++
++def test_frequency_keeps_surrogate_recovery(encoding) -> None:
++    text = "before \ud800 after"
++    tokens, frequency = encoding.encode(text, analyze_frequency=True)
++    assert tokens == encoding.encode(text)
++    assert frequency == dict(Counter(tokens))
++
++
++@pytest.mark.parametrize("threads", [1, 3])
++def test_batch_frequency_is_deterministic_and_preserves_order(encoding, threads) -> None:
++    texts = ["repeat repeat", "", "🙂", "repeat repeat"]
++    expected = [encoding.encode(text) for text in texts]
++    rows, frequency = encoding.encode_batch(
++        texts, analyze_frequency=True, num_threads=threads
++    )
++    assert rows == expected
++    assert frequency == dict(Counter(token for row in expected for token in row))
++
++
++def test_empty_batch_and_default_shapes(encoding) -> None:
++    assert encoding.encode_batch([], analyze_frequency=True) == ([], {})
++    assert isinstance(encoding.encode("text"), list)
++    assert isinstance(encoding.encode_batch(["text"]), list)
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..2eb58a2 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -76,13 +76,21 @@ class Encoding:
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+             return self._core_bpe.encode_ordinary(text)
+ 
++    def _count_token_frequency(self, tokens: list[int]) -> dict[int, int]:
++        """Return the number of occurrences of each token in *tokens*."""
++        freq: dict[int, int] = {}
++        for token in tokens:
++            freq[token] = freq.get(token, 0) + 1
++        return freq
++
+     def encode(
+         self,
+         text: str,
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        analyze_frequency: bool = False,
++    ) -> list[int] | tuple[list[int], dict[int, int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -96,6 +104,8 @@ class Encoding:
+           cause all text corresponding to special tokens to be encoded as natural text.
+         - Setting `allowed_special` to "all" will cause this function to treat all text
+           corresponding to special tokens to be encoded as special tokens.
++        - Setting `analyze_frequency` to True will return `(tokens, frequencies)`, where
++          `frequencies` maps each token ID to its number of occurrences.
+ 
+         ```
+         >>> enc.encode("hello world")
+@@ -108,6 +118,8 @@ class Encoding:
+         # Raises ValueError
+         >>> enc.encode("<|endoftext|>", disallowed_special=())
+         [27, 91, 437, 1659, 5239, 91, 29]
++        >>> enc.encode("hello world", analyze_frequency=True)
++        ([31373, 995], {31373: 1, 995: 1})
+         ```
+         """
+         if allowed_special == "all":
+@@ -121,7 +133,7 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +142,13 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++
++        if analyze_frequency:
++            frequencies = self._count_token_frequency(tokens)
++            return tokens, frequencies
++
++        return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,11 +197,17 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[list[int]]:
++        analyze_frequency: bool = False,
++    ) -> list[list[int]] | tuple[list[list[int]], dict[int, int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+         See `encode` for more details on `allowed_special` and `disallowed_special`.
+ 
++        If `analyze_frequency` is True, returns `(document_tokens, corpus_frequency)`.
++        `document_tokens` has one token list per input string, in input order, and
++        `corpus_frequency` maps each token ID to its total number of occurrences across
++        all documents.
++
+         ```
+         >>> enc.encode_batch(["hello world", "goodbye world"])
+         [[31373, 995], [11274, 16390, 995]]
+@@ -200,7 +224,14 @@ class Encoding:
+             self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++            results = list(e.map(encoder, text))
++        if analyze_frequency:
++            frequencies: dict[int, int] = {}
++            for tokens in results:
++                for token in tokens:
++                    frequencies[token] = frequencies.get(token, 0) + 1
++            return results, frequencies
++        return results
+ 
+     def encode_with_unstable(
+         self,

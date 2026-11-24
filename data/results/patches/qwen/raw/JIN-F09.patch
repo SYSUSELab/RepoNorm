@@ -1,0 +1,225 @@
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea650..cad7803 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1157,12 +1157,48 @@ class _GroupTuple(t.NamedTuple):
+         return tuple.__str__(self)
+ 
+ 
++
++def _group_by_level(
++    environment: "Environment",
++    items: "t.List[V]",
++    exprs: t.List[t.Callable[[t.Any], t.Any]],
++    level: int,
++    default: t.Optional[t.Any],
++) -> "t.List[t.Tuple[t.Any, t.Any]]":
++    """Recursively group items by attribute at the specified level."""
++    if level == len(exprs) - 1:
++        # Leaf level - just group by the current expression
++        expr = exprs[level]
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(items, key=expr), expr)
++        ]
++    
++    # Intermediate level - group and recurse
++    expr = exprs[level]
++    grouped = {}
++    
++    for item in items:
++        key = expr(item)
++        if key not in grouped:
++            grouped[key] = []
++        grouped[key].append(item)
++    
++    result = []
++    for key in sorted(grouped.keys()):
++        nested = _group_by_level(environment, grouped[key], exprs, level + 1, default)
++        result.append(_GroupTuple(key, nested))
++    
++    return result
++
++
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.Sequence[t.Union[str, int]]],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+@@ -1206,28 +1242,159 @@ def sync_do_groupby(
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
++    Hierarchical grouping can be done by specifying multiple attributes
++    with the ``levels`` parameter. Each attribute defines one level,
++    in order. The attribute can be a list or a comma-separated string.
++
++    .. sourcecode:: jinja
++
++        <ul>{% for dept, roles in users|groupby(["department", "role"], levels=2) %}
++          <li>{{ dept }}
++            <ul>{% for role, members in roles %}
++              <li>{{ role }}: {{ members|map(attribute="name")|join(", ") }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.0
++        Added the ``default`` parameter.
++
+     .. versionchanged:: 2.6
+         The attribute supports dot notation for nested access.
+     """
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    # Normalize attribute to a list
++    if isinstance(attribute, str):
++        # Check if it's a comma-separated list
++        if "," in attribute:
++            attrs = [a.strip() for a in attribute.split(",")]
++        else:
++            attrs = [attribute]
++    elif isinstance(attribute, (list, tuple)):
++        attrs = list(attribute)
++    else:
++        attrs = [attribute]
++    
++    # Validate levels parameter
++    if levels is not None:
++        # Check for boolean (bool is subclass of int in Python)
++        if isinstance(levels, bool):
++            raise FilterArgumentError("levels must be an integer or None")
++        
++        # Check for non-positive or non-integer
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        # Validate attribute count matches levels
++        if len(attrs) != levels:
++            raise FilterArgumentError(
++                f"attribute list length ({len(attrs)}) must equal levels ({levels})"
++            )
++    
++    # Create attribute getters
++    exprs = [make_attrgetter(environment, attr, default=default) for attr in attrs]
++    
++    # Convert value to list for sorting
++    items = list(value)
++    
++    if levels is None or levels == 1:
++        # Single-level grouping (original behavior)
++        expr = exprs[0]
++        return [
++            _GroupTuple(key, list(values))
++            for key, values in groupby(sorted(items, key=expr), expr)
++        ]
++    else:
++        # Multi-level hierarchical grouping
++        return _group_by_level(environment, items, exprs, 0, default)
++
++
++
++async def _group_by_level_async(
++    environment: "Environment",
++    items: "t.List[V]",
++    exprs: t.List[t.Callable[[t.Any], t.Any]],
++    level: int,
++    default: t.Optional[t.Any],
++) -> "t.List[t.Tuple[t.Any, t.Any]]":
++    """Async recursive version of _group_by_level."""
++    if level == len(exprs) - 1:
++        # Leaf level - just group by the current expression
++        expr = exprs[level]
++        return [
++            _GroupTuple(key, await auto_to_list(values))
++            for key, values in groupby(sorted(items, key=expr), expr)
++        ]
++    
++    # Intermediate level - group and recurse
++    expr = exprs[level]
++    grouped = {}
++    
++    for item in items:
++        key = expr(item)
++        if key not in grouped:
++            grouped[key] = []
++        grouped[key].append(item)
++    
++    result = []
++    for key in sorted(grouped.keys()):
++        nested = await _group_by_level_async(environment, grouped[key], exprs, level + 1, default)
++        result.append(_GroupTuple(key, nested))
++    
++    return result
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+ async def do_groupby(
+     environment: "Environment",
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+-    attribute: t.Union[str, int],
++    attribute: t.Union[str, int, t.Sequence[t.Union[str, int]]],
+     default: t.Optional[t.Any] = None,
++    levels: t.Optional[int] = None,
+ ) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
+-    expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    # Normalize attribute to a list
++    if isinstance(attribute, str):
++        # Check if it's a comma-separated list
++        if "," in attribute:
++            attrs = [a.strip() for a in attribute.split(",")]
++        else:
++            attrs = [attribute]
++    elif isinstance(attribute, (list, tuple)):
++        attrs = list(attribute)
++    else:
++        attrs = [attribute]
++    
++    # Validate levels parameter
++    if levels is not None:
++        # Check for boolean (bool is subclass of int in Python)
++        if isinstance(levels, bool):
++            raise FilterArgumentError("levels must be an integer or None")
++        
++        # Check for non-positive or non-integer
++        if not isinstance(levels, int) or levels <= 0:
++            raise FilterArgumentError("levels must be a positive integer")
++        
++        # Validate attribute count matches levels
++        if len(attrs) != levels:
++            raise FilterArgumentError(
++                f"attribute list length ({len(attrs)}) must equal levels ({levels})"
++            )
++    
++    # Create attribute getters
++    exprs = [make_attrgetter(environment, attr, default=default) for attr in attrs]
++    
++    # Convert value to list for sorting
++    items = await auto_to_list(value)
++    
++    if levels is None or levels == 1:
++        # Single-level grouping (original behavior)
++        expr = exprs[0]
++        return [
++            _GroupTuple(key, await auto_to_list(values))
++            for key, values in groupby(sorted(items, key=expr), expr)
++        ]
++    else:
++        # Multi-level hierarchical grouping
++        return await _group_by_level_async(environment, items, exprs, 0, default)
+ 
+ 
+ @pass_environment

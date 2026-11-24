@@ -1,0 +1,102 @@
+diff --git a/outlines/backends/xgrammar.py b/outlines/backends/xgrammar.py
+index fcb1672..54dd9f2 100644
+--- a/outlines/backends/xgrammar.py
++++ b/outlines/backends/xgrammar.py
+@@ -17,12 +17,12 @@ if TYPE_CHECKING:
+ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+     """Logits processor for XGrammar.
+ 
+-    This class wraps the `xgr.contrib.hf.LogitsProcessor` class and adds
+-    a `reset` method to reset the logits processor for a new generation.
++    Maintains one low-level matcher per batch row and applies its token mask.
++    A reset discards matcher state for a new generation.
+ 
+     """
+ 
+-    def __init__(self, compiled_grammar: str):
++    def __init__(self, compiled_grammar: str, tensor_library_name: str):
+         """
+         Parameters
+         ----------
+@@ -34,20 +34,42 @@ class XGrammarLogitsProcessor(OutlinesLogitsProcessor):
+ 
+         self.xgr = xgr
+         self.compiled_grammar = compiled_grammar
+-        self.xgrammar_logits_processor = None
+-        super().__init__("torch")
++        self.tensor_library_name = tensor_library_name
++        super().__init__(tensor_library_name)
++        self.reset()
+ 
+     def reset(self):
+         """Reset the logits processor for a new generation."""
+-        self.xgrammar_logits_processor = None
++        self.is_first_token = True
++        self._matchers = []
++        self._bitmask = None
+ 
+     def process_logits(self, input_ids: TensorType, logits: TensorType) -> TensorType:
+         """Bias the logits."""
+-        if self.xgrammar_logits_processor is None:
+-            self.xgrammar_logits_processor = self.xgr.contrib.hf.LogitsProcessor(
+-                self.compiled_grammar
++        batch_size = input_ids.shape[0]
++        if self.is_first_token:
++            self._matchers = [
++                self.xgr.GrammarMatcher(self.compiled_grammar)
++                for _ in range(batch_size)
++            ]
++            self._bitmask = self.xgr.allocate_token_bitmask(
++                batch_size, self.compiled_grammar.tokenizer_info.vocab_size
+             )
+-        return self.xgrammar_logits_processor(input_ids, logits) # type: ignore
++            self.is_first_token = False
++        elif len(self._matchers) != batch_size:
++            raise ValueError("Batch size changed before reset")
++        else:
++            for row, matcher in enumerate(self._matchers):
++                if not matcher.is_terminated():
++                    if not matcher.accept_token(int(input_ids[row, -1].item())):
++                        raise ValueError("Generated token does not match grammar")
++        for row, matcher in enumerate(self._matchers):
++            if not matcher.is_terminated():
++                matcher.fill_next_token_bitmask(self._bitmask, row)
++        self.xgr.apply_token_bitmask_inplace(
++            logits, self._bitmask.to(logits.device)
++        )
++        return logits
+ 
+ 
+ class XGrammarBackend(BaseBackend):
+@@ -77,6 +99,7 @@ class XGrammarBackend(BaseBackend):
+             vocab_size=vocab_size
+         )
+         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
++        self.tensor_library_name = model.tensor_library_name
+ 
+     def get_json_schema_logits_processor(
+         self, json_schema: str
+@@ -97,7 +120,7 @@ class XGrammarBackend(BaseBackend):
+         compiled_grammar = self.grammar_compiler.compile_json_schema(
+             json_schema
+         )
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, self.tensor_library_name)
+ 
+     def get_regex_logits_processor(self, regex: str) -> "LogitsProcessor":
+         """Create a logits processor from a regex.
+@@ -114,7 +137,7 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_regex(regex)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, self.tensor_library_name)
+ 
+     def get_cfg_logits_processor(self, grammar: str) -> "LogitsProcessor":
+         """Create a logits processor from a context-free grammar.
+@@ -131,4 +154,4 @@ class XGrammarBackend(BaseBackend):
+ 
+         """
+         compiled_grammar = self.grammar_compiler.compile_grammar(grammar)
+-        return XGrammarLogitsProcessor(compiled_grammar)
++        return XGrammarLogitsProcessor(compiled_grammar, self.tensor_library_name)

@@ -1,0 +1,168 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 88e167d2..9d776166 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,8 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Support stable priorities in ``FileSystemLoader`` search-path sequences.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/docs/api.rst b/docs/api.rst
+index b2db5375..a24aa3b7 100644
+--- a/docs/api.rst
++++ b/docs/api.rst
+@@ -442,6 +442,14 @@ own loader, subclass :class:`BaseLoader` and override `get_source`.
+ 
+ Here a list of the builtin loaders Jinja provides:
+ 
++``FileSystemLoader`` sequences may contain priority entries
++written as ``(path, priority)``. Higher priorities come first;
++ties preserve input order. Ordinary paths have priority zero.
++Negative values and duplicates are supported. Lookup and
++listing use the same ordered paths. Boolean priorities and
++malformed tuple entries raise ``TypeError`` on construction.
++Ordinary paths keep their string and path-like input support.
++
+ .. autoclass:: jinja2.FileSystemLoader
+ 
+ .. autoclass:: jinja2.PackageLoader
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd04..f5e92f62 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -165,6 +165,12 @@ class FileSystemLoader(BaseLoader):
+ 
+         loader = FileSystemLoader(["/override/templates", "/default/templates"])
+ 
++    Sequence items may be ``(path, priority)``. Higher integer
++    priorities come first; ties preserve input order. Ordinary
++    paths have priority zero. Negative values and duplicates
++    are supported. Boolean priorities and malformed tuples
++    raise :exc:`TypeError` during construction.
++
+     :param searchpath: A path, or list of paths, to the directory that
+         contains the templates.
+     :param encoding: Use this encoding to read the text from template
+@@ -173,18 +179,49 @@ class FileSystemLoader(BaseLoader):
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++
++    .. versionchanged:: 3.1.0
++        Support priority entries in search-path sequences.
+     """
+ 
+     def __init__(
+         self,
+-        searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        searchpath: t.Union[
++            str,
++            os.PathLike,
++            t.Sequence[
++                t.Union[
++                    str,
++                    os.PathLike,
++                    t.Tuple[t.Union[str, os.PathLike], int],
++                ]
++            ],
++        ],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+ 
+-        self.searchpath = [os.fspath(p) for p in searchpath]
++        paths: t.List[t.Tuple[str, int, int]] = []
++
++        for index, item in enumerate(searchpath):
++            if isinstance(item, tuple):
++                if len(item) != 2:
++                    raise TypeError("priority path entries must be (path, priority)")
++
++                path, priority = item
++
++                if not isinstance(priority, int) or isinstance(priority, bool):
++                    raise TypeError("search path priority must be an integer")
++            else:
++                path = item
++                priority = 0
++
++            paths.append((os.fspath(path), priority, index))
++
++        paths.sort(key=lambda item: -item[1])
++        self.searchpath = [path for path, _, _ in paths]
+         self.encoding = encoding
+         self.followlinks = followlinks
+ 
+diff --git a/tests/test_n4c_author_searchpath_priorities.py b/tests/test_n4c_author_searchpath_priorities.py
+new file mode 100644
+index 00000000..4729a472
+--- /dev/null
++++ b/tests/test_n4c_author_searchpath_priorities.py
+@@ -0,0 +1,61 @@
++import os
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import FileSystemLoader
++from jinja2 import TemplateNotFound
++
++
++def test_priority_paths_preserve_source_protocol(tmp_path):
++    default, high = tmp_path / "default", tmp_path / "high"
++    default.mkdir()
++    high.mkdir()
++    (default / "page").write_text("wrong")
++    path = high / "page"
++    path.write_bytes("café".encode("latin-1"))
++    loader = FileSystemLoader([default, (high, 3)], encoding="latin-1")
++    text, filename, current = loader.get_source(Environment(), "page")
++    assert text == "café" and os.path.samefile(filename, path)
++    assert current() is True
++    stamp = path.stat()
++    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2000000000))
++    assert current() is False
++    path.unlink()
++    assert current() is False
++
++
++def test_priority_paths_preserve_parent_guard(tmp_path):
++    root = tmp_path / "root"
++    root.mkdir()
++    (tmp_path / "secret").write_text("outside")
++    loader = FileSystemLoader([(root, 2)])
++    with pytest.raises(TemplateNotFound) as caught:
++        loader.get_source(Environment(), "../secret")
++    assert caught.value.name == "../secret"
++
++
++@pytest.mark.parametrize("follow", [False, True])
++def test_priority_listing_remains_sorted_unique_and_follows_option(tmp_path, follow):
++    root, linked = tmp_path / "root", tmp_path / "linked"
++    root.mkdir()
++    linked.mkdir()
++    (root / "z").write_text("z")
++    (root / "a").write_text("a")
++    (linked / "child").write_text("child")
++    (root / "nested").symlink_to(linked, target_is_directory=True)
++    loader = FileSystemLoader([(root, 1), (root, -1)], followlinks=follow)
++    expected = ["a", "nested/child", "z"] if follow else ["a", "z"]
++    assert loader.list_templates() == expected
++
++
++def test_priority_ties_plain_path_and_duplicate_entries(tmp_path):
++    a, b = tmp_path / "a", tmp_path / "b"
++    loader = FileSystemLoader([a, (b, 0), (a, 0), (b, -1)])
++    assert loader.searchpath == [str(a), str(b), str(a), str(b)]
++
++
++@pytest.mark.parametrize("entry", [("path", True), ("path", 1.2), ("path",)])
++def test_priority_configuration_errors_are_not_skipped(entry):
++    with pytest.raises(TypeError):
++        FileSystemLoader([entry])

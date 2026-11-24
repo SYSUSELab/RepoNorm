@@ -1,0 +1,131 @@
+diff --git a/dspy/streaming/streaming_listener.py b/dspy/streaming/streaming_listener.py
+index 98fd4aca..ae7a485c 100644
+--- a/dspy/streaming/streaming_listener.py
++++ b/dspy/streaming/streaming_listener.py
+@@ -1,7 +1,10 @@
++# This script will help us understand what changes we need to make
++
+ import re
+ from collections import defaultdict
+ from queue import Queue
+ from typing import TYPE_CHECKING, Any
++import time  # Need this for timestamps
+ 
+ from litellm import ModelResponseStream
+ 
+@@ -48,6 +51,12 @@ class StreamListener:
+         self.cache_hit = False
+         self.allow_reuse = allow_reuse
+ 
++        # Stats tracking
++        self.chunk_count = 0
++        self.char_count = 0
++        self.first_ts = None
++        self.last_ts = None
++
+         self.adapter_identifiers = {
+             "ChatAdapter": {
+                 "start_identifier": f"[[ ## {self.signature_field_name} ## ]]",
+@@ -91,6 +100,11 @@ class StreamListener:
+                 self.field_start_queue = []
+                 self.field_end_queue = Queue()
+                 self.stream_start = False
++                # Reset stats for reuse
++                self.chunk_count = 0
++                self.char_count = 0
++                self.first_ts = None
++                self.last_ts = None
+             else:
+                 return
+ 
+@@ -112,6 +126,24 @@ class StreamListener:
+                 self.cache_hit = True
+                 self.stream_start = True
+                 self.stream_end = True
++                # Process the token and update stats for cache hit scenario
++                # Extract content between start and end identifiers
++                match = re.search(end_identifier, message_after_start_identifier)
++                if match:
++                    token = message_after_start_identifier[:match.start()].lstrip()
++                else:
++                    token = message_after_start_identifier.lstrip()
++                if isinstance(settings.adapter, JSONAdapter) and token.startswith('"'):
++                    token = token[1:]
++                if token:
++                    # Update stats before emitting
++                    if self.first_ts is None:
++                        self.first_ts = time.time()
++                    self.last_ts = time.time()
++                    self.chunk_count += 1
++                    self.char_count += len(token)
++                    
++                    return StreamResponse(self.predict_name, self.signature_field_name, token.rstrip())
+                 return
+ 
+         if len(self.field_start_queue) == 0 and not self.stream_start and start_indicator in chunk_message:
+@@ -166,6 +198,13 @@ class StreamListener:
+                 token = token.rstrip()  # Remove the trailing \n\n
+ 
+             if token:
++                # Update stats before emitting
++                if self.first_ts is None:
++                    self.first_ts = time.time()
++                self.last_ts = time.time()
++                self.chunk_count += 1
++                self.char_count += len(token)
++                
+                 return StreamResponse(self.predict_name, self.signature_field_name, token)
+ 
+     def flush(self) -> str:
+@@ -178,7 +217,7 @@ class StreamListener:
+         last_tokens = "".join(self.field_end_queue.queue)
+         self.field_end_queue = Queue()
+         if isinstance(settings.adapter, JSONAdapter):
+-            match = re.search(r'",|"\s*}', last_tokens)
++            match = re.search(r'",|"\\s*}', last_tokens)
+             if match:
+                 boundary_index = match.start()
+             else:
+@@ -198,6 +237,42 @@ class StreamListener:
+                 f"{', '.join([a.__name__ for a in ADAPTER_SUPPORT_STREAMING])}"
+             )
+ 
++    def stats(self) -> dict[str, Any]:
++        """Return serialization-friendly statistics about the active field stream.
++        
++        Returns a dictionary with the following keys:
++        - predict_name: The name of the predictor
++        - field: The signature field name being listened to
++        - chunk_count: Number of chunks emitted since stream start
++        - char_count: Total character count of emitted chunks
++        - first_ts: Timestamp of first emission (seconds since epoch), or None
++        - last_ts: Timestamp of last emission (seconds since epoch), or None
++        - duration_s: Duration between first and last emission, or None
++        - avg_chunk_chars: Average characters per chunk, or 0
++        
++        Before an emission, counters are zero, timestamps/duration are None, and average is zero.
++        When the listener enters its ended state, all counters and timestamps reset immediately.
++        """
++        duration_s = None
++        avg_chunk_chars = 0.0
++        
++        if self.first_ts is not None and self.last_ts is not None:
++            duration_s = self.last_ts - self.first_ts
++            
++        if self.chunk_count > 0:
++            avg_chunk_chars = self.char_count / self.chunk_count
++            
++        return {
++            "predict_name": self.predict_name,
++            "field": self.signature_field_name,
++            "chunk_count": self.chunk_count,
++            "char_count": self.char_count,
++            "first_ts": self.first_ts,
++            "last_ts": self.last_ts,
++            "duration_s": duration_s,
++            "avg_chunk_chars": avg_chunk_chars,
++        }
++
+ 
+ def find_predictor_for_stream_listeners(program: "Module", stream_listeners: list[StreamListener]):
+     """Find the predictor for each stream listener.

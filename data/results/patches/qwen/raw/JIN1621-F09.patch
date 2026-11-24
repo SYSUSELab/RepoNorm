@@ -1,0 +1,547 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..be7a569 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -1,9 +1,9 @@
+ """API and implementations for loading templates from different data
+-sources.
+-"""
++sources."""
+ import importlib.util
+ import os
+ import sys
++import threading
+ import typing as t
+ import weakref
+ import zipimport
+@@ -132,22 +132,336 @@ class BaseLoader:
+             code = bucket.code
+ 
+         # if we don't have code so far (not cached, no longer up to
+-        # date) etc. we compile the template
++        # date), compile it.
+         if code is None:
+             code = environment.compile(source, name, filename)
+ 
+-        # if the bytecode cache is available and the bucket doesn't
+-        # have a code so far, we give the bucket the new code and put
+-        # it back to the bytecode cache.
+-        if bcc is not None and bucket.code is None:
+-            bucket.code = code
+-            bcc.set_bucket(bucket)
+-
+         return environment.template_class.from_code(
+             environment, code, globals, uptodate
+         )
+ 
+ 
++class PrefixLoader(BaseLoader):
++    """This loader allows you to prepend a prefix to templates loaded by
++    other loaders.
++
++    >>> loader = PrefixLoader({
++    ...     'app': PackageLoader('myapp.app'),
++    ...     'admin': PackageLoader('myapp.admin')
++    ... })
++
++    This is useful if you want to have different template directories
++    for different parts of your application.
++    """
++
++    delimiter = "/"
++    loader_attr = "loader"
++
++    def __init__(self, mapping: t.Mapping[str, BaseLoader]) -> None:
++        self.mapping = dict(mapping)
++
++    def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        if "/" not in template:
++            raise TemplateNotFound(template)
++        prefix, name = template.split("/", 1)
++        try:
++            loader = self.mapping[prefix]
++        except KeyError:
++            raise TemplateNotFound(template)
++        return loader, name
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        loader, local_name = self.get_loader(name)
++        try:
++            return loader.load(environment, local_name, globals)
++        except TemplateNotFound as e:
++            # re-raise the exception with the correct filename here.
++            # (the one that includes the prefix)
++            raise TemplateNotFound(name) from e
++
++    def list_templates(self) -> t.List[str]:
++        result = []
++        for prefix, loader in self.mapping.items():
++            for template in loader.list_templates():
++                result.append(prefix + self.delimiter + template)
++        return result
++
++
++class ChoiceLoader(BaseLoader):
++    """This loader works like the `PrefixLoader` just that no prefix is
++    specified.  If a template could not be found by one loader the next one
++    is tried.
++
++    >>> loader = ChoiceLoader([
++    ...     FileSystemLoader('/path/to/user/templates'),
++    ...     FileSystemLoader('/path/to/system/templates')
++    ... ])
++
++    This is useful if you want to allow users to override builtin templates
++    from a different location.
++    """
++
++    def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        self.loaders = loaders
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        for loader in self.loaders:
++            try:
++                return loader.get_source(environment, template)
++            except TemplateNotFound:
++                pass
++        raise TemplateNotFound(template)
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        for loader in self.loaders:
++            try:
++                return loader.load(environment, name, globals)
++            except TemplateNotFound:
++                pass
++        raise TemplateNotFound(name)
++
++    def list_templates(self) -> t.List[str]:
++        found = set()
++        for loader in self.loaders:
++            found.update(loader.list_templates())
++        return sorted(found)
++
++
++class _TemplateModule(ModuleType):
++    """Like a normal module but with support for weak references"""
++
++
++class ModuleLoader(BaseLoader):
++    """This loader loads templates from precompiled templates.
++
++    Example usage:
++
++    >>> loader = ChoiceLoader([
++    ...     ModuleLoader('/path/to/compiled/templates'),
++    ...     FileSystemLoader('/path/to/templates')
++    ... ])
++
++    Templates can be precompiled with :meth:`Environment.compile_templates`.
++    """
++
++    has_source_access = False
++
++    def __init__(
++        self, path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
++    ) -> None:
++        package_name = f"_jinja2_module_templates_{id(self):x}"
++
++        # create a fake module that looks for the templates in the
++        # path given.
++        mod = _TemplateModule(package_name)
++
++        if not isinstance(path, abc.Iterable) or isinstance(path, str):
++            path = [path]
++
++        mod.__path__ = [os.fspath(p) for p in path]
++
++        sys.modules[package_name] = weakref.proxy(
++            mod, lambda x: sys.modules.pop(package_name, None)
++        )
++
++        # the only strong reference, the sys.modules entry is weak
++        # so that the garbage collector can remove it once the
++        # loader that created it goes out of business.
++        self.module = mod
++        self.package_name = package_name
++
++    @staticmethod
++    def get_template_key(name: str) -> str:
++        return "tmpl_" + sha1(name.encode("utf-8")).hexdigest()
++
++    @staticmethod
++    def get_module_filename(name: str) -> str:
++        return ModuleLoader.get_template_key(name) + ".py"
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        key = self.get_template_key(name)
++        module = f"{self.package_name}.{key}"
++        mod = getattr(self.module, module, None)
++
++        if mod is None:
++            try:
++                mod = __import__(module, None, None, ["root"])
++            except ImportError as e:
++                raise TemplateNotFound(name) from e
++
++            # remove the entry from sys.modules, we only want the attribute
++            # on the module object we have stored on the loader.
++            sys.modules.pop(module, None)
++
++        if globals is None:
++            globals = {}
++
++        return environment.template_class.from_module_dict(
++            environment, mod.__dict__, globals
++        )
++
++
++class DictLoader(BaseLoader):
++    """Loads templates from a dictionary.
++
++    >>> loader = DictLoader({'index.html': 'Hello World!'})
++
++    This is useful for testing purposes or when templates are generated
++    dynamically.
++    """
++
++    def __init__(self, mapping: t.Dict[str, str]) -> None:
++        self.mapping = mapping
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        if template not in self.mapping:
++            raise TemplateNotFound(template)
++        source = self.mapping[template]
++        return source, None, lambda: template in self.mapping
++
++    def list_templates(self) -> t.List[str]:
++        return sorted(self.mapping.keys())
++
++
++class _FileSystemLoaderMonitor:
++    """Background monitor for FileSystemLoader that proactively invalidates
++    template caches when files are modified, deleted, or added.
++    """
++
++    def __init__(self, loader: "FileSystemLoader") -> None:
++        self.loader = loader
++        self._thread: t.Optional[threading.Thread] = None
++        self._stop_event = threading.Event()
++        self._environments: t.List[weakref.ref] = []
++        self._lock = threading.Lock()
++        self._last_scan: t.Dict[str, float] = {}
++
++    def start(self) -> None:
++        """Start the monitoring thread. Idempotent - safe to call multiple times."""
++        if self._thread is not None and self._thread.is_alive():
++            return
++        
++        self._stop_event.clear()
++        self._thread = threading.Thread(
++            target=self._run, daemon=True, name="jinja2_fsloader_monitor"
++        )
++        self._thread.start()
++
++    def stop(self) -> None:
++        """Stop the monitoring thread. Idempotent - safe to call multiple times."""
++        self._stop_event.set()
++        if self._thread is not None:
++            self._thread.join(timeout=1.0)
++            self._thread = None
++
++    def _run(self) -> None:
++        """Main loop for the monitoring thread."""
++        while not self._stop_event.is_set():
++            try:
++                self.scan_once()
++            except Exception:
++                # Background filesystem errors do not terminate the monitor
++                pass
++            
++            # Wait for the next interval (0.5 seconds) or stop event
++            self._stop_event.wait(0.5)
++
++    def add_environment(self, environment: "Environment") -> None:
++        """Add an environment to be tracked."""
++        with self._lock:
++            ref = weakref.ref(environment)
++            if ref not in self._environments:
++                self._environments.append(ref)
++
++    def remove_environments(self) -> None:
++        """Remove dead environment references."""
++        with self._lock:
++            self._environments = [ref for ref in self._environments if ref() is not None]
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous comparison and invalidate changed entries.
++        
++        Returns canonical /-separated template names that were invalidated.
++        """
++        self.remove_environments()
++        
++        # Get current state of all templates
++        current_state = self._get_current_state()
++        
++        invalidated = []
++        
++        # Check for deleted templates
++        for name, mtime in list(self._last_scan.items()):
++            if name not in current_state:
++                self._invalidate_template(name)
++                invalidated.append(name)
++        
++        # Check for modified templates
++        for name, new_mtime in current_state.items():
++            old_mtime = self._last_scan.get(name)
++            if old_mtime is not None and old_mtime != new_mtime:
++                self._invalidate_template(name)
++                invalidated.append(name)
++        
++        # Update last scan state
++        self._last_scan = current_state
++        
++        return invalidated
++    
++    def _get_current_state(self) -> t.Dict[str, float]:
++        """Get current mtime for all templates."""
++        state = {}
++        for searchpath in self.loader.searchpath:
++            walk_dir = os.walk(searchpath, followlinks=self.loader.followlinks)
++            for dirpath, _, filenames in walk_dir:
++                for filename in filenames:
++                    full_path = os.path.join(dirpath, filename)
++                    try:
++                        mtime = os.path.getmtime(full_path)
++                        # Convert to canonical template name
++                        rel_path = os.path.relpath(full_path, searchpath)
++                        template_name = (
++                            rel_path.replace(os.path.sep, "/")
++                            .lstrip("./")
++                        )
++                        state[template_name] = mtime
++                    except OSError:
++                        pass
++        return state
++    
++    def _invalidate_template(self, name: str) -> None:
++        """Invalidate a template in all tracked environments."""
++        with self._lock:
++            for ref in self._environments:
++                env = ref()
++                if env is not None and env.cache is not None:
++                    cache_key = (weakref.ref(self.loader), name)
++                    if cache_key in env.cache:
++                        del env.cache[cache_key]
++
++
+ class FileSystemLoader(BaseLoader):
+     """Load templates from a directory in the file system.
+ 
+@@ -170,9 +484,13 @@ class FileSystemLoader(BaseLoader):
+     :param encoding: Use this encoding to read the text from template
+         files.
+     :param followlinks: Follow symbolic links in the path.
++    :param auto_reload: Whether to proactively invalidate the cache when
++        templates are modified, deleted, or added. Defaults to ``False``.
+ 
+     .. versionchanged:: 2.8
+         Added the ``followlinks`` parameter.
++    .. versionadded:: 3.1
++        Added the ``auto_reload`` parameter.
+     """
+ 
+     def __init__(
+@@ -180,6 +498,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        auto_reload: bool = False,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,6 +506,8 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.auto_reload = auto_reload
++        self._monitor: t.Optional[_FileSystemLoaderMonitor] = None
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+@@ -230,6 +551,95 @@ class FileSystemLoader(BaseLoader):
+                         found.add(template)
+         return sorted(found)
+ 
++    def start_monitoring(self) -> None:
++        """Start the background monitoring thread.
++        
++        This method is idempotent - calling it multiple times has no effect
++        if monitoring is already running. When auto_reload is False, this
++        method does nothing.
++        """
++        if not self.auto_reload:
++            return
++        
++        if self._monitor is None:
++            self._monitor = _FileSystemLoaderMonitor(self)
++        
++        self._monitor.start()
++
++    def close(self) -> None:
++        """Close the monitoring thread.
++        
++        This method is idempotent - calling it multiple times has no effect.
++        Closing terminates the thread, and weak tracking does not keep
++        environments alive.
++        """
++        if self._monitor is not None:
++            self._monitor.stop()
++            self._monitor = None
++
++    def __enter__(self) -> "FileSystemLoader":
++        """Context manager entry - starts monitoring."""
++        self.start_monitoring()
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        """Context manager exit - stops monitoring."""
++        self.close()
++
++    def scan_once(self) -> t.List[str]:
++        """Perform a synchronous comparison and invalidate changed entries.
++        
++        Returns canonical /-separated template names that were invalidated.
++        """
++        if self._monitor is None:
++            self._monitor = _FileSystemLoaderMonitor(self)
++        
++        return self._monitor.scan_once()
++
++    def invalidate_changed(self, paths: t.Iterable[str]) -> t.List[str]:
++        """Synchronously invalidate the supplied absolute paths.
++        
++        Paths outside search roots are ignored. Nested paths and leading-dot
++        names are preserved.
++        
++        Returns canonical /-separated template names that were invalidated.
++        """
++        invalidated = []
++        seen = set()
++        
++        for path in paths:
++            abs_path = os.path.abspath(path)
++            
++            # Check if path is within any search root
++            for searchpath in self.searchpath:
++                # Normalize paths for comparison
++                searchpath_norm = os.path.normpath(searchpath)
++                abs_path_norm = os.path.normpath(abs_path)
++                
++                if abs_path_norm.startswith(searchpath_norm + os.path.sep) or abs_path_norm == searchpath_norm:
++                    # Convert to template name
++                    rel_path = os.path.relpath(abs_path_norm, searchpath_norm)
++                    template_name = (
++                        rel_path.replace(os.path.sep, "/")
++                        .lstrip("./")
++                    )
++                    
++                    if template_name not in seen:
++                        seen.add(template_name)
++                        
++                        # Invalidate in all tracked environments
++                        if self._monitor is not None:
++                            with self._monitor._lock:
++                                for ref in self._monitor._environments:
++                                    env = ref()
++                                    if env is not None and env.cache is not None:
++                                        cache_key = (weakref.ref(self), template_name)
++                                        if cache_key in env.cache:
++                                            del env.cache[cache_key]
++                                            invalidated.append(template_name)
++                    break
++        
++        return invalidated
+ 
+ class PackageLoader(BaseLoader):
+     """Load templates from a directory in a Python package.
+@@ -572,10 +982,57 @@ class ChoiceLoader(BaseLoader):
+         return sorted(found)
+ 
+ 
++class ChoiceLoader(BaseLoader):
++    """This loader works like the `PrefixLoader` just that no prefix is
++    specified.  If a template could not be found by one loader the next one
++    is tried.
++
++    >>> loader = ChoiceLoader([
++    ...     FileSystemLoader('/path/to/user/templates'),
++    ...     FileSystemLoader('/path/to/system/templates')
++    ... ])
++
++    This is useful if you want to allow users to override builtin templates
++    from a different location.
++    """
++
++    def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++        self.loaders = loaders
++
++    def get_source(
++        self, environment: "Environment", template: str
++    ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        for loader in self.loaders:
++            try:
++                return loader.get_source(environment, template)
++            except TemplateNotFound:
++                pass
++        raise TemplateNotFound(template)
++
++    @internalcode
++    def load(
++        self,
++        environment: "Environment",
++        name: str,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++    ) -> "Template":
++        for loader in self.loaders:
++            try:
++                return loader.load(environment, name, globals)
++            except TemplateNotFound:
++                pass
++        raise TemplateNotFound(name)
++
++    def list_templates(self) -> t.List[str]:
++        found = set()
++        for loader in self.loaders:
++            found.update(loader.list_templates())
++        return sorted(found)
++
++
+ class _TemplateModule(ModuleType):
+     """Like a normal module but with support for weak references"""
+ 
+-
+ class ModuleLoader(BaseLoader):
+     """This loader loads templates from precompiled templates.
+ 

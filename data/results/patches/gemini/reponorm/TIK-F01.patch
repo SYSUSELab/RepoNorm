@@ -1,0 +1,144 @@
+diff --git a/tests/test_budget/test_budget.py b/tests/test_budget/test_budget.py
+new file mode 100644
+index 0000000..a74f5e9
+--- /dev/null
++++ b/tests/test_budget/test_budget.py
+@@ -0,0 +1,52 @@
++import tiktoken
++import pytest
++
++def test_budget_implementation():
++    enc = tiktoken.get_encoding("gpt2")
++    
++    # Test max_tokens
++    # "hello world" -> [31373, 995] (2 tokens)
++    
++    # Should work
++    enc.encode("hello world", max_tokens=2)
++    enc.encode("hello world", max_tokens=3)
++    
++    # Should raise ValueError
++    with pytest.raises(ValueError, match="max_tokens exceeded"):
++        enc.encode("hello world", max_tokens=1)
++        
++    # Should raise ValueError for invalid max_tokens
++    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
++        enc.encode("hello world", max_tokens=0)
++    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
++        enc.encode("hello world", max_tokens=-1)
++    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
++        enc.encode("hello world", max_tokens=True) # bool is not int
++
++    # Test encode_batch
++    # ["hello", "world"] -> [[31373], [995]]
++    
++    # Should work
++    enc.encode_batch(["hello", "world"], max_tokens=1, max_total_tokens=2)
++    
++    # Should raise ValueError for per-document budget
++    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
++        enc.encode_batch(["hello", "world"], max_tokens=0)
++        
++    # Should raise ValueError for total budget
++    with pytest.raises(ValueError, match="max_total_tokens exceeded"):
++        enc.encode_batch(["hello", "world"], max_total_tokens=1)
++        
++    # Should raise ValueError for invalid max_total_tokens
++    with pytest.raises(ValueError, match="max_total_tokens must be a positive integer"):
++        enc.encode_batch(["hello", "world"], max_total_tokens=0)
++
++    print("All tests passed!")
++
++if __name__ == "__main__":
++    try:
++        test_budget_implementation()
++    except Exception as e:
++        print(f"Test failed: {e}")
++        import traceback
++        traceback.print_exc()
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..4a5f4ce 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,6 +82,7 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        max_tokens: int | None = None,
+     ) -> list[int]:
+         """Encodes a string into tokens.
+ 
+@@ -110,6 +111,10 @@ class Encoding:
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
+         """
++
++        if max_tokens is not None:
++            if type(max_tokens) is not int or max_tokens <= 0:
++                raise ValueError("max_tokens must be a positive integer")
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -121,7 +126,10 @@ class Encoding:
+                 raise_disallowed_special_token(match.group())
+ 
+         try:
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++            if max_tokens is not None and len(tokens) > max_tokens:
++                raise ValueError(f"max_tokens exceeded: {len(tokens)} > {max_tokens}")
++            return tokens
+         except UnicodeEncodeError:
+             # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+             # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+@@ -130,7 +138,10 @@ class Encoding:
+             # string, but given that this is input we want to support, maybe that's okay.
+             # Also we use errors="replace" to handle weird things like lone surrogates.
+             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++            tokens = self._core_bpe.encode(text, allowed_special)
++            if max_tokens is not None and len(tokens) > max_tokens:
++                raise ValueError(f"max_tokens exceeded: {len(tokens)} > {max_tokens}")
++            return tokens
+ 
+     def encode_to_numpy(
+         self,
+@@ -179,6 +190,8 @@ class Encoding:
+         num_threads: int = 8,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
++        max_tokens: int | None = None,
++        max_total_tokens: int | None = None,
+     ) -> list[list[int]]:
+         """Encodes a list of strings into tokens, in parallel.
+ 
+@@ -189,6 +202,13 @@ class Encoding:
+         [[31373, 995], [11274, 16390, 995]]
+         ```
+         """
++
++        if max_tokens is not None:
++            if type(max_tokens) is not int or max_tokens <= 0:
++                raise ValueError("max_tokens must be a positive integer")
++        if max_total_tokens is not None:
++            if type(max_total_tokens) is not int or max_total_tokens <= 0:
++                raise ValueError("max_total_tokens must be a positive integer")
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -197,10 +217,13 @@ class Encoding:
+             disallowed_special = frozenset(disallowed_special)
+ 
+         encoder = functools.partial(
+-            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special
++            self.encode, allowed_special=allowed_special, disallowed_special=disallowed_special, max_tokens=max_tokens
+         )
+         with ThreadPoolExecutor(num_threads) as e:
+-            return list(e.map(encoder, text))
++            results = list(e.map(encoder, text))
++        if max_total_tokens is not None and sum(len(t) for t in results) > max_total_tokens:
++            raise ValueError(f"max_total_tokens exceeded: {sum(len(t) for t in results)} > {max_total_tokens}")
++        return results
+ 
+     def encode_with_unstable(
+         self,

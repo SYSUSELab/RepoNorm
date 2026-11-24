@@ -1,0 +1,84 @@
+diff --git a/dspy/adapters/types/tool.py b/dspy/adapters/types/tool.py
+index 843eceed..f6e3daca 100644
+--- a/dspy/adapters/types/tool.py
++++ b/dspy/adapters/types/tool.py
+@@ -1,9 +1,12 @@
+ import asyncio
+ import inspect
++import json
++import hashlib
++import math
+ from typing import TYPE_CHECKING, Any, Callable, Type, get_origin, get_type_hints
+ 
+ from jsonschema import ValidationError, validate
+-from pydantic import BaseModel, TypeAdapter, create_model
++from pydantic import BaseModel, TypeAdapter, create_model, PrivateAttr
+ 
+ from dspy.adapters.types.base_type import Type
+ from dspy.dsp.utils.settings import settings
+@@ -259,6 +262,65 @@ class ToolCalls(Type):
+         name: str
+         args: dict[str, Any]
+ 
++        _fingerprint: str = PrivateAttr(default="")
++        _id: str = PrivateAttr(default="")
++
++        def model_post_init(self, __context):
++            """Compute fingerprint and id after initialization."""
++            object.__setattr__(self, "_fingerprint", self._compute_fingerprint())
++            object.__setattr__(self, "_id", self._fingerprint[:8])
++
++        def __setattr__(self, name, value):
++            if name in ("_fingerprint", "_id"):
++                raise AttributeError(f"Cannot assign or override '{name}' on ToolCall")
++            super().__setattr__(name, value)
++
++        @staticmethod
++        def _canonicalize_value(v):
++            """Recursively canonicalize a value for fingerprinting.
++
++            Rules:
++            - Sort dictionary keys (done by json.dumps sort_keys=True)
++            - Treat tuples as lists
++            - Trim surrounding whitespace from string values
++            - Preserve numeric/boolean types and list order
++            - Do not trim dictionary keys or the tool name
++            - Reject nonfinite numbers and non-JSON values with ValueError
++            """
++            if isinstance(v, dict):
++                return {k: ToolCalls.ToolCall._canonicalize_value(v) for k, v in v.items()}
++            elif isinstance(v, tuple):
++                return [ToolCalls.ToolCall._canonicalize_value(x) for x in v]
++            elif isinstance(v, list):
++                return [ToolCalls.ToolCall._canonicalize_value(x) for x in v]
++            elif isinstance(v, str):
++                return v.strip()
++            elif isinstance(v, bool):
++                return v
++            elif isinstance(v, (int, float)):
++                if isinstance(v, bool):
++                    return v
++                import math as _math
++                if _math.isnan(v) or _math.isinf(v):
++                    raise ValueError(f"Nonfinite number not allowed: {v}")
++                return v
++            elif v is None:
++                return v
++            else:
++                raise ValueError(f"Non-JSON value not allowed: {type(v).__name__}")
++
++        def _compute_fingerprint(self) -> str:
++            """Compute the SHA-256 fingerprint of this tool call.
++
++            The fingerprint is the 64-character hexadecimal SHA-256 of the
++            UTF-8 canonical JSON object ``{"name": name, "args": canonical_args}``,
++            using sorted keys and compact comma/colon separators.
++            """
++            canonical_args = self._canonicalize_value(self.args)
++            obj = {"name": self.name, "args": canonical_args}
++            json_str = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++            return hashlib.sha256(json_str.encode("utf-8")).hexdigest()
++
+     tool_calls: list[ToolCall]
+ 
+     @classmethod

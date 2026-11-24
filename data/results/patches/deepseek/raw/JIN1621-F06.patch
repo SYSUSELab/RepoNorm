@@ -1,0 +1,219 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..b078726 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -38,6 +38,19 @@ def split_template_path(template: str) -> t.List[str]:
+     return pieces
+ 
+ 
++def _do_transform(
++    name: str,
++    path_transform: t.Optional[t.Callable[[str], str]],
++) -> str:
++    """Apply path_transform if present, validating the return type."""
++    if path_transform is None:
++        return name
++    rv = path_transform(name)
++    if not isinstance(rv, str):
++        raise TypeError("path_transform must return a string")
++    return rv
++
++
+ class BaseLoader:
+     """Baseclass for all loaders.  Subclass this and override `get_source` to
+     implement a custom loading mechanism.  The environment provides a
+@@ -180,6 +193,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,11 +201,15 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+-        pieces = split_template_path(template)
++        try:
++            pieces = split_template_path(_do_transform(template, self.path_transform))
++        except TemplateNotFound:
++            raise TemplateNotFound(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+@@ -269,6 +287,7 @@ class PackageLoader(BaseLoader):
+         package_name: str,
+         package_path: "str" = "templates",
+         encoding: str = "utf-8",
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         package_path = os.path.normpath(package_path).rstrip(os.path.sep)
+ 
+@@ -281,6 +300,7 @@ class PackageLoader(BaseLoader):
+         self.package_path = package_path
+         self.package_name = package_name
+         self.encoding = encoding
++        self.path_transform = path_transform
+ 
+         # Make sure the package exists. This also makes namespace
+         # packages work, otherwise get_loader returns None.
+@@ -326,7 +346,10 @@ class PackageLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Optional[t.Callable[[], bool]]]:
+-        p = os.path.join(self._template_root, *split_template_path(template))
++        try:
++            p = os.path.join(self._template_root, *split_template_path(_do_transform(template, self.path_transform)))
++        except TemplateNotFound:
++            raise TemplateNotFound(template)
+         up_to_date: t.Optional[t.Callable[[], bool]]
+ 
+         if self._archive is None:
+@@ -401,15 +424,21 @@ class DictLoader(BaseLoader):
+     Because auto reloading is rarely useful this is disabled per default.
+     """
+ 
+-    def __init__(self, mapping: t.Mapping[str, str]) -> None:
++    def __init__(
++        self,
++        mapping: t.Mapping[str, str],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
++    ) -> None:
+         self.mapping = mapping
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, None, t.Callable[[], bool]]:
+-        if template in self.mapping:
+-            source = self.mapping[template]
+-            return source, None, lambda: source == self.mapping.get(template)
++        name = _do_transform(template, self.path_transform)
++        if name in self.mapping:
++            source = self.mapping[name]
++            return source, None, lambda: source == self.mapping.get(name)
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+@@ -444,13 +473,15 @@ class FunctionLoader(BaseLoader):
+                 ]
+             ],
+         ],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         self.load_func = load_func
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+-        rv = self.load_func(template)
++        rv = self.load_func(_do_transform(template, self.path_transform))
+ 
+         if rv is None:
+             raise TemplateNotFound(template)
+@@ -477,18 +508,23 @@ class PrefixLoader(BaseLoader):
+     """
+ 
+     def __init__(
+-        self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
++        self,
++        mapping: t.Mapping[str, BaseLoader],
++        delimiter: str = "/",
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         self.mapping = mapping
+         self.delimiter = delimiter
++        self.path_transform = path_transform
+ 
+     def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        name = _do_transform(template, self.path_transform)
+         try:
+-            prefix, name = template.split(self.delimiter, 1)
++            prefix, local_name = name.split(self.delimiter, 1)
+             loader = self.mapping[prefix]
+         except (ValueError, KeyError) as e:
+             raise TemplateNotFound(template) from e
+-        return loader, name
++        return loader, local_name
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+@@ -538,15 +574,21 @@ class ChoiceLoader(BaseLoader):
+     from a different location.
+     """
+ 
+-    def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++    def __init__(
++        self,
++        loaders: t.Sequence[BaseLoader],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
++    ) -> None:
+         self.loaders = loaders
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        name = _do_transform(template, self.path_transform)
+         for loader in self.loaders:
+             try:
+-                return loader.get_source(environment, template)
++                return loader.get_source(environment, name)
+             except TemplateNotFound:
+                 pass
+         raise TemplateNotFound(template)
+@@ -558,12 +600,14 @@ class ChoiceLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        original_name = name
++        name = _do_transform(name, self.path_transform)
+         for loader in self.loaders:
+             try:
+                 return loader.load(environment, name, globals)
+             except TemplateNotFound:
+                 pass
+-        raise TemplateNotFound(name)
++        raise TemplateNotFound(original_name)
+ 
+     def list_templates(self) -> t.List[str]:
+         found = set()
+@@ -592,9 +636,12 @@ class ModuleLoader(BaseLoader):
+     has_source_access = False
+ 
+     def __init__(
+-        self, path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
++        self,
++        path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         package_name = f"_jinja2_module_templates_{id(self):x}"
++        self.path_transform = path_transform
+ 
+         # create a fake module that looks for the templates in the
+         # path given.
+@@ -630,6 +677,8 @@ class ModuleLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        original_name = name
++        name = _do_transform(name, self.path_transform)
+         key = self.get_template_key(name)
+         module = f"{self.package_name}.{key}"
+         mod = getattr(self.module, module, None)
+@@ -638,7 +687,7 @@ class ModuleLoader(BaseLoader):
+             try:
+                 mod = __import__(module, None, None, ["root"])
+             except ImportError as e:
+-                raise TemplateNotFound(name) from e
++                raise TemplateNotFound(original_name) from e
+ 
+             # remove the entry from sys.modules, we only want the attribute
+             # on the module object we have stored on the loader.

@@ -1,0 +1,143 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..6df2646 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -916,6 +916,7 @@ class Command:
+         no_args_is_help: bool = False,
+         hidden: bool = False,
+         deprecated: bool | str = False,
++        required_if: t.Any | None = None,
+     ) -> None:
+         #: the name the command thinks it has.  Upon registering a command
+         #: on a :class:`Group` the group will default the command name
+@@ -2091,6 +2092,7 @@ class Parameter:
+         ]
+         | None = None,
+         deprecated: bool | str = False,
++        required_if: t.Any | None = None,
+     ) -> None:
+         self.name: str | None
+         self.opts: list[str]
+@@ -2119,6 +2121,9 @@ class Parameter:
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.required_if = required_if
++        if required_if is not None and not isinstance(required_if, (dict, cabc.Callable)):
++            raise TypeError("required_if must be a dict or callable.")
+ 
+         if __debug__:
+             if self.type.is_composite and nargs != self.type.arity:
+@@ -2347,6 +2352,18 @@ class Parameter:
+ 
+     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
+         value = self.type_cast_value(ctx, value)
++        if self.required_if is not None and self.value_is_missing(value):
++            if isinstance(self.required_if, dict):
++                for param_name, expected_value in self.required_if.items():
++                    if param_name not in ctx.params:
++                        raise UsageError(f"Parameter {param_name!r} not found in context.")
++                    if ctx.params.get(param_name) != expected_value:
++                        break
++                else:
++                    raise MissingParameter(ctx=ctx, param=self)
++            elif callable(self.required_if):
++                if self.required_if(ctx, self):
++                    raise MissingParameter(ctx=ctx, param=self)
+ 
+         if self.required and self.value_is_missing(value):
+             raise MissingParameter(ctx=ctx, param=self)
+@@ -2549,6 +2566,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        required_if: t.Any | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2556,7 +2574,7 @@ class Option(Parameter):
+ 
+         default_is_missing = "default" not in attrs
+         super().__init__(
+-            param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
++            param_decls, type=type, multiple=multiple, deprecated=deprecated, required_if=required_if, **attrs
+         )
+ 
+         if prompt is True:
+diff --git a/tests/test_required_if.py b/tests/test_required_if.py
+new file mode 100644
+index 0000000..99aa037
+--- /dev/null
++++ b/tests/test_required_if.py
+@@ -0,0 +1,71 @@
++import click
++from click.testing import CliRunner
++import pytest
++
++def test_required_if_mapping():
++    @click.command()
++    @click.option("--auth-mode")
++    @click.option("--password", required_if={"auth_mode": "password"})
++    def cli(auth_mode, password):
++        click.echo(f"auth_mode={auth_mode}, password={password}")
++
++    runner = CliRunner()
++    
++    # Should fail if auth_mode is password but password is missing
++    result = runner.invoke(cli, ["--auth-mode", "password"])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output
++
++    # Should succeed if auth_mode is not password and password is missing
++    result = runner.invoke(cli, ["--auth-mode", "token"])
++    assert result.exit_code == 0
++    assert "auth_mode=token, password=None" in result.output
++
++    # Should succeed if auth_mode is password and password is provided
++    result = runner.invoke(cli, ["--auth-mode", "password", "--password", "secret"])
++    assert result.exit_code == 0
++    assert "auth_mode=password, password=secret" in result.output
++
++def test_required_if_callable():
++    @click.command()
++    @click.option("--count", type=int)
++    @click.option("--value", required_if=lambda ctx, param: ctx.params.get("count", 0) > 5)
++    def cli(count, value):
++        click.echo(f"count={count}, value={value}")
++
++    runner = CliRunner()
++    
++    # Should fail if count > 5 and value is missing
++    result = runner.invoke(cli, ["--count", "6"])
++    assert result.exit_code != 0
++    assert "Missing option" in result.output
++
++    # Should succeed if count <= 5 and value is missing
++    result = runner.invoke(cli, ["--count", "5"])
++    assert result.exit_code == 0
++    assert "count=5, value=None" in result.output
++
++    # Should succeed if count > 5 and value is provided
++    result = runner.invoke(cli, ["--count", "6", "--value", "foo"])
++    assert result.exit_code == 0
++    assert "count=6, value=foo" in result.output
++
++def test_required_if_invalid_type():
++    with pytest.raises(TypeError, match="required_if must be a dict or callable."):
++        @click.command()
++        @click.option("--foo", required_if="invalid")
++        def cli(foo):
++            pass
++
++def test_required_if_invalid_param_name():
++    @click.command()
++    @click.option("--password", required_if={"invalid_param": "value"})
++    def cli(password):
++        pass
++
++    runner = CliRunner()
++    result = runner.invoke(cli, [])
++    # This should probably raise a UsageError or something similar.
++    assert result.exit_code != 0
++    assert "Parameter" in result.output and "not found in context" in result.output
++    # Let's see what happens.

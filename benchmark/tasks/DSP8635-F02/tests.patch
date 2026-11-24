@@ -1,0 +1,92 @@
+diff --git a/tests/propose/test_grounded_proposer2.py b/tests/propose/test_grounded_proposer2.py
+new file mode 100644
+index 0000000..0dbc8c7
+--- /dev/null
++++ b/tests/propose/test_grounded_proposer2.py
+@@ -0,0 +1,86 @@
++import copy
++import random
++from types import SimpleNamespace
++
++import pytest
++import dspy
++from dspy.predict.predict import Predict as RealPredict
++from dspy.propose import grounded_proposer as gp
++
++
++class ExampleProgram(dspy.Module):
++    def __init__(self, two=False):
++        super().__init__()
++        self.first = RealPredict('question -> answer')
++        if two:
++            self.second = RealPredict('question -> answer')
++
++
++def recording_proposer(monkeypatch, *, outputs=None, program=None, rng=None, **options):
++    program = program or ExampleProgram()
++    outputs = outputs or {}
++    events = []
++    model = SimpleNamespace(kwargs={'temperature': 0.7, 'max_tokens': 500}, inspect_history=lambda **kw: None)
++    class Recorder:
++        def __init__(self, signature):
++            self.signature = signature
++        def __call__(self, **kwargs):
++            events.append({'signature': self.signature, 'kwargs': copy.deepcopy(kwargs),
++                           'model_kwargs': dict(model.kwargs)})
++            if outputs.get('raise_on') == self.signature.__name__:
++                raise RuntimeError('recorded generation failure')
++            values = {}
++            for field in self.signature.output_fields:
++                if self.signature.__name__ == 'ShortenInstruction':
++                    values[field] = outputs.get('shortened', 'A shortened instruction.')
++                else:
++                    values[field] = outputs.get(field, {
++                        'program_description': 'Program description. More details.',
++                        'module_description': 'Module description. More details.',
++                        'proposed_instruction': 'PROPOSED INSTRUCTION: A useful generated instruction.',
++                    }.get(field, 'value'))
++            return dspy.Prediction(**values)
++    monkeypatch.setattr(gp.dspy, 'Predict', Recorder)
++    monkeypatch.setattr(gp, 'get_prompt_model', lambda supplied: supplied)
++    monkeypatch.setattr(gp, 'get_dspy_source_code', lambda program: 'recorded program code')
++    monkeypatch.setattr(gp, 'create_dataset_summary', lambda **kwargs: 'recorded summary')
++    settings = dict(use_dataset_summary=False, program_aware=True, use_task_demos=False,
++                    set_tip_randomly=False, set_history_randomly=False, rng=rng or random.Random(17))
++    settings.update(options)
++    proposer = gp.GroundedProposer(prompt_model=model, program=program, trainset=[], **settings)
++    return proposer, program, model, events
++
++
++def propose(proposer, program, *, count=1, logs=None):
++    return proposer.propose_instructions_for_program([], program, None, logs or {}, count, 0.5)
++
++
++def generation_events(events):
++    return [event for event in events if event['signature'].__name__ == 'GenerateSingleModuleInstruction']
++
++
++@pytest.mark.parametrize('limit,expected', [(-3, 0), (0, 0), (1, 1), (5, 5), (20, 20), (99, 20)])
++def test_history_limit_reaches_actual_generated_prompt(monkeypatch, tmp_path, limit, expected):
++    program = ExampleProgram(two=True)
++    logs = {}
++    for index in range(23):
++        saved = program.deepcopy()
++        for pred_i, predictor in enumerate(saved.predictors()):
++            predictor.signature = predictor.signature.with_instructions(f'History_{pred_i}_{index:02d}')
++        path = tmp_path / f'history-{index}.json'
++        saved.save(str(path))
++        logs[index] = {'program_path': str(path), 'score': index}
++    proposer, program, model, events = recording_proposer(monkeypatch, program=program, max_instruct_history=limit)
++    propose(proposer, program, logs=logs)
++    generated = generation_events(events)
++    assert len(generated) == 2
++    for pred_i, event in enumerate(generated):
++        history = event['kwargs']['previous_instructions']
++        names = [line.split(' | Score:')[0] for line in history.splitlines() if ' | Score:' in line]
++        assert names == [f'History_{pred_i}_{index:02d}' for index in range(23 - expected, 23)]
++
++
++@pytest.mark.parametrize('invalid', [True, 1.5, '5', None])
++def test_history_limit_rejects_nonintegers(monkeypatch, invalid):
++    with pytest.raises(ValueError):
++        recording_proposer(monkeypatch, max_instruct_history=invalid)

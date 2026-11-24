@@ -1,0 +1,232 @@
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index d7d9bd0..4ecf9cc 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -180,6 +180,7 @@ class FileSystemLoader(BaseLoader):
+         searchpath: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
+         encoding: str = "utf-8",
+         followlinks: bool = False,
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         if not isinstance(searchpath, abc.Iterable) or isinstance(searchpath, str):
+             searchpath = [searchpath]
+@@ -187,11 +188,21 @@ class FileSystemLoader(BaseLoader):
+         self.searchpath = [os.fspath(p) for p in searchpath]
+         self.encoding = encoding
+         self.followlinks = followlinks
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Callable[[], bool]]:
+-        pieces = split_template_path(template)
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(template)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = template
++        try:
++            pieces = split_template_path(lookup_name)
++        except TemplateNotFound:
++            raise TemplateNotFound(template)
+         for searchpath in self.searchpath:
+             filename = os.path.join(searchpath, *pieces)
+             f = open_if_exists(filename)
+@@ -269,6 +280,7 @@ class PackageLoader(BaseLoader):
+         package_name: str,
+         package_path: "str" = "templates",
+         encoding: str = "utf-8",
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         package_path = os.path.normpath(package_path).rstrip(os.path.sep)
+ 
+@@ -281,6 +293,7 @@ class PackageLoader(BaseLoader):
+         self.package_path = package_path
+         self.package_name = package_name
+         self.encoding = encoding
++        self.path_transform = path_transform
+ 
+         # Make sure the package exists. This also makes namespace
+         # packages work, otherwise get_loader returns None.
+@@ -326,7 +339,17 @@ class PackageLoader(BaseLoader):
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, str, t.Optional[t.Callable[[], bool]]]:
+-        p = os.path.join(self._template_root, *split_template_path(template))
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(template)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = template
++        try:
++            pieces = split_template_path(lookup_name)
++        except TemplateNotFound:
++            raise TemplateNotFound(template)
++        p = os.path.join(self._template_root, *pieces)
+         up_to_date: t.Optional[t.Callable[[], bool]]
+ 
+         if self._archive is None:
+@@ -401,15 +424,25 @@ class DictLoader(BaseLoader):
+     Because auto reloading is rarely useful this is disabled per default.
+     """
+ 
+-    def __init__(self, mapping: t.Mapping[str, str]) -> None:
++    def __init__(
++        self, mapping: t.Mapping[str, str],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
++    ) -> None:
+         self.mapping = mapping
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, None, t.Callable[[], bool]]:
+-        if template in self.mapping:
+-            source = self.mapping[template]
+-            return source, None, lambda: source == self.mapping.get(template)
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(template)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = template
++        if lookup_name in self.mapping:
++            source = self.mapping[lookup_name]
++            return source, None, lambda: source == self.mapping.get(lookup_name)
+         raise TemplateNotFound(template)
+ 
+     def list_templates(self) -> t.List[str]:
+@@ -444,13 +477,21 @@ class FunctionLoader(BaseLoader):
+                 ]
+             ],
+         ],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         self.load_func = load_func
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
+-        rv = self.load_func(template)
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(template)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = template
++        rv = self.load_func(lookup_name)
+ 
+         if rv is None:
+             raise TemplateNotFound(template)
+@@ -477,17 +518,26 @@ class PrefixLoader(BaseLoader):
+     """
+ 
+     def __init__(
+-        self, mapping: t.Mapping[str, BaseLoader], delimiter: str = "/"
++        self,
++        mapping: t.Mapping[str, BaseLoader],
++        delimiter: str = "/",
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         self.mapping = mapping
+         self.delimiter = delimiter
++        self.path_transform = path_transform
+ 
+     def get_loader(self, template: str) -> t.Tuple[BaseLoader, str]:
++        original = template
++        if self.path_transform is not None:
++            template = self.path_transform(template)
++            if not isinstance(template, str):
++                raise TypeError("path_transform must return a string")
+         try:
+             prefix, name = template.split(self.delimiter, 1)
+             loader = self.mapping[prefix]
+         except (ValueError, KeyError) as e:
+-            raise TemplateNotFound(template) from e
++            raise TemplateNotFound(original) from e
+         return loader, name
+ 
+     def get_source(
+@@ -538,15 +588,26 @@ class ChoiceLoader(BaseLoader):
+     from a different location.
+     """
+ 
+-    def __init__(self, loaders: t.Sequence[BaseLoader]) -> None:
++    def __init__(
++        self,
++        loaders: t.Sequence[BaseLoader],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
++    ) -> None:
+         self.loaders = loaders
++        self.path_transform = path_transform
+ 
+     def get_source(
+         self, environment: "Environment", template: str
+     ) -> t.Tuple[str, t.Optional[str], t.Optional[t.Callable[[], bool]]]:
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(template)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = template
+         for loader in self.loaders:
+             try:
+-                return loader.get_source(environment, template)
++                return loader.get_source(environment, lookup_name)
+             except TemplateNotFound:
+                 pass
+         raise TemplateNotFound(template)
+@@ -558,9 +619,15 @@ class ChoiceLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(name)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = name
+         for loader in self.loaders:
+             try:
+-                return loader.load(environment, name, globals)
++                return loader.load(environment, lookup_name, globals)
+             except TemplateNotFound:
+                 pass
+         raise TemplateNotFound(name)
+@@ -592,7 +659,9 @@ class ModuleLoader(BaseLoader):
+     has_source_access = False
+ 
+     def __init__(
+-        self, path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]]
++        self,
++        path: t.Union[str, os.PathLike, t.Sequence[t.Union[str, os.PathLike]]],
++        path_transform: t.Optional[t.Callable[[str], str]] = None,
+     ) -> None:
+         package_name = f"_jinja2_module_templates_{id(self):x}"
+ 
+@@ -614,6 +683,7 @@ class ModuleLoader(BaseLoader):
+         # loader that created it goes out of business.
+         self.module = mod
+         self.package_name = package_name
++        self.path_transform = path_transform
+ 
+     @staticmethod
+     def get_template_key(name: str) -> str:
+@@ -630,7 +700,13 @@ class ModuleLoader(BaseLoader):
+         name: str,
+         globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
+     ) -> "Template":
+-        key = self.get_template_key(name)
++        if self.path_transform is not None:
++            lookup_name = self.path_transform(name)
++            if not isinstance(lookup_name, str):
++                raise TypeError("path_transform must return a string")
++        else:
++            lookup_name = name
++        key = self.get_template_key(lookup_name)
+         module = f"{self.package_name}.{key}"
+         mod = getattr(self.module, module, None)
+ 

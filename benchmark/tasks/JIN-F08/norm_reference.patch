@@ -1,0 +1,214 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index d67381b1..4fb1c5dc 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -5,6 +5,9 @@ Version 3.1.0
+ 
+ Unreleased
+ 
++-   Add a ``with_counts`` option to ``groupby`` for returning each materialized
++    group's member count as a third result field.
++
+ -   Drop support for Python 3.6. :pr:`1534`
+ -   Remove previously deprecated code. :pr:`1544`
+ 
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 80ea6504..d0d81b1b 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -1144,6 +1144,19 @@ def do_round(
+     return t.cast(float, func(value * (10**precision)) / (10**precision))
+ 
+ 
++class _CountedGroupTuple(t.NamedTuple):
++    grouper: t.Any
++    list: t.List
++    # This data field intentionally replaces tuple.count for the opt-in result.
++    count: int  # type: ignore
++
++    def __repr__(self) -> str:
++        return tuple.__repr__(self)
++
++    def __str__(self) -> str:
++        return tuple.__str__(self)
++
++
+ class _GroupTuple(t.NamedTuple):
+     grouper: t.Any
+     list: t.List
+@@ -1157,13 +1170,17 @@ class _GroupTuple(t.NamedTuple):
+         return tuple.__str__(self)
+ 
+ 
++_AnyGroupTuple = t.Union[_GroupTuple, _CountedGroupTuple]
++
++
+ @pass_environment
+ def sync_do_groupby(
+     environment: "Environment",
+     value: "t.Iterable[V]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    with_counts: bool = False,
++) -> "t.List[_AnyGroupTuple]":
+     """Group a sequence of objects by an attribute using Python's
+     :func:`itertools.groupby`. The attribute can use dot notation for
+     nested access, like ``"address.city"``. Unlike Python's ``groupby``,
+@@ -1203,6 +1220,22 @@ def sync_do_groupby(
+           <li>{{ city }}: {{ items|map(attribute="name")|join(", ") }}</li>
+         {% endfor %}</ul>
+ 
++    When ``with_counts`` is ``True``, the filter returns tuples of
++    ``(grouper, list, count)`` instead of ``(grouper, list)``.
++
++    .. sourcecode:: html+jinja
++
++        <ul>{% for city, items, count in users|groupby("city", with_counts=true) %}
++          <li>{{ city }} ({{ count }} users)
++            <ul>{% for user in items %}
++              <li>{{ user.name }}
++            {% endfor %}</ul>
++          </li>
++        {% endfor %}</ul>
++
++    .. versionchanged:: 3.1
++        Added the ``with_counts`` parameter.
++
+     .. versionchanged:: 3.0
+         Added the ``default`` parameter.
+ 
+@@ -1210,10 +1243,17 @@ def sync_do_groupby(
+         The attribute supports dot notation for nested access.
+     """
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, list(values))
+-        for key, values in groupby(sorted(value, key=expr), expr)
+-    ]
++    result: t.List[_AnyGroupTuple] = []
++
++    for key, values in groupby(sorted(value, key=expr), expr):
++        items = list(values)
++
++        if with_counts:
++            result.append(_CountedGroupTuple(key, items, len(items)))
++        else:
++            result.append(_GroupTuple(key, items))
++
++    return result
+ 
+ 
+ @async_variant(sync_do_groupby)  # type: ignore
+@@ -1222,12 +1262,20 @@ async def do_groupby(
+     value: "t.Union[t.AsyncIterable[V], t.Iterable[V]]",
+     attribute: t.Union[str, int],
+     default: t.Optional[t.Any] = None,
+-) -> "t.List[t.Tuple[t.Any, t.List[V]]]":
++    with_counts: bool = False,
++) -> "t.List[_AnyGroupTuple]":
+     expr = make_attrgetter(environment, attribute, default=default)
+-    return [
+-        _GroupTuple(key, await auto_to_list(values))
+-        for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr)
+-    ]
++    result: t.List[_AnyGroupTuple] = []
++
++    for key, values in groupby(sorted(await auto_to_list(value), key=expr), expr):
++        items = await auto_to_list(values)
++
++        if with_counts:
++            result.append(_CountedGroupTuple(key, items, len(items)))
++        else:
++            result.append(_GroupTuple(key, items))
++
++    return result
+ 
+ 
+ @pass_environment
+diff --git a/tests/test_groupby_counts_contribution.py b/tests/test_groupby_counts_contribution.py
+new file mode 100644
+index 00000000..8ad2de30
+--- /dev/null
++++ b/tests/test_groupby_counts_contribution.py
+@@ -0,0 +1,80 @@
++import asyncio
++
++import pytest
++
++from jinja2 import Environment
++from jinja2 import StrictUndefined
++from jinja2 import UndefinedError
++
++
++def test_counted_groups_expose_tuple_and_named_fields():
++    env = Environment()
++    rows = [{"kind": "b"}, {"kind": "a"}, {"kind": "b"}]
++
++    groups = env.call_filter("groupby", iter(rows), ["kind"], {"with_counts": True})
++
++    assert [(g.grouper, g.list, g.count) for g in groups] == [
++        ("a", [rows[1]], 1),
++        ("b", [rows[0], rows[2]], 2),
++    ]
++    assert tuple(groups[1]) == ("b", [rows[0], rows[2]], 2)
++    assert groups[1][2] == 2
++    assert repr(groups[1]) == repr(("b", [rows[0], rows[2]], 2))
++    legacy = env.call_filter("groupby", rows, ["kind"])[0]
++    assert len(legacy) == 2
++    assert callable(legacy.count)
++
++
++def test_count_is_snapshot_of_materialized_members():
++    env = Environment()
++    groups = env.call_filter(
++        "groupby", [{"kind": "a"}], ["kind"], {"with_counts": True}
++    )
++
++    groups[0].list.append({"kind": "a"})
++
++    assert groups[0].count == 1
++    assert len(groups[0].list) == 2
++
++
++def test_counts_use_environment_lookup_and_default():
++    class UpperKeyEnvironment(Environment):
++        def getitem(self, obj, argument):
++            if argument == "kind" and argument in obj:
++                return obj[argument].upper()
++
++            return super().getitem(obj, argument)
++
++    env = UpperKeyEnvironment()
++    rows = [{"kind": "a"}, {}, {"kind": "A"}]
++    groups = env.call_filter(
++        "groupby",
++        rows,
++        ["kind"],
++        {"default": "missing", "with_counts": True},
++    )
++
++    assert [(g.grouper, g.count) for g in groups] == [("A", 2), ("missing", 1)]
++
++
++def test_counts_propagate_strict_undefined_comparison():
++    env = Environment(undefined=StrictUndefined)
++
++    with pytest.raises(UndefinedError):
++        env.call_filter("groupby", [{}, {}], ["kind"], {"with_counts": True})
++
++
++def test_counts_async_accepts_async_input():
++    async def stream():
++        for row in [{"kind": "a"}, {"kind": "a"}]:
++            yield row
++
++    async def run():
++        env = Environment(enable_async=True)
++        return await env.call_filter(
++            "groupby", stream(), ["kind"], {"with_counts": True}
++        )
++
++    groups = asyncio.run(run())
++
++    assert [(g.grouper, g.count, len(g.list)) for g in groups] == [("a", 2, 2)]

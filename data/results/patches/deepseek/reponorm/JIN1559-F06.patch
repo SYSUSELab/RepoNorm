@@ -1,0 +1,428 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0c380c8..db71d47 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -437,6 +437,10 @@ class Environment:
+         if extensions is not missing:
+             rv.extensions.update(load_extensions(rv, extensions))
+ 
++        # Each overlay must have its own translation cache state.
++        rv.translation_cache = None
++        rv.translation_cache_partition = None
++
+         return _environment_config_check(rv)
+ 
+     @property
+diff --git a/src/jinja2/ext.py b/src/jinja2/ext.py
+index d21b83a..99fc3ec 100644
+--- a/src/jinja2/ext.py
++++ b/src/jinja2/ext.py
+@@ -14,6 +14,7 @@ from .runtime import concat  # type: ignore
+ from .runtime import Context
+ from .runtime import Undefined
+ from .utils import import_string
++from .utils import LRUCache
+ from .utils import pass_context
+ 
+ if t.TYPE_CHECKING:
+@@ -242,6 +243,92 @@ def _make_new_npgettext(
+     return npgettext
+ 
+ 
++def _make_cached_gettext(func, env):
++    """Wrap a gettext callable with LRU caching."""
++    if env.translation_cache is None:
++        return func
++
++    def wrapper(singular):
++        cache = env.translation_cache
++        if cache is None:
++            return func(singular)
++        partition = env.translation_cache_partition
++        key = ("gettext", singular, partition)
++        try:
++            return cache[key]
++        except KeyError:
++            result = func(singular)
++            cache[key] = result
++            return result
++
++    return wrapper
++
++
++def _make_cached_ngettext(func, env):
++    """Wrap an ngettext callable with LRU caching."""
++    if env.translation_cache is None:
++        return func
++
++    def wrapper(singular, plural, n):
++        cache = env.translation_cache
++        if cache is None:
++            return func(singular, plural, n)
++        partition = env.translation_cache_partition
++        key = ("ngettext", singular, plural, n, partition)
++        try:
++            return cache[key]
++        except KeyError:
++            result = func(singular, plural, n)
++            cache[key] = result
++            return result
++
++    return wrapper
++
++
++def _make_cached_pgettext(func, env):
++    """Wrap a pgettext callable with LRU caching."""
++    if env.translation_cache is None:
++        return func
++
++    def wrapper(context, singular):
++        cache = env.translation_cache
++        if cache is None:
++            return func(context, singular)
++        partition = env.translation_cache_partition
++        key = ("pgettext", context, singular, partition)
++        try:
++            return cache[key]
++        except KeyError:
++            result = func(context, singular)
++            cache[key] = result
++            return result
++
++    return wrapper
++
++
++def _make_cached_npgettext(func, env):
++    """Wrap an npgettext callable with LRU caching."""
++    if env.translation_cache is None:
++        return func
++
++    def wrapper(context, singular, plural, n):
++        cache = env.translation_cache
++        if cache is None:
++            return func(context, singular, plural, n)
++        partition = env.translation_cache_partition
++        key = ("npgettext", context, singular, plural, n, partition)
++        try:
++            return cache[key]
++        except KeyError:
++            result = func(context, singular, plural, n)
++            cache[key] = result
++            return result
++
++    return wrapper
++
++
++
++
+ class InternationalizationExtension(Extension):
+     """This extension adds gettext support to Jinja."""
+ 
+@@ -264,6 +351,11 @@ class InternationalizationExtension(Extension):
+             uninstall_gettext_translations=self._uninstall,
+             extract_translations=self._extract,
+             newstyle_gettext=False,
++            translation_cache=None,
++            translation_cache_partition=None,
++            set_translation_cache_partition=self._set_translation_cache_partition,
++            clear_translation_cache=self._clear_translation_cache,
++            resize_translation_cache=self._resize_translation_cache,
+         )
+ 
+     def _install(
+@@ -319,9 +411,31 @@ class InternationalizationExtension(Extension):
+         newstyle: t.Optional[bool] = None,
+         pgettext: t.Optional[t.Callable[[str, str], str]] = None,
+         npgettext: t.Optional[t.Callable[[str, str, str, int], str]] = None,
++        cache_size: int = 0,
++        cache_partition: t.Any = None,
+     ) -> None:
++        # Clear prior cached results.
++        self._clear_translation_cache()
++
+         if newstyle is not None:
+             self.environment.newstyle_gettext = newstyle  # type: ignore
++
++        # Set up caching layer before newstyle wrapping so that formatting
++        # variables are not part of the raw provider keys.
++        env = self.environment
++        if cache_size > 0:
++            env.translation_cache = LRUCache(cache_size)
++            env.translation_cache_partition = cache_partition
++            gettext = _make_cached_gettext(gettext, env)
++            ngettext = _make_cached_ngettext(ngettext, env)
++            if pgettext is not None:
++                pgettext = _make_cached_pgettext(pgettext, env)
++            if npgettext is not None:
++                npgettext = _make_cached_npgettext(npgettext, env)
++        else:
++            env.translation_cache = None
++            env.translation_cache_partition = None
++
+         if self.environment.newstyle_gettext:  # type: ignore
+             gettext = _make_new_gettext(gettext)
+             ngettext = _make_new_ngettext(ngettext)
+@@ -336,10 +450,42 @@ class InternationalizationExtension(Extension):
+             gettext=gettext, ngettext=ngettext, pgettext=pgettext, npgettext=npgettext
+         )
+ 
+-    def _uninstall(self, translations: "_SupportedTranslations") -> None:
++    def _uninstall(self, translations: t.Optional["_SupportedTranslations"] = None) -> None:
++        self._clear_translation_cache()
+         for key in ("gettext", "ngettext", "pgettext", "npgettext"):
+             self.environment.globals.pop(key, None)
+ 
++    def _set_translation_cache_partition(
++        self, value: t.Hashable
++    ) -> None:
++        self._clear_translation_cache()
++        self.environment.translation_cache_partition = value
++
++    def _clear_translation_cache(self) -> None:
++        cache = self.environment.translation_cache
++        if cache is not None:
++            cache.clear()
++
++    def _resize_translation_cache(self, capacity: int) -> None:
++        if capacity < 0:
++            raise ValueError(
++                "Capacity must be a non-negative integer."
++            )
++        env = self.environment
++        if capacity == 0:
++            env.translation_cache = None
++        elif env.translation_cache is None:
++            env.translation_cache = LRUCache(capacity)
++        else:
++            new_cache = LRUCache(capacity)
++            # Copy entries up to the new capacity. Iterate over old items
++            # to preserve the most recently used entries.
++            for key, value in list(env.translation_cache.items()):
++                if len(new_cache) >= capacity:
++                    break
++                new_cache[key] = value
++            env.translation_cache = new_cache
++
+     def _extract(
+         self,
+         source: t.Union[str, nodes.Template],
+diff --git a/tests/test_ext.py b/tests/test_ext.py
+index b54e905..044af3a 100644
+--- a/tests/test_ext.py
++++ b/tests/test_ext.py
+@@ -712,3 +712,215 @@ class TestAutoEscape:
+         """
+         )
+         assert tmpl.render(x=42, y=23) == "42|23|99|[1][2][3]|42"
++
++
++class TestTranslationCache:
++    """Tests for optional bounded LRU cache on translation callables."""
++
++    def setup_env(self, cache_size=5):
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        call_count = {"gettext": 0, "ngettext": 0, "pgettext": 0, "npgettext": 0}
++
++        def _gettext(s):
++            call_count["gettext"] += 1
++            return f"translated({s})"
++
++        def _ngettext(s, p, n):
++            call_count["ngettext"] += 1
++            return f"ngtrans({s},{p},{n})"
++
++        def _pgettext(c, s):
++            call_count["pgettext"] += 1
++            return f"pgtrans({c},{s})"
++
++        def _npgettext(c, s, p, n):
++            call_count["npgettext"] += 1
++            return f"npgt({c},{s},{p},{n})"
++
++        env.install_gettext_callables(
++            _gettext, _ngettext, newstyle=True,
++            pgettext=_pgettext, npgettext=_npgettext,
++            cache_size=cache_size,
++        )
++        return env, call_count
++
++    def test_default_cache_disabled(self):
++        """cache_size=0 (default) does not cache."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: "result", lambda s, p, n: "plural",
++            newstyle=True,
++        )
++        assert env.translation_cache is None
++
++    def test_cache_hits_reduce_provider_calls(self):
++        """Same arguments hit cache and do not call provider again."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string("{{ gettext('hello') }}")
++        tmpl.render()
++        tmpl.render()
++        tmpl.render()
++        assert counts["gettext"] == 1, "provider should be called only once"
++
++    def test_cache_eviction(self):
++        """LRU eviction removes oldest entries."""
++        env, counts = self.setup_env(cache_size=3)
++        # Access 4 different keys; the 4th should evict the 1st
++        tmpl = env.from_string("{{ gettext(s) }}")
++        for msg in ["a", "b", "c", "d"]:
++            tmpl.render(s=msg)
++        # a was evicted, so calling a again should call provider
++        tmpl.render(s="a")
++        assert counts["gettext"] == 5, (
++            f"expected 5 calls (4 distinct + 1 miss after eviction), got {counts['gettext']}"
++        )
++
++    def test_partition_separation(self):
++        """Different partitions produce different cache entries."""
++        env, counts = self.setup_env(cache_size=10)
++        tmpl = env.from_string("{{ gettext('key') }}")
++        env.clear_translation_cache()
++        tmpl.render()
++        tmpl.render()
++        assert counts["gettext"] == 1, "second call should hit cache"
++
++        # Change partition and render again; switching partition clears old
++        # entries so the provider is called again.
++        env.set_translation_cache_partition("locale2")
++        tmpl.render()
++        assert counts["gettext"] == 2, "new partition should miss cache"
++
++        # Switch back; partition change clears old entries, so provider is
++        # called again for the original key.
++        env.set_translation_cache_partition(None)
++        tmpl.render()
++        assert counts["gettext"] == 3, "switch back to original partition clears cache"
++
++    def test_clear_translation_cache(self):
++        """clear_translation_cache() empties the cache."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string("{{ gettext('x') }}")
++        tmpl.render()
++        tmpl.render()
++        assert counts["gettext"] == 1
++        env.clear_translation_cache()
++        tmpl.render()
++        assert counts["gettext"] == 2, "cache miss after clear"
++
++    def test_resize_to_zero(self):
++        """resize_translation_cache(0) disables and clears the cache."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string("{{ gettext('x') }}")
++        tmpl.render()
++        tmpl.render()
++        assert counts["gettext"] == 1
++        env.resize_translation_cache(0)
++        assert env.translation_cache is None
++        tmpl.render()
++        assert counts["gettext"] == 2, "no caching after resize to 0"
++
++    def test_resize_negative_raises(self):
++        """resize_translation_cache(-1) raises ValueError."""
++        env = Environment(extensions=["jinja2.ext.i18n"])
++        env.install_gettext_callables(
++            lambda s: "x", lambda s, p, n: "y", newstyle=True,
++        )
++        with pytest.raises(ValueError):
++            env.resize_translation_cache(-1)
++
++    def test_resize_new_capacity(self):
++        """resize_translation_cache(n) changes capacity without losing recent entries."""
++        env, counts = self.setup_env(cache_size=10)
++        tmpl = env.from_string("{{ gettext(s) }}")
++        for msg in ["a", "b", "c"]:
++            tmpl.render(s=msg)
++        # resize smaller but still > number of entries
++        env.resize_translation_cache(2)
++        assert env.translation_cache is not None
++        assert len(env.translation_cache) <= 2
++        # 'a' was accessed first, so likely evicted by LRU under small cache
++        # but b and c were more recent; just verify cache still works
++        tmpl.render(s="b")
++        tmpl.render(s="c")
++        # b and c should be cached
++        expected_calls = counts["gettext"]
++        tmpl.render(s="b")
++        assert counts["gettext"] == expected_calls, "b should still be cached"
++
++    def test_install_clears_prior_cache(self):
++        """Installing new callables clears prior cache."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string("{{ gettext('x') }}")
++        tmpl.render()
++        tmpl.render()
++        assert counts["gettext"] == 1
++        # Re-install with a new provider and verify old cached result is gone
++        env.install_gettext_callables(
++            lambda s: "new(" + s + ")",
++            lambda s, p, n: "new(" + s + "," + p + "," + str(n) + ")",
++            newstyle=True, cache_size=5,
++        )
++        tmpl2 = env.from_string("{{ gettext('x') }}")
++        result = tmpl2.render()
++        assert result == "new(x)", f"Expected 'new(x)' but got {result!r}"
++
++    def test_uninstall_clears_cache(self):
++        """Uninstalling translation callables clears prior cache."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string("{{ gettext('x') }}")
++        tmpl.render()
++        # Put something in cache
++        assert env.translation_cache is not None
++        assert len(env.translation_cache) > 0
++        # Uninstall should clear the cache
++        env.uninstall_gettext_translations()
++        assert env.translation_cache is not None
++        assert len(env.translation_cache) == 0
++
++    def test_overlay_independent_cache(self):
++        """Overlay has its own independent cache state."""
++        env, counts = self.setup_env(cache_size=5)
++        overlay = env.overlay()
++        assert overlay.translation_cache is None
++        assert overlay.translation_cache_partition is None
++
++    def test_ngettext_caching(self):
++        """ngettext results are cached."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string(
++            "{{ ngettext('item', 'items', n) }}"
++        )
++        tmpl.render(n=1)
++        tmpl.render(n=1)
++        assert counts["ngettext"] == 1, "ngettext should be cached"
++
++    def test_pgettext_caching(self):
++        """pgettext results are cached."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string(
++            "{{ pgettext('context', 'key') }}"
++        )
++        tmpl.render()
++        tmpl.render()
++        assert counts["pgettext"] == 1, "pgettext should be cached"
++
++    def test_npgettext_caching(self):
++        """npgettext results are cached."""
++        env, counts = self.setup_env(cache_size=5)
++        tmpl = env.from_string(
++            "{{ npgettext('ctx', 'item', 'items', n) }}"
++        )
++        tmpl.render(n=1)
++        tmpl.render(n=1)
++        assert counts["npgettext"] == 1, "npgettext should be cached"
++
++    def test_pgettext_and_npgettext_separate_from_gettext(self):
++        """Different function kinds have independent cache entries."""
++        env, counts = self.setup_env(cache_size=10)
++        tmpl_get = env.from_string("{{ gettext('key') }}")
++        tmpl_pg = env.from_string("{{ pgettext('ctx', 'key') }}")
++        tmpl_get.render()
++        tmpl_pg.render()
++        # both should be 1 call each
++        assert counts["gettext"] == 1
++        assert counts["pgettext"] == 1

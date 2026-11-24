@@ -1,0 +1,251 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 1b8af9a..8533dcb 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,5 +1,12 @@
+ .. currentmodule:: click
+ 
++Version 8.3.0
++-------------
++
++Unreleased
++
++-   Add optional smart value completion strategies to ``Option``.
++
+ Version 8.2.1
+ -------------
+ 
+diff --git a/docs/shell-completion.rst b/docs/shell-completion.rst
+index bb69b78..a8f053d 100644
+--- a/docs/shell-completion.rst
++++ b/docs/shell-completion.rst
+@@ -153,6 +153,12 @@ with the incomplete value.
+ Overriding Value Completion
+ ---------------------------
+ 
++Options can enable built-in value strategies with
++``auto_complete=True``,
++which selects a strategy from the option name, or explicitly select
++``user``, ``branch``, ``environment``, ``file``, or ``directory``.
++An explicit ``shell_complete`` callback always takes precedence.
++
+ Value completions for a parameter can be customized without a custom
+ type by providing a ``shell_complete`` function. The function is used
+ instead of any completion provided by the type. It is passed 3 keyword
+diff --git a/src/click/_n4c_compatibility_probe.py b/src/click/_n4c_compatibility_probe.py
+new file mode 100644
+index 0000000..07b8396
+--- /dev/null
++++ b/src/click/_n4c_compatibility_probe.py
+@@ -0,0 +1 @@
++type UnsupportedOnPython310 = int
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..3e4bc77 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2506,6 +2506,9 @@ class Option(Parameter):
+                                context.
+     :param help: the help string.
+     :param hidden: hide this option from help outputs.
++    :param auto_complete: Enable name-based smart completion with
++        ``True``, or select ``user``, ``branch``, ``environment``,
++        ``file``, or ``directory`` independently of the option name.
+     :param attrs: Other command arguments described in :class:`Parameter`.
+ 
+     .. versionchanged:: 8.2
+@@ -2549,6 +2552,8 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        auto_complete: bool
++        | t.Literal["user", "branch", "environment", "file", "directory"] = False,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2636,6 +2641,17 @@ class Option(Parameter):
+         self.show_default = show_default
+         self.show_choices = show_choices
+         self.show_envvar = show_envvar
++        if not isinstance(auto_complete, (bool, str)):
++            raise TypeError("auto_complete must be a boolean or a strategy name")
++        if isinstance(auto_complete, str) and auto_complete not in {
++            "user",
++            "branch",
++            "environment",
++            "file",
++            "directory",
++        }:
++            raise ValueError("Unknown auto_complete strategy")
++        self.auto_complete = auto_complete
+ 
+         if __debug__:
+             if deprecated and prompt:
+@@ -3032,6 +3048,90 @@ class Option(Parameter):
+ 
+         return value, source
+ 
++    def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
++        """Return completions for the incomplete value.
++
++        An explicit completion callback takes precedence. Otherwise,
++        enabled smart completion uses the option name or selected
++        strategy. Disabled smart completion uses the parameter type.
++
++        :param ctx: Invocation context for this command.
++        :param incomplete: Value being completed. May be empty.
++
++        .. versionchanged:: 8.3.0
++            Added smart completion through ``auto_complete``.
++        """
++        # Custom shell_complete always takes precedence
++        if self._custom_shell_complete is not None:
++            return super().shell_complete(ctx, incomplete)
++
++        # Use smart completion if enabled
++        if self.auto_complete:
++            return self._smart_complete(ctx, incomplete)
++
++        return super().shell_complete(ctx, incomplete)
++
++    def _smart_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
++        from click.shell_completion import CompletionItem
++
++        if self.name is None:
++            return []
++        tokens: set[str] = (
++            {self.auto_complete}
++            if isinstance(self.auto_complete, str)
++            else set(self.name.lower().split("_"))
++        )
++
++        if tokens.intersection({"user", "username", "owner", "author"}):
++            try:
++                import pwd
++            except ImportError:
++                return super().shell_complete(ctx, incomplete)
++            try:
++                values = {
++                    entry.pw_name
++                    for entry in pwd.getpwall()
++                    if entry.pw_name.startswith(incomplete)
++                    and not entry.pw_name.startswith("_")
++                }
++            except OSError:
++                return super().shell_complete(ctx, incomplete)
++            return [CompletionItem(value) for value in sorted(values)[:20]]
++
++        if tokens.intersection({"branch", "ref", "revision"}):
++            import subprocess
++
++            try:
++                result = subprocess.run(
++                    ["git", "branch", "-a", "--format=%(refname:short)"],
++                    capture_output=True,
++                    text=True,
++                    timeout=2,
++                )
++            except (subprocess.SubprocessError, OSError):
++                return super().shell_complete(ctx, incomplete)
++            if result.returncode != 0:
++                return super().shell_complete(ctx, incomplete)
++            values = {
++                line.strip()
++                for line in result.stdout.splitlines()
++                if line.strip().startswith(incomplete)
++            }
++            return [CompletionItem(value) for value in sorted(values)[:20]]
++
++        if tokens.intersection({"env", "environment", "var"}):
++            prefix = incomplete.upper()
++            values = {name for name in os.environ if name.upper().startswith(prefix)}
++            return [CompletionItem(value) for value in sorted(values)[:20]]
++
++        if tokens.intersection({"file", "path", "dir", "directory", "output", "input"}):
++            path_type = types.Path(
++                file_okay=not tokens.intersection({"dir", "directory"})
++            )
++            return path_type.shell_complete(ctx, self, incomplete)
++
++        return super().shell_complete(ctx, incomplete)
++
+ 
+ class Argument(Parameter):
+     """Arguments are positional parameters to a command.  They generally
+diff --git a/tests/test_n4c_author_smart_completion.py b/tests/test_n4c_author_smart_completion.py
+new file mode 100644
+index 0000000..c439632
+--- /dev/null
++++ b/tests/test_n4c_author_smart_completion.py
+@@ -0,0 +1,72 @@
++from collections import namedtuple
++
++import pytest
++
++import click
++from click.shell_completion import CompletionItem
++
++
++def values(option, incomplete=""):
++    ctx = click.Context(click.Command("cli", params=[option]))
++    return [item.value for item in option.shell_complete(ctx, incomplete)]
++
++
++def test_explicit_callback_precedes_smart_strategy():
++    option = click.Option(
++        ["--username"],
++        auto_complete=True,
++        shell_complete=lambda ctx, param, incomplete: [CompletionItem("custom")],
++    )
++    assert values(option) == ["custom"]
++
++
++def test_environment_returns_sorted_unique_names_not_values(monkeypatch):
++    monkeypatch.setenv("N4C_AUTO_B", "secret-b")
++    monkeypatch.setenv("N4C_AUTO_A", "secret-a")
++    option = click.Option(["--env-var"], auto_complete=True)
++    assert values(option, "N4C_AUTO_") == ["N4C_AUTO_A", "N4C_AUTO_B"]
++
++
++def test_user_strategy_filters_private_and_limits(monkeypatch):
++    import pwd
++
++    entry = namedtuple("Entry", "pw_name")
++    names = [entry(f"person{i:02}") for i in range(25)] + [entry("_private")]
++    monkeypatch.setattr(
++        pwd, "getpwall", lambda: list(reversed(names)) + [entry("person00")]
++    )
++    result = values(click.Option(["--owner"], auto_complete=True), "")
++    assert result == [f"person{i:02}" for i in range(20)]
++
++
++def test_explicit_strategy_ignores_parameter_name(monkeypatch):
++    monkeypatch.setenv("N4C_EXPLICIT", "not-returned")
++    option = click.Option(["--branch"], auto_complete="environment")
++    assert values(option, "N4C_") == ["N4C_EXPLICIT"]
++
++
++def test_unknown_name_falls_back_to_type_completion():
++    option = click.Option(["--color"], type=click.Choice(["amber"]), auto_complete=True)
++    assert values(option, "a") == ["amber"]
++
++
++def test_path_strategies_delegate_with_directory_boundary():
++    for strategy in ("file", "directory"):
++        option = click.Option(["--destination"], auto_complete=strategy)
++        ctx = click.Context(click.Command("cli", params=[option]))
++        expected = click.Path(file_okay=strategy != "directory").shell_complete(
++            ctx, option, "project"
++        )
++        actual = option.shell_complete(ctx, "project")
++        assert [(item.value, item.type) for item in actual] == [
++            (item.value, item.type) for item in expected
++        ]
++
++
++@pytest.mark.parametrize(
++    ("value", "error"),
++    [("unknown", ValueError), ("", ValueError), (1, TypeError), (None, TypeError)],
++)
++def test_invalid_values_are_rejected(value, error):
++    with pytest.raises(error):
++        click.Option(["--identity"], auto_complete=value)

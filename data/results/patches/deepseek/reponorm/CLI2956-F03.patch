@@ -1,0 +1,199 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index f57ada6..c74444b 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2549,6 +2549,7 @@ class Option(Parameter):
+         show_choices: bool = True,
+         show_envvar: bool = False,
+         deprecated: bool | str = False,
++        batch_size: int | None = None,
+         **attrs: t.Any,
+     ) -> None:
+         if help:
+@@ -2662,6 +2663,21 @@ class Option(Parameter):
+                 if self.is_flag:
+                     raise TypeError("'count' is not valid with 'is_flag'.")
+ 
++            if batch_size is not None:
++                if isinstance(batch_size, bool):
++                    raise TypeError("'batch_size' must be an integer, not bool.")
++
++                if not isinstance(batch_size, int):
++                    raise TypeError("'batch_size' must be a positive integer.")
++
++                if batch_size <= 0:
++                    raise ValueError("'batch_size' must be a positive integer.")
++
++                if not self.multiple:
++                    raise TypeError("'batch_size' requires 'multiple=True'.")
++
++        self.batch_size = batch_size
++
+     def to_info_dict(self) -> dict[str, t.Any]:
+         info_dict = super().to_info_dict()
+         info_dict.update(
+@@ -2995,6 +3011,17 @@ class Option(Parameter):
+ 
+         return rv
+ 
++    def process_value(self, ctx: Context, value: t.Any) -> t.Any:
++        value = super().process_value(ctx, value)
++
++        if self.multiple and self.batch_size is not None and value:
++            return tuple(
++                value[i : i + self.batch_size]
++                for i in range(0, len(value), self.batch_size)
++            )
++
++        return value
++
+     def consume_value(
+         self, ctx: Context, opts: cabc.Mapping[str, Parameter]
+     ) -> tuple[t.Any, ParameterSource]:
+diff --git a/tests/test_options.py b/tests/test_options.py
+index 5c30418..57cb700 100644
+--- a/tests/test_options.py
++++ b/tests/test_options.py
+@@ -1139,3 +1139,142 @@ def test_duplicate_names_warning(runner, opts_one, opts_two):
+ 
+     with pytest.warns(UserWarning):
+         runner.invoke(cli, [])
++
++
++
++def test_batch_size_constructor_validates(runner):
++    """Test that batch_size validates at construction time."""
++
++    # batch_size with multiple=True, positive integer -- valid
++    opt = click.Option(["--foo"], multiple=True, batch_size=3)
++    assert opt.batch_size == 3
++
++    # batch_size=None -- valid (preserves existing behavior)
++    opt = click.Option(["--foo"], multiple=True, batch_size=None)
++    assert opt.batch_size is None
++
++    # Boolean is rejected
++    with pytest.raises(TypeError, match="batch_size"):
++        click.Option(["--foo"], multiple=True, batch_size=True)
++
++    # Non-integer is rejected
++    with pytest.raises(TypeError, match="batch_size"):
++        click.Option(["--foo"], multiple=True, batch_size=3.5)
++
++    with pytest.raises(TypeError, match="batch_size"):
++        click.Option(["--foo"], multiple=True, batch_size="5")
++
++    # Zero is rejected
++    with pytest.raises(ValueError, match="batch_size"):
++        click.Option(["--foo"], multiple=True, batch_size=0)
++
++    # Negative is rejected
++    with pytest.raises(ValueError, match="batch_size"):
++        click.Option(["--foo"], multiple=True, batch_size=-1)
++
++    # Without multiple=True is rejected
++    with pytest.raises(TypeError, match="batch_size"):
++        click.Option(["--foo"], batch_size=5)
++
++    with pytest.raises(TypeError, match="batch_size"):
++        click.Option(["--foo"], multiple=False, batch_size=5)
++
++
++def test_batch_size_with_options(runner):
++    """Test that batch_size works through the @click.option decorator."""
++
++    @click.command()
++    @click.option("--item", "-i", multiple=True, batch_size=2, type=str)
++    def cli(item):
++        click.echo(repr(item))
++
++    result = runner.invoke(cli, ["-i", "a", "-i", "b", "-i", "c"])
++    assert not result.exception
++    assert result.output.strip() == "(('a', 'b'), ('c',))"
++
++    # Empty
++    result = runner.invoke(cli, [])
++    assert not result.exception
++    assert result.output.strip() == "()"
++
++
++def test_batch_size_preserves_values(runner):
++    """Test that batch_size preserves 0, False, empty string, None."""
++
++    @click.command()
++    @click.option("--val", multiple=True, batch_size=3, type=str)
++    def cli(val):
++        click.echo(repr(val))
++
++    result = runner.invoke(cli, ["--val", "0", "--val", "", "--val", "None"])
++    assert not result.exception
++    assert result.output.strip() == "(('0', '', 'None'),)"
++
++
++def test_batch_size_exact_batch(runner):
++    """Test that batch_size groups into exact-sized batches."""
++
++    @click.command()
++    @click.option("--n", multiple=True, batch_size=2, type=int)
++    def cli(n):
++        click.echo(repr(n))
++
++    # Even number of items
++    result = runner.invoke(cli, ["--n", "1", "--n", "2", "--n", "3", "--n", "4"])
++    assert not result.exception
++    assert result.output.strip() == "((1, 2), (3, 4))"
++
++
++def test_batch_size_single_item(runner):
++    """Test that batch_size=1 produces singleton batches."""
++
++    @click.command()
++    @click.option("--n", multiple=True, batch_size=1, type=int)
++    def cli(n):
++        click.echo(repr(n))
++
++    result = runner.invoke(cli, ["--n", "10", "--n", "20", "--n", "30"])
++    assert not result.exception
++    assert result.output.strip() == "((10,), (20,), (30,))"
++
++
++def test_batch_size_short_final_batch(runner):
++    """Test that the last batch can be shorter than batch_size."""
++
++    @click.command()
++    @click.option("--n", multiple=True, batch_size=4, type=int)
++    def cli(n):
++        click.echo(repr(n))
++
++    result = runner.invoke(cli, ["--n", "1", "--n", "2", "--n", "3"])
++    assert not result.exception
++    assert result.output.strip() == "((1, 2, 3),)"
++
++
++def test_batch_size_none_no_batching(runner):
++    """Test that batch_size=None preserves existing tuple behavior."""
++
++    @click.command()
++    @click.option("--n", multiple=True, type=int)
++    def cli(n):
++        click.echo(repr(n))
++
++    result = runner.invoke(cli, ["--n", "1", "--n", "2", "--n", "3"])
++    assert not result.exception
++    assert result.output.strip() == "(1, 2, 3)"
++
++
++def test_batch_size_with_callback(runner):
++    """Test that callback runs before batching."""
++
++    def _callback(ctx, param, value):
++        return tuple(v.upper() for v in value)
++
++    @click.command()
++    @click.option("--s", multiple=True, batch_size=2, callback=_callback)
++    def cli(s):
++        click.echo(repr(s))
++
++    result = runner.invoke(cli, ["--s", "a", "--s", "b", "--s", "c"])
++    assert not result.exception
++    assert result.output.strip() == "(('A', 'B'), ('C',))"

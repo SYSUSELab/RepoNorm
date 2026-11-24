@@ -1,0 +1,500 @@
+diff --git a/dspy/clients/__init__.py b/dspy/clients/__init__.py
+index 52be745a..b8320875 100644
+--- a/dspy/clients/__init__.py
++++ b/dspy/clients/__init__.py
+@@ -33,6 +33,7 @@ def configure_cache(
+     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
+     memory_max_entries: Optional[int] = 1000000,
+     enable_litellm_cache: bool = False,
++    namespace: Optional[str] = None,
+ ):
+     """Configure the cache for DSPy.
+ 
+@@ -43,6 +44,9 @@ def configure_cache(
+         disk_size_limit_bytes: The size limit of the on-disk cache.
+         memory_max_entries: The maximum number of entries in the in-memory cache.
+         enable_litellm_cache: Whether to enable LiteLLM cache.
++        namespace: Initial namespace for the cache. None uses original cache keys.
++                   A string prefixes cache keys with the first 8 hex SHA-256 characters
++                   of the UTF-8 namespace and a colon.
+     """
+     if enable_disk_cache and enable_litellm_cache:
+         raise ValueError(
+@@ -72,6 +76,7 @@ def configure_cache(
+         disk_cache_dir,
+         disk_size_limit_bytes,
+         memory_max_entries,
++        namespace=namespace,
+     )
+ 
+ 
+diff --git a/dspy/clients/cache.py b/dspy/clients/cache.py
+index bfa7dbde..57b9b522 100644
+--- a/dspy/clients/cache.py
++++ b/dspy/clients/cache.py
+@@ -1,18 +1,58 @@
+-import copy
+-import inspect
++import hashlib
+ import logging
+-import threading
+-from functools import wraps
+-from hashlib import sha256
+-from typing import Any, Dict, Optional
+ 
++logger = logging.getLogger(__name__)
++import inspect
++import threading
++import copy
+ import cloudpickle
++import json
++import os
++from typing import Any, Callable, Dict, Optional, TypeVar, Union
++
++import cachetools
++import diskcache
+ import pydantic
+ import ujson
+-from cachetools import LRUCache
+-from diskcache import FanoutCache
++from functools import wraps
+ 
+-logger = logging.getLogger(__name__)
++T = TypeVar("T")
++
++
++def _sha256_hex(data: bytes) -> str:
++    """Compute SHA-256 hash and return as hexadecimal string."""
++    return hashlib.sha256(data).hexdigest()
++
++
++class NamespaceAccessor:
++    """Namespace accessor that compares equal to current string or None.
++    
++    Exposes current value through .value attribute.
++    """
++    
++    def __init__(self, cache_instance):
++        self._cache = cache_instance
++    
++    @property
++    def value(self) -> Optional[str]:
++        """Get the current namespace value."""
++        return self._cache._get_current_namespace()
++    
++    def __eq__(self, other):
++        """Compare equal to current string or None."""
++        current = self.value
++        if other is None:
++            return current is None
++        if isinstance(other, str):
++            return current == other
++        return False
++    
++    def __repr__(self):
++        return f"NamespaceAccessor(value={self.value!r})"
++    
++    def __call__(self, value: Optional[str]):
++        """Context manager for temporary namespace changes."""
++        return self._cache.namespace_context(value)
+ 
+ 
+ class Cache:
+@@ -30,25 +70,31 @@ class Cache:
+         disk_cache_dir: str,
+         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
+         memory_max_entries: Optional[int] = 1000000,
+-
++        namespace: Optional[str] = None,
+     ):
+-        """
++        """Initialize the cache.
++        
+         Args:
+             enable_disk_cache: Whether to enable on-disk cache.
+             enable_memory_cache: Whether to enable in-memory cache.
+-            disk_cache_dir: The directory where the disk cache is stored.
+-            disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
+-            memory_max_entries: The maximum size of the in-memory cache (in number of items).
++            disk_cache_dir: Directory for on-disk cache.
++            disk_size_limit_bytes: Size limit for on-disk cache.
++            memory_max_entries: Maximum entries in memory cache.
++            namespace: Initial namespace for cache keys. None uses original keys.
++                      A string prefixes keys with first 8 hex SHA-256 chars + colon.
+         """
+-
+         self.enable_disk_cache = enable_disk_cache
+         self.enable_memory_cache = enable_memory_cache
+-        if self.enable_memory_cache:
+-            self.memory_cache = LRUCache(maxsize=memory_max_entries)
++        
++        # Initialize memory cache
++        if enable_memory_cache:
++            self.memory_cache = cachetools.LRUCache(maxsize=memory_max_entries)
+         else:
+             self.memory_cache = {}
+-        if self.enable_disk_cache:
+-            self.disk_cache = FanoutCache(
++        
++        # Initialize disk cache
++        if enable_disk_cache:
++            self.disk_cache = diskcache.FanoutCache(
+                 shards=16,
+                 timeout=10,
+                 directory=disk_cache_dir,
+@@ -56,20 +102,97 @@ class Cache:
+             )
+         else:
+             self.disk_cache = {}
+-
+-        self._lock = threading.RLock()
+-
+-    def __contains__(self, key: str) -> bool:
+-        """Check if a key is in the cache."""
+-        return key in self.memory_cache or key in self.disk_cache
+-
++        
++        # Thread-local storage for namespace using contextvars
++        self._namespace_var = None  # Will be set lazily
++        self._namespace_lock = None  # Will be set lazily
++        
++        # Set initial namespace
++        self.set_namespace(namespace)
++        
++        # Lock for thread-safe operations
++        self._lock = threading.Lock()
++    
++    def _ensure_thread_local(self):
++        """Ensure thread-local storage is initialized."""
++        import threading
++        import contextvars
++        
++        if self._namespace_var is None:
++            self._namespace_var = contextvars.ContextVar(
++                "dspy_cache_namespace", 
++                default=None
++            )
++            self._namespace_lock = threading.Lock()
++    
++    def _get_current_namespace(self) -> Optional[str]:
++        """Get the current namespace from thread-local storage."""
++        self._ensure_thread_local()
++        return self._namespace_var.get()
++    
++    def set_namespace(self, value: Optional[str]) -> None:
++        """Set the cache namespace.
++        
++        Args:
++            value: Namespace value. Must be a string or None.
++                   Strings are prefixed to cache keys with first 8 hex SHA-256 chars + colon.
++                   None uses original cache keys without prefix.
++        
++        Raises:
++            ValueError: If value is not a string or None.
++        """
++        if value is not None and not isinstance(value, str):
++            raise ValueError(f"Namespace must be a string or None, got {type(value).__name__}")
++        
++        self._ensure_thread_local()
++        self._namespace_var.set(value)
++    
++    @property
++    def namespace(self) -> NamespaceAccessor:
++        """Get namespace accessor for reading and setting namespace.
++        
++        The accessor can be used as:
++        - cache.namespace (returns current value via .value)
++        - cache.namespace == "my_ns" (comparison)
++        - cache.namespace("new_ns") (context manager)
++        """
++        return NamespaceAccessor(self)
++    
++    def namespace_context(self, value: Optional[str]):
++        """Create a context manager for temporary namespace changes.
++        
++        Args:
++            value: Temporary namespace value. None clears the namespace.
++        
++        Returns:
++            Context manager that temporarily sets namespace and restores on exit.
++        """
++        class NamespaceContext:
++            def __init__(self, cache, value):
++                self._cache = cache
++                self._value = value
++                self._old_value = None
++            
++            def __enter__(self):
++                self._old_value = self._cache._get_current_namespace()
++                self._cache.set_namespace(self._value)
++                return self._cache
++            
++            def __exit__(self, exc_type, exc_val, exc_tb):
++                self._cache.set_namespace(self._old_value)
++                return False
++        
++        return NamespaceContext(self, value)
++    
+     def cache_key(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> str:
+         """
+         Obtain a unique cache key for the given request dictionary by hashing its JSON
+         representation. For request fields having types that are known to be JSON-incompatible,
+         convert them to a JSON-serializable format before hashing.
++        
++        If a namespace is set, the key is prefixed with the first 8 hexadecimal characters
++        of the SHA-256 hash of the UTF-8 encoded namespace, followed by a colon.
+         """
+-
+         ignored_args_for_cache_key = ignored_args_for_cache_key or []
+ 
+         def transform_value(value):
+@@ -94,9 +217,22 @@ class Cache:
+                 return value
+ 
+         params = {k: transform_value(v) for k, v in request.items() if k not in ignored_args_for_cache_key}
+-        return sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
+-
++        base_key = sha256(ujson.dumps(params, sort_keys=True).encode()).hexdigest()
++        
++        # Get current namespace and prepend if not None
++        namespace = self._get_current_namespace()
++        if namespace is not None:
++            # Compute first 8 hex chars of SHA-256(namespace)
++            ns_hash = _sha256_hex(namespace.encode('utf-8'))[:8]
++            return f"{ns_hash}:{base_key}"
++        
++        return base_key
++    
+     def get(self, request: Dict[str, Any], ignored_args_for_cache_key: Optional[list[str]] = None) -> Any:
++        """Get a value from the cache.
++        
++        First checks memory cache, then disk cache.
++        """
+         try:
+             key = self.cache_key(request, ignored_args_for_cache_key)
+         except Exception:
+@@ -120,7 +256,7 @@ class Cache:
+             # Clear the usage data when cache is hit, because no LM call is made
+             response.usage = {}
+         return response
+-
++    
+     def put(
+         self,
+         request: Dict[str, Any],
+@@ -144,7 +280,15 @@ class Cache:
+             except Exception as e:
+                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
+                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
+-
++    
++    def delete(self, key: str) -> None:
++        """Delete a key from the cache."""
++        if self.enable_memory_cache and key in self.memory_cache:
++            del self.memory_cache[key]
++        
++        if self.enable_disk_cache and key in self.disk_cache:
++            self.disk_cache.delete(key)
++    
+     def reset_memory_cache(self) -> None:
+         if not self.enable_memory_cache:
+             return
+@@ -168,6 +312,18 @@ class Cache:
+             with open(filepath, "rb") as f:
+                 self.memory_cache = cloudpickle.load(f)
+ 
++    def clear(self) -> None:
++        """Clear all cached values."""
++        if self.enable_memory_cache:
++            self.memory_cache.clear()
++        
++        if self.enable_disk_cache:
++            self.disk_cache.clear()
++
++
++# Alias for backward compatibility
++sha256 = hashlib.sha256
++
+ 
+ def request_cache(
+     cache_arg_name: Optional[str] = None,
+@@ -175,88 +331,100 @@ def request_cache(
+     enable_memory_cache: bool = True,
+     *,  # everything after this is keyword-only
+     maxsize: Optional[int] = None,  # legacy / no-op
+-):
+-    """
+-    Decorator for applying caching to a function based on the request argument.
+-
++    namespace: Optional[str] = None,
++) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
++    """Decorator to cache function results based on arguments.
++    
+     Args:
+-        cache_arg_name: The name of the argument that contains the request. If not provided, the entire kwargs is used
+-            as the request.
+-        ignored_args_for_cache_key: A list of arguments to ignore when computing the cache key from the request.
+-        enable_memory_cache: Whether to enable in-memory cache at call time. If False, the memory cache will not be
+-            written to on new data.
++        cache_arg_name: Name of the cache argument to pass to the function.
++        ignored_args_for_cache_key: List of argument names to ignore when computing cache key.
++        enable_memory_cache: Whether to enable memory caching for this function.
++        maxsize: Legacy parameter, no longer used.
++        namespace: Optional namespace for this specific function's cache. If provided,
++                   temporarily overrides the caller's active namespace for the whole call.
++    
++    Returns:
++        Decorated function with caching behavior.
+     """
+-    ignored_args_for_cache_key = ignored_args_for_cache_key or ["api_key", "api_base", "base_url"]
+-    # Deprecation notice
+-    if maxsize is not None:
+-        logger.warning(
+-            "[DEPRECATION] `maxsize` is deprecated and no longer does anything; "
+-            "the cache is now handled internally by `dspy.cache`. "
+-            "This parameter will be removed in a future release.",
+-        )
+-
+-    def decorator(fn):
+-        @wraps(fn)
+-        def process_request(args, kwargs):
+-            # Use fully qualified function name for uniqueness
+-            fn_identifier = f"{fn.__module__}.{fn.__qualname__}"
+-
+-            # Create a modified request that includes the function identifier so that it's incorporated into the cache
+-            # key. Deep copy is required because litellm sometimes modifies the kwargs in place.
+-            if cache_arg_name:
+-                # When `cache_arg_name` is provided, use the value of the argument with this name as the request for
+-                # caching.
+-                modified_request = copy.deepcopy(kwargs[cache_arg_name])
++    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
++        @wraps(func)
++        def wrapper(*args, **kwargs):
++            # Determine effective namespace
++            if namespace is not None:
++                # Use decorator-provided namespace
++                import dspy
++                old_ns = dspy.cache._get_current_namespace()
++                dspy.cache.set_namespace(namespace)
++                try:
++                    result = _call_with_cache(func, args, kwargs, cache_arg_name, 
++                                             ignored_args_for_cache_key, enable_memory_cache)
++                finally:
++                    dspy.cache.set_namespace(old_ns)
++                return result
+             else:
+-                # When `cache_arg_name` is not provided, use the entire kwargs as the request for caching.
+-                modified_request = copy.deepcopy(kwargs)
+-                for i, arg in enumerate(args):
+-                    modified_request[f"positional_arg_{i}"] = arg
+-            modified_request["_fn_identifier"] = fn_identifier
+-
+-            return modified_request
+-
+-        @wraps(fn)
+-        def sync_wrapper(*args, **kwargs):
+-            import dspy
+-
+-            cache = dspy.cache
+-            modified_request = process_request(args, kwargs)
+-
+-            # Retrieve from cache if available
+-            cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+-
+-            if cached_result is not None:
+-                return cached_result
+-
+-            # Otherwise, compute and store the result
+-            result = fn(*args, **kwargs)
+-            # `enable_memory_cache` can be provided at call time to avoid indefinite growth.
+-            cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
+-
+-            return result
+-
+-        @wraps(fn)
+-        async def async_wrapper(*args, **kwargs):
+-            import dspy
+-
+-            cache = dspy.cache
+-            modified_request = process_request(args, kwargs)
+-
+-            # Retrieve from cache if available
+-            cached_result = cache.get(modified_request, ignored_args_for_cache_key)
+-            if cached_result is not None:
+-                return cached_result
+-
+-            # Otherwise, compute and store the result
+-            result = await fn(*args, **kwargs)
+-            cache.put(modified_request, result, ignored_args_for_cache_key, enable_memory_cache)
++                # Use caller's active namespace
++                return _call_with_cache(func, args, kwargs, cache_arg_name,
++                                      ignored_args_for_cache_key, enable_memory_cache)
++        
++        return wrapper
++    
++    return decorator
+ 
+-            return result
+ 
+-        if inspect.iscoroutinefunction(fn):
+-            return async_wrapper
++def _call_with_cache(func, args, kwargs, cache_arg_name, ignored_args_for_cache_key, enable_memory_cache):
++    """Helper to call function with caching using current namespace."""
++    import dspy
++    import asyncio
++    import copy
++    
++    # Check if function is async
++    is_async = asyncio.iscoroutinefunction(func)
++    
++    # Build request dict based on cache_arg_name
++    if cache_arg_name:
++        # Use the value of the argument with this name as the request for caching
++        # Find the value of cache_arg_name from args and kwargs
++        sig = inspect.signature(func)
++        bound = sig.bind(*args, **kwargs)
++        bound.apply_defaults()
++        
++        if cache_arg_name in bound.arguments:
++            request = copy.deepcopy(bound.arguments[cache_arg_name])
+         else:
+-            return sync_wrapper
+-
+-    return decorator
++            # Fallback: use all kwargs
++            request = copy.deepcopy(kwargs)
++    else:
++        # Use all kwargs as the request
++        request = copy.deepcopy(kwargs)
++        for i, arg in enumerate(args):
++            request[f"positional_arg_{i}"] = arg
++    
++    # Add function identifier to ensure uniqueness across different functions
++    fn_identifier = f"{func.__module__}.{func.__qualname__}"
++    request["_fn_identifier"] = fn_identifier
++    
++    # Try to get from cache (pass request dict, not key)
++    cached = dspy.cache.get(request, ignored_args_for_cache_key)
++    if cached is not None:
++        if is_async:
++            # For async functions, return a coroutine that yields the cached value
++            async def async_cached():
++                return cached
++            return async_cached()
++        return cached
++    
++    # Call function
++    result = func(*args, **kwargs)
++    
++    # If async, need to await and then cache
++    if is_async:
++        async def async_wrapper():
++            computed_result = await result
++            dspy.cache.put(request, computed_result, ignored_args_for_cache_key, enable_memory_cache)
++            return computed_result
++        return async_wrapper()
++    
++    # Put in cache
++    dspy.cache.put(request, result, ignored_args_for_cache_key, enable_memory_cache)
++    
++    return result

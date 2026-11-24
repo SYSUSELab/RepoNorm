@@ -1,0 +1,94 @@
+diff --git a/tiktoken/core.py b/tiktoken/core.py
+index 6bc9736..e411722 100644
+--- a/tiktoken/core.py
++++ b/tiktoken/core.py
+@@ -82,7 +82,9 @@ class Encoding:
+         *,
+         allowed_special: Literal["all"] | AbstractSet[str] = set(),  # noqa: B006
+         disallowed_special: Literal["all"] | Collection[str] = "all",
+-    ) -> list[int]:
++        chunk_size: int | None = None,
++        chunk_overlap: int = 0,
++    ) -> list[int] | list[list[int]]:
+         """Encodes a string into tokens.
+ 
+         Special tokens are artificial tokens used to unlock capabilities from a model,
+@@ -110,6 +112,20 @@ class Encoding:
+         [27, 91, 437, 1659, 5239, 91, 29]
+         ```
+         """
++        # Validate chunk_size and chunk_overlap
++        if chunk_size is not None:
++            if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
++                raise ValueError("chunk_size must be a positive integer or None")
++            if chunk_size < 1:
++                raise ValueError("chunk_size must be a positive integer")
++            if isinstance(chunk_overlap, bool) or not isinstance(chunk_overlap, int):
++                raise ValueError("chunk_overlap must be a non-negative integer")
++            if chunk_overlap < 0 or chunk_overlap >= chunk_size:
++                raise ValueError("chunk_overlap must be in [0, chunk_size)")
++        elif chunk_overlap != 0:
++            raise ValueError("chunk_overlap must be 0 when chunk_size is None")
++
++        # Resolve allowed/disallowed special tokens
+         if allowed_special == "all":
+             allowed_special = self.special_tokens_set
+         if disallowed_special == "all":
+@@ -120,17 +136,46 @@ class Encoding:
+             if match := _special_token_regex(disallowed_special).search(text):
+                 raise_disallowed_special_token(match.group())
+ 
+-        try:
+-            return self._core_bpe.encode(text, allowed_special)
+-        except UnicodeEncodeError:
+-            # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
+-            # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
+-            # fixup for any surrogate pairs that may have sneaked their way into the text.
+-            # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
+-            # string, but given that this is input we want to support, maybe that's okay.
+-            # Also we use errors="replace" to handle weird things like lone surrogates.
+-            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+-            return self._core_bpe.encode(text, allowed_special)
++        # Non-chunking path (original behavior)
++        if chunk_size is None:
++            try:
++                return self._core_bpe.encode(text, allowed_special)
++            except UnicodeEncodeError:
++                # BPE operates on bytes, but the regex operates on unicode. If we pass a str that is
++                # invalid UTF-8 to Rust, it will rightfully complain. Here we do a quick and dirty
++                # fixup for any surrogate pairs that may have sneaked their way into the text.
++                # Technically, this introduces a place where encode + decode doesn't roundtrip a Python
++                # string, but given that this is input we want to support, maybe that's okay.
++                # Also we use errors="replace" to handle weird things like lone surrogates.
++                text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                return self._core_bpe.encode(text, allowed_special)
++
++        # Chunking path
++        n = len(text)
++        if n == 0:
++            return [[]]
++
++        windows = []
++        start = 0
++        while start < n:
++            end = min(start + chunk_size, n)
++            windows.append(text[start:end])
++            if end == n:
++                break
++            start = end - chunk_overlap
++            if start >= n:
++                break
++
++        # Encode each window independently
++        result = []
++        for window_text in windows:
++            try:
++                encoded = self._core_bpe.encode(window_text, allowed_special)
++            except UnicodeEncodeError:
++                window_text = window_text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
++                encoded = self._core_bpe.encode(window_text, allowed_special)
++            result.append(encoded)
++        return result
+ 
+     def encode_to_numpy(
+         self,
